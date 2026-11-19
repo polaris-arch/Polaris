@@ -85,6 +85,11 @@ function renderDialog() {
   h.stateIndex = 0;
   h.refIndex = 0;
   const modal = BackupImportDialog({ instanceId: 'backup-1' }) as ReactElement<{
+    children: ReactElement<{
+      'aria-disabled': boolean;
+      onClick: () => void;
+      onKeyDown: (event: { key: string; preventDefault: () => void }) => void;
+    }>;
     footer: ReactElement<{ children: ReactElement<{ onClick: () => void }>[] }>;
     onClose: () => void;
   }>;
@@ -108,6 +113,33 @@ beforeEach(() => {
 });
 
 describe('BackupImportDialog restore feedback', () => {
+  it('admits one picker at a time and permits another after cancellation', async () => {
+    h.state[0] = null;
+    let cancel!: (value: { canceled: boolean }) => void;
+    const pending = new Promise<{ canceled: boolean }>((done) => { cancel = done; });
+    vi.mocked(api.backup.importPick)
+      .mockReturnValueOnce(pending)
+      .mockResolvedValueOnce({ canceled: true });
+
+    const modal = renderDialog();
+    const picker = modal.props.children.props;
+    picker.onClick();
+    picker.onClick();
+    picker.onKeyDown({ key: 'Enter', preventDefault: vi.fn() });
+    modal.props.onClose();
+    expect(api.backup.importPick).toHaveBeenCalledTimes(1);
+    expect(h.closed).toEqual([]);
+    expect(renderDialog().props.children.props['aria-disabled']).toBe(true);
+
+    cancel({ canceled: true });
+    await pending;
+
+    const ready = renderDialog().props.children.props;
+    expect(ready['aria-disabled']).toBe(false);
+    ready.onKeyDown({ key: ' ', preventDefault: vi.fn() });
+    expect(api.backup.importPick).toHaveBeenCalledTimes(2);
+  });
+
   it('asks about the selected categories and overwrite before applying; cancel preserves the preview', () => {
     restoreClick();
     restoreClick();

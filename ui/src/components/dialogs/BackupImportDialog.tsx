@@ -63,9 +63,11 @@ export function BackupImportDialog({ instanceId }: { instanceId: string }) {
   const [selected, setSelected] = useState<Set<BackupCategory>>(new Set());
   const [busy, setBusy] = useState(false);
   const pendingConfirmId = useRef<string | null>(null);
-  const applying = useRef(false);
+  const inFlight = useRef(false);
 
   const doPick = async () => {
+    if (inFlight.current || pendingConfirmId.current || !hasInstance(instanceId)) return;
+    inFlight.current = true;
     setBusy(true);
     try {
       const r = await api.backup.importPick();
@@ -90,6 +92,7 @@ export function BackupImportDialog({ instanceId }: { instanceId: string }) {
       console.error('[BackupImportDialog] import pick failed:', e);
       toast.error(t('backupImport.errParse'), backupErrorText(undefined, t));
     } finally {
+      inFlight.current = false;
       if (hasInstance(instanceId)) setBusy(false);
     }
   };
@@ -100,7 +103,7 @@ export function BackupImportDialog({ instanceId }: { instanceId: string }) {
   };
 
   const requestClose = () => {
-    if (applying.current || pendingConfirmId.current || !hasInstance(instanceId)) return;
+    if (inFlight.current || pendingConfirmId.current || !hasInstance(instanceId)) return;
     if (picked) {
       const confirmId = open({
         kind: 'confirm',
@@ -127,6 +130,8 @@ export function BackupImportDialog({ instanceId }: { instanceId: string }) {
   };
 
   const applySelection = async (filePath: string, categories: BackupCategory[]) => {
+    if (inFlight.current || !hasInstance(instanceId)) return;
+    inFlight.current = true;
     setBusy(true);
     try {
       const r = await api.backup.importApply(filePath, categories);
@@ -148,13 +153,13 @@ export function BackupImportDialog({ instanceId }: { instanceId: string }) {
       console.error('[BackupImportDialog] import apply failed:', e);
       toast.error(t('backupImport.errApply'), backupErrorText(undefined, t));
     } finally {
-      applying.current = false;
+      inFlight.current = false;
       if (hasInstance(instanceId)) setBusy(false);
     }
   };
 
   const handleApply = () => {
-    if (!picked || selected.size === 0 || busy || pendingConfirmId.current || applying.current || !hasInstance(instanceId)) return;
+    if (!picked || selected.size === 0 || inFlight.current || pendingConfirmId.current || !hasInstance(instanceId)) return;
     const categories = BACKUP_CATEGORIES.filter((cat) => selected.has(cat));
     const filePath = picked.filePath;
     const confirmId = open({
@@ -173,8 +178,6 @@ export function BackupImportDialog({ instanceId }: { instanceId: string }) {
           if (pendingConfirmId.current !== confirmId || !hasInstance(confirmId)) return;
           pendingConfirmId.current = null;
           closeInstance(confirmId);
-          if (applying.current || !hasInstance(instanceId)) return;
-          applying.current = true;
           return applySelection(filePath, categories);
         },
       },
@@ -217,7 +220,8 @@ export function BackupImportDialog({ instanceId }: { instanceId: string }) {
         <div
           className="dz"
           role="button"
-          tabIndex={0}
+          aria-disabled={busy}
+          tabIndex={busy ? -1 : 0}
           onClick={() => void doPick()}
           onKeyDown={(e) => {
             if (e.key === 'Enter' || e.key === ' ') {
