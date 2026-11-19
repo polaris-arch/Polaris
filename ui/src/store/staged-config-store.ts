@@ -59,6 +59,16 @@ import {
 
 /** 直接从 IPC 契约取，避免与 `pending-bar-logic.ts` 的同名联合各写一份（store 不该反向依赖组件层）。 */
 type ApplyReceipt = Awaited<ReturnType<typeof api.proxy.applyPendingChanges>>;
+type ApplyDispatch = (precedingSave: ApplyReceipt | null) => boolean;
+
+/** Order the renderer's explicit IPC dispatch after any Save already in flight. */
+export async function dispatchSavedApply<T>(invoke: () => Promise<T>, onDispatch?: ApplyDispatch): Promise<T | undefined> {
+  const admitted = await withConfigWriteLock(async () => {
+    if (onDispatch?.(useStagedConfigStore.getState().savedRuntimeApply) === false) return undefined;
+    return { reply: invoke() };
+  });
+  return admitted?.reply;
+}
 type ApplyStatus = ApplyReceipt['status'];
 
 /**
@@ -238,7 +248,7 @@ export interface StagedConfigState {
   /** 关掉冲突弹窗、不保存（staged 一条不丢）。 */
   dismissConflict: () => void;
   /** Save then request Apply; an explicit restart token confirms the already saved candidate without re-saving. */
-  applyNow: (restartConfirmation?: string, impactConfirmation?: string) => Promise<ApplyNowResult>;
+  applyNow: (restartConfirmation?: string, impactConfirmation?: string, onDispatch?: ApplyDispatch) => Promise<ApplyNowResult>;
   /**
    * 每次拿到磁盘 config 后调用。
    *  - 首次：**无条件恢复**存储里的条目，并连同存储里的 `baseline` 一起恢复（那是「这批编辑
@@ -330,7 +340,7 @@ export const useStagedConfigStore = create<StagedConfigState>((set, get) => ({
     set({ conflict: null, conflictBaseline: null });
   },
 
-  applyNow: async (restartConfirmation, impactConfirmation) => {
+  applyNow: async (restartConfirmation, impactConfirmation, onDispatch) => {
     // Confirmation is bound to the already saved candidate. Never save newer drafts here.
     if (restartConfirmation !== undefined && impactConfirmation !== undefined) return { saved: false, status: 'conflict' };
     if (impactConfirmation === undefined) {
@@ -339,11 +349,15 @@ export const useStagedConfigStore = create<StagedConfigState>((set, get) => ({
       void api.proxy.cancelRuntimeImpact(impactConfirmation).catch(() => null);
       return { saved: true, status: 'conflict' };
     }
-    const entries = get().entries;
-    const version = get().baseVersion;
-    const r = await (impactConfirmation === undefined
-      ? api.proxy.applyPendingChanges(restartConfirmation)
-      : api.proxy.confirmRuntimeImpact(impactConfirmation)).catch(() => null);
+    const dispatched = await dispatchSavedApply(async () => {
+      const { entries, baseVersion: version } = get();
+      const r = await (impactConfirmation === undefined
+        ? api.proxy.applyPendingChanges(restartConfirmation)
+        : api.proxy.confirmRuntimeImpact(impactConfirmation)).catch(() => null);
+      return { entries, version, r };
+    }, onDispatch);
+    if (!dispatched) return { saved: false, status: null };
+    const { entries, version, r } = dispatched;
     if (r?.impactConfirmation && (get().entries !== entries || get().baseVersion !== version)) {
       void api.proxy.cancelRuntimeImpact(r.impactConfirmation).catch(() => null);
       return { saved: true, status: 'conflict' };
@@ -362,6 +376,7 @@ export const useStagedConfigStore = create<StagedConfigState>((set, get) => ({
       ...(r?.hostEffects === undefined ? {} : { hostEffects: r.hostEffects }),
       ...(r?.coreState === undefined ? {} : { coreState: r.coreState }),
       ...(r?.configurationDurable === undefined ? {} : { configurationDurable: r.configurationDurable }),
+      ...(r?.persistenceRetryable === undefined ? {} : { persistenceRetryable: r.persistenceRetryable }),
       ...(r?.persistenceTransactionId === undefined ? {} : { persistenceTransactionId: r.persistenceTransactionId }),
       ...(r?.retirementState === undefined ? {} : { retirementState: r.retirementState }),
       ...(r?.nativeRetirements === undefined ? {} : { nativeRetirements: r.nativeRetirements }),

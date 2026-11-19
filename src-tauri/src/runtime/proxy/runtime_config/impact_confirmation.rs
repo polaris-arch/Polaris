@@ -25,6 +25,7 @@ pub(super) struct PreparedImpactChoice {
     pub(super) token: String,
     pub(super) pending: PendingOperation,
     pub(super) running: Value,
+    pub(super) saved_revision: u64,
     expires: Instant,
 }
 
@@ -67,9 +68,18 @@ impl ProxyRuntime {
             .as_ref()
             .map(|plan| plan.effects.clone())
             .unwrap_or_default();
+        let Some(saved_revision) = self
+            .config
+            .try_with_saved_commit(|desired| {
+                (desired == &pending.desired).then(|| self.config.saved_revision())
+            })
+            .ok()
+            .flatten()
+        else {
+            return RuntimeApplyResult::status("conflict");
+        };
         if self.gate.is_busy()
             || !self.selector_operation_is_current(pending.generation, pending.intent)
-            || self.config.current().ok().as_ref() != Some(&pending.desired)
         {
             return RuntimeApplyResult::status("conflict");
         }
@@ -84,6 +94,7 @@ impl ProxyRuntime {
             token,
             pending,
             running,
+            saved_revision,
             expires: Instant::now() + lifetime,
         });
         result
@@ -124,6 +135,7 @@ impl ProxyRuntime {
                 && !self.gate.is_busy()
                 && self.core_running()
                 && self.selector_operation_is_current(pending.generation, pending.intent)
+                && self.config.saved_revision() == choice.saved_revision
                 && self.config.current().ok().as_ref() == Some(&pending.desired)
                 && self.current_config_snapshot().as_ref() == Some(&choice.running)
         };

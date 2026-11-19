@@ -592,6 +592,41 @@ async fn staged_save_leaves_same_id_node_debt_when_verified_fingerprints_are_una
         "missing fingerprints prevent even planning"
     );
     assert_eq!(rt.current_config_snapshot(), Some(running));
+    rt.selector_reconcile.mark_required();
+    assert!(rt.pending_changes().pending_apply);
+}
+
+#[tokio::test]
+async fn selector_reconciliation_alone_preserves_the_save_fence_without_config_debt() {
+    let (rt, _dir, running, _) = host_dns_restart_fixture();
+    rt.config.save_full(&running).unwrap();
+    let pending = ts_pending_raw_fixture(&rt, running.clone());
+    *rt.switch_snapshot.write().unwrap() = Some(ProxyRuntime::build_switch_snapshot(
+        &pending.typed,
+        &pending.generated,
+        &pending.deps,
+    ));
+    rt.selector_reconcile.mark_required();
+    let summary = rt.pending_changes();
+    assert!(!summary.pending_apply);
+    assert!(!summary.restart_deferred);
+    assert!(rt.selector_reconcile.is_required());
+
+    let mut candidate = running.clone();
+    candidate["logLevel"] = json!("debug");
+    rt.config.save_full(&candidate).unwrap();
+    let candidate = rt.config.current().unwrap();
+    let owner = StagedSaveOwner::capture(&rt, rt.config.saved_revision());
+    assert!(rt
+        .apply_staged_save_if_current(running.clone(), candidate, owner, |_| {})
+        .await
+        .is_none());
+    assert!(
+        rt.pending_changes().pending_apply,
+        "the genuine saved log-level change stays visible"
+    );
+    assert!(rt.selector_reconcile.is_required());
+    assert_eq!(rt.current_config_snapshot(), Some(running));
 }
 
 #[tokio::test]
@@ -677,7 +712,15 @@ async fn staged_save_stale_terminal_native_observer_cannot_report_success() {
 
 #[test]
 fn stale_host_dns_restart_choices_preserve_current_state_and_debt() {
-    for stale in ["disk", "running", "generation", "intent", "stopped", "busy"] {
+    for stale in [
+        "disk",
+        "disk-aba",
+        "running",
+        "generation",
+        "intent",
+        "stopped",
+        "busy",
+    ] {
         let (rt, _dir, running, candidate) = host_dns_restart_fixture();
         let result = rt.restart_choice(
             &candidate,
@@ -695,10 +738,15 @@ fn stale_host_dns_restart_choices_preserve_current_state_and_debt() {
             .take()
             .unwrap();
         match stale {
-            "disk" => {
+            "disk" | "disk-aba" => {
                 let mut newer = candidate.clone();
                 newer["logLevel"] = "warn".into();
                 rt.config.save_full(&newer).unwrap();
+                if stale == "disk-aba" {
+                    rt.config.save_full(&candidate).unwrap();
+                    assert_eq!(rt.config.current().unwrap(), candidate);
+                    assert_eq!(rt.selector_reconcile.intent_generation(), choice.intent);
+                }
             }
             "running" => {
                 let mut newer = running.clone();

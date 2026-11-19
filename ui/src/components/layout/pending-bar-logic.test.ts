@@ -341,16 +341,13 @@ describe('composeBarView：A 的两个动作生命周期态盖住整行 B（表�
   const ALL_B: PendingPhase[] = ['none', 'pending', 'applying', 'applyFailed'];
 
   // 变异对照：把 saving 的分派挪到 clean/staged 之后（不再优先）→ 表末行的 `*` 失效 → 转红。
-  it('saving × 任意 B → 「保存中…」且全禁用', () => {
+  it('saving × 任意 B → 「保存中…」，等待热应用回执再展示应用动作', () => {
     for (const b of ALL_B) {
       const input = { stagedPhase: 'saving' as StagedPhase, pendingPhase: b, stagedCount: 2 };
       const v = composeBarView(barInput(input));
       expect(v, `B=${b}`).toMatchObject({ visible: true, err: false, titleKey: 'home.pendingSaving' });
-      expect(disabledIds(input), `B=${b} 保存在飞时还有可点的按钮`).toEqual([
-        'reset',
-        'save',
-        ...(b === 'none' ? [] : ['apply']),
-      ]);
+      expect(ids(input), `B=${b}`).toEqual(['reset', 'save']);
+      expect(disabledIds(input), `B=${b}`).toEqual(['reset', 'save']);
     }
   });
 

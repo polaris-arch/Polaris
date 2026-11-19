@@ -65,7 +65,7 @@ async fn cancel_and_wrong_token_never_admit_or_replace_the_retained_plan() {
 
 #[tokio::test]
 async fn expired_choice_and_changed_desired_running_generation_or_intent_fail_before_rpc() {
-    for drift in 0..5 {
+    for drift in 0..6 {
         let (runtime, _dir, _calls) = crate::runtime::proxy::tests::test_runtime_recording();
         let pending = candidate(&runtime);
         let result = runtime.prepare_runtime_impact_choice(pending);
@@ -81,10 +81,17 @@ async fn expired_choice_and_changed_desired_running_generation_or_intent_fail_be
                     .unwrap()
                     .expires = Instant::now() - Duration::from_secs(1);
             }
-            1 => {
-                let mut newer = runtime.config.current().unwrap();
+            1 | 5 => {
+                let original = runtime.config.current().unwrap();
+                let intent = runtime.selector_reconcile.intent_generation();
+                let mut newer = original.clone();
                 newer["mixedPort"] = serde_json::json!(3090);
                 runtime.config.save_full(&newer).unwrap();
+                if drift == 5 {
+                    runtime.config.save_full(&original).unwrap();
+                    assert_eq!(runtime.config.current().unwrap(), original);
+                    assert_eq!(runtime.selector_reconcile.intent_generation(), intent);
+                }
             }
             2 => {
                 *runtime.current_config.write().unwrap() =

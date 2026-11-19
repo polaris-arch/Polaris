@@ -1836,6 +1836,7 @@ async fn native_mode_projection_preserves_confirmed_queue_and_unapplied_desired_
         pending.clone(),
         ForceRestartSource::Confirmed {
             intent_generation: intent,
+            saved_revision: rt.config.saved_revision(),
         },
     ));
     let status = rt.native_auto_set_enabled(false).await.unwrap();

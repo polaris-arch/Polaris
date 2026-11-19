@@ -424,6 +424,7 @@ async fn paired_runtime_capabilities(
 struct RestartChoice {
     token: String,
     candidate: Value,
+    saved_revision: u64,
     generation: u64,
     intent: u64,
     running: Value,
@@ -434,6 +435,18 @@ pub(crate) struct StagedSaveOwner {
     pub(crate) generation: u64,
     pub(crate) intent: u64,
     pub(crate) revision: u64,
+}
+
+impl StagedSaveOwner {
+    pub(crate) fn capture(runtime: &ProxyRuntime, revision: u64) -> Self {
+        // Saved revisions order separate graph edits. Keep the current selector
+        // intent so a plain Save cannot supersede the startup selector handshake.
+        Self {
+            generation: runtime.core_generation(),
+            intent: runtime.selector_reconcile.intent_generation(),
+            revision,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1411,6 +1424,7 @@ impl ProxyRuntime {
         let choice = RestartChoice {
             token: token.clone(),
             candidate: candidate.clone(),
+            saved_revision: self.config.saved_revision(),
             generation,
             intent,
             running,
@@ -1464,6 +1478,10 @@ impl ProxyRuntime {
         if previous == candidate
             || !self.selector_operation_is_current(owner.generation, owner.intent)
             || self.gate.is_busy()
+            || !self
+                .pending_force_restart
+                .read()
+                .is_ok_and(|choice| choice.is_none())
             || self.selector_reconcile.is_required()
             || !self
                 .switch_snapshot
@@ -2278,16 +2296,16 @@ impl ProxyRuntime {
         if self.runtime_host_execution_in_flight() {
             return self.remember_runtime_result(RuntimeApplyResult::status("conflict"));
         }
-        let expected_running = confirmation.as_ref().and_then(|token| {
+        let expected_confirmation = confirmation.as_ref().and_then(|token| {
             self.runtime_config_apply.lock().ok().and_then(|state| {
                 state
                     .impact
                     .as_ref()
                     .filter(|choice| &choice.token == token)
-                    .map(|choice| choice.running.clone())
+                    .map(|choice| (choice.running.clone(), choice.saved_revision))
             })
         });
-        if confirmation.is_some() && expected_running.is_none() {
+        if confirmation.is_some() && expected_confirmation.is_none() {
             return self.remember_runtime_result(RuntimeApplyResult::status("conflict"));
         }
         // Controller facts are read with no ledger/publication lock held. The
@@ -2320,9 +2338,11 @@ impl ProxyRuntime {
         // keeps it paused; a verified unapplied rejection alone may resume it.
         let mut tailnet_limited = false;
         let mut native_limited = false;
-        let staged_save = pending.saved_revision.is_some();
+        let saved_revision = pending.saved_revision.or(expected_confirmation
+            .as_ref()
+            .map(|(_, revision)| *revision));
         let admit = |desired: &Value| {
-            if desired != &pending.desired || !self.saved_revision_matches(pending.saved_revision) {
+            if desired != &pending.desired || !self.saved_revision_matches(saved_revision) {
                 return false;
             }
             self.selector_reconcile.with_intent_claim(|current_intent| {
@@ -2331,7 +2351,7 @@ impl ProxyRuntime {
                     || self.gate.generation() != generation
                     || self.gate.is_busy()
                     || !self.protected_runtime_publication_current(&pending)
-                    || expected_running.as_ref().is_some_and(|running| {
+                    || expected_confirmation.as_ref().is_some_and(|(running, _)| {
                         self.current_config_snapshot().as_ref() != Some(running)
                     })
                 {
@@ -2370,7 +2390,7 @@ impl ProxyRuntime {
                 true
             })
         };
-        let admitted = if staged_save {
+        let admitted = if saved_revision.is_some() {
             self.config.try_with_saved_commit(admit)
         } else {
             self.config.with_current(admit)
@@ -2648,6 +2668,7 @@ impl ProxyRuntime {
                         !state.impact.as_ref().is_some_and(|choice| {
                             choice.token == token
                                 && choice.running == running
+                                && self.config.saved_revision() == choice.saved_revision
                                 && choice.pending.plan.plan_id == pending.plan.plan_id
                                 && choice.pending.plan.impact_digest == pending.plan.impact_digest
                         })
@@ -3586,41 +3607,42 @@ impl ProxyRuntime {
         self: &Arc<Self>,
         choice: RestartChoice,
     ) -> RuntimeApplyResult {
-        let candidate_current = self
-            .config
-            .with_current(|value| value == &choice.candidate)
-            .unwrap_or(false);
-        if !candidate_current
-            || self.current_config_snapshot().as_ref() != Some(&choice.running)
-            || !self.selector_operation_is_current(choice.generation, choice.intent)
-            || self.gate.is_busy()
-        {
-            return self.remember_runtime_result(RuntimeApplyResult::status("conflict"));
-        }
         let id = self.force_restart_seq.fetch_add(1, Ordering::SeqCst);
-        let accepted = self.selector_reconcile.with_intent_claim(|intent| {
-            if intent != choice.intent
-                || self.gate.generation() != choice.generation
-                || self.gate.is_busy()
-            {
-                return false;
-            }
-            let Ok(mut pending) = self.pending_force_restart.write() else {
-                return false;
-            };
-            self.debounced.invalidate_pending();
-            *pending = Some((
-                id,
-                choice.candidate,
-                super::ForceRestartSource::Confirmed {
-                    intent_generation: choice.intent,
-                },
-            ));
-            self.gate.set_force_restart(id);
-            true
-        });
+        let accepted = self
+            .config
+            .try_with_saved_commit(|desired| {
+                if desired != &choice.candidate
+                    || self.config.saved_revision() != choice.saved_revision
+                {
+                    return false;
+                }
+                self.selector_reconcile.with_intent_claim(|intent| {
+                    if intent != choice.intent
+                        || !self.selector_operation_is_current(choice.generation, intent)
+                        || self.gate.is_busy()
+                        || self.current_config_snapshot().as_ref() != Some(&choice.running)
+                    {
+                        return false;
+                    }
+                    let Ok(mut pending) = self.pending_force_restart.write() else {
+                        return false;
+                    };
+                    self.debounced.invalidate_pending();
+                    *pending = Some((
+                        id,
+                        choice.candidate,
+                        super::ForceRestartSource::Confirmed {
+                            intent_generation: choice.intent,
+                            saved_revision: choice.saved_revision,
+                        },
+                    ));
+                    self.gate.set_force_restart(id);
+                    true
+                })
+            })
+            .unwrap_or(false);
         if !accepted {
-            return self.runtime_native_result(RuntimeApplyResult::status("conflict"));
+            return self.remember_runtime_result(RuntimeApplyResult::status("conflict"));
         }
         self.schedule_restart_for_generation(choice.generation);
         let mut result = RuntimeApplyResult::status("applied");

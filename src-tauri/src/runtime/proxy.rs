@@ -1364,7 +1364,10 @@ pub struct SpeedProbeTargets {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ForceRestartSource {
     /// Exact snapshot approved by the restart dialog; never refreshed by later edits.
-    Confirmed { intent_generation: u64 },
+    Confirmed {
+        intent_generation: u64,
+        saved_revision: u64,
+    },
     /// An explicit Apply or full-config operation owns the snapshot; later selector intents only
     /// update its selected id and must not revoke the authorized full restart.
     Full,

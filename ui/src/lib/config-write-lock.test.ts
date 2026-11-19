@@ -93,7 +93,7 @@ describe('接线：主窗里的配置事务必须都在闸门内', () => {
   });
 
   // 变异对照：把任一处的 `withConfigWriteLock(...)` 拆掉、只留裸调用 → 对应断言转红。
-  it('五处都真的裹在 withConfigWriteLock 里', () => {
+  it('六处都真的裹在 withConfigWriteLock 里', () => {
     const appStore = readFileSync(join(SRC, 'store/app-store.ts'), 'utf8');
     expect(stripComments(appStore)).toMatch(/withConfigWriteLock\(async \(\) => \{\s*beginConfigMutation\(\);\s*await api\.config\.patch\(patch\);\s*\}\)/);
     expect(stripComments(appStore)).toMatch(/withConfigWriteLock\(async \(\) => \{\s*beginConfigMutation\(\);\s*await api\.config\.mutateEntities\(mutations\);\s*\}\)/);
@@ -102,21 +102,23 @@ describe('接线：主窗里的配置事务必须都在闸门内', () => {
     expect(switchTransaction).toContain('await api.server.switch(serverId)');
     expect(switchTransaction).toContain('await api.config.get()');
     // performSave 是薄壳：整个函数体（**含开头读 entries**）都在临界区内。
-    expect(readFileSync(join(SRC, 'store/staged-config-store.ts'), 'utf8')).toContain(
+    const stagedStore = stripComments(readFileSync(join(SRC, 'store/staged-config-store.ts'), 'utf8'));
+    expect(stagedStore).toContain(
       'withConfigWriteLock(() => performSaveLocked(set, get, autoApply))'
     );
+    expect(stagedStore).toMatch(/withConfigWriteLock\(async \(\) => \{\s*if \(onDispatch\?\.\(useStagedConfigStore\.getState\(\)\.savedRuntimeApply\) === false\) return undefined;\s*return \{ reply: invoke\(\) \};\s*\}\)/);
     expect(stripComments(readFileSync(join(SRC, 'components/screens/settings/use-config.ts'), 'utf8'))).toMatch(
       /withConfigWriteLock\(async \(\) => \{\s*beginConfigMutation\(\);\s*return configApi\.patch\(direct\);\s*\}\)/
     );
   });
 
   // 不可嵌套（临界区内再入队 = 自锁）。当前使用点互不调用；新增使用点必须先读头注那条。
-  it('闸门只有五个主窗生产使用点', () => {
+  it('闸门只有六个主窗生产使用点', () => {
     const appStore = readFileSync(join(SRC, 'store/app-store.ts'), 'utf8');
     const stagedStore = readFileSync(join(SRC, 'store/staged-config-store.ts'), 'utf8');
     const settings = readFileSync(join(SRC, 'components/screens/settings/use-config.ts'), 'utf8');
     expect((appStore.match(/withConfigWriteLock\((?:async )?\(\) =>/g) ?? []).length).toBe(3);
-    expect((stagedStore.match(/withConfigWriteLock\((?:async )?\(\) =>/g) ?? []).length).toBe(1);
+    expect((stagedStore.match(/withConfigWriteLock\((?:async )?\(\) =>/g) ?? []).length).toBe(2);
     expect((settings.match(/withConfigWriteLock\((?:async )?\(\) =>/g) ?? []).length).toBe(1);
     expect(filesWith('withConfigWriteLock(', ['config-write-lock.ts'])).toEqual([
       'components/screens/settings/use-config.ts',

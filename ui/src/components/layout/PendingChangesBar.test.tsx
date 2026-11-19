@@ -67,10 +67,14 @@ vi.mock('@/store/app-store', () => ({
   normalizePendingChanges: (pending: unknown) => pending,
   useAppStore: Object.assign((select: (state: typeof h.app) => unknown) => select(h.app), { getState: () => h.app }),
 }));
-vi.mock('@/store/staged-config-store', () => {
+vi.mock('@/store/staged-config-store', async () => {
+  const { withConfigWriteLock } = await import('@/lib/config-write-lock');
   const state = { entries: [], saveStatus: 'idle', conflict: null, applyNow: h.applyNow,
     get savedRuntimeApply() { return h.savedRuntimeApply; } };
-  return { useStagedConfigStore: Object.assign((select: (value: typeof state) => unknown) => select(state), {
+  return { dispatchSavedApply: async <T,>(invoke: () => Promise<T>, onDispatch: (value: PendingApplyResult | null) => boolean) => {
+    const admitted = await withConfigWriteLock(async () => onDispatch(h.savedRuntimeApply) ? { reply: invoke() } : undefined);
+    return admitted?.reply;
+  }, useStagedConfigStore: Object.assign((select: (value: typeof state) => unknown) => select(state), {
     getState: () => state,
     setState: ({ savedRuntimeApply }: { savedRuntimeApply: PendingApplyResult | null }) => { h.savedRuntimeApply = savedRuntimeApply; },
   }) };
@@ -80,6 +84,7 @@ vi.mock('@/lib/error-handler', () => ({ toast: { info: vi.fn(), error: vi.fn(), 
 import PendingChangesBar from './PendingChangesBar';
 import { ImpactApplyDialog } from '@/components/dialogs/ImpactApplyDialog';
 import { toast } from '@/lib/error-handler';
+import { withConfigWriteLock } from '@/lib/config-write-lock';
 
 type Props = { children?: ReactNode; className?: string; onClick?: () => void; disabled?: boolean; onConfirm?: () => void };
 function elements(node: ReactNode): ReactElement<Props>[] {
@@ -237,6 +242,45 @@ it('keeps polling a superseded Save owner without offering a persistence replay'
   expect(toast.info).not.toHaveBeenCalled();
 });
 
+it('keeps explicit ownership over a previously queued Save with the same selector intent', async () => {
+  h.app.proxyStatus = { running: true, mainGeneration: 6 };
+  h.savedRuntimeApply = { ok: true, status: 'hotApplied', transactionId: 'queued-save',
+    runtimeGeneration: 7, selectionIntentGeneration: 9, coreState: 'committed', configurationDurable: true };
+  h.applyNow.mockResolvedValueOnce({ ok: true, saved: true, status: 'hotApplied', transactionId: 'new-explicit',
+    runtimeGeneration: 7, selectionIntentGeneration: 9, coreState: 'committed', configurationDurable: true });
+  click('home.pendingApplyBtn');
+  await microtasks();
+  h.app.proxyStatus = { running: true, mainGeneration: 7 };
+  renderBar();
+  expect(h.states[0]).toMatchObject({ phase: 'idle', transactionId: 'new-explicit' });
+  expect(h.savedRuntimeApply).toBeNull();
+  expect(toast.info).toHaveBeenCalledExactlyOnceWith('home.pendingHotApplied');
+});
+
+it('attributes a Save already in flight before external Apply dispatches', async () => {
+  let finishSave!: () => void;
+  const saving = withConfigWriteLock(async () => {
+    await new Promise<void>(resolve => { finishSave = resolve; });
+    h.savedRuntimeApply = { ok: true, status: 'hotApplied', transactionId: 'older-in-flight',
+      runtimeGeneration: 7, selectionIntentGeneration: 9, coreState: 'committed', configurationDurable: true };
+  });
+  h.freshApply.mockResolvedValueOnce({ ok: true, status: 'hotApplied', transactionId: 'new-external-apply',
+    runtimeGeneration: 7, selectionIntentGeneration: 9, coreState: 'committed', configurationDurable: true });
+  h.app.applyRequested = true;
+  renderBar();
+  await microtasks();
+  expect(h.freshApply).not.toHaveBeenCalled();
+  expect(h.savedRuntimeApply).toBeNull();
+  finishSave();
+  await saving;
+  await microtasks();
+  renderBar();
+  expect(h.freshApply).toHaveBeenCalledOnce();
+  expect(h.states[0]).toMatchObject({ phase: 'idle', transactionId: 'new-external-apply' });
+  expect(h.savedRuntimeApply).toBeNull();
+  expect(toast.info).toHaveBeenCalledExactlyOnceWith('home.pendingHotApplied');
+});
+
 it('keeps the confirmation armed only for the saved settings the user saw', async () => {
   h.revertSaved.mockResolvedValue(true);
   h.app.pendingChanges = { ...h.app.pendingChanges, savedSettingsRevertToken: 'original' };
@@ -263,7 +307,7 @@ describe('pre-confirmed apply request', () => {
     renderBar();
     expect(h.app.setApplyRequested).toHaveBeenCalledExactlyOnceWith(false);
     expect(h.freshApply).toHaveBeenCalledExactlyOnceWith();
-    expect(h.applyNow).toHaveBeenCalledExactlyOnceWith('restart-token');
+    expect(h.applyNow).toHaveBeenCalledExactlyOnceWith('restart-token', undefined, expect.any(Function));
     expect(h.states[1]).toBeNull();
   });
 });
@@ -300,7 +344,7 @@ describe('desktop host execution and four-account feedback', () => {
     h.applyNow.mockResolvedValueOnce({ saved: true, ...owned('hostEffectsPending'), hostExecutionId: 'host-next' });
     dialog!.props.onConfirm!();
     await microtasks();
-    expect(h.applyNow).toHaveBeenNthCalledWith(2, undefined, 'new-plan');
+    expect(h.applyNow).toHaveBeenNthCalledWith(2, undefined, 'new-plan', expect.any(Function));
     expect((h.states[0] as ApplyState).host).toMatchObject({ executionId: 'host-next', phase: 'pending' });
   });
 

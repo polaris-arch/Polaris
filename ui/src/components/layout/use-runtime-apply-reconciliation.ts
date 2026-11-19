@@ -16,6 +16,7 @@ interface Attempt {
   awaitingReply?: boolean;
   intentGeneration: number | undefined;
   runtimeGeneration?: number;
+  precedingSave?: PendingApplyResult | null;
 }
 
 function sameCore(state: ApplyState, owner: RuntimeCoreRecovery): boolean {
@@ -69,7 +70,8 @@ export function useRuntimeApplyReconciliation(
     useStagedConfigStore.setState({ savedRuntimeApply: null });
     const savedIntent = savedRuntimeApply.selectionIntentGeneration ?? -1;
     const newerIntent = ((attempt?.runtimeGeneration ?? apply.mainGeneration) === generation
-        && (attempt?.intentGeneration ?? -1) > savedIntent)
+        && ((attempt?.intentGeneration ?? -1) > savedIntent
+          || savedIntent >= 0 && attempt?.intentGeneration === savedIntent && attempt.precedingSave === savedRuntimeApply))
       || (apply.coreRecovery?.runtimeGeneration === generation
         && (apply.coreRecovery?.selectionIntentGeneration ?? -1) > savedIntent);
     if (generation === undefined || generation !== observed || !status.running || olderLifecycle || newerIntent) {

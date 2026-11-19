@@ -448,8 +448,8 @@ export function composeBarView(input: BarInput): BarView {
       titleKey: 'home.pendingSaving',
       titleVars: {},
       detailKey: '',
-      // 全禁用：保存在飞时点重置会丢掉正在落盘的那批意图，点应用会叠一次 force-restart。
-      actions: gateApply([act('reset', true), act('save', true), ...(pendingPhase === 'none' ? [] : [act('apply', true)])]),
+      // 保存包含热应用探测。收到回执前，短暂的磁盘与运行态差异不需要用户介入。
+      actions: [act('reset', true), act('save', true)],
     };
   }
   if (stagedPhase === 'saveFailed') {

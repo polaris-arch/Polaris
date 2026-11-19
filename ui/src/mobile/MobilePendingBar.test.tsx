@@ -92,10 +92,14 @@ vi.mock('@/store/app-store', () => ({
     getState: () => h.app,
   }),
 }));
-vi.mock('@/store/staged-config-store', () => {
+vi.mock('@/store/staged-config-store', async () => {
+  const { withConfigWriteLock } = await import('@/lib/config-write-lock');
   const state = { entries: [], saveStatus: 'idle', conflict: null, applyNow: h.applyNow,
     get savedRuntimeApply() { return h.savedRuntimeApply; } };
-  return { useStagedConfigStore: Object.assign((selector: (value: typeof state) => unknown) => selector(state), {
+  return { dispatchSavedApply: async <T,>(invoke: () => Promise<T>, onDispatch: (value: PendingApplyResult | null) => boolean) => {
+    const admitted = await withConfigWriteLock(async () => onDispatch(h.savedRuntimeApply) ? { reply: invoke() } : undefined);
+    return admitted?.reply;
+  }, useStagedConfigStore: Object.assign((selector: (value: typeof state) => unknown) => selector(state), {
     getState: () => state,
     setState: ({ savedRuntimeApply }: { savedRuntimeApply: PendingApplyResult | null }) => { h.savedRuntimeApply = savedRuntimeApply; },
   }) };
@@ -257,7 +261,7 @@ describe('mobile pending restart and write feedback', () => {
     expect(html).not.toContain('private-path');
     expect(html).not.toContain('restart-token');
     expect(html).not.toContain('class="btn');
-    expect(h.applyNow).toHaveBeenCalledExactlyOnceWith(undefined);
+    expect(h.applyNow).toHaveBeenCalledExactlyOnceWith(undefined, undefined, expect.any(Function));
     expect(h.retryPersistence).not.toHaveBeenCalled();
   });
 
@@ -283,7 +287,7 @@ describe('mobile pending restart and write feedback', () => {
     sheet.props.onSubmit!();
     await vi.waitFor(() => expect(h.states[0]).toMatchObject({ phase: 'idle' }));
     expect(h.applyNow).toHaveBeenCalledTimes(2);
-    expect(h.applyNow).toHaveBeenNthCalledWith(2, 'restart-token');
+    expect(h.applyNow).toHaveBeenNthCalledWith(2, 'restart-token', undefined, expect.any(Function));
     expect(h.states[1]).toBeNull();
     expect(h.retryPersistence).not.toHaveBeenCalled();
   });
@@ -305,7 +309,7 @@ describe('mobile pending restart and write feedback', () => {
     registered(h.offLifecycle);
     await vi.waitFor(() => expect(h.states[0]).toMatchObject({ phase: 'idle' }));
     if (action === 'apply') {
-      expect(h.applyNow).toHaveBeenCalledExactlyOnceWith(undefined);
+      expect(h.applyNow).toHaveBeenCalledExactlyOnceWith(undefined, undefined, expect.any(Function));
       expect(h.retryPersistence).not.toHaveBeenCalled();
     } else {
       expect(h.retryPersistence).toHaveBeenCalledExactlyOnceWith('same-transaction');
@@ -338,7 +342,7 @@ describe('mobile pending restart and write feedback', () => {
     await vi.waitFor(() => expect(h.states[0]).toMatchObject({ phase: 'failed' }));
     expect(h.states[1]).toBeNull();
     expect(markup(renderBar())).toContain('m-pending-err');
-    expect(h.applyNow).toHaveBeenCalledExactlyOnceWith(undefined);
+    expect(h.applyNow).toHaveBeenCalledExactlyOnceWith(undefined, undefined, expect.any(Function));
   });
 
   it.each(['write', 'listener'])('%s rejection renders a persistent error and an explicit retry action', async (failure) => {
@@ -372,7 +376,7 @@ describe('mobile pending restart and write feedback', () => {
     click('home.pendingRetryPersistenceBtn');
     await vi.waitFor(() => expect(h.states[0]).toMatchObject({ phase: 'idle' }));
     expect(h.retryPersistence.mock.calls).toEqual([['same-transaction'], ['same-transaction']]);
-    expect(h.applyNow).toHaveBeenCalledExactlyOnceWith(undefined);
+    expect(h.applyNow).toHaveBeenCalledExactlyOnceWith(undefined, undefined, expect.any(Function));
   });
 });
 
@@ -444,7 +448,7 @@ describe('mobile independent host effect consumption', () => {
     h.applyNow.mockResolvedValueOnce({ saved: true, ...owned('hostEffectsPending'), hostExecutionId: 'host-next' });
     sheet.props.onSubmit!();
     await microtasks();
-    expect(h.applyNow).toHaveBeenNthCalledWith(2, undefined, 'fresh-host-plan');
+    expect(h.applyNow).toHaveBeenNthCalledWith(2, undefined, 'fresh-host-plan', expect.any(Function));
     expect((h.states[0] as ApplyState).host).toMatchObject({ executionId: 'host-next', phase: 'pending' });
     expect(h.freshApply).toHaveBeenCalledTimes(1);
   });
@@ -601,7 +605,7 @@ describe('mobile impact consent disclosure', () => {
     h.applyNow.mockResolvedValueOnce({ saved: true, ok: true, status: 'hotApplied', configurationDurable: true });
     sheet.props.onSubmit!();
     await microtasks();
-    expect(h.applyNow).toHaveBeenNthCalledWith(2, undefined, 'private-impact-token');
+    expect(h.applyNow).toHaveBeenNthCalledWith(2, undefined, 'private-impact-token', expect.any(Function));
     expect(h.freshApply).not.toHaveBeenCalled();
     expect(h.retryPersistence).not.toHaveBeenCalled();
   });

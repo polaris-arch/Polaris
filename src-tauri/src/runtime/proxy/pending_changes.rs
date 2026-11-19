@@ -209,15 +209,19 @@ impl ProxyRuntime {
             .switch_snapshot
             .read()
             .ok()
-            .and_then(|g| g.as_ref().map(|s| s.fingerprints.clone()))
-            .unwrap_or_default();
+            .and_then(|g| g.as_ref().map(|s| s.fingerprints.clone()));
         let current_fps = node_fingerprints::modified_table_json(current);
         let mut modified: Vec<_> = old_ids
             .intersection(&new_ids)
-            .filter(|id| match (snap_fps.get(*id), current_fps.get(*id)) {
-                (Some(old), Some(new)) => old != new,
-                // 任一侧取不到指纹（快照缺失 / 节点解析不出）⇒ 没有比对基准 ⇒ 不判 modified。
-                _ => false,
+            .filter(|id| {
+                match (
+                    snap_fps.as_ref().and_then(|snapshot| snapshot.get(*id)),
+                    current_fps.get(*id),
+                ) {
+                    (Some(old), Some(new)) => old != new,
+                    // 任一侧取不到指纹（快照缺失 / 节点解析不出）⇒ 没有比对基准 ⇒ 不判 modified。
+                    _ => false,
+                }
             })
             .cloned()
             .collect();
@@ -240,7 +244,10 @@ impl ProxyRuntime {
             .as_ref()
             .and_then(|runtime| non_node_runtime_debt(runtime, current, self.helper.platform()))
             .unwrap_or_else(|| self.restart_deferred.load(Ordering::SeqCst));
-        let reconcile_pending = desired.is_none() && self.selector_reconcile.is_required();
+        // A lost graph baseline can conceal saved work. Selector reconciliation
+        // alone keeps the Save admission fence and its own attestation path.
+        let baseline_pending =
+            desired.is_none() && snap_fps.is_none() && self.selector_reconcile.is_required();
         let recovery_pending = self.staged_save_recovery_pending();
         let pending_apply = !added.is_empty()
             || !modified.is_empty()
@@ -250,7 +257,7 @@ impl ProxyRuntime {
             || self.host_effect_pending()
             || self.has_uncommitted_rule_content()
             || recovery_pending
-            || reconcile_pending
+            || baseline_pending
             || native_pending;
         let restart_required = applied.as_ref().is_some_and(|runtime| {
             super::runtime_config::structural_runtime_change(
@@ -274,7 +281,7 @@ impl ProxyRuntime {
                 || selected_pending
                 || self.host_effect_pending()
                 || self.has_uncommitted_rule_content()
-                || reconcile_pending
+                || baseline_pending
                 || recovery_pending,
         }
     }

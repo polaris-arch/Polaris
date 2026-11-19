@@ -48,10 +48,10 @@ import { FormSheet } from './forms/FormSheet';
 import { ImpactApplySummary, impactApplyDisclosure } from '@/shared/ImpactApplySummary';
 import { useImpactConfirmation } from '@/components/dialogs/use-impact-confirmation';
 import type { ProxyErrorTranslate } from '@/domain/proxy-error-text';
-import type { ProxyLifecycleEvent } from '@/contracts/types';
+import type { PendingApplyResult, ProxyLifecycleEvent } from '@/contracts/types';
 import { useConfirmTwice } from '@/lib/confirm-twice';
 import { useAppStore } from '@/store/app-store';
-import { useStagedConfigStore } from '@/store/staged-config-store';
+import { dispatchSavedApply, useStagedConfigStore, type ApplyNowResult } from '@/store/staged-config-store';
 import {
   APPLY_CONFIRM_TIMEOUT_MS,
   applyOutcome,
@@ -122,6 +122,7 @@ export function MobilePendingBar(): ReactElement | null {
     cancelled: boolean;
     intentGeneration: number | undefined;
     runtimeGeneration: number | undefined;
+    precedingSave: PendingApplyResult | null;
     early: ProxyLifecycleEvent[];
     earlyGeneration: number | undefined;
     earlyStopped: boolean;
@@ -285,6 +286,7 @@ export function MobilePendingBar(): ReactElement | null {
     const request = { awaitingReply: true, cancelled: false,
       intentGeneration: undefined as number | undefined,
       runtimeGeneration: initial.mainGeneration,
+      precedingSave: useStagedConfigStore.getState().savedRuntimeApply,
       early: [] as ProxyLifecycleEvent[],
       earlyGeneration: initial.mainGeneration, earlyStopped: false };
     applyRequest.current = request;
@@ -305,14 +307,22 @@ export function MobilePendingBar(): ReactElement | null {
           reason: null, reconciling: !!initial.coreRecovery });
         return;
       }
+      const onDispatch = (precedingSave: PendingApplyResult | null) => {
+        request.precedingSave = precedingSave;
+        return applyRequest.current === request && !request.cancelled && (!hostRetry || sameHostCandidate());
+      };
+      const dispatch = (invoke: () => Promise<PendingApplyResult>) => dispatchSavedApply(invoke, onDispatch)
+        .then<ApplyNowResult>((receipt) => receipt
+          ? { ...receipt, saved: true, applyId: receipt.applyId ?? undefined }
+          : { status: null, saved: false });
       const result = hostRetry
         // Fresh Plan/confirmation for the saved candidate; never save drafts or replay a Core transaction.
-        ? { ...await api.proxy.applyPendingChanges(), saved: true }
+        ? await dispatch(() => api.proxy.applyPendingChanges())
         : persistenceTransactionId === undefined
           ? await (impactConfirmation === undefined
-            ? useStagedConfigStore.getState().applyNow(restartConfirmation)
-            : useStagedConfigStore.getState().applyNow(undefined, impactConfirmation))
-          : { ...await api.proxy.retryRuntimePersistence(persistenceTransactionId), saved: true };
+            ? useStagedConfigStore.getState().applyNow(restartConfirmation, undefined, onDispatch)
+            : useStagedConfigStore.getState().applyNow(undefined, impactConfirmation, onDispatch))
+          : await dispatch(() => api.proxy.retryRuntimePersistence(persistenceTransactionId));
       if (applyRequest.current !== request) return;
       request.awaitingReply = false;
       if (!result.saved) {
@@ -484,7 +494,7 @@ export function MobilePendingBar(): ReactElement | null {
         {view.accountDetailKeys?.map(key => <span className="m-pending-detail" key={key}>{t(key)}</span>)}
         {view.detailKey !== '' && (apply.nativeRetirements?.length || pending.nativeRetirements?.length || apply.host && apply.host.phase !== 'settled') ? (
           <span className="m-pending-detail">{t(view.detailKey)}</span>
-        ) : pendingPhase === 'pending' && (
+        ) : saveStatus !== 'saving' && pendingPhase === 'pending' && (
           <span className="m-pending-detail">{t('home.pendingSavedStillNeedsApply')}</span>
         )}
       </div>

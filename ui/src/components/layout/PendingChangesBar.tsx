@@ -38,7 +38,7 @@
 import { useEffect, useRef, useState, type Dispatch, type SetStateAction } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useAppStore } from '@/store/app-store';
-import { useStagedConfigStore } from '@/store/staged-config-store';
+import { dispatchSavedApply, useStagedConfigStore, type ApplyNowResult } from '@/store/staged-config-store';
 import { StagedConflictDialog } from '@/components/dialogs/StagedConflictDialog';
 import { api } from '@/ipc';
 import { useRuntimeApplyReconciliation } from '@/components/layout/use-runtime-apply-reconciliation';
@@ -48,7 +48,7 @@ import { useImpactConfirmation } from '@/components/dialogs/use-impact-confirmat
 import { toast } from '@/lib/error-handler';
 import { cn } from '@/lib/utils';
 import { useConfirmTwice } from '@/lib/confirm-twice';
-import type { ProxyLifecycleEvent } from '@/contracts/types';
+import type { PendingApplyResult, ProxyLifecycleEvent } from '@/contracts/types';
 import type { ProxyErrorTranslate } from '@/domain/proxy-error-text';
 import {
   APPLY_CONFIRM_TIMEOUT_MS,
@@ -129,6 +129,7 @@ export default function PendingChangesBar() {
     cancelled: boolean;
     intentGeneration: number | undefined;
     runtimeGeneration: number | undefined;
+    precedingSave: PendingApplyResult | null;
     early: ProxyLifecycleEvent[];
     earlyGeneration: number | undefined;
     earlyStopped: boolean;
@@ -301,6 +302,7 @@ export default function PendingChangesBar() {
     const request = { awaitingReply: true, cancelled: false,
       intentGeneration: undefined as number | undefined,
       runtimeGeneration: initial.mainGeneration,
+      precedingSave: useStagedConfigStore.getState().savedRuntimeApply,
       early: [] as ProxyLifecycleEvent[],
       earlyGeneration: initial.mainGeneration, earlyStopped: false };
     applyRequest.current = request;
@@ -321,14 +323,22 @@ export default function PendingChangesBar() {
           reason: null, reconciling: !!initial.coreRecovery });
         return;
       }
+      const onDispatch = (precedingSave: PendingApplyResult | null) => {
+        request.precedingSave = precedingSave;
+        return applyRequest.current === request && !request.cancelled && (!hostRetry || sameHostCandidate());
+      };
+      const dispatch = (invoke: () => Promise<PendingApplyResult>) => dispatchSavedApply(invoke, onDispatch)
+        .then<ApplyNowResult>((receipt) => receipt
+          ? { ...receipt, saved: true, applyId: receipt.applyId ?? undefined }
+          : { status: null, saved: false });
       const result = hostRetry || preconfirmed
         // Fresh Plan/confirmation for the saved candidate; never save drafts or replay a Core transaction.
-        ? { ...await api.proxy.applyPendingChanges(), saved: true }
+        ? await dispatch(() => api.proxy.applyPendingChanges())
         : persistenceTransactionId === undefined
           ? await (impactConfirmation === undefined
-            ? useStagedConfigStore.getState().applyNow(restartConfirmation)
-            : useStagedConfigStore.getState().applyNow(undefined, impactConfirmation))
-          : { ...await api.proxy.retryRuntimePersistence(persistenceTransactionId), saved: true };
+            ? useStagedConfigStore.getState().applyNow(restartConfirmation, undefined, onDispatch)
+            : useStagedConfigStore.getState().applyNow(undefined, impactConfirmation, onDispatch))
+          : await dispatch(() => api.proxy.retryRuntimePersistence(persistenceTransactionId));
       if (applyRequest.current !== request) return;
       request.awaitingReply = false;
       if (!result.saved) {

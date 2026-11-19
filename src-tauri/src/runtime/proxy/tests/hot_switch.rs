@@ -4243,6 +4243,7 @@ async fn non_restart_leg_refreshes_legacy_queue_but_preserves_confirmed_snapshot
         let source = if confirmed {
             ForceRestartSource::Confirmed {
                 intent_generation: rt.selector_reconcile.intent_generation(),
+                saved_revision: rt.config.saved_revision(),
             }
         } else {
             ForceRestartSource::Full
@@ -4268,6 +4269,7 @@ async fn unconfirmed_graph_change_preserves_existing_force_snapshot() {
     for old_source in [
         ForceRestartSource::Confirmed {
             intent_generation: 0,
+            saved_revision: 0,
         },
         ForceRestartSource::Full,
         ForceRestartSource::Selected {
@@ -4484,6 +4486,41 @@ async fn diff_is_empty_after_the_restart_that_apply_pending_scheduled_lands() {
     );
 }
 
+#[tokio::test]
+async fn timer_cannot_restart_a_confirmed_config_after_an_equal_later_save() {
+    let (rt, _dir) = test_runtime();
+    let running = two_node_config(7891, "node-a");
+    mark_running_with_snapshot(&rt, &running);
+    let mut desired = running.clone();
+    desired["mixedPort"] = serde_json::json!(7892);
+    rt.config.save_full(&desired).unwrap();
+    let desired = rt.config.current().unwrap();
+    let generation = rt.gate.generation();
+    let intent = rt.selector_reconcile.intent_generation();
+
+    let (status, id) = rt.apply_confirmed_for_test().await;
+    assert_eq!(status, "applied");
+    let id = id.unwrap();
+    rt.config.save_full(&running).unwrap();
+    rt.config.save_full(&desired).unwrap();
+    assert_eq!(rt.config.current().unwrap(), desired);
+    assert_eq!(rt.selector_reconcile.intent_generation(), intent);
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    rt.debounced
+        .schedule_with_ticket(true, move |outcome, ticket| {
+            let _ = tx.send((outcome, ticket));
+        });
+    let (_, ticket) = rx.await.unwrap();
+    assert!(rt
+        .claim_debounced_restart(Some(id), generation, ticket)
+        .is_none());
+    assert_eq!(rt.gate.generation(), generation);
+    assert!(rt.pending_force_restart.read().unwrap().is_none());
+    assert!(rt.gate.pending().force_restart_id.is_none());
+    assert_eq!(rt.current_config_snapshot().as_ref(), Some(&running));
+}
+
 /// H-1 顺序门（上游 ProxyManager.ts:1731 注释）：**depth>0 必须先于句柄判空**。
 /// 顺序颠倒 → restart 的 stop→start 空窗内（句柄暂空、depth>0）本次强制重启被静默丢弃，
 /// 用户重试遇 304 → 不再触发 force-restart → 死循环。
@@ -4508,6 +4545,7 @@ async fn timer_with_old_force_id_cannot_consume_a_new_apply_snapshot() {
         original,
         ForceRestartSource::Confirmed {
             intent_generation: rt.selector_reconcile.intent_generation(),
+            saved_revision: rt.config.saved_revision(),
         },
     ));
     rt.gate.set_force_restart(7);
@@ -4530,6 +4568,7 @@ async fn timer_with_old_force_id_cannot_consume_a_new_apply_snapshot() {
             next.clone(),
             ForceRestartSource::Confirmed {
                 intent_generation: rt.selector_reconcile.intent_generation(),
+                saved_revision: rt.config.saved_revision(),
             },
         ));
         rt.gate.set_force_restart(8);
@@ -4781,30 +4820,16 @@ async fn real_core_staged_save_hot_applies_safe_graph_in_the_same_generation() {
     let before = rt.config.current().unwrap();
     let started = rt.start(before.clone()).await.expect("start paired Core");
     let generation = rt.core_generation();
-    let (candidate, owner) = {
-        // Start returns before its background selector PUT. Wait for its serial
-        // boundary and attest the active member before claiming a new intent.
-        let _selector = rt.switch_serial.lock().await;
-        let groups = rt
-            .management_api()
-            .await
-            .groups_snapshot()
-            .await
-            .expect("read paired Core selector");
-        assert!(groups
-            .iter()
-            .any(|group| group.tag == PROXY_SELECTOR_TAG && group.selected == "Node A"));
-        assert!(!rt.selector_reconcile.is_required());
-        let mut candidate = before.clone();
-        candidate["logLevel"] = "debug".into();
-        rt.config.save_full(&candidate).unwrap();
-        let owner = crate::runtime::proxy::runtime_config::StagedSaveOwner {
-            generation,
-            intent: rt.register_selector_intent(),
-            revision: rt.config.saved_revision(),
-        };
-        (rt.config.current().unwrap(), owner)
-    };
+    let startup_intent = rt.selector_reconcile.intent_generation();
+    let mut candidate = before.clone();
+    candidate["logLevel"] = "debug".into();
+    rt.config.save_full(&candidate).unwrap();
+    let candidate = rt.config.current().unwrap();
+    let owner = crate::runtime::proxy::runtime_config::StagedSaveOwner::capture(
+        &rt,
+        rt.config.saved_revision(),
+    );
+    assert_eq!(owner.intent, startup_intent);
     let receipt = rt
         .apply_staged_save_if_current(before, candidate.clone(), owner, |_| {})
         .await
@@ -4816,6 +4841,16 @@ async fn real_core_staged_save_hot_applies_safe_graph_in_the_same_generation() {
     assert_eq!(rt.status().pid, started.pid);
     assert_eq!(rt.core_generation(), generation);
     assert_eq!(rt.current_config_snapshot(), Some(candidate));
+    let groups = rt
+        .management_api()
+        .await
+        .groups_snapshot()
+        .await
+        .expect("read paired Core selector");
+    assert!(groups
+        .iter()
+        .any(|group| group.tag == PROXY_SELECTOR_TAG && group.selected == "Node A"));
+    assert!(!rt.selector_reconcile.is_required());
     assert!(!rt.pending_changes().pending_apply);
     rt.stop().await.expect("stop paired Core");
 }

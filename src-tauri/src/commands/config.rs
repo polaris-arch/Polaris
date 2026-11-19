@@ -440,13 +440,8 @@ pub async fn config_save(
             state
                 .config()
                 .try_with_saved_commit(|latest| {
-                    (latest == &config && state.config().saved_revision() == save.revision).then(
-                        || StagedSaveOwner {
-                            generation: state.proxy().core_generation(),
-                            intent: state.proxy().register_selector_intent(),
-                            revision: save.revision,
-                        },
-                    )
+                    (latest == &config && state.config().saved_revision() == save.revision)
+                        .then(|| StagedSaveOwner::capture(state.proxy(), save.revision))
                 })
                 .ok()
                 .flatten()

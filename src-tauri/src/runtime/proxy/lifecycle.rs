@@ -2258,15 +2258,21 @@ impl ProxyRuntime {
                     }
                     let snapshot = match (force_id, pending.as_ref()) {
                         (Some(want), Some((id, value, source))) if want == *id => {
-                            if matches!(source, super::ForceRestartSource::Confirmed { .. })
-                                && value != desired
+                            if let super::ForceRestartSource::Confirmed { saved_revision, .. } =
+                                source
                             {
-                                *pending = None;
-                                self.gate.clear_force_restart();
-                                return None;
+                                if value != desired
+                                    || *saved_revision != self.config.saved_revision()
+                                {
+                                    *pending = None;
+                                    self.gate.clear_force_restart();
+                                    return None;
+                                }
                             }
                             if let super::ForceRestartSource::Selected { intent_generation }
-                            | super::ForceRestartSource::Confirmed { intent_generation } = source
+                            | super::ForceRestartSource::Confirmed {
+                                intent_generation, ..
+                            } = source
                             {
                                 if *intent_generation != current_intent {
                                     *pending = None;

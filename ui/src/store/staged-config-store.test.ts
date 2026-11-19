@@ -709,6 +709,26 @@ describe('并发保存（withConfigWriteLock）', () => {
     expect(useStagedConfigStore.getState().saveStatus).toBe('idle');
   });
 
+  it('captures the preceding Save only once the explicit IPC can dispatch', async () => {
+    seedStaged();
+    let finishSave!: (outcome: SaveOutcome) => void;
+    saveMock.mockImplementationOnce(() => new Promise(resolve => { finishSave = resolve; }));
+    const receipt = { ok: true, status: 'hotApplied' as const, transactionId: 'preceding-save',
+      runtimeGeneration: 7, selectionIntentGeneration: 9, coreState: 'committed' as const, configurationDurable: true };
+    const capture = vi.fn(() => true);
+    const store = useStagedConfigStore.getState();
+    const saved = store.save();
+    const applied = store.applyNow('already-reviewed-restart', undefined, capture);
+    await vi.waitFor(() => expect(finishSave).toBeTypeOf('function'));
+    expect(capture).not.toHaveBeenCalled();
+    expect(applyMock).not.toHaveBeenCalled();
+    finishSave({ status: 'saved', version: 'v-save', config: CONFIG, runtimeApply: receipt });
+    await expect(saved).resolves.toBe(true);
+    await expect(applied).resolves.toMatchObject({ saved: true });
+    expect(capture).toHaveBeenCalledExactlyOnceWith(receipt);
+    expect(applyMock).toHaveBeenCalledExactlyOnceWith('already-reviewed-restart');
+  });
+
   /**
    * **正向对照**：闸门只串行，不该把真正的外部冲突吞掉。别人（托盘 / 另一个窗口 / 后台写盘）
    * 在两次 IPC 之间改了盘 ⇒ 那是真冲突，必须照实报 `saveFailed` 且**一条 staged 都不丢**（NFR-1），
