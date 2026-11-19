@@ -440,6 +440,30 @@ fn reconcile_merge_only_keeps_all_when_failed_provider_names_unknown() {
     );
 }
 
+#[test]
+fn partial_refresh_without_node_changes_preserves_order_and_active_selection() {
+    let mut incoming = srv("A", "a.com", 443);
+    incoming.provider_name = Some("success".into());
+    let mut existing = serde_json::to_value(&incoming).unwrap();
+    existing["id"] = json!("id-A");
+    existing["updatedAt"] = json!("2026-08-20T00:00:00Z");
+    let mut cfg = json!({
+        "selectedServerId": "id-B",
+        "servers": [
+            existing,
+            {"id":"manual","name":"Manual","protocol":"vless","address":"manual.com","port":443},
+            {"id":"id-B","name":"B","protocol":"vless","address":"b.com","port":443,"subscriptionId":"sub1","providerName":"failed"}
+        ]
+    });
+    let before = cfg.clone();
+
+    let out =
+        reconcile_subscription_servers(&mut cfg, "sub1", vec![incoming], true, &["failed".into()]);
+
+    assert_eq!((out.added, out.updated, out.deleted), (0, 0, 0));
+    assert_eq!(cfg, before);
+}
+
 /// M1 · **provider 级精确 merge-back**（本批修复的核心，上游 `leftoverToKeep`）。
 ///
 /// 场景：订阅有两个 provider，`P_fail` 拉取 503（transient）、`P_ok` 成功。两者名下各有一个节点

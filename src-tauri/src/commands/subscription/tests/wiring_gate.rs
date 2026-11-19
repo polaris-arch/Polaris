@@ -414,7 +414,7 @@ fn metadata_only_success_paths_emit_signal_without_runtime_publication() {
     );
     assert!(unchanged304.contains("return update_failure(error)"));
     let unchanged200 = inner
-        .split("if !content_changed && !partial {")
+        .split("if !content_changed {")
         .nth(1)
         .unwrap()
         .split("let token = owner.token();")
@@ -432,6 +432,7 @@ fn metadata_only_success_paths_emit_signal_without_runtime_publication() {
             .count(),
         1
     );
+    assert!(unchanged200.contains("return update_ok(0, 0, 0, !partial, user_info.as_ref())"));
     for branch in [unchanged304, unchanged200] {
         for forbidden in [
             "broadcast_config_changed",
@@ -452,11 +453,9 @@ fn metadata_only_success_paths_emit_signal_without_runtime_publication() {
         1
     );
     let saved = inner.find("match transaction {").unwrap();
-    assert!(saved < inner.find("if !content_changed && !partial {").unwrap());
-    assert!(
-        inner[saved..inner.find("if !content_changed && !partial {").unwrap()]
-            .contains("Err(e) => return update_failure")
-    );
+    let unchanged = inner.find("if !content_changed {").unwrap();
+    assert!(saved < unchanged);
+    assert!(inner[saved..unchanged].contains("Err(e) => return update_failure"));
     let persist = fn_body("fn refresh_not_modified_metadata(");
     assert!(
         persist.find("config.update(|cfg|").unwrap() < persist.find("token.is_current()").unwrap()

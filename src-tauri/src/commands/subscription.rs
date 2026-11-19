@@ -1101,21 +1101,25 @@ async fn perform_subscription_update_inner(
         Err(e) => return update_failure(format!("{e}")),
     };
 
-    // 7) L-5：200 但节点集内容等价（!content_changed && !partial）→ 仅刷元数据 return unchanged，
-    //    仅发空配置变化信号供现有监听者重读；不走 switch_mode/HOT。
-    if !content_changed && !partial {
+    // 7) 节点内容未变时只刷新元数据。部分拉取仍保留自己的终态。
+    if !content_changed {
         publish_subscription_metadata(&owner.token(), || {
             super::config::emit_config_changed_signal(app);
         });
+        let outcome = if partial {
+            "partial_unchanged"
+        } else {
+            "unchanged"
+        };
         log::info!(
-            "subscription reconcile timing: outcome=unchanged initial_config_ms={initial_config_ms} fetch_pipeline_ms={fetch_pipeline_ms} config_transaction_ms={transaction_ms} reconcile_total_ms={} total_ms={}",
+            "subscription reconcile timing: outcome={outcome} initial_config_ms={initial_config_ms} fetch_pipeline_ms={fetch_pipeline_ms} config_transaction_ms={transaction_ms} reconcile_total_ms={} total_ms={}",
             apply_started.elapsed().as_millis(),
             update_started.elapsed().as_millis()
         );
-        return update_ok(0, 0, 0, true, user_info.as_ref());
+        return update_ok(0, 0, 0, !partial, user_info.as_ref());
     }
 
-    // 8) 内容变 / partial → 广播（汇流点自动热切换）+ 出口变则作废解锁缓存。
+    // 8) 节点内容变更 → 广播（汇流点自动热切换）+ 出口变则作废解锁缓存。
     let token = owner.token();
     let intent = match prepare_subscription_publication(
         state.config(),
@@ -1835,6 +1839,16 @@ fn reconcile_subscription_servers(
     // 报给前端的 deleted = **实际**删掉的（= leftover 总数 − 被 merge-back 保留的）。
     // 此前 merge_only 恒 0，把「成功 provider 下架了 3 个节点」谎报成「无变化」。
     let deleted = leftover_total.saturating_sub(kept.len());
+    let outcome = ReconcileOutcome {
+        added,
+        updated,
+        deleted,
+    };
+    // A partial snapshot with no node changes does not own the saved ordering
+    // or selection. Keep the existing graph byte-for-byte in this case.
+    if merge_only && added == 0 && updated == 0 && deleted == 0 {
+        return outcome;
+    }
 
     others.extend(reconciled);
     others.extend(kept); // provider 级 merge-back：失败 provider / 无归属的存量保留
@@ -1873,11 +1887,7 @@ fn reconcile_subscription_servers(
         }
     }
 
-    ReconcileOutcome {
-        added,
-        updated,
-        deleted,
-    }
+    outcome
 }
 
 /// 订阅预检核心（**生产与门共用同一份**）：拉取 → 解析 → 节点计数，产出前端 `SubscriptionPreviewResult`。
