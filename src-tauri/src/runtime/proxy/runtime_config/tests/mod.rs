@@ -571,6 +571,65 @@ async fn hot_config_edit_while_stopped_saves_for_next_start_without_a_runtime_re
     assert!(!rt.pending_changes().pending_apply);
 }
 
+#[tokio::test]
+async fn hot_config_edit_retries_only_before_local_apply_admission() {
+    let (rt, _dir, _, saved) = host_dns_restart_fixture();
+    let expires = (SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        + 5000) as i64;
+    let owner = StagedSaveOwner::capture(&rt, rt.config.saved_revision());
+    let (held, holding) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let writer = {
+        let rt = Arc::clone(&rt);
+        tokio::task::spawn_blocking(move || {
+            rt.config
+                .update_with_cleanup_revision(false, |_| {
+                    held.send(()).unwrap();
+                    released.recv().unwrap();
+                    crate::runtime::config::Decision::Skip(())
+                })
+                .unwrap();
+        })
+    };
+    holding.await.unwrap();
+    assert_eq!(
+        rt.config.try_with_saved_commit_classified(|_| ()),
+        Err(SavedCommitError::WriterBusy),
+    );
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    let attempt = rt.try_runtime_saved_commit(Some(owner), expires, |config| {
+        calls.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(config, &saved);
+        true
+    });
+    let release = async move {
+        tokio::time::sleep(HOT_EDIT_WRITER_RETRY_INTERVAL * 2).await;
+        release.send(()).unwrap();
+    };
+    let (result, ()) = tokio::join!(attempt, release);
+    writer.await.unwrap();
+    assert_eq!(result, Some(true));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(rt.runtime_config_apply.lock().unwrap().pending.is_none());
+
+    let expired = rt
+        .try_runtime_saved_commit(Some(owner), 0, |_| {
+            panic!("expired ticket cannot claim local admission")
+        })
+        .await;
+    assert_eq!(expired, None::<()>);
+    rt.register_selector_intent();
+    let superseded = rt
+        .try_runtime_saved_commit(Some(owner), expires, |_| {
+            panic!("superseded ticket cannot claim local admission")
+        })
+        .await;
+    assert_eq!(superseded, None::<()>);
+}
+
 #[test]
 fn hot_config_edit_pending_projection_does_not_consume_independent_or_failed_work() {
     let (rt, _dir, running, _) = host_dns_restart_fixture();

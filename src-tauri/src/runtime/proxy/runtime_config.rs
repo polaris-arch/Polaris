@@ -3,10 +3,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path};
 use std::sync::{atomic::Ordering, Arc};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::hot_switch::SwitchOutcome;
 use super::ProxyRuntime;
-use crate::runtime::config::PreparedConfigEdit;
+use crate::runtime::config::{PreparedConfigEdit, SavedCommitError};
 use crate::runtime::route_binding::{
     plan_protected_runtime_bindings, protected_generated_policy_compatible, ProtectedBindingPlan,
     ProtectedPhysicalRoot,
@@ -33,6 +34,16 @@ const CLIENT_IMPACT_POLICY_VERSION: u32 = 1;
 // including a delayed impact confirmation; never evict an unobserved PENDING or
 // sticky UNKNOWN to make room for another native owner.
 const NATIVE_RETIREMENT_OBSERVATION_LIMIT: usize = 256;
+
+const HOT_EDIT_WRITER_RETRY_LIMIT: Duration = Duration::from_millis(150);
+const HOT_EDIT_WRITER_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+
+fn runtime_plan_ticket_is_live(expires_at_unix_milli: i64) -> bool {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    expires_at_unix_milli > 0 && (expires_at_unix_milli as u128) > now.as_millis()
+}
 
 // The protocol is an authenticated observation of a previously byte/source-admitted
 // core. Its manifest digest is metadata, NOT a signature or substitute for that
@@ -1700,7 +1711,7 @@ impl ProxyRuntime {
                     commit_blocker = blocker;
                     return false;
                 }
-                true
+                runtime_plan_ticket_is_live(pending.plan.expires_at_unix_milli)
             },
             |revision| publication.publish(StagedSaveOwner { revision, ..owner }),
         )?
@@ -1721,7 +1732,11 @@ impl ProxyRuntime {
                 Box::pin(self.execute_prepared_runtime_candidate(client, pending, None, false))
                     .await
             }
-            Err(_) => self.remember_runtime_result(RuntimeApplyResult::status("unconfirmed")),
+            Err(_) => {
+                let mut result = RuntimeApplyResult::status("conflict");
+                result.core_state = Some("unchanged");
+                self.remember_runtime_result(result)
+            }
         };
         let owner = StagedSaveOwner { revision, ..owner };
         // Execution can return an unconfirmed result after admitting Apply.
@@ -2442,6 +2457,9 @@ impl ProxyRuntime {
                         .any(|class| class == "api_generation_handoff_v1")
             });
         let api_handoff = if target_api != baseline.management || api_generation_handoff {
+            if prospective {
+                return decline(RuntimeApplyResult::status("impactConfirmationRequired"));
+            }
             if baseline
                 .control
                 .as_ref()
@@ -2600,6 +2618,48 @@ impl ProxyRuntime {
         Ok((client, pending))
     }
 
+    fn automatic_edit_owner(&self, pending: &PendingOperation) -> Option<StagedSaveOwner> {
+        let owner = pending.staged_save_owner()?;
+        self.runtime_config_apply
+            .lock()
+            .ok()
+            .and_then(|state| state.automatic_edit.filter(|current| *current == owner))
+    }
+
+    async fn try_runtime_saved_commit<T>(
+        &self,
+        automatic: Option<StagedSaveOwner>,
+        plan_expiry: i64,
+        mut commit: impl FnMut(&Value) -> T,
+    ) -> Option<T> {
+        let Some(owner) = automatic else {
+            return self.config.try_with_saved_commit(commit).ok();
+        };
+        let deadline = tokio::time::Instant::now() + HOT_EDIT_WRITER_RETRY_LIMIT;
+        loop {
+            if !owner.is_current(self)
+                || self.gate.is_busy()
+                || !runtime_plan_ticket_is_live(plan_expiry)
+            {
+                return None;
+            }
+            match self.config.try_with_saved_commit_classified(&mut commit) {
+                Ok(result) => return Some(result),
+                Err(SavedCommitError::WriterBusy) => {
+                    // This error occurs before the admission callback. No
+                    // state was changed and no Apply RPC was sent.
+                    let now = tokio::time::Instant::now();
+                    if now >= deadline {
+                        return None;
+                    }
+                    tokio::time::sleep_until((now + HOT_EDIT_WRITER_RETRY_INTERVAL).min(deadline))
+                        .await;
+                }
+                Err(_) => return None,
+            }
+        }
+    }
+
     async fn execute_prepared_runtime_candidate(
         self: &Arc<Self>,
         client: Arc<SingBoxApiClient>,
@@ -2658,6 +2718,8 @@ impl ProxyRuntime {
         let saved_revision = pending.saved_revision.or(expected_confirmation
             .as_ref()
             .map(|(_, revision)| *revision));
+        let automatic = self.automatic_edit_owner(&pending);
+        let plan_expiry = pending.plan.expires_at_unix_milli;
         let admit = |desired: &Value| {
             if desired != &pending.desired || !self.saved_revision_matches(saved_revision) {
                 return false;
@@ -2667,6 +2729,7 @@ impl ProxyRuntime {
                 if current_intent != intent
                     || self.gate.generation() != generation
                     || self.gate.is_busy()
+                    || (automatic.is_some() && !runtime_plan_ticket_is_live(plan_expiry))
                     || !self.protected_runtime_publication_current(&pending)
                     || expected_confirmation.as_ref().is_some_and(|(running, _)| {
                         self.current_config_snapshot().as_ref() != Some(running)
@@ -2708,9 +2771,10 @@ impl ProxyRuntime {
             })
         };
         let admitted = if saved_revision.is_some() {
-            self.config.try_with_saved_commit(admit)
+            self.try_runtime_saved_commit(automatic, plan_expiry, admit)
+                .await
         } else {
-            self.config.with_current(admit)
+            self.config.with_current(admit).ok()
         }
         .unwrap_or(false);
         if !admitted {
@@ -2719,6 +2783,9 @@ impl ProxyRuntime {
             } else {
                 "conflict"
             });
+            if automatic.is_some() {
+                result.core_state = Some("unchanged");
+            }
             if native_limited {
                 result.reasons.push(RuntimeApplyReason {
                     code: "RESOURCE_LIMIT_EXCEEDED",
@@ -2993,12 +3060,7 @@ impl ProxyRuntime {
                 {
                     return false;
                 }
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default();
-                if pending.plan.expires_at_unix_milli <= 0
-                    || pending.plan.expires_at_unix_milli as u128 <= now.as_millis()
-                {
+                if !runtime_plan_ticket_is_live(pending.plan.expires_at_unix_milli) {
                     return false;
                 }
                 state.impact = None;
@@ -3538,9 +3600,12 @@ impl ProxyRuntime {
             return self.remember_runtime_result(result);
         }
         let publication = self
-            .config
-            .try_with_saved_commit(|desired| {
-                (desired == &pending.desired && self.saved_revision_matches(pending.saved_revision))
+            .try_runtime_saved_commit(
+                self.automatic_edit_owner(&pending),
+                pending.plan.expires_at_unix_milli,
+                |desired| {
+                    (desired == &pending.desired
+                        && self.saved_revision_matches(pending.saved_revision))
                     .then(|| {
                         self.publish_prepared_runtime_candidate(
                             &pending,
@@ -3551,8 +3616,9 @@ impl ProxyRuntime {
                         )
                     })
                     .flatten()
-            })
-            .ok()
+                },
+            )
+            .await
             .flatten();
         let Some((tailnet_changed, tailnet_token, execution)) = publication else {
             return self.remember_runtime_result(RuntimeApplyResult::status("conflict"));
