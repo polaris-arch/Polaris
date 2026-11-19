@@ -307,7 +307,9 @@ mod native {
             return Ok(());
         }
         #[cfg(target_os = "linux")]
-        if let Some(pid) = rustix::process::Pid::from_raw(i32::try_from(_pid)?) {
+        {
+            let pid = rustix::process::Pid::from_raw(i32::try_from(_pid)?)
+                .ok_or("Invalid owned Core PID")?;
             // The unreaped, owned child keeps this PID reserved until wait.
             if rustix::process::kill_process(pid, rustix::process::Signal::TERM).is_ok()
                 && timeout(STOP_DEADLINE, child.wait())
@@ -469,7 +471,7 @@ mod native {
                 )
             };
             let width = std::mem::size_of::<HMODULE>() as u32;
-            if ok == 0 || needed > capacity || needed % width != 0 {
+            if ok == 0 || needed > capacity || !needed.is_multiple_of(width) {
                 return Err("Cannot read complete actual Core module inventory".into());
             }
             let mut name = vec![0u16; 32768];
