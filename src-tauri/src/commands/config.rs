@@ -693,6 +693,7 @@ fn is_app_patch_key(key: &str) -> bool {
             | "autoCheckUpdate"
             | "autoDownloadUpdate"
             | "appUpdateChannel"
+            | "autoSwitchNode"
             | "mainSessionViaProxy"
             | "ghProxyPrefix"
             | "autoPrivacyMode"
