@@ -914,7 +914,7 @@ describe('original native listener retirement account', () => {
     const pending = applyReceiptState(state(), { ...result, status: 'hotApplied', retirementState: 'PENDING',
       nativeRetirements: undefined }, true);
     expect(pending.nativeRetirements).toBeUndefined();
-    expect(applyOutcome('hotApplied').toast?.key).toBe('home.pendingHotApplied');
+    expect(applyOutcome('hotApplied')).toEqual({ phase: 'idle', toast: null });
     expect(composeBarView(barInput({ nativeRetirements: pending.nativeRetirements })).visible).toBe(false);
   });
 

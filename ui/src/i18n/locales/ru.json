@@ -500,7 +500,6 @@
     "pendingNativeSaveUnconfirmed": "Сохранение конфигурации ещё не подтверждено; его необходимо восстановить отдельно.",
     "pendingNativeHostSettled": "Системные настройки подтверждены; очистка старой сетевой точки входа проверяется отдельно.",
     "pendingCheckNativeBtn": "Проверить закрытие входа",
-    "pendingHotApplied": "Применено к работающему ядру.",
     "pendingSavedChangesApplied": "Применены изменения {{changes}}.",
     "pendingSavedLogLevelApplied": "Уровень журнала изменён на {{level}}.",
     "pendingSavedMoreChangesApplied": "Применены изменения {{changes}} и ещё {{count}}.",

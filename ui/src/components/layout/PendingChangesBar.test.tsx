@@ -241,7 +241,7 @@ it.each(['hotApplied', 'applied'] as const)('keeps a newer explicit %s while an 
   } else {
     expect(h.states[0]).toMatchObject({ phase: 'idle', transactionId: 'newer-explicit' });
     expect(h.savedRuntimeApply).toBeNull();
-    expect(toast.info).toHaveBeenCalledExactlyOnceWith('home.pendingHotApplied');
+    expect(toast.info).not.toHaveBeenCalled();
   }
 });
 
@@ -325,7 +325,7 @@ it('keeps explicit ownership over a previously queued Save with the same selecto
   renderBar();
   expect(h.states[0]).toMatchObject({ phase: 'idle', transactionId: 'new-explicit' });
   expect(h.savedRuntimeApply).toBeNull();
-  expect(toast.info).toHaveBeenCalledExactlyOnceWith('home.pendingHotApplied');
+  expect(toast.info).not.toHaveBeenCalled();
 });
 
 it('attributes a Save already in flight before external Apply dispatches', async () => {
@@ -349,7 +349,7 @@ it('attributes a Save already in flight before external Apply dispatches', async
   expect(h.freshApply).toHaveBeenCalledOnce();
   expect(h.states[0]).toMatchObject({ phase: 'idle', transactionId: 'new-external-apply' });
   expect(h.savedRuntimeApply).toBeNull();
-  expect(toast.info).toHaveBeenCalledExactlyOnceWith('home.pendingHotApplied');
+  expect(toast.info).not.toHaveBeenCalled();
 });
 
 it('keeps the confirmation armed only for the saved settings the user saw', async () => {
@@ -688,7 +688,7 @@ describe('desktop native listener cleanup stays independent', () => {
     await vi.waitFor(() => expect((h.states[0] as ApplyState).configurationDurable).toBe(true));
     h.app.pendingChanges = empty();
     expect(renderBar()).toBeNull();
-    expect(toast.info).toHaveBeenCalledExactlyOnceWith('home.pendingHotApplied');
+    expect(toast.info).not.toHaveBeenCalled();
     h.app.pendingChanges = { ...empty(), nativeRetirements: [native] };
     expect(markup()).toContain('home.pendingNativeCleanupUnknown');
     expect((h.states[0] as ApplyState).nativeRetirements).toEqual([native]);

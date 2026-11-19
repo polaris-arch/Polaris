@@ -419,8 +419,7 @@ export function MobilePendingBar(): ReactElement | null {
       next = preserveNativeRetirements(mergeNativeRetirements(latestApply.current, useAppStore.getState().pendingChanges.nativeRetirements), next);
       setApply(next);
       // Preserve the mobile policy: an Apply racing Stop stays neutral without a skipped toast.
-      if (outcome.toast !== null && result.status !== 'skipped'
-          && !(result.status === 'hotApplied' && (next.nativeRetirements?.length || next.host && next.host.phase !== 'settled'))) toast[outcome.toast.kind](t(outcome.toast.key));
+      if (outcome.toast && result.status !== 'skipped') toast[outcome.toast.kind](t(outcome.toast.key));
     } catch (error) {
       if (applyRequest.current !== request) return;
       request.awaitingReply = false;

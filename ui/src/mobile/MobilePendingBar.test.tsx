@@ -694,7 +694,7 @@ describe('mobile original native listener cleanup', () => {
     h.app.pendingChanges = empty();
     expect(renderBar()).toBeNull();
     const { toast } = await import('@/lib/error-handler');
-    expect(toast.info).toHaveBeenCalledExactlyOnceWith('home.pendingHotApplied');
+    expect(toast.info).not.toHaveBeenCalled();
     h.app.pendingChanges = { ...empty(), nativeRetirements: [native] };
     expect(markup(renderBar())).toContain('home.pendingNativeCleanupUnknown');
     expect((h.states[0] as ApplyState).nativeRetirements).toEqual([native]);

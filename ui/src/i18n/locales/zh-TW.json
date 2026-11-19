@@ -478,7 +478,6 @@
     "pendingNativeSaveUnconfirmed": "設定儲存仍未確認，需另行復原儲存。",
     "pendingNativeHostSettled": "系統設定已確認完成；舊網路入口清理仍須另行確認。",
     "pendingCheckNativeBtn": "檢查入口關閉狀態",
-    "pendingHotApplied": "已套用至執行中的核心。",
     "pendingSavedChangesApplied": "{{changes}}已生效。",
     "pendingSavedLogLevelApplied": "日誌層級已切換為 {{level}}。",
     "pendingSavedMoreChangesApplied": "{{changes}}及另外 {{count}} 項變更已生效。",

@@ -100,7 +100,9 @@ export function applyOutcome(status: ApplyStatus | null | undefined, reasons?: P
     case 'deferred':
       return { phase: 'applying', toast: null };
     case 'hotApplied':
-      return { phase: 'idle', toast: { kind: 'info', key: 'home.pendingHotApplied' } };
+      // The manual receipt settles the bar. Exact Save receipts supply their
+      // own operation summary through the shared reconciliation hook.
+      return { phase: 'idle', toast: null };
     case 'hotDurabilityPending':
       return { phase: 'durabilityPending', toast: null };
     case 'nativeCleanupUnknown':

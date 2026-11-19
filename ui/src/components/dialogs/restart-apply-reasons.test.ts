@@ -53,7 +53,7 @@ describe('safe restart reasons and locale parity', () => {
     const locales = ['en-US', 'zh-CN', 'zh-TW', 'ru', 'fa'];
     const keys = ['restartApplyTitle', 'restartApplyDescription', 'restartApplyConfirm', 'restartApplyKeepConnection',
       'restartApplyUnsupportedCore', 'restartApplyTun', 'restartApplyListener', 'restartApplyNamespace', 'restartApplyServices',
-      'restartApplyCache', 'restartApplyDnsAutoSource', 'restartApplyHostEffects', 'restartApplyStructural', 'pendingHotApplied', 'pendingHotDurabilityPending',
+      'restartApplyCache', 'restartApplyDnsAutoSource', 'restartApplyHostEffects', 'restartApplyStructural', 'pendingHotDurabilityPending',
       'pendingHotConflict', 'pendingHotRejected', 'pendingHotUnconfirmed'];
     for (const locale of locales) {
       const home = JSON.parse(readFileSync(new URL(`../../i18n/locales/${locale}.json`, import.meta.url), 'utf8')).home;

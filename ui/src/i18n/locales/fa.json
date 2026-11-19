@@ -500,7 +500,6 @@
     "pendingNativeSaveUnconfirmed": "ذخیره شدن پیکربندی هنوز تأیید نشده و باید جداگانه بازیابی شود.",
     "pendingNativeHostSettled": "تنظیمات سیستم تأیید شده است؛ پاک‌سازی ورودی شبکهٔ قبلی جداگانه بررسی می‌شود.",
     "pendingCheckNativeBtn": "بررسی بسته شدن ورودی",
-    "pendingHotApplied": "در هسته در حال اجرا اعمال شد.",
     "pendingSavedChangesApplied": "{{changes}} اعمال شد.",
     "pendingSavedLogLevelApplied": "سطح ثبت گزارش به {{level}} تغییر کرد.",
     "pendingSavedMoreChangesApplied": "{{changes}} و {{count}} تغییر دیگر اعمال شد.",

@@ -436,8 +436,7 @@ export default function PendingChangesBar() {
       request.early = [];
       next = preserveNativeRetirements(mergeNativeRetirements(latestApply.current, useAppStore.getState().pendingChanges.nativeRetirements), next);
       setApply(next);
-      if (outcome.toast !== null
-          && !(result.status === 'hotApplied' && (next.nativeRetirements?.length || next.host && next.host.phase !== 'settled'))) toast[outcome.toast.kind](t(outcome.toast.key));
+      if (outcome.toast) toast[outcome.toast.kind](t(outcome.toast.key));
     } catch (error) {
       if (applyRequest.current !== request) return;
       request.awaitingReply = false;

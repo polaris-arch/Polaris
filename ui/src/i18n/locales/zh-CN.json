@@ -478,7 +478,6 @@
     "pendingNativeSaveUnconfirmed": "配置保存仍未确认，需单独恢复保存。",
     "pendingNativeHostSettled": "系统设置已确认完成；旧网络入口清理仍单独待确认。",
     "pendingCheckNativeBtn": "检查入口关闭状态",
-    "pendingHotApplied": "已应用到运行中的内核。",
     "pendingSavedChangesApplied": "{{changes}}已生效。",
     "pendingSavedLogLevelApplied": "日志级别已切换为 {{level}}。",
     "pendingSavedMoreChangesApplied": "{{changes}}及另外 {{count}} 项变更已生效。",
