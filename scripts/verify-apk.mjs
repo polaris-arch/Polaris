@@ -622,31 +622,143 @@ function aarElfFacts(raw, abi, requireAndroidNote) {
   return { ptLoad, androidAPI };
 }
 
-// The AAR owner supplies the identity of the member it already extracted.
-// Prove the exact buffered bytes before using them as native receipt evidence.
-function verifyAarElf(path, abi, expectedBytes, expectedSha, library) {
-  const { receipt } = JSON.parse(readFileSync(join(ROOT, 'scripts/mobile-core/receipt-policy.json'), 'utf8'));
-  if (!Number.isSafeInteger(expectedBytes) || expectedBytes < 64 || expectedBytes > 2 * receipt.artifactBytes
-    || !/^[a-f0-9]{64}$/.test(expectedSha) || !['libbox', 'dependency'].includes(library)) {
-    throw new Error('bounded original AAR ELF member pin required');
+// Keep the evidence bound to the exact bytes observed and staged by the AAR owner.
+function readPinnedAarEvidence(path, expectedBytes, expectedSha, { minimum, maximum, subject }) {
+  if (!Number.isSafeInteger(expectedBytes) || expectedBytes < minimum || expectedBytes > maximum
+    || !/^[a-f0-9]{64}$/.test(expectedSha)) {
+    throw new Error('bounded original ' + subject + ' pin required');
   }
   const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
     const before = fstatSync(fd);
-    if (!before.isFile() || before.size !== expectedBytes) throw new Error('AAR ELF member size differs');
+    if (!before.isFile() || before.size !== expectedBytes) throw new Error(subject + ' size differs');
     const raw = Buffer.allocUnsafe(expectedBytes);
     for (let at = 0; at < raw.length;) {
       const bytes = readSync(fd, raw, at, raw.length - at, at);
-      if (bytes === 0) throw new Error('truncated AAR ELF member');
+      if (bytes === 0) throw new Error('truncated ' + subject);
       at += bytes;
     }
     if (fstatSync(fd).size !== before.size || createHash('sha256').update(raw).digest('hex') !== expectedSha) {
-      throw new Error('AAR ELF member pin differs');
+      throw new Error(subject + ' pin differs');
     }
-    return aarElfFacts(raw, abi, library === 'libbox');
+    return raw;
   } finally {
     closeSync(fd);
   }
+}
+
+// Exact javap -s declarations and JVM descriptors observed from gomobile.
+const AAR_HOT_JAVA_API = {
+  CommandServer: [
+    ['public native void startOrReloadServiceWithRetryableRuntimePersistence(java.lang.String, io.nekohasekai.libbox.OverrideOptions, io.nekohasekai.libbox.RuntimePersistenceHandler) throws java.lang.Exception;',
+      '(Ljava/lang/String;Lio/nekohasekai/libbox/OverrideOptions;Lio/nekohasekai/libbox/RuntimePersistenceHandler;)V'],
+    ['public native java.lang.String runtimeCapabilities() throws java.lang.Exception;', '()Ljava/lang/String;'],
+  ],
+  RuntimePersistenceHandler: [
+    ['public abstract java.lang.String runtimePersistenceMode();', '()Ljava/lang/String;'],
+    ['public abstract void persistRuntimeConfiguration(java.lang.String, long, java.lang.String, java.lang.String) throws java.lang.Exception;',
+      '(Ljava/lang/String;JLjava/lang/String;Ljava/lang/String;)V'],
+  ],
+  'Libbox$proxyRuntimePersistenceHandler': [
+    ['public native java.lang.String runtimePersistenceMode();', '()Ljava/lang/String;'],
+    ['public native void persistRuntimeConfiguration(java.lang.String, long, java.lang.String, java.lang.String) throws java.lang.Exception;',
+      '(Ljava/lang/String;JLjava/lang/String;Ljava/lang/String;)V'],
+  ],
+  OverrideOptions: [['public io.nekohasekai.libbox.OverrideOptions();', '()V']],
+};
+const AAR_HOT_JNI_EXPORTS = [
+  'JNI_OnLoad',
+  'Java_io_nekohasekai_libbox_CommandServer_startOrReloadServiceWithRetryableRuntimePersistence',
+  'Java_io_nekohasekai_libbox_CommandServer_runtimeCapabilities',
+  'Java_io_nekohasekai_libbox_Libbox_00024proxyRuntimePersistenceHandler_persistRuntimeConfiguration',
+  'Java_io_nekohasekai_libbox_Libbox_00024proxyRuntimePersistenceHandler_runtimePersistenceMode',
+];
+const AAR_JAVA_API = {
+  Libbox: ['newTransientCommandServer(', 'newStrictCommandServer(', 'newManagedStrictCommandServer(',
+    'interfaceUpdateListenerIdentity(', 'checkConfigWithResult(', 'java.lang.String version()'],
+  CommandServer: ['startOrReloadService(', 'public native java.lang.String exportTailscaleStoreRetirement();',
+    'public native java.lang.String exportTailscaleDirectoryCapability();',
+    'public native java.lang.String exportTailscaleDirectoryRetirement();',
+    'activateTailscaleDirectoryDomain(', 'void wakeNow()', 'void recordScreenState(boolean)'],
+  PlatformInterface: ['void bindInterfaceControl(int, java.lang.String)'],
+  ConfigValidationResult: ['getRequestID()', 'getConfigDigest()', 'getContractVersion()', 'getValidation()',
+    'getCleanup()', 'getValidationError()', 'getCleanupError()', 'getTailscaleStoreRetirement()', 'getTailscaleStoreMembership()'],
+  ExchangeContext: ['void errnoCode(int)', 'void errorCode(int)', 'void onCancel(', 'void rawSuccess(byte[])', 'void success(java.lang.String)'],
+  LocalDNSTransport: ['void exchange(', 'void lookup(', 'boolean raw()'],
+  Func: ['void invoke()'],
+};
+const AAR_VALIDATION_SETTERS = ['setRequestID(', 'setConfigDigest(', 'setValidation(', 'setCleanup(',
+  'setTailscaleStoreRetirement(', 'setTailscaleStoreMembership('];
+
+// Retain the native parser's Python whitespace and LF-only line boundaries.
+const TOOL_WHITESPACE = '\\u0009-\\u000d\\u001c-\\u0020\\u0085\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000';
+const TOOL_SPACE = '[' + TOOL_WHITESPACE + ']';
+const TOOL_NONSPACE = '[^' + TOOL_WHITESPACE + ']';
+const TOOL_WORD = '[\\p{L}\\p{N}_]';
+const TOOL_LINE_START = '(?<![^\\n])', TOOL_LINE_END = '(?=\\n|$)';
+const JAVA_RECEIVER = new RegExp(TOOL_LINE_START + '([^\\n]*(?<!' + TOOL_WORD
+  + ')(?:class|interface) [^\\n]*\\{)' + TOOL_SPACE + '*' + TOOL_LINE_END, 'gu');
+const JAVA_METHOD = new RegExp(TOOL_LINE_START + TOOL_SPACE + '*([^\\n]+;)'
+  + TOOL_SPACE + '*\\n' + TOOL_SPACE + '*descriptor: ([^\\n]+)' + TOOL_SPACE + '*' + TOOL_LINE_END, 'gu');
+const DEFINED_JNI = new RegExp('GLOBAL' + TOOL_SPACE + '+DEFAULT' + TOOL_SPACE + '+(?!UND(?!' + TOOL_WORD + '))'
+  + TOOL_NONSPACE + '+' + TOOL_SPACE + '+(' + TOOL_NONSPACE + '+)', 'gu');
+const stripToolSpace = (value) => value.replace(new RegExp('^' + TOOL_SPACE + '+|' + TOOL_SPACE + '+$', 'gu'), '');
+const normalizeJava = (value) => value.split(new RegExp(TOOL_SPACE + '+', 'u')).filter(Boolean).join(' ').replace(/ *, */g, ',');
+
+function verifyAarHotJava(classes) {
+  const packageName = 'io.nekohasekai.libbox.';
+  for (const [name, methods] of Object.entries(AAR_HOT_JAVA_API)) {
+    const source = classes?.[name];
+    if (typeof source !== 'string') throw new Error('HOT Java class inventory missing: ' + name);
+    const proxy = name.startsWith('Libbox$');
+    const expected = name === 'RuntimePersistenceHandler'
+      ? 'public interface ' + packageName + name + ' {'
+      : (proxy ? 'final class ' : 'public final class ') + packageName + name + ' implements go.Seq$Proxy'
+        + (proxy ? ',' + packageName + 'RuntimePersistenceHandler' : '') + ' {';
+    const headers = [...source.matchAll(JAVA_RECEIVER)];
+    if (headers.length !== 1 || normalizeJava(headers[0][1]) !== expected) {
+      throw new Error('HOT Java receiver/interface differs: ' + name);
+    }
+    const pairs = [...source.matchAll(JAVA_METHOD)];
+    for (const [declaration, descriptor] of methods) {
+      const method = declaration.split('(', 1)[0].split(' ').at(-1);
+      const match = new RegExp('(?<![\\p{L}\\p{N}_$])' + RegExp.escape(method) + '\\(', 'u');
+      const actual = pairs
+        .filter(([, decl]) => match.test(decl))
+        .map(([, decl, desc]) => [normalizeJava(decl), stripToolSpace(desc)])
+        // gobind also emits a package-private refnum(int) constructor.
+        .filter(([decl, desc]) => name !== 'OverrideOptions' || desc === '()V' || decl.includes('()'));
+      if (actual.length !== 1 || actual[0][0] !== normalizeJava(declaration) || actual[0][1] !== descriptor) {
+        throw new Error('HOT Java method/descriptor/error differs: ' + name + '.' + method);
+      }
+    }
+  }
+}
+
+export function verifyAarInterfaces(observation) {
+  const { javaInterfaces, hotJavaInterfaces, jni } = observation;
+  verifyAarHotJava(hotJavaInterfaces);
+  for (const [name, members] of Object.entries(AAR_JAVA_API)) {
+    if (typeof javaInterfaces?.[name] !== 'string' || !members.every(member => javaInterfaces[name].includes(member))) {
+      throw new Error('generated Java API differs: ' + name);
+    }
+  }
+  if (!javaInterfaces.Libbox.includes('ConfigValidationContractVersion = "polaris-validation-v1"')) {
+    throw new Error('validation API contract differs');
+  }
+  if (AAR_VALIDATION_SETTERS.some(setter => javaInterfaces.ConfigValidationResult.includes(setter))) {
+    throw new Error('validation result must be readonly');
+  }
+  return Object.fromEntries(Object.keys(ABIS).map(abi => {
+    if (typeof jni?.[abi] !== 'string') throw new Error('JNI observation missing: ' + abi);
+    const exports = new Set(Array.from(jni[abi].matchAll(DEFINED_JNI), match => match[1]));
+    if (!exports.has('JNI_OnLoad') || ![...exports].some(symbol => symbol.startsWith('Java_go_Seq_'))) {
+      throw new Error('actual generated JNI loader/sequence exports missing: ' + abi);
+    }
+    if (!AAR_HOT_JNI_EXPORTS.every(symbol => exports.has(symbol))) throw new Error('actual HOT JNI exports missing: ' + abi);
+    const observed = [...exports].filter(symbol => symbol.startsWith('Java_') || symbol.startsWith('JNI_'));
+    return [abi, observed.sort((left, right) => Buffer.compare(Buffer.from(left), Buffer.from(right)))];
+  }));
 }
 
 export function elfSectionNames(buf) {
@@ -1214,8 +1326,28 @@ function main() {
   if (process.argv[2] === '--aar-elf') {
     const [, , , path, abi, bytes, sha, library] = process.argv;
     if (process.argv.length !== 8) throw new Error('usage: verify-apk.mjs --aar-elf <path> <abi> <bytes> <sha256> <libbox|dependency>');
-    const facts = verifyAarElf(path, abi, Number(bytes), sha, library);
+    if (!['libbox', 'dependency'].includes(library)) throw new Error('bounded original AAR ELF member pin required');
+    const { receipt } = JSON.parse(readFileSync(join(ROOT, 'scripts/mobile-core/receipt-policy.json'), 'utf8'));
+    const raw = readPinnedAarEvidence(path, Number(bytes), sha, {
+      minimum: 64, maximum: 2 * receipt.artifactBytes, subject: 'AAR ELF member',
+    });
+    const facts = aarElfFacts(raw, abi, library === 'libbox');
     console.log(JSON.stringify(facts, (_, value) => typeof value === 'bigint' ? JSON.rawJSON(value.toString()) : value));
+    return;
+  }
+  if (process.argv[2] === '--aar-interface-classes') {
+    if (process.argv.length !== 3) throw new Error('usage: verify-apk.mjs --aar-interface-classes');
+    console.log(JSON.stringify({ javaInterfaces: Object.keys(AAR_JAVA_API), hotJavaInterfaces: Object.keys(AAR_HOT_JAVA_API) }));
+    return;
+  }
+  if (process.argv[2] === '--aar-interfaces') {
+    const [, , , path, bytes, sha] = process.argv;
+    if (process.argv.length !== 6) throw new Error('usage: verify-apk.mjs --aar-interfaces <path> <bytes> <sha256>');
+    const { receipt } = JSON.parse(readFileSync(join(ROOT, 'scripts/mobile-core/receipt-policy.json'), 'utf8'));
+    const raw = readPinnedAarEvidence(path, Number(bytes), sha, {
+      minimum: 1, maximum: receipt.controlBytes, subject: 'AAR interface observation',
+    });
+    console.log(JSON.stringify(verifyAarInterfaces(JSON.parse(raw))));
     return;
   }
   if (process.argv[2] === '--sdk-payload') {

@@ -30,6 +30,7 @@ import {
   parseZipEntries,
   permissionViolations,
   strippedReport,
+  verifyAarInterfaces,
   verifySdkPayload,
   zipOverheadBound,
 } from './verify-apk.mjs';
@@ -1291,6 +1292,389 @@ test('AAR ELF CLI preserves all ABI receipt rows and rejects malformed member by
   rejected(dependency, 'armeabi-v7a', /ELF PT_LOAD bounds/, 'dependency');
 });
 
+
+// Exact retained javap -s stdout from diagnostic run 39562122098, result.json.
+// SHA-256 cab4336ea2975412264b4eaab68b44a714b8e2fe20fdb4a66cbbe077ab7abeb1.
+const RETAINED_AAR_HOT_JAVA = {
+  "CommandServer": `Compiled from "CommandServer.java"
+public final class io.nekohasekai.libbox.CommandServer implements go.Seq$Proxy {
+  public final int refnum;
+    descriptor: I
+  public final int incRefnum();
+    descriptor: ()I
+
+  public io.nekohasekai.libbox.CommandServer(io.nekohasekai.libbox.CommandServerHandler, io.nekohasekai.libbox.PlatformInterface);
+    descriptor: (Lio/nekohasekai/libbox/CommandServerHandler;Lio/nekohasekai/libbox/PlatformInterface;)V
+
+  io.nekohasekai.libbox.CommandServer(int);
+    descriptor: (I)V
+
+  public native java.lang.String acknowledgeRuntimePersistence(java.lang.String) throws java.lang.Exception;
+    descriptor: (Ljava/lang/String;)Ljava/lang/String;
+
+  public native void activateTailscaleDirectoryDomain(java.lang.String, java.lang.String) throws java.lang.Exception;
+    descriptor: (Ljava/lang/String;Ljava/lang/String;)V
+
+  public native java.lang.String applyRuntimeConfig(java.lang.String) throws java.lang.Exception;
+    descriptor: (Ljava/lang/String;)Ljava/lang/String;
+
+  public native void cancelNotification(java.lang.String, int) throws java.lang.Exception;
+    descriptor: (Ljava/lang/String;I)V
+
+  public native void close();
+    descriptor: ()V
+
+  public native void closeService() throws java.lang.Exception;
+    descriptor: ()V
+
+  public native java.lang.String exportTailscaleDirectoryCapability();
+    descriptor: ()Ljava/lang/String;
+
+  public native java.lang.String exportTailscaleDirectoryRetirement();
+    descriptor: ()Ljava/lang/String;
+
+  public native java.lang.String exportTailscaleStoreRetirement();
+    descriptor: ()Ljava/lang/String;
+
+  public native boolean needFindProcess();
+    descriptor: ()Z
+
+  public native boolean needWIFIState();
+    descriptor: ()Z
+
+  public native void pause();
+    descriptor: ()V
+
+  public native java.lang.String planRuntimeConfig(java.lang.String) throws java.lang.Exception;
+    descriptor: (Ljava/lang/String;)Ljava/lang/String;
+
+  public native void recordScreenState(boolean);
+    descriptor: (Z)V
+
+  public native void resetNetwork();
+    descriptor: ()V
+
+  public native java.lang.String runtimeCapabilities() throws java.lang.Exception;
+    descriptor: ()Ljava/lang/String;
+
+  public native java.lang.String runtimeConfigStatus(java.lang.String) throws java.lang.Exception;
+    descriptor: (Ljava/lang/String;)Ljava/lang/String;
+
+  public native void setError(java.lang.String);
+    descriptor: (Ljava/lang/String;)V
+
+  public native void start() throws java.lang.Exception;
+    descriptor: ()V
+
+  public native void startOrReloadService(java.lang.String, io.nekohasekai.libbox.OverrideOptions) throws java.lang.Exception;
+    descriptor: (Ljava/lang/String;Lio/nekohasekai/libbox/OverrideOptions;)V
+
+  public native void startOrReloadServiceWithRetryableRuntimePersistence(java.lang.String, io.nekohasekai.libbox.OverrideOptions, io.nekohasekai.libbox.RuntimePersistenceHandler) throws java.lang.Exception;
+    descriptor: (Ljava/lang/String;Lio/nekohasekai/libbox/OverrideOptions;Lio/nekohasekai/libbox/RuntimePersistenceHandler;)V
+
+  public native void startOrReloadServiceWithRuntimePersistence(java.lang.String, io.nekohasekai.libbox.OverrideOptions, io.nekohasekai.libbox.RuntimePersistenceHandler) throws java.lang.Exception;
+    descriptor: (Ljava/lang/String;Lio/nekohasekai/libbox/OverrideOptions;Lio/nekohasekai/libbox/RuntimePersistenceHandler;)V
+
+  public native void updateWIFIState();
+    descriptor: ()V
+
+  public native void wake();
+    descriptor: ()V
+
+  public native void wakeNow();
+    descriptor: ()V
+
+  public native void writeMessage(int, java.lang.String);
+    descriptor: (ILjava/lang/String;)V
+
+  public boolean equals(java.lang.Object);
+    descriptor: (Ljava/lang/Object;)Z
+
+  public int hashCode();
+    descriptor: ()I
+
+  public java.lang.String toString();
+    descriptor: ()Ljava/lang/String;
+
+  static {};
+    descriptor: ()V
+}
+`,
+  "Libbox$proxyRuntimePersistenceHandler": `Compiled from "Libbox.java"
+final class io.nekohasekai.libbox.Libbox$proxyRuntimePersistenceHandler implements go.Seq$Proxy,io.nekohasekai.libbox.RuntimePersistenceHandler {
+  public final int refnum;
+    descriptor: I
+  public final int incRefnum();
+    descriptor: ()I
+
+  io.nekohasekai.libbox.Libbox$proxyRuntimePersistenceHandler(int);
+    descriptor: (I)V
+
+  public native void persistRuntimeConfiguration(java.lang.String, long, java.lang.String, java.lang.String) throws java.lang.Exception;
+    descriptor: (Ljava/lang/String;JLjava/lang/String;Ljava/lang/String;)V
+
+  public native java.lang.String runtimePersistenceMode();
+    descriptor: ()Ljava/lang/String;
+}
+`,
+  "OverrideOptions": `Compiled from "OverrideOptions.java"
+public final class io.nekohasekai.libbox.OverrideOptions implements go.Seq$Proxy {
+  public final int refnum;
+    descriptor: I
+  public final int incRefnum();
+    descriptor: ()I
+
+  io.nekohasekai.libbox.OverrideOptions(int);
+    descriptor: (I)V
+
+  public io.nekohasekai.libbox.OverrideOptions();
+    descriptor: ()V
+
+  public final native boolean getAutoRedirect();
+    descriptor: ()Z
+
+  public final native void setAutoRedirect(boolean);
+    descriptor: (Z)V
+
+  public final native io.nekohasekai.libbox.StringIterator getIncludePackage();
+    descriptor: ()Lio/nekohasekai/libbox/StringIterator;
+
+  public final native void setIncludePackage(io.nekohasekai.libbox.StringIterator);
+    descriptor: (Lio/nekohasekai/libbox/StringIterator;)V
+
+  public final native io.nekohasekai.libbox.StringIterator getExcludePackage();
+    descriptor: ()Lio/nekohasekai/libbox/StringIterator;
+
+  public final native void setExcludePackage(io.nekohasekai.libbox.StringIterator);
+    descriptor: (Lio/nekohasekai/libbox/StringIterator;)V
+
+  public boolean equals(java.lang.Object);
+    descriptor: (Ljava/lang/Object;)Z
+
+  public int hashCode();
+    descriptor: ()I
+
+  public java.lang.String toString();
+    descriptor: ()Ljava/lang/String;
+
+  static {};
+    descriptor: ()V
+}
+`,
+  "RuntimePersistenceHandler": `Compiled from "RuntimePersistenceHandler.java"
+public interface io.nekohasekai.libbox.RuntimePersistenceHandler {
+  public abstract void persistRuntimeConfiguration(java.lang.String, long, java.lang.String, java.lang.String) throws java.lang.Exception;
+    descriptor: (Ljava/lang/String;JLjava/lang/String;Ljava/lang/String;)V
+
+  public abstract java.lang.String runtimePersistenceMode();
+    descriptor: ()Ljava/lang/String;
+}
+`,
+};
+
+const AAR_JAVA_OBSERVATION = {
+  Libbox: `newTransientCommandServer(
+newStrictCommandServer(
+newManagedStrictCommandServer(
+interfaceUpdateListenerIdentity(
+checkConfigWithResult(
+java.lang.String version()
+ConfigValidationContractVersion = "polaris-validation-v1"
+`,
+  CommandServer: `startOrReloadService(
+public native java.lang.String exportTailscaleStoreRetirement();
+public native java.lang.String exportTailscaleDirectoryCapability();
+public native java.lang.String exportTailscaleDirectoryRetirement();
+activateTailscaleDirectoryDomain(
+void wakeNow()
+void recordScreenState(boolean)
+`,
+  PlatformInterface: `void bindInterfaceControl(int, java.lang.String)
+`,
+  ConfigValidationResult: `getRequestID()
+getConfigDigest()
+getContractVersion()
+getValidation()
+getCleanup()
+getValidationError()
+getCleanupError()
+getTailscaleStoreRetirement()
+getTailscaleStoreMembership()
+`,
+  ExchangeContext: `void errnoCode(int)
+void errorCode(int)
+void onCancel(
+void rawSuccess(byte[])
+void success(java.lang.String)
+`,
+  LocalDNSTransport: `void exchange(
+void lookup(
+boolean raw()
+`,
+  Func: `void invoke()
+`,
+};
+
+const AAR_DEFINED_JNI = [
+  'JNI_OnLoad',
+  'Java_io_nekohasekai_libbox_CommandServer_runtimeCapabilities',
+  'Java_io_nekohasekai_libbox_CommandServer_startOrReloadServiceWithRetryableRuntimePersistence',
+  'Java_io_nekohasekai_libbox_Libbox_00024proxyRuntimePersistenceHandler_persistRuntimeConfiguration',
+  'Java_io_nekohasekai_libbox_Libbox_00024proxyRuntimePersistenceHandler_runtimePersistenceMode',
+  'Java_go_Seq_incRef',
+];
+
+
+const AAR_HOT_METHOD_NAMES = {
+  CommandServer: ['startOrReloadServiceWithRetryableRuntimePersistence', 'runtimeCapabilities'],
+  RuntimePersistenceHandler: ['runtimePersistenceMode', 'persistRuntimeConfiguration'],
+  'Libbox$proxyRuntimePersistenceHandler': ['runtimePersistenceMode', 'persistRuntimeConfiguration'],
+  OverrideOptions: ['io.nekohasekai.libbox.OverrideOptions'],
+};
+
+function aarInterfaceObservation() {
+  const definitions = [...AAR_DEFINED_JNI, 'unrelated'].map(name => '1: 0 16 FUNC GLOBAL DEFAULT 13 ' + name);
+  return {
+    javaInterfaces: { ...AAR_JAVA_OBSERVATION },
+    hotJavaInterfaces: { ...RETAINED_AAR_HOT_JAVA },
+    jni: Object.fromEntries(Object.keys(ABIS).map(abi => [abi, definitions.join('\n')])),
+  };
+}
+
+test('AAR Java observes the retained receivers, exact method/error descriptors, and read-only validation API', () => {
+  const observation = aarInterfaceObservation();
+  const expected = [...AAR_DEFINED_JNI].sort();
+  assert.deepEqual(verifyAarInterfaces(observation), Object.fromEntries(Object.keys(ABIS).map(abi => [abi, expected])));
+  const mutate = (name, text, expectedError) => {
+    const hotJavaInterfaces = { ...observation.hotJavaInterfaces, [name]: text };
+    assert.throws(() => verifyAarInterfaces({ ...observation, hotJavaInterfaces }), expectedError);
+  };
+  for (const [name, source] of Object.entries(RETAINED_AAR_HOT_JAVA)) {
+    const candidates = [...source.matchAll(/^  (.+;)\n    descriptor: (.+)$/gm)]
+      .filter(([, decl]) => AAR_HOT_METHOD_NAMES[name].some(method => decl.includes(' ' + method + '(')))
+      .filter(([, decl]) => name !== 'OverrideOptions' || decl.includes('()'));
+    assert.equal(candidates.length, AAR_HOT_METHOD_NAMES[name].length, name);
+    for (const [pair, decl, descriptor] of candidates) {
+      const variations = [
+        decl.replace('public ', 'public static '), decl.replace('public ', 'protected '), decl.replace('public ', ''),
+        decl.replace('(', 'Wrong('), decl.replace(/ (native|abstract) /, ' '), '',
+      ].filter(other => other !== decl).map(other => pair.replace(decl, other));
+      if (decl.includes(' throws java.lang.Exception;')) {
+        variations.push(pair.replace(' throws java.lang.Exception', ''), pair.replace('java.lang.Exception', 'java.lang.Error'));
+      } else {
+        variations.push(pair.replace(';', ' throws java.lang.Exception;'));
+      }
+      variations.push(pair.replace('descriptor: ' + descriptor, 'descriptor: ()I'), pair + '\n' + pair);
+      if (name !== 'OverrideOptions') {
+        variations.push(pair + '\n' + pair.replace('(', '(int, '));
+      }
+      for (const mutation of variations) {
+        mutate(name, source.replace(pair, mutation), /HOT Java method\/descriptor\/error differs/);
+      }
+    }
+    mutate(name, source.replace('io.nekohasekai.libbox.' + name, 'io.nekohasekai.libbox.ForeignReceiver'),
+      /HOT Java receiver\/interface differs/);
+  }
+  const proxy = 'Libbox$proxyRuntimePersistenceHandler';
+  mutate(proxy, observation.hotJavaInterfaces[proxy].replace(',io.nekohasekai.libbox.RuntimePersistenceHandler', ''),
+    /HOT Java receiver\/interface differs/);
+  mutate('OverrideOptions', observation.hotJavaInterfaces.OverrideOptions.replace(
+    '  public io.nekohasekai.libbox.OverrideOptions();\n    descriptor: ()V\n', ''),
+  /HOT Java method\/descriptor\/error differs/);
+  mutate('CommandServer', observation.hotJavaInterfaces.CommandServer.replace('public final class', 'public\uFEFFfinal class'),
+    /HOT Java receiver\/interface differs/);
+  mutate('CommandServer', observation.hotJavaInterfaces.CommandServer.replace(
+    '\npublic final class', '\u2028public final class'), /HOT Java receiver\/interface differs/);
+  assert.deepEqual(verifyAarInterfaces({
+    ...observation,
+    hotJavaInterfaces: {
+      ...observation.hotJavaInterfaces,
+      CommandServer: observation.hotJavaInterfaces.CommandServer.replace('public final class', 'public\u0085final class'),
+    },
+  }), verifyAarInterfaces(observation));
+  assert.throws(() => verifyAarInterfaces({ ...observation, hotJavaInterfaces: {} }), /HOT Java class inventory missing/);
+
+  for (const [name, source] of Object.entries(AAR_JAVA_OBSERVATION)) {
+    for (const required of source.trimEnd().split('\n')) {
+      const change = { ...observation.javaInterfaces, [name]: source.replace(required, '') };
+      assert.throws(() => verifyAarInterfaces({ ...observation, javaInterfaces: change }),
+        /generated Java API differs|validation API contract differs/);
+    }
+  }
+  for (const setter of ['setRequestID', 'setConfigDigest', 'setValidation', 'setCleanup', 'setTailscaleStoreRetirement', 'setTailscaleStoreMembership']) {
+    const javaInterfaces = { ...observation.javaInterfaces };
+    javaInterfaces.ConfigValidationResult += 'public void ' + setter + '();\n';
+    assert.throws(() => verifyAarInterfaces({ ...observation, javaInterfaces }), /validation result must be readonly/);
+  }
+});
+
+test('AAR JNI requires all defined bridges on each ABI and retains only sorted JNI exports', () => {
+  const observation = aarInterfaceObservation();
+  for (const abi of Object.keys(ABIS)) {
+    for (const bridge of AAR_DEFINED_JNI) {
+      const source = observation.jni[abi];
+      const mutations = [
+        source.replace('DEFAULT 13 ' + bridge, 'DEFAULT UND ' + bridge),
+        source.replace('DEFAULT 13 ' + bridge, 'PROTECTED 13 ' + bridge),
+        source.replace('GLOBAL DEFAULT 13 ' + bridge, 'WEAK DEFAULT 13 ' + bridge),
+        source.replace(bridge, bridge.replace('CommandServer', 'CommandClient') +
+          (bridge.includes('CommandServer') ? '' : bridge.startsWith('Java_go_Seq_') ? 'OtherPrefix' : 'Wrong')),
+      ];
+      // A different go.Seq method still meets the original prefix-only predicate.
+      if (bridge.startsWith('Java_go_Seq_')) mutations.pop();
+      for (const text of mutations) {
+        const jni = { ...observation.jni, [abi]: text };
+        assert.throws(() => verifyAarInterfaces({ ...observation, jni }), /actual (generated JNI loader\/sequence|HOT JNI) exports missing/);
+      }
+    }
+  }
+});
+
+test('AAR interface commands bind observations to the exact tool captures', () => {
+  using fixture = mkdtempDisposableSync(join(tmpdir(), 'polaris-aar-interface-'));
+  const script = fileURLToPath(new URL('./verify-apk.mjs', import.meta.url));
+  const run = (...args) => {
+    const result = spawnSync(process.execPath, [script, ...args], { encoding: 'utf8', timeout: 5000 });
+    assert.ifError(result.error);
+    return result;
+  };
+  const captures = run('--aar-interface-classes');
+  assert.equal(captures.status, 0, captures.stderr);
+  const plan = JSON.parse(captures.stdout);
+  assert.deepEqual(plan.javaInterfaces, Object.keys(AAR_JAVA_OBSERVATION));
+  assert.deepEqual([...plan.hotJavaInterfaces].sort(), Object.keys(RETAINED_AAR_HOT_JAVA).sort());
+  const source = readFileSync(new URL('./mobile-core/artifacts.py', import.meta.url), 'utf8');
+  const owner = source.split('def inspect_aar(', 2)[1].split('def tree_inventory(', 1)[0];
+  for (const requirement of ['formal AAR must contain all four ABIs', 'check_buildinfo(facts, value, graph',
+    "'--aar-elf'", "'--dyn-syms', '--wide'", "'--aar-interfaces'", "'--aar-interface-classes'"]) {
+    assert.ok(owner.includes(requirement), requirement);
+  }
+  const path = join(fixture.path, 'observations.json');
+  const observation = aarInterfaceObservation();
+  const raw = Buffer.from(JSON.stringify(observation));
+  const pin = createHash('sha256').update(raw).digest('hex');
+  writeFileSync(path, raw);
+  const checked = run('--aar-interfaces', path, raw.length, pin);
+  assert.equal(checked.status, 0, checked.stderr);
+  assert.deepEqual(JSON.parse(checked.stdout), verifyAarInterfaces(observation));
+  const oversized = run('--aar-interfaces', path, 16 * 1024 ** 2 + 1, pin);
+  assert.equal(oversized.status, 1);
+  assert.match(oversized.stderr, /bounded original AAR interface observation pin required/);
+  const bad = Buffer.from(raw);
+  bad[1] ^= 1;
+  writeFileSync(path, bad);
+  const tampered = run('--aar-interfaces', path, raw.length, pin);
+  assert.equal(tampered.status, 1);
+  assert.match(tampered.stderr, /AAR interface observation pin differs/);
+  if (process.platform !== 'win32') {
+    const link = join(fixture.path, 'link.json');
+    writeFileSync(path, raw);
+    symlinkSync(path, link);
+    const redirected = run('--aar-interfaces', link, raw.length, pin);
+    assert.equal(redirected.status, 1);
+    assert.match(redirected.stderr, /ELOOP/);
+  }
+});
 
 test('geo exact inventory rejects same-count renames and nested replacements', () => {
   for (const replacement of ['renamed.srs', 'nested/geosite-0.srs']) {
