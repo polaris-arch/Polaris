@@ -306,6 +306,16 @@ describe('mobile pending restart and write feedback', () => {
     expect(h.retryPersistence).not.toHaveBeenCalled();
   });
 
+  it('reports a failed restart cancellation while keeping the saved settings available', async () => {
+    h.app.pendingChanges = { ...h.app.pendingChanges, savedSettingsRevertToken: 'revert-token' };
+    const sheet = await openRestartSheet();
+    h.cancelRestart.mockRejectedValueOnce(new Error('unconfirmed'));
+    await sheet.props.onRequestClose();
+    expect(toast.error).toHaveBeenCalledExactlyOnceWith('errors.operationFailed');
+    expect(markup(renderBar())).toContain('home.pendingRevertSavedSettings');
+    expect(h.applyNow).toHaveBeenCalledTimes(1);
+  });
+
   it('only explicit confirmation submits the exact token, once even on a repeated tap', async () => {
     const sheet = await openRestartSheet();
     h.applyNow.mockResolvedValueOnce({ saved: true, status: 'hotApplied', runtimeGeneration: 7 });

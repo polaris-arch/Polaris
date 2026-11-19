@@ -565,6 +565,9 @@ export const ANDROID_IMPACT_SCOPES = Object.freeze({
       + 'The actual Android-minus-host dep-info confirms this exact source; changes require the Android compile/package leg. '
       + 'This registration covers build impact, not device execution or native retirement/custody proof.',
   },
+  'src-tauri/src/runtime/core_execution.rs': {
+    why: 'The Android libbox startup request is compiled into the APK Rust cdylib and selects its native startup path.',
+  },
   'src-tauri/src/runtime/proxy/android_rule_assets.rs': {
     why: 'Android 启动按代准备和回收规则文件，目录所有权随 APK 的 Rust cdylib 发布。'
       + '改动须触发 Android 编译和打包，系统自启与实际文件回读由设备验收确认。',
@@ -863,6 +866,9 @@ export const ANDROID_IMPACT_SCOPES = Object.freeze({
  * 那正是完备性门 C 组固定 comment-only 合成负例要证伪的形态；原 mesh.rs 已有真实 Android 分支。
  */
 export const NO_ANDROID_IMPACT_SCOPES = Object.freeze({
+  'src-tauri/src/runtime/proxy/runtime_config/tests/mod.rs':
+    'The cfg(test) fixture is excluded from APKs. Its Android field only supplies a default for the shared test data. '
+    + 'ci.yml cargo check --target aarch64-linux-android -p polaris covers the corresponding production field.',
   'src-tauri/src/commands/updater/core_info.rs':
     'Only desktop capabilities_only selects the compiled TLS directory; Android retains the loaded-native observation path. '
     + 'ci.yml aarch64-linux-android cross check compiles the production Android command and its Rust observation consumer. '

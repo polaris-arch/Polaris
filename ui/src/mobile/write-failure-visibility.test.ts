@@ -379,7 +379,10 @@ const FEEDBACK: readonly ScreenFeedback[] = [
     dir: 'mobile/MobilePendingBar.tsx',
     shape: 'reporter',
     mechanism: 'setApply',
-    reporterByCall: { 'api.proxy.revertSavedSettings': 'toast.error' },
+    reporterByCall: {
+      'api.proxy.revertSavedSettings': 'toast.error',
+      'api.proxy.cancelRuntimeRestart': 'toast.error',
+    },
     teeth: { file: 'mobile/MobilePendingBar.tsx', decl: 'onApply', channel: 'setApply', needsCatch: true },
     why: '持久化重试与显式应用共用 onApply；失败进入 failed 态，经 composeBarView 渲染为常驻错误条与重试入口（行为门：MobilePendingBar.test.tsx）',
   },

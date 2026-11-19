@@ -649,7 +649,8 @@ export default function PendingChangesBar() {
         <RestartApplyDialog prompt={restartPrompt}
           onDismiss={() => {
             setRestartPrompt(null);
-            void api.proxy.cancelRuntimeRestart(restartPrompt.token).catch(() => null);
+            void api.proxy.cancelRuntimeRestart(restartPrompt.token)
+              .catch(() => toast.error(t('errors.operationFailed')));
           }}
           onConfirm={() => void onApply(restartPrompt.token)} />
       )}

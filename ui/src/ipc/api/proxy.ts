@@ -129,8 +129,11 @@ export const proxyApi = {
     return invoke(IPC_CHANNELS.PROXY_APPLY_PENDING_CHANGES, { cancelImpactConfirmation });
   },
 
-  async cancelRuntimeRestart(cancelRestartConfirmation: string): Promise<PendingApplyResult> {
-    return invoke(IPC_CHANNELS.PROXY_APPLY_PENDING_CHANGES, { cancelRestartConfirmation });
+  async cancelRuntimeRestart(cancelRestartConfirmation: string): Promise<void> {
+    const { status } = await invoke<PendingApplyResult>(IPC_CHANNELS.PROXY_APPLY_PENDING_CHANGES, { cancelRestartConfirmation });
+    if (status !== 'cancelled' && status !== 'conflict') {
+      throw new Error(status);
+    }
   },
 
   /**

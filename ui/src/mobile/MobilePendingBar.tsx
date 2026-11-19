@@ -532,9 +532,13 @@ export function MobilePendingBar(): ReactElement | null {
         <FormSheet
           compact
           title={t('home.restartApplyTitle')}
-          onRequestClose={() => {
+          onRequestClose={async () => {
             setRestartPrompt(null);
-            void api.proxy.cancelRuntimeRestart(restartPrompt.token).catch(() => null);
+            try {
+              await api.proxy.cancelRuntimeRestart(restartPrompt.token);
+            } catch {
+              toast.error(t('errors.operationFailed'));
+            }
           }}
           closeLabel={t('common.close')}
           cancelLabel={t('home.restartApplyKeepConnection')}
