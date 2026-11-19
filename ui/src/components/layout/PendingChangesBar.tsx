@@ -48,7 +48,7 @@ import { useImpactConfirmation } from '@/components/dialogs/use-impact-confirmat
 import { toast } from '@/lib/error-handler';
 import { cn } from '@/lib/utils';
 import { useConfirmTwice } from '@/lib/confirm-twice';
-import type { PendingApplyResult, ProxyLifecycleEvent } from '@/contracts/types';
+import type { PendingApplyResult, ProxyLifecycleEvent, TakeoverApplyOwner } from '@/contracts/types';
 import type { ProxyErrorTranslate } from '@/domain/proxy-error-text';
 import {
   APPLY_CONFIRM_TIMEOUT_MS,
@@ -277,7 +277,7 @@ export default function PendingChangesBar() {
     await useStagedConfigStore.getState().save();
   };
 
-  const onApply = async (restartConfirmation?: string, persistenceTransactionId?: string, impactConfirmation?: string, hostRetry = false, preconfirmed = false) => {
+  const onApply = async (restartConfirmation?: string, persistenceTransactionId?: string, impactConfirmation?: string, hostRetry = false, takeoverOwner?: TakeoverApplyOwner) => {
     if (applyRequest.current?.awaitingReply || apply.phase === 'applying'
         || apply.host?.phase === 'pending' && !apply.host.superseded) return;
     if (hostRetry && useStagedConfigStore.getState().entries.length > 0) return;
@@ -331,9 +331,10 @@ export default function PendingChangesBar() {
         .then<ApplyNowResult>((receipt) => receipt
           ? { ...receipt, saved: true, applyId: receipt.applyId ?? undefined }
           : { status: null, saved: false });
-      const result = hostRetry || preconfirmed
-        // Fresh Plan/confirmation for the saved candidate; never save drafts or replay a Core transaction.
-        ? await dispatch(() => api.proxy.applyPendingChanges())
+      const result = hostRetry || takeoverOwner
+        ? await dispatch(() => takeoverOwner
+          ? api.proxy.applyPendingChanges(undefined, takeoverOwner)
+          : api.proxy.applyPendingChanges())
         : persistenceTransactionId === undefined
           ? await (impactConfirmation === undefined
             ? useStagedConfigStore.getState().applyNow(restartConfirmation, undefined, onDispatch)
@@ -387,7 +388,7 @@ export default function PendingChangesBar() {
           return;
         }
         // The user already accepted the interruption in the originating dialog: use this exact token, no second prompt.
-        if (preconfirmed) return void onApply(result.restartConfirmation);
+        if (takeoverOwner) return void onApply(result.restartConfirmation);
         setRestartPrompt({ token: result.restartConfirmation, reasons: result.reasons ?? [] });
         setApply(hostDebt ? { ...initial, phase: initial.coreRecovery ? 'durabilityPending' : 'idle',
           reason: null, reconciling: !!initial.coreRecovery } : preserveNativeRetirements(initial, { phase: 'idle', reason: null }));
@@ -498,8 +499,10 @@ export default function PendingChangesBar() {
   useEffect(() => {
     if (!applyRequested) return;
     const current = applyRequest.current;
-    void onApply(undefined, undefined, undefined, false, true);
-    if (applyRequest.current !== current) useAppStore.getState().setApplyRequested(false);
+    void onApply(undefined, undefined, undefined, false, applyRequested);
+    if (applyRequest.current !== current && useAppStore.getState().applyRequested === applyRequested) {
+      useAppStore.getState().setApplyRequested(null);
+    }
   }, [applyRequested, apply.phase, apply.host?.phase, apply.host?.superseded]);
   if (!view.visible && restartPrompt === null && impactChoice.prompt === null) return conflictDialog;
 

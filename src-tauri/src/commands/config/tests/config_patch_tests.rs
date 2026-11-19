@@ -398,6 +398,49 @@ fn takeover_consumes_latest_fake_ip_flag_without_overwriting_dns_edits() {
 }
 
 #[test]
+fn takeover_commit_compares_the_prompt_revision_before_editing() {
+    let dir = temp_dir("takeover-confirm-revision");
+    let manager = ConfigManager::new(dir.clone());
+    let mut original = manager.load_full().unwrap();
+    original["proxyModeType"] = json!("systemProxy");
+    original["dnsConfig"]["enableFakeIp"] = json!(false);
+    original["dnsConfig"]["fakeIpTunAutoEnable"] = json!(true);
+    original["logLevel"] = json!("debug");
+    manager.save_full(&original).unwrap();
+    let original = manager.current().unwrap();
+    let preview_revision = manager.saved_revision();
+    let mut newer = original.clone();
+    newer["logLevel"] = json!("warn");
+    manager.save_full(&newer).unwrap();
+    manager.save_full(&original).unwrap();
+
+    let corrected = std::cell::Cell::new(false);
+    assert!(
+        config_takeover_edit_if(&manager, ProxyModeType::Tun, &corrected, || {
+            manager.saved_revision() == preview_revision
+        })
+        .unwrap()
+        .is_none()
+    );
+    assert!(!corrected.get());
+    assert_eq!(manager.current().unwrap(), original);
+
+    let confirmed_revision = manager.saved_revision();
+    let (_, saved, changed, revision) =
+        config_takeover_edit_if(&manager, ProxyModeType::Tun, &corrected, || {
+            manager.saved_revision() == confirmed_revision
+        })
+        .unwrap()
+        .unwrap();
+    assert!(changed && corrected.get());
+    assert!(revision > confirmed_revision);
+    assert_eq!(revision, manager.saved_revision());
+    assert_eq!(saved["proxyModeType"], "tun");
+    assert_eq!(saved["dnsConfig"]["enableFakeIp"], true);
+    assert_eq!(saved["logLevel"], "debug");
+}
+
+#[test]
 fn partial_backup_shared_dependency_conflict_leaves_every_category_and_disk_unchanged() {
     let dir = temp_dir("backup-dependency-conflict");
     let manager = ConfigManager::new(dir.clone());

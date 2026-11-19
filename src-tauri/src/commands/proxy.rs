@@ -338,6 +338,7 @@ pub async fn proxy_apply_pending_changes(
     retry_persistence_transaction_id: Option<String>,
     impact_confirmation: Option<String>,
     cancel_impact_confirmation: Option<String>,
+    takeover_owner: Option<crate::runtime::proxy::runtime_config::TakeoverApplyOwner>,
 ) -> Result<ApiResponse<Value>, ()> {
     // The explicit retry selector is mutually exclusive with restart permission.
     if restart_confirmation.is_some() && retry_persistence_transaction_id.is_some() {
@@ -352,7 +353,16 @@ pub async fn proxy_apply_pending_changes(
     {
         return Err(());
     }
-    let result = if let Some(token) = cancel_impact_confirmation {
+    let result = if let Some(owner) = takeover_owner {
+        if restart_confirmation.is_some()
+            || retry_persistence_transaction_id.is_some()
+            || impact_confirmation.is_some()
+            || cancel_impact_confirmation.is_some()
+        {
+            return Err(());
+        }
+        Box::pin(state.proxy.clone().apply_owned_takeover(owner)).await
+    } else if let Some(token) = cancel_impact_confirmation {
         state.proxy.cancel_runtime_impact_choice(&token)
     } else if let Some(token) = impact_confirmation {
         // 各腿 Box：内联 future 会把命令 future 撑到数百 KiB，Windows 主线程构造时栈溢出。

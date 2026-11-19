@@ -32,7 +32,7 @@ use crate::events::channel::{
 };
 use crate::response::{ok_void, ApiResponse};
 use crate::runtime::config::{ConfigManager, Decision};
-use crate::runtime::proxy::runtime_config::StagedSaveOwner;
+use crate::runtime::proxy::runtime_config::{StagedSaveOwner, TakeoverApplyOwner};
 use crate::runtime::proxy::{ProxyRuntime, StagedClassification, SwitchOutcome};
 use crate::runtime::unlock::{
     selected_exit_changed, BroadcastSink, UnlockEventSink, UnlockRuntime,
@@ -551,7 +551,21 @@ fn config_takeover_edit(
     mode: ProxyModeType,
     corrected: &std::cell::Cell<bool>,
 ) -> Result<(Option<String>, Value, bool), polaris_store::StoreError> {
-    config_edit_core(config, move |next| {
+    config_takeover_edit_if(config, mode, corrected, || true).map(|committed| {
+        let (old_selected, saved, changed, _) = committed.expect("unconditional edit");
+        (old_selected, saved, changed)
+    })
+}
+
+type ConfigEdit = (Option<String>, Value, bool, u64);
+
+fn config_takeover_edit_if(
+    config: &ConfigManager,
+    mode: ProxyModeType,
+    corrected: &std::cell::Cell<bool>,
+    admitted: impl FnOnce() -> bool,
+) -> Result<Option<ConfigEdit>, polaris_store::StoreError> {
+    config_edit_with_revision(config, admitted, move |next| {
         next["proxyModeType"] = json!(mode);
         corrected.set(crate::tray::apply_fake_ip_tun_entry(next));
         true
@@ -562,39 +576,55 @@ fn config_edit_core(
     config: &ConfigManager,
     edit: impl FnOnce(&mut Value) -> bool,
 ) -> Result<(Option<String>, Value, bool), polaris_store::StoreError> {
-    let ((old_selected, changed, transaction_view), saved) =
-        config.update_deferred_cleanup(|current| {
-            let old_selected = current
-                .get("selectedServerId")
-                .and_then(Value::as_str)
-                .map(str::to_string);
-            let mut next = current.clone();
-            if !edit(&mut next) {
-                return Decision::Skip((old_selected, false, current.clone()));
-            }
+    config_edit_with_revision(config, || true, edit).map(|committed| {
+        let (old_selected, saved, changed, _) = committed.expect("unconditional edit");
+        (old_selected, saved, changed)
+    })
+}
 
-            // 补丁入口同样经过全量保存的字段所有权与派生投影规则；否则换一个写入口就能绕过隐私保护、
-            // 后端权威字段和 UA 验证器失效语义。
-            preserve_server_owned_secrets_from(current, &mut next);
-            enforce_backend_authoritative_fields_from(current, &mut next);
-            crate::commands::server::prune_recent_server_ids_to_existing(&mut next);
-            sync_traffic_rules_projection(&mut next);
-            log_invalidated_validators(invalidate_validators_on_global_ua_change(
-                current, &mut next,
-            ));
-            if next == *current {
-                Decision::Skip((old_selected, false, current.clone()))
-            } else {
-                *current = next;
-                Decision::Write((old_selected, true, current.clone()))
-            }
-        })?;
+fn config_edit_with_revision(
+    config: &ConfigManager,
+    admitted: impl FnOnce() -> bool,
+    edit: impl FnOnce(&mut Value) -> bool,
+) -> Result<Option<ConfigEdit>, polaris_store::StoreError> {
+    let (attempt, saved, revision) = config.update_with_cleanup_revision(true, |current| {
+        if !admitted() {
+            return Decision::Skip(None);
+        }
+        let old_selected = current
+            .get("selectedServerId")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let mut next = current.clone();
+        if !edit(&mut next) {
+            return Decision::Skip(Some((old_selected, false, current.clone())));
+        }
 
+        // 补丁入口同样经过全量保存的字段所有权与派生投影规则；否则换一个写入口就能绕过隐私保护、
+        // 后端权威字段和 UA 验证器失效语义。
+        preserve_server_owned_secrets_from(current, &mut next);
+        enforce_backend_authoritative_fields_from(current, &mut next);
+        crate::commands::server::prune_recent_server_ids_to_existing(&mut next);
+        sync_traffic_rules_projection(&mut next);
+        log_invalidated_validators(invalidate_validators_on_global_ua_change(
+            current, &mut next,
+        ));
+        if next == *current {
+            Decision::Skip(Some((old_selected, false, current.clone())))
+        } else {
+            *current = next;
+            Decision::Write(Some((old_selected, true, current.clone())))
+        }
+    })?;
+
+    let Some((old_selected, changed, transaction_view)) = attempt else {
+        return Ok(None);
+    };
     match (changed, saved) {
-        (true, Some(saved)) => Ok((old_selected, saved, true)),
+        (true, Some(saved)) => Ok(Some((old_selected, saved, true, revision))),
         // Skip 的返回快照与 old_selected 来自同一锁内事务；不要在解锁后再读一次，否则另一 writer
         // 可插入其间，让后续“出口是否变化”拿两份不属于同一时刻的值做比较。
-        (false, None) => Ok((old_selected, transaction_view, false)),
+        (false, None) => Ok(Some((old_selected, transaction_view, false, revision))),
         _ => unreachable!("config patch decision and persistence must agree"),
     }
 }
@@ -637,8 +667,54 @@ pub fn config_set_takeover(
     app: AppHandle,
     state: State<'_, AppRuntime>,
     mode: ProxyModeType,
+    preview: Option<bool>,
+    expected_owner: Option<TakeoverApplyOwner>,
 ) -> ApiResponse<Value> {
+    let conflict =
+        || ApiResponse::err_with_code("接管配置已变更，请重新确认", "CONFIG_TAKEOVER_CONFLICT");
+    if preview == Some(true) {
+        if expected_owner.is_some() {
+            return conflict();
+        }
+        return state
+            .proxy()
+            .takeover_preview()
+            .map_or_else(conflict, |(owner, pending_apply)| {
+                ApiResponse::ok(json!({"owner": owner, "pendingApply": pending_apply}))
+            });
+    }
     let corrected = std::cell::Cell::new(false);
+    if let Some(owner) = expected_owner {
+        let saved = config_takeover_edit_if(state.config(), mode, &corrected, || {
+            state.config().saved_revision() == owner.saved_revision
+                && state.proxy().takeover_owner_is_live(owner)
+        });
+        return match saved {
+            Ok(Some((old_selected, mut cfg, changed, revision))) => {
+                if changed {
+                    emit_config_changed_signal(&app);
+                }
+                invalidate_unlock_on_exit_change(
+                    state.unlock(),
+                    &BroadcastSink::new(&app),
+                    state.proxy().status().running,
+                    old_selected.as_deref(),
+                    cfg.get("selectedServerId").and_then(Value::as_str),
+                );
+                state.proxy().push_pending_changes();
+                apply_frontend_view(&mut cfg);
+                let owner = TakeoverApplyOwner {
+                    saved_revision: revision,
+                    ..owner
+                };
+                ApiResponse::ok(
+                    json!({"config": cfg, "corrected": corrected.get(), "owner": owner}),
+                )
+            }
+            Ok(None) => conflict(),
+            Err(error) => config_store_error(error),
+        };
+    }
     let result = config_takeover_edit(state.config(), mode, &corrected);
     let response = config_edit_response(&app, &state, result);
     if response.success {

@@ -23,7 +23,7 @@ const h = vi.hoisted(() => ({
     proxyStatus: { running: true, mainGeneration: 7 }, config: null as Record<string, unknown> | null,
     nativeRetirementEndedBeforeGeneration: 0, confirmNativeRetirementEnd: vi.fn(),
     servers: [] as Array<{ id: string; name: string }>, refreshPendingChanges: vi.fn(),
-    applyRequested: false, setApplyRequested: vi.fn(),
+    applyRequested: null as { savedRevision: number; generation: number; intent: number } | null, setApplyRequested: vi.fn(),
   },
 }));
 vi.mock('react', async original => ({
@@ -162,7 +162,7 @@ beforeEach(() => {
   h.app.nativeRetirementEndedBeforeGeneration = 0;
   h.app.pendingChanges = { added: ['node'], modified: [], removed: [], restartDeferred: false };
   h.app.proxyStatus = { running: true, mainGeneration: 7 };
-  h.app.applyRequested = false;
+  h.app.applyRequested = null;
   h.app.refreshPendingChanges.mockImplementation(async (ownerIsCurrent: () => boolean) => {
     const pending = await h.pendingRead();
     if (ownerIsCurrent()) h.app.pendingChanges = pending;
@@ -391,7 +391,8 @@ it('attributes a Save already in flight before external Apply dispatches', async
   });
   h.freshApply.mockResolvedValueOnce({ ok: true, status: 'hotApplied', transactionId: 'new-external-apply',
     runtimeGeneration: 7, selectionIntentGeneration: 9, coreState: 'committed', configurationDurable: true });
-  h.app.applyRequested = true;
+  const owner = { savedRevision: 3, generation: 7, intent: 9 };
+  h.app.applyRequested = owner;
   renderBar();
   await microtasks();
   expect(h.freshApply).not.toHaveBeenCalled();
@@ -400,7 +401,7 @@ it('attributes a Save already in flight before external Apply dispatches', async
   await saving;
   await microtasks();
   renderBar();
-  expect(h.freshApply).toHaveBeenCalledOnce();
+  expect(h.freshApply).toHaveBeenCalledExactlyOnceWith(undefined, owner);
   expect(h.states[0]).toMatchObject({ phase: 'idle', transactionId: 'new-external-apply' });
   expect(h.savedRuntimeApply).toBeNull();
   expect(toast.success).not.toHaveBeenCalled();
@@ -422,7 +423,8 @@ it('keeps the confirmation armed only for the saved settings the user saw', asyn
 
 describe('pre-confirmed apply request', () => {
   it('applies the saved candidate and confirms its restart token without a second prompt or draft save', async () => {
-    h.app.applyRequested = true;
+    const owner = { savedRevision: 3, generation: 7, intent: 9 };
+    h.app.applyRequested = owner;
     h.app.setApplyRequested.mockImplementation(requested => { h.app.applyRequested = requested; });
     h.freshApply.mockResolvedValueOnce({ ok: false, status: 'restartRequired', restartConfirmation: 'restart-token',
       reasons: [{ code: 'HOST_CARRIER_TRANSITION_REQUIRES_RESTART', path: 'proxyModeType' }] });
@@ -430,10 +432,23 @@ describe('pre-confirmed apply request', () => {
     renderBar();
     await microtasks();
     renderBar();
-    expect(h.app.setApplyRequested).toHaveBeenCalledExactlyOnceWith(false);
-    expect(h.freshApply).toHaveBeenCalledExactlyOnceWith();
+    expect(h.app.setApplyRequested).toHaveBeenCalledExactlyOnceWith(null);
+    expect(h.freshApply).toHaveBeenCalledExactlyOnceWith(undefined, owner);
     expect(h.applyNow).toHaveBeenCalledExactlyOnceWith('restart-token', undefined, expect.any(Function));
     expect(h.states[1]).toBeNull();
+  });
+
+  it('keeps a replaced takeover candidate pending without applying the latest saved configuration', async () => {
+    const owner = { savedRevision: 3, generation: 7, intent: 9 };
+    h.app.applyRequested = owner;
+    h.app.setApplyRequested.mockImplementation(requested => { h.app.applyRequested = requested; });
+    h.freshApply.mockResolvedValueOnce({ ok: false, status: 'conflict' });
+    renderBar();
+    await microtasks();
+    renderBar();
+    expect(h.freshApply).toHaveBeenCalledExactlyOnceWith(undefined, owner);
+    expect(h.applyNow).not.toHaveBeenCalled();
+    expect(h.states[0]).toMatchObject({ phase: 'failed' });
   });
 });
 

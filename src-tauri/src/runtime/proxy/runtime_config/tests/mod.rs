@@ -336,7 +336,10 @@ fn cached_results_owner_ack_and_retirement_revalidate_current_pairing() {
 #[test]
 fn restart_choice_keeps_the_original_observation_generation_and_intent() {
     let source = crate::test_support::crate_code("runtime/proxy/runtime_config.rs");
-    let body = crate::commands::guard_scan::impl_method_body(&source, "    fn restart_choice(");
+    let body = crate::commands::guard_scan::impl_method_body(
+        &source,
+        "    fn restart_choice_at_revision(",
+    );
     assert!(body.contains("selector_operation_is_current(generation, intent)"));
     assert!(!body.contains("let generation = self.gate.generation()"));
     assert!(!body.contains("let intent = self.selector_reconcile.intent_generation()"));
@@ -463,7 +466,7 @@ async fn host_dns_consent_and_failed_admission_do_not_accept_the_saved_host_effe
         strategy: host_effects::HostEffectStrategy::NeedsSnapshotBeforeCore,
         recipe: Value::Null,
     };
-    let result = rt.host_effect_restart_choice(&candidate, &host_plan, generation, intent);
+    let result = rt.host_effect_restart_choice(&candidate, &host_plan, generation, intent, None);
     assert_eq!(result.status, "restartRequired");
     assert!(result.restart_confirmation.is_some());
     assert_eq!(result.reasons[0].code, "hostEffectsRequireRestart");
@@ -609,6 +612,54 @@ async fn staged_save_never_inherits_its_grant_from_equal_bytes_written_later() {
         .await;
     assert!(receipt.is_none());
     assert_eq!(rt.current_config_snapshot(), Some(running));
+}
+
+#[tokio::test]
+async fn takeover_apply_rejects_later_saved_revisions_including_equal_bytes() {
+    let (rt, _dir, running, candidate) = host_dns_restart_fixture();
+    let (owner, _) = rt.takeover_preview().expect("saved takeover owner");
+    let mut newer = candidate.clone();
+    newer["logLevel"] = json!("warn");
+    for saved in [&newer, &candidate] {
+        rt.config.save_full(saved).unwrap();
+        let result = rt.apply_owned_takeover(owner).await;
+        assert_eq!(result.status, "conflict");
+        assert!(result.restart_confirmation.is_none());
+        assert!(result.impact_confirmation.is_none());
+        assert!(rt.runtime_config_apply.lock().unwrap().pending.is_none());
+        assert_eq!(rt.current_config_snapshot().as_ref(), Some(&running));
+    }
+}
+
+#[test]
+fn takeover_plan_cannot_issue_choices_after_a_saved_revision_is_replaced() {
+    let (rt, _dir, running, candidate) = host_dns_restart_fixture();
+    let (owner, _) = rt.takeover_preview().expect("saved takeover owner");
+    let mut pending = ts_pending_raw_fixture(&rt, candidate.clone());
+    pending.saved_revision = Some(owner.saved_revision);
+    pending.plan.expires_at_unix_milli = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        + std::time::Duration::from_secs(60))
+    .as_millis() as i64;
+    rt.config.save_full(&running).unwrap();
+    rt.config.save_full(&candidate).unwrap();
+    let restart = rt.restart_choice_at_revision(
+        &candidate,
+        "structuralChange",
+        vec!["proxyModeType".into()],
+        owner.generation,
+        owner.intent,
+        Some(owner.saved_revision),
+    );
+    assert_eq!(restart.status, "conflict");
+    assert!(restart.restart_confirmation.is_none());
+    let impact = rt.prepare_runtime_impact_choice(pending);
+    assert_eq!(impact.status, "conflict");
+    assert!(impact.impact_confirmation.is_none());
+    let ledger = rt.runtime_config_apply.lock().unwrap();
+    assert!(ledger.restart.is_none());
+    assert!(ledger.impact.is_none());
 }
 
 #[tokio::test]

@@ -508,6 +508,13 @@ export interface NativeRetirementDebt {
   reason: { code: 'LISTENER_RETIREMENT_FAILED'; path: 'inbounds' };
 }
 
+/** Identity of the exact saved revision authorized by desktop takeover. */
+export interface TakeoverApplyOwner {
+  savedRevision: number;
+  generation: number;
+  intent: number;
+}
+
 /**
  * §2 待应用差集：节点集相对**运行核起核快照**的差异。均为 serverId 列表；
  * 三个都空 = 运行核与 config 一致（或核未运行）。

@@ -437,6 +437,14 @@ pub(crate) struct StagedSaveOwner {
     pub(crate) revision: u64,
 }
 
+#[derive(Clone, Copy, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct TakeoverApplyOwner {
+    pub(crate) saved_revision: u64,
+    pub(crate) generation: u64,
+    pub(crate) intent: u64,
+}
+
 impl StagedSaveOwner {
     pub(crate) fn capture(runtime: &ProxyRuntime, revision: u64) -> Self {
         // Saved revisions order separate graph edits. Keep the current selector
@@ -1380,6 +1388,7 @@ impl ProxyRuntime {
         plan: &host_effects::HostEffectPlan,
         generation: u64,
         intent: u64,
+        saved_revision: Option<u64>,
     ) -> RuntimeApplyResult {
         let dns_source_snapshot = matches!(
             plan.strategy,
@@ -1388,7 +1397,7 @@ impl ProxyRuntime {
             .effects
             .iter()
             .any(|effect| effect.kind == host_effects::HostEffectKind::Dns);
-        self.restart_choice(
+        self.restart_choice_at_revision(
             candidate,
             "hostEffectsRequireRestart",
             vec![if dns_source_snapshot {
@@ -1398,9 +1407,11 @@ impl ProxyRuntime {
             }],
             generation,
             intent,
+            saved_revision,
         )
     }
 
+    #[cfg(any(test, feature = "native-production-verification"))]
     fn restart_choice(
         &self,
         candidate: &Value,
@@ -1409,11 +1420,37 @@ impl ProxyRuntime {
         generation: u64,
         intent: u64,
     ) -> RuntimeApplyResult {
+        self.restart_choice_at_revision(candidate, code, paths, generation, intent, None)
+    }
+
+    fn restart_choice_at_revision(
+        &self,
+        candidate: &Value,
+        code: &'static str,
+        paths: Vec<String>,
+        generation: u64,
+        intent: u64,
+        expected_revision: Option<u64>,
+    ) -> RuntimeApplyResult {
         if self.gate.is_busy() || !self.selector_operation_is_current(generation, intent) {
             return RuntimeApplyResult::status("conflict");
         }
         let Some(running) = self.current_config_snapshot() else {
             return RuntimeApplyResult::status("unconfirmed");
+        };
+        let saved_revision = if let Some(expected) = expected_revision {
+            let current = self
+                .config
+                .try_with_saved_commit(|desired| {
+                    desired == candidate && self.saved_revision_matches(Some(expected))
+                })
+                .unwrap_or(false);
+            if !current {
+                return RuntimeApplyResult::status("conflict");
+            }
+            expected
+        } else {
+            self.config.saved_revision()
         };
         let token = format!(
             "{}:{}:{}",
@@ -1424,7 +1461,7 @@ impl ProxyRuntime {
         let choice = RestartChoice {
             token: token.clone(),
             candidate: candidate.clone(),
-            saved_revision: self.config.saved_revision(),
+            saved_revision,
             generation,
             intent,
             running,
@@ -1508,6 +1545,7 @@ impl ProxyRuntime {
             candidate.clone(),
             Some(&candidate),
             Some(owner),
+            true,
         ))
         .await;
         let current_owner =
@@ -1580,26 +1618,36 @@ impl ProxyRuntime {
         candidate: Value,
         expected_desired: Option<&Value>,
     ) -> RuntimeApplyResult {
-        Box::pin(self.apply_runtime_candidate_with_policy(candidate, expected_desired, None)).await
+        Box::pin(self.apply_runtime_candidate_with_policy(candidate, expected_desired, None, false))
+            .await
     }
 
     async fn apply_runtime_candidate_with_policy(
         self: &Arc<Self>,
         candidate: Value,
         expected_desired: Option<&Value>,
-        staged_save_owner: Option<StagedSaveOwner>,
+        saved_owner: Option<StagedSaveOwner>,
+        staged_save: bool,
     ) -> RuntimeApplyResult {
         let generation = self.gate.generation();
         let intent = self.selector_reconcile.intent_generation();
-        let offer_confirmation = staged_save_owner.is_none();
+        let offer_confirmation = !staged_save;
+        let saved_revision = saved_owner.map(|owner| owner.revision);
         let restart_choice = |candidate: &Value, code, paths, generation, intent| {
             if offer_confirmation {
-                self.restart_choice(candidate, code, paths, generation, intent)
+                self.restart_choice_at_revision(
+                    candidate,
+                    code,
+                    paths,
+                    generation,
+                    intent,
+                    saved_revision,
+                )
             } else {
                 RuntimeApplyResult::status("restartRequired")
             }
         };
-        if staged_save_owner.is_some_and(|owner| {
+        if saved_owner.is_some_and(|owner| {
             (owner.generation, owner.intent) != (generation, intent)
                 || !self.saved_revision_matches(Some(owner.revision))
         }) || self.gate.is_busy()
@@ -1607,6 +1655,9 @@ impl ProxyRuntime {
             return self.remember_runtime_result(RuntimeApplyResult::status("conflict"));
         }
         if !self.core_running() {
+            if saved_owner.is_some() {
+                return self.remember_runtime_result(RuntimeApplyResult::status("conflict"));
+            }
             if offer_confirmation {
                 self.process_deferred_config_deletions().await;
             }
@@ -2080,6 +2131,7 @@ impl ProxyRuntime {
             || !identity_equal(plan.expected.as_ref(), capabilities.active.as_ref())
             || plan.expected_control_revision != capabilities.control_revision
             || !self.selector_operation_is_current(generation, intent)
+            || !self.saved_revision_matches(saved_revision)
         {
             return self.remember_runtime_result(RuntimeApplyResult::status("conflict"));
         }
@@ -2227,7 +2279,13 @@ impl ProxyRuntime {
             host_effects::HostEffectStrategy::NeedsSnapshotBeforeCore
         ) {
             return self.remember_runtime_result(if offer_confirmation {
-                self.host_effect_restart_choice(&candidate, &host_plan, generation, intent)
+                self.host_effect_restart_choice(
+                    &candidate,
+                    &host_plan,
+                    generation,
+                    intent,
+                    saved_revision,
+                )
             } else {
                 RuntimeApplyResult::status("restartRequired")
             });
@@ -2237,7 +2295,7 @@ impl ProxyRuntime {
             api_handoff,
             pairing: baseline.pairing.clone(),
             desired,
-            saved_revision: staged_save_owner.map(|owner| owner.revision),
+            saved_revision,
             deletion_scope,
             physical_route_config: if protected_binding_plan.is_some() {
                 typed.clone()
@@ -2321,12 +2379,13 @@ impl ProxyRuntime {
             if !offer_confirmation {
                 return self.remember_runtime_result(RuntimeApplyResult::status("restartRequired"));
             }
-            return self.remember_runtime_result(self.restart_choice(
+            return self.remember_runtime_result(self.restart_choice_at_revision(
                 &pending.candidate,
                 "structuralChange",
                 vec!["outbounds.physical_route_binding".into()],
                 generation,
                 intent,
+                pending.saved_revision,
             ));
         }
         if pending.plan.no_op {
@@ -3571,6 +3630,76 @@ impl ProxyRuntime {
                 .runtime_config_apply
                 .try_lock()
                 .is_ok_and(|state| state.pending.is_none())
+    }
+
+    pub(crate) fn takeover_preview(&self) -> Option<(TakeoverApplyOwner, bool)> {
+        let (desired, owner) = self
+            .config
+            .try_with_saved_commit(|desired| {
+                (
+                    desired.clone(),
+                    TakeoverApplyOwner {
+                        saved_revision: self.config.saved_revision(),
+                        generation: self.core_generation(),
+                        intent: self.selector_reconcile.intent_generation(),
+                    },
+                )
+            })
+            .ok()?;
+        let pending = self.pending_changes_against(Some(&desired)).pending_apply;
+        self.config
+            .try_with_saved_commit(|_| {
+                (self.takeover_owner_is_live(owner)
+                    && self.saved_revision_matches(Some(owner.saved_revision)))
+                .then_some((owner, pending))
+            })
+            .ok()
+            .flatten()
+    }
+
+    pub(crate) fn takeover_owner_is_live(&self, owner: TakeoverApplyOwner) -> bool {
+        !self.gate.is_busy() && self.selector_operation_is_current(owner.generation, owner.intent)
+    }
+
+    pub(crate) async fn apply_owned_takeover(
+        self: &Arc<Self>,
+        owner: TakeoverApplyOwner,
+    ) -> RuntimeApplyResult {
+        let _serial = self.switch_serial.lock().await;
+        let desired = self
+            .config
+            .try_with_saved_commit(|desired| {
+                (self.takeover_owner_is_live(owner)
+                    && self.saved_revision_matches(Some(owner.saved_revision)))
+                .then(|| desired.clone())
+            })
+            .ok()
+            .flatten();
+        let Some(desired) = desired else {
+            return self.runtime_native_result(RuntimeApplyResult::status("conflict"));
+        };
+        if !self.runtime_config_apply.lock().is_ok_and(|state| {
+            state.pending.as_ref().is_none_or(|pending| {
+                pending.desired == desired
+                    && pending.saved_revision == Some(owner.saved_revision)
+                    && pending.generation == owner.generation
+                    && pending.intent == owner.intent
+            })
+        }) {
+            return self.runtime_native_result(RuntimeApplyResult::status("conflict"));
+        }
+        let saved_owner = StagedSaveOwner {
+            generation: owner.generation,
+            intent: owner.intent,
+            revision: owner.saved_revision,
+        };
+        Box::pin(self.apply_runtime_candidate_with_policy(
+            desired.clone(),
+            Some(&desired),
+            Some(saved_owner),
+            false,
+        ))
+        .await
     }
 
     /// User choice is bound to the exact candidate, running projection, generation

@@ -71,7 +71,12 @@ impl ProxyRuntime {
         let Some(saved_revision) = self
             .config
             .try_with_saved_commit(|desired| {
-                (desired == &pending.desired).then(|| self.config.saved_revision())
+                let revision = self.config.saved_revision();
+                (desired == &pending.desired
+                    && pending
+                        .saved_revision
+                        .is_none_or(|expected| expected == revision))
+                .then_some(revision)
             })
             .ok()
             .flatten()

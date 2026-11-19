@@ -1,6 +1,6 @@
 import { invoke, invokeScalar, listen, listenReady, isTauri } from '../ipc-client';
 import { IPC_CHANNELS } from '../../domain/ipc-channels';
-import type { UserConfig, StagedClassification, SaveOutcome } from '../../contracts/types';
+import type { UserConfig, StagedClassification, SaveOutcome, TakeoverApplyOwner } from '../../contracts/types';
 import type { TunExclusionPreview } from '../../contracts/tun-exclusion-preview';
 import type { TunnelConflictReport } from '../../contracts/tunnel-conflict-report';
 import type { EndpointForceRouteReport } from '../../contracts/endpoint-force-route-report';
@@ -82,8 +82,12 @@ export const configApi = {
   },
 
   /** 在后端最新配置写事务内切换接管并消费 FakeIP-TUN 一次性标志。 */
-  async setTakeover(mode: NonNullable<UserConfig['proxyModeType']>): Promise<{ config: UserConfig; corrected: boolean }> {
-    return invoke(IPC_CHANNELS.CONFIG_SET_TAKEOVER, { mode });
+  async previewTakeover(mode: NonNullable<UserConfig['proxyModeType']>): Promise<{ owner: TakeoverApplyOwner; pendingApply: boolean }> {
+    return invoke(IPC_CHANNELS.CONFIG_SET_TAKEOVER, { mode, preview: true });
+  },
+
+  async setTakeover(mode: NonNullable<UserConfig['proxyModeType']>, expectedOwner?: TakeoverApplyOwner): Promise<{ config: UserConfig; corrected: boolean; owner?: TakeoverApplyOwner }> {
+    return invoke(IPC_CHANNELS.CONFIG_SET_TAKEOVER, { mode, expectedOwner });
   },
 
   /** 在后端最新配置上按实体主键原子 upsert/delete；同一数组的并发编辑不会整字段互相覆盖。 */

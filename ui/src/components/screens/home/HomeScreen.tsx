@@ -29,6 +29,7 @@ import { useTranslation } from 'react-i18next';
 import { useAppStore, useEffectiveConfig } from '@/store/app-store';
 import { useNavStore } from '@/store/nav-store';
 import { api } from '@/ipc';
+import { IpcError } from '@/ipc/ipc-client';
 import { unlockApi, ipInfoApi } from '@/ipc/api-client';
 import { toast } from '@/lib/error-handler';
 import { cn } from '@/lib/utils';
@@ -49,7 +50,7 @@ import {
 import { exitAddrText } from './exit-addr';
 import { notifyDesktop } from '@/lib/desktop-notify';
 import { withProxyStartClaim } from '@/lib/proxy-start-claim';
-import { ProxyErrorCode } from '@/contracts/types';
+import { ProxyErrorCode, type TakeoverApplyOwner } from '@/contracts/types';
 import { ConnectionTopology } from './ConnectionTopology';
 import { useSwitchNode } from '@/components/screens/shared/use-switch-node';
 import { switchReceiptFeedback } from '@/components/screens/shared/switch-receipt-feedback';
@@ -84,7 +85,6 @@ import {
   speedTestBlockedMessage,
 } from '../shared/speedtest-feedback';
 import { speedTestBlockReason } from '@/components/screens/nodes/nodes-logic';
-import { hasPendingWork } from '@/components/layout/pending-bar-logic';
 
 /* ── 解锁检测服务展示名（对齐原型 UNLOCK_SVCS，分 AI / 流媒体两组）── */
 interface UnlockSvcMeta {
@@ -843,12 +843,11 @@ export function HomeScreen() {
 
   /* 接管模式及 FakeIP-TUN 修正在后端最新配置事务内一次完成。 */
   const applyIntercept = useCallback(
-    async (v: InterceptKind) => {
+    async (v: InterceptKind, expectedOwner?: TakeoverApplyOwner) => {
       if (!diskConfig) return;
       try {
-        const { corrected } = await api.config.setTakeover(v);
-        // 已连接：确认框已确认「立即生效」→ 交待应用条直接应用（含重启令牌），不再经「立即应用」与重启二次确认。
-        if (connected) useAppStore.getState().setApplyRequested(true);
+        const { corrected, owner } = await api.config.setTakeover(v, expectedOwner);
+        if (owner) useAppStore.getState().setApplyRequested(owner);
         // 仅在真把 false 改回 true 时提示（罕见且有实际副作用需告知）；纯消费 flag 不打扰用户。
         // toast 在主窗可见时够用，但接管方式亦可从**托盘浮层**（独立窗口，FX-tray 已加入口）切换 →
         // 主窗 toast 此时看不到，故并发一条系统通知兜底（对齐 上游 notify-user；正文不含节点身份）。
@@ -862,36 +861,47 @@ export function HomeScreen() {
         }
       } catch (err) {
         console.error('[home] set intercept failed:', err);
-        toast.error(t('settings.proxyMode.failUpdate'));
+        toast.error(t(err instanceof IpcError && err.code === 'CONFIG_TAKEOVER_CONFLICT'
+          ? 'home.pendingHotConflict' : 'settings.proxyMode.failUpdate'));
       }
     },
-    [diskConfig, connected, t]
+    [diskConfig, t]
   );
 
   /* ── 接管方式切换入口：已连接时切换要立即应用到运行中的核（可能重启、瞬断当前连接）→ 先弹一次确认，
    *    确认后写盘并直接应用；未连接直接落盘（下次连接生效）。 */
+  const takeoverPreviewRequest = useRef(0);
   const onInterceptChange = useCallback(
-    (v: InterceptKind) => {
+    async (v: InterceptKind) => {
       if (!config || v === config.proxyModeType) return;
+      const request = ++takeoverPreviewRequest.current;
       if (!connected) {
         void applyIntercept(v);
         return;
       }
-      openDialog({
-        kind: 'confirm',
-        payload: {
-          title: t('settings.proxyMode.confirmTitle'),
-          // 应用的是整份已保存候选：另有已保存未应用的改动时如实告知会一并生效。
-          message: hasPendingWork(useAppStore.getState().pendingChanges)
-            ? `${t('settings.proxyMode.confirmDesc')}\n${t('settings.proxyMode.confirmPendingNote')}`
-            : t('settings.proxyMode.confirmDesc'),
-          confirmLabel: t('settings.proxyMode.confirmBtn'),
-          onConfirm: () => {
-            closeDialog(); // 回调自行 pop（dialog-store 不自动关）
-            void applyIntercept(v);
+      try {
+        const { owner, pendingApply } = await api.config.previewTakeover(v);
+        if (request !== takeoverPreviewRequest.current) return;
+        openDialog({
+          kind: 'confirm',
+          payload: {
+            title: t('settings.proxyMode.confirmTitle'),
+            message: pendingApply
+              ? `${t('settings.proxyMode.confirmDesc')}\n${t('settings.proxyMode.confirmPendingNote')}`
+              : t('settings.proxyMode.confirmDesc'),
+            confirmLabel: t('settings.proxyMode.confirmBtn'),
+            onConfirm: () => {
+              closeDialog();
+              void applyIntercept(v, owner);
+            },
           },
-        },
-      });
+        });
+      } catch (error) {
+        if (request !== takeoverPreviewRequest.current) return;
+        console.error('[home] preview intercept failed:', error);
+        toast.error(t(error instanceof IpcError && error.code === 'CONFIG_TAKEOVER_CONFLICT'
+          ? 'home.pendingHotConflict' : 'settings.proxyMode.failUpdate'));
+      }
     },
     [config, connected, applyIntercept, openDialog, closeDialog, t]
   );

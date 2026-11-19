@@ -1,6 +1,6 @@
 import { invoke, listen, listenReady } from '../ipc-client';
 import { IPC_CHANNELS } from '../../domain/ipc-channels';
-import type { PendingApplyResult, ProxyStatus, ProxyErrorCode, SystemProxyStatus, InvalidNodeInfo, PendingNodeChanges, ProxyLifecycleEvent, ExpectedMainCoreStop, ExpectedMainCoreStopResult } from '../../contracts/types';
+import type { PendingApplyResult, ProxyStatus, ProxyErrorCode, SystemProxyStatus, InvalidNodeInfo, PendingNodeChanges, ProxyLifecycleEvent, ExpectedMainCoreStop, ExpectedMainCoreStopResult, TakeoverApplyOwner } from '../../contracts/types';
 import type { TailscaleStatusEvent } from '../../contracts/tailscale-status';
 import type { AutoNodeSwitchedPayload } from '../../contracts/auto-select';
 import type { TailscaleLoginProgress } from '../../domain/tailscale-login-progress';
@@ -110,7 +110,10 @@ export const proxyApi = {
   },
 
   /** Plan/apply the saved candidate. A restart requires its exact confirmation token. */
-  async applyPendingChanges(restartConfirmation?: string): Promise<PendingApplyResult> {
+  async applyPendingChanges(restartConfirmation?: string, takeoverOwner?: TakeoverApplyOwner): Promise<PendingApplyResult> {
+    if (takeoverOwner !== undefined) {
+      return invoke(IPC_CHANNELS.PROXY_APPLY_PENDING_CHANGES, { takeoverOwner, restartConfirmation });
+    }
     return restartConfirmation === undefined
       ? invoke(IPC_CHANNELS.PROXY_APPLY_PENDING_CHANGES)
       : invoke(IPC_CHANNELS.PROXY_APPLY_PENDING_CHANGES, { restartConfirmation });
