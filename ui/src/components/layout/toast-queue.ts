@@ -36,7 +36,7 @@
  * 谁要拿 IPv6 那条注释来「统一」掉本模块，请先回答「这条反馈陈述的事实有效期是多长」。
  */
 
-/** 原型三档配色：ok/err 有专属样式，`''` 走基础样式（不自造第四档）。 */
+/** `''` 使用宿主的基础信息样式。 */
 export type ToastKind = 'ok' | 'err' | 'warn' | '';
 
 export interface ToastEntry {

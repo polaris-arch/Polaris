@@ -101,6 +101,7 @@ vi.mock('./MobileToaster', async (importOriginal) => {
 });
 
 import { renderToStaticMarkup } from 'react-dom/server';
+import { ToastStatusIcon } from '@/components/Icons';
 import { setToastImpl, toast, type ToastOptions } from '@/lib/error-handler';
 import { useAppStore } from '@/store/app-store';
 import { useStagedConfigStore } from '@/store/staged-config-store';
@@ -157,11 +158,21 @@ describe('① toast 宿主：门面 → 宿主这一跳真的通了', () => {
       ['ok', 'ok'],
       ['bad', 'err'],
       ['hi', ''],
-      ['careful', ''],
+      ['careful', 'warn'],
     ]);
     // `error` 的第二参是失败原因；桌面那版曾经把它丢了，这里正面钉住。
     expect(calls[1].desc).toBe('因为某某');
     restore();
+  });
+
+  it('四种通知的图标形状可区分，屏幕阅读器只读通知文案', () => {
+    const icons = (['ok', '', 'warn', 'err'] as const)
+      .map((kind) => renderToStaticMarkup(<ToastStatusIcon kind={kind} />));
+    expect(new Set(icons).size).toBe(icons.length);
+    for (const icon of icons) {
+      expect(icon).toContain('aria-hidden="true"');
+      expect(icon).toContain('focusable="false"');
+    }
   });
 
   it('`ToastOptions` 原样透传（去重键 / sticky / 动作 —— 队列语义靠它们）', () => {

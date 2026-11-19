@@ -832,13 +832,22 @@ h1[tabindex='-1']:focus-visible { outline: none; }
 .statusbar{ height:var(--statusbar-h); }
 #toast-stack{ bottom:calc(var(--statusbar-h) + var(--toast-gap)); }
 
+/* The live host uses a light tint and an icon for each tone in both themes. */
+#toast-stack .toast{
+  --toast-accent:var(--flow-hi); --toast-surface:var(--flow-weak);
+  background:hsl(var(--toast-surface)); color:hsl(var(--fg)); border-color:hsl(var(--toast-accent)/.36);
+}
+#toast-stack .toast.ok{ --toast-accent:var(--ok); --toast-surface:var(--ok-weak); }
+#toast-stack .toast.warn{ --toast-accent:var(--warn); --toast-surface:var(--warn-weak); }
+#toast-stack .toast.err{ --toast-accent:var(--err); --toast-surface:var(--err-weak); }
+.toast-status-icon{ display:inline-block; vertical-align:-.24em; margin-inline-end:.45em; color:hsl(var(--toast-accent)); }
+#toast-stack .toast-desc{ color:hsl(var(--fg-dim)); opacity:1; }
+
 /* ── toast 行内动作与关闭（`.toast-actions` / `.toast-close`）──────────────────────
  * 唯一消费者：测速中断态的「继续剩余 / 重新测速 / 关闭」。原型的 `notify()` 没有这一档，故本规则**原型无对应**
  * ——写在这里而不是 prototype.css/components.css：那两处是冻结的原型移植面（禁改），端口侧新增一律落本层。
  *
- * 只用 `.toast` 已有的配色变量，不引第二套色板：`.toast` 基础态在浅色下是深底浅字（`--fg` 底 / `--surface` 字），
- * 深色下反过来（surface-2 底 / fg 字）。按钮若写死颜色，必然在其中一档上糊成一片。故边框与文字一律
- * `currentColor` —— 它恒等于该条 toast 当前的前景色，两档主题自动同向，且 `.toast.ok/.err` 变体也跟着走。
+ * 按钮的边框与文字使用 `currentColor`，沿用宿主在当前主题下的文字颜色。
  * 底色留 `transparent`（描边按钮）：`color-mix()` / 相对色语法能做出更好看的淡填充，但本仓 CSS 至今
  * **零处**使用它们，为一个按钮把 WebKitGTK 的版本下限抬上去不值当 —— 描边在三端 webview 都是无条件可用的。 */
 .toast.dismissible{ position:relative; padding-inline-end:34px; }
@@ -1907,11 +1916,6 @@ body:has(.pending-bar.show) #toast-stack{
 .toast.dismissible .toast-action{ max-width:100%; white-space:normal; overflow-wrap:anywhere; }
 
 /* Shared warning language and compact read-only settings values. */
-.toast.warn{ background:hsl(var(--warn-weak)); color:hsl(var(--warn)); border-color:hsl(var(--warn)/.35); }
-@media (prefers-color-scheme:dark){
-  :root:not([data-theme="light"]) .toast.warn{ background:hsl(var(--warn-weak)); color:hsl(var(--warn)); border-color:hsl(var(--warn)/.35); }
-}
-:root[data-theme="dark"] .toast.warn{ background:hsl(var(--warn-weak)); color:hsl(var(--warn)); border-color:hsl(var(--warn)/.35); }
 .feedback-notice.warning{ background:hsl(var(--warn-weak)); border-color:hsl(var(--warn)/.3); }
 .feedback-notice.warning .feedback-notice-title{ color:hsl(var(--warn)); }
 .feedback-notice.warning .feedback-notice-actions .btn.ghost{ border-color:hsl(var(--warn)/.45); color:hsl(var(--warn)); }

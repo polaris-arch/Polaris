@@ -23,7 +23,7 @@
  * - **栈上限 2**：原型 `while(c.children.length>=2) c.firstChild.remove()` —— 超出即挤掉最旧的，
  *   不是无限堆叠（连续失败时屏幕不会被糊满）；
  * - 2200ms 后淡出、200ms 后卸载；`.show` 类驱动进场（CSS 已在 prototype.css:578-587，含 dark 收敛）；
- * - kind → class：ok/err 有专属配色，info 走基础样式，warning 复用应用的 --warn 风险色。
+ * - kind → class：四种通知共用布局，按状态选择浅染底色和图标。
  *
  * # 原型之外的两样能力（`key` / `sticky`）
  *
@@ -55,6 +55,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { setToastImpl, type ToastOptions } from '@/lib/error-handler';
+import { ToastStatusIcon } from '../Icons';
 import { useTopDialogEl } from '../dialogs/dialog-top-layer';
 import {
   autoDismissMs,
@@ -192,7 +193,10 @@ export function Toaster() {
               </svg>
             </button>
           )}
-          <div className="toast-msg">{it.msg}</div>
+          <div className="toast-msg">
+            <ToastStatusIcon kind={it.kind} />
+            {it.msg}
+          </div>
           {it.desc && <div className="toast-desc" tabIndex={it.dismiss ? 0 : undefined}>{it.desc}</div>}
           {it.actions && it.actions.length > 0 && (
             <div className="toast-actions">

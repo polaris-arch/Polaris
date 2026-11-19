@@ -37,6 +37,7 @@
 
 import { useEffect, useRef, useState, type ReactElement } from 'react';
 import { setToastImpl, type ToastOptions } from '@/lib/error-handler';
+import { ToastStatusIcon } from '@/components/Icons';
 import {
   autoDismissMs,
   LEAVE_MS,
@@ -45,6 +46,13 @@ import {
   type ToastEntry,
   type ToastKind,
 } from '@/components/layout/toast-queue';
+
+const toastKindClasses: Record<ToastKind, string> = {
+  ok: ' m-toast-ok',
+  '': '',
+  warn: ' m-toast-warn',
+  err: ' m-toast-err',
+};
 
 /** 一次入栈请求。抽成类型是为了让 [`installMobileToastHost`] 的注入面能被单测直接驱动。 */
 export type ToastPush = (
@@ -61,15 +69,14 @@ export type ToastPush = (
  * `environment:'node'`、无 jsdom ⇒ effect 体在 `renderToStaticMarkup` 下不执行，写在组件里的注入
  * 就一条**行为**判据都写不出来。拆开之后判据可以真的调 `toast.error(...)`，看它有没有走到这里。
  *
- * 四条通道的映射逐字同桌面 `Toaster.tsx:130-136`（含 `error` 的第二参 description 要接上），
- * 差别只有：这里没有 `''` 这一档的第四种配色可造 —— 原型只有三档，`info`/`warning` 走基础样式。
+ * 四条通道的映射与桌面相同，包含 `error` 可选的第二段说明。
  */
 export function installMobileToastHost(push: ToastPush): () => void {
   setToastImpl({
     success: (m, o) => push(m, 'ok', undefined, o),
     error: (m, d, o) => push(m, 'err', d, o),
     info: (m, o) => push(m, '', undefined, o),
-    warning: (m, o) => push(m, '', undefined, o),
+    warning: (m, o) => push(m, 'warn', undefined, o),
   });
   // 门面是模块级单例；卸载后仍保留 push 闭包会写进一个已卸载组件。恢复 console 兜底，
   // StrictMode 重挂载时下一轮 effect 立即重新注入当前实例（同桌面）。
@@ -145,12 +152,15 @@ export function MobileToaster(): ReactElement | null {
           /* 不是 `it.id`：同 key 更新会换新 id，用 id 作 React key 等于每次刷新都卸载重挂
              ⇒ 进场动画重播。见 `toast-queue.ts` 的 `toastListKey`。 */
           key={toastListKey(it)}
-          className={`m-toast${it.kind === 'ok' ? ' m-toast-ok' : it.kind === 'err' ? ' m-toast-err' : ''}${
+          className={`m-toast${toastKindClasses[it.kind]}${
             it.leaving ? ' m-toast-leaving' : ''
           }${it.dismiss ? ' m-toast-dismissible' : ''}`}
         >
           <div className="m-toast-body">
-            <div className="m-toast-msg">{it.msg}</div>
+            <div className="m-toast-msg">
+              <ToastStatusIcon kind={it.kind} />
+              {it.msg}
+            </div>
             {it.desc !== undefined && <div className="m-toast-desc" tabIndex={it.dismiss ? 0 : undefined}>{it.desc}</div>}
           </div>
           {it.actions !== undefined && it.actions.length > 0 && (

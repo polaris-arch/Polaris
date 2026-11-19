@@ -312,13 +312,15 @@ body {
 }
 
 .m-toast {
+  --toast-accent: var(--flow-hi);
+  --toast-surface: var(--flow-weak);
   display: flex;
   align-items: flex-start;
   gap: var(--sp-2);
   padding: var(--sp-3);
   border-radius: var(--r);
-  border: 1px solid hsl(var(--line));
-  background: hsl(var(--surface));
+  border: 1px solid hsl(var(--toast-accent) / 0.36);
+  background: hsl(var(--toast-surface));
   box-shadow: var(--shadow-pop);
   color: hsl(var(--fg));
   /* 进场：一次性播完，不靠「下一帧加 .show」那套两帧语义（判据环境里没有 rAF 可依赖）。 */
@@ -326,15 +328,25 @@ body {
 }
 
 .m-toast-ok {
-  border-color: hsl(var(--ok) / 0.45);
-  background: hsl(var(--ok-weak));
-  color: hsl(var(--ok));
+  --toast-accent: var(--ok);
+  --toast-surface: var(--ok-weak);
+}
+
+.m-toast-warn {
+  --toast-accent: var(--warn);
+  --toast-surface: var(--warn-weak);
 }
 
 .m-toast-err {
-  border-color: hsl(var(--err) / 0.45);
-  background: hsl(var(--err-weak));
-  color: hsl(var(--err));
+  --toast-accent: var(--err);
+  --toast-surface: var(--err-weak);
+}
+
+.toast-status-icon {
+  display: inline-block;
+  vertical-align: -0.24em;
+  margin-inline-end: 0.45em;
+  color: hsl(var(--toast-accent));
 }
 
 .m-toast-leaving {
@@ -359,7 +371,7 @@ body {
   margin-top: var(--sp-1);
   font-size: 0.8125rem;
   line-height: 1.35;
-  opacity: 0.85;
+  color: hsl(var(--fg-dim));
   overflow-wrap: anywhere;
 }
 

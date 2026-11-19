@@ -1,5 +1,5 @@
 /**
- * 内嵌图标（1:1 提取自原型 polaris-prototype.html nav-item / statusbar / winctl SVG path）。
+ * 可跨平台复用的内嵌图标。导航、状态栏和窗口控制图标取自 polaris-prototype.html。
  *
  * 原型把每个图标的 <svg> 直接写在 markup 里（L1588-1598 导航 / L2433-2438 状态栏 / L1572-1574 窗口控制）。
  * 这里抽成组件方便复用；viewBox/path 与原型逐字对齐，仅改用 currentColor + 统一 props。
@@ -7,8 +7,36 @@
  */
 
 import type { SVGProps } from 'react';
+import type { ToastKind } from './layout/toast-queue';
 
 type IconProps = SVGProps<SVGSVGElement>;
+
+const toastStatusPaths: Record<ToastKind, string> = {
+  ok: 'M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0ZM8 12l2.5 2.5L16 9',
+  '': 'M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0ZM12 11v5m0-8h.01',
+  warn: 'M12 3 2.6 19.3a1 1 0 0 0 .9 1.5h17a1 1 0 0 0 .9-1.5L12 3Zm0 6v4m0 3h.01',
+  err: 'M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0ZM9 9l6 6m0-6-6 6',
+};
+
+export function ToastStatusIcon({ kind }: { kind: ToastKind }) {
+  return (
+    <svg
+      className="toast-status-icon"
+      viewBox="0 0 24 24"
+      width="16"
+      height="16"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.8"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+      focusable="false"
+    >
+      <path d={toastStatusPaths[kind]} />
+    </svg>
+  );
+}
 
 /* ── 导航项（原型 .nav-item svg，L1588-1598）── */
 
