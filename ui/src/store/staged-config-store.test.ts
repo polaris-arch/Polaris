@@ -105,6 +105,7 @@ function resetStore(enabled: boolean): void {
     enabled,
     entries: [],
     baseVersion: null,
+    latestSavedConfig: null,
     baseline: null,
     hydrated: false,
     saveStatus: 'idle',
@@ -750,6 +751,39 @@ describe('并发保存（withConfigWriteLock）', () => {
 });
 
 describe('reset —— 「重置」同时是条上唯一的清红出口', () => {
+  it.each(['reset', 'revert', 'use disk'] as const)(
+    'uses the observed disk value after clearing the last draft via %s',
+    async (action) => {
+      const store = useStagedConfigStore.getState();
+      const previous = { ...CONFIG, logLevel: 'debug' } as UserConfig;
+      const disk = { ...CONFIG, logLevel: 'info' } as UserConfig;
+      store.hydrate(previous);
+      const draft = {
+        id: 'setting:logLevel', kind: 'setting', entityPath: ['logLevel'],
+        label: 'Log level', nextValue: 'warn',
+      } as const;
+      store.stage(draft);
+      getMock.mockResolvedValue(disk);
+      if (action === 'revert') {
+        store.hydrate(disk);
+        store.revert(draft.id);
+      } else {
+        await expect(store.save()).resolves.toBe(false);
+        expect(useStagedConfigStore.getState().conflict?.map((row) => row.entryId)).toEqual([draft.id]);
+        if (action === 'use disk') {
+          await expect(store.resolveConflict([])).resolves.toBe(true);
+        } else {
+          store.dismissConflict();
+          store.reset();
+        }
+      }
+      expect(useStagedConfigStore.getState().entries).toEqual([]);
+      store.stage({ ...draft, nextValue: 'debug' });
+      await expect(store.save()).resolves.toBe(true);
+      expect(saveMock).toHaveBeenCalledExactlyOnceWith({ ...disk, logLevel: 'debug' }, true, configBaseVersion(disk), true);
+    }
+  );
+
   /**
    * 保存失败后点「重置」：条目丢掉，红也必须跟着灭。
    * 变异对照：重置时不把 `saveStatus` 恢复为 `idle` →

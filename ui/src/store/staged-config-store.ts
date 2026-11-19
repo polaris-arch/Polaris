@@ -189,19 +189,14 @@ export interface StagedConfigState {
   enabled: boolean;
   /** 有序意图条目。`entries.length` 即 stagedDiff 的大小（Q5：不需要后端算）。 */
   entries: StagedEntry[];
-  /**
-   * 最近一次见到的磁盘 config 版本；null = 还没 hydrate 过。
-   * **只用于 `hydrate` 的「盘没变就别白忙」短路**——恢复腿不再拿它做失配丢弃判定，
-   * 持久化载荷里也不再存它（`StagedPayload` 存的是 `baseline` 本体）。
-   */
+  /** 最近一次读到的已保存配置及版本。清空最后一条草稿时用它开始下一批。 */
   baseVersion: string | null;
+  latestSavedConfig: UserConfig | null;
   /**
    * **staged 建立那一刻的磁盘快照**（Q8-b 的 `baseline`）—— 冲突检出的比对基准，
    * 也是「保存」重放的语义原点。
    *
-   * 与 `baseVersion` 是两件事，不可合并：
-   *  - `baseVersion` 跟着磁盘走（后台写盘也刷），管的是「存储里那份 staged 还新不新鲜」；
-   *  - `baseline` 在有 staged 期间**冻住**，管的是「这批编辑是相对哪一版盘做的」。
+   * `latestSavedConfig` 跟随读到的磁盘快照，`baseline` 在这批草稿存续期间保持不变。
    *
    * 让 baseline 跟着磁盘走 = 冲突检出恒空 ⇒ 静默吃掉别人的改动（Q1 里那条 NFR-2 违反）。
    * 反过来用 `effectiveConfig` 当 baseline ⇒ 用户自己的每条改动都被判成「磁盘变了」⇒ 恒冲突。
@@ -232,7 +227,7 @@ export interface StagedConfigState {
   stage: (entry: StagedEntry) => void;
   /** 撤销单条（明细 popover 的红叉）。 */
   revert: (id: string) => void;
-  /** 「重置」：丢弃全部 staged（baseline 不动，磁盘不动）。 */
+  /** 「重置」：丢弃全部草稿，从最近一次读到的已保存配置开始下一批。 */
   reset: () => void;
   /**
    * 「保存」：Q8-b 的四步 —— 拉磁盘现值 → 算冲突集 → 无冲突静默 `replay(disk, entries)` 后落盘
@@ -272,6 +267,7 @@ export const useStagedConfigStore = create<StagedConfigState>((set, get) => ({
   enabled: STAGED_CONFIG_ENABLED,
   entries: [],
   baseVersion: null,
+  latestSavedConfig: null,
   baseline: null,
   hydrated: false,
   saveStatus: 'idle',
@@ -292,23 +288,25 @@ export const useStagedConfigStore = create<StagedConfigState>((set, get) => ({
   },
 
   revert: (id) => {
-    const { enabled, entries, baseline } = get();
+    const { enabled, entries, baseline, latestSavedConfig } = get();
     if (!enabled) return;
     const next = revertEntry(entries, id);
     if (next.length === entries.length) return;
+    const nextBaseline = next.length === 0 ? latestSavedConfig ?? baseline : baseline;
     // 撤销同样改变了裁决的对象集；旧弹窗不再是一份可提交的冲突快照。
-    set({ entries: next, conflict: null, conflictBaseline: null });
-    persist(baseline, next);
+    set({ entries: next, baseline: nextBaseline, conflict: null, conflictBaseline: null });
+    persist(nextBaseline, next);
   },
 
   reset: () => {
-    const { enabled, entries, baseline, saveStatus, conflict } = get();
+    const { enabled, entries, baseline, latestSavedConfig, saveStatus, conflict } = get();
     // 「已经是干净态」才短路。`saveStatus` / `conflict` 一并看：条在 `.err` 上（或弹窗开着）时
     // 「重置」的可见承诺是**把红点掉、把窗关上**，只按 entries 判会在「保存失败后又被别处清空
     // 条目」这种边角留一条永远消不掉的红。
     if (!enabled || (entries.length === 0 && saveStatus === 'idle' && conflict === null)) return;
     set({
       entries: [],
+      baseline: latestSavedConfig ?? baseline,
       saveStatus: 'idle',
       conflict: null,
       conflictBaseline: null,
@@ -319,7 +317,7 @@ export const useStagedConfigStore = create<StagedConfigState>((set, get) => ({
   save: async () => performSave(set, get),
 
   resolveConflict: async (keepEntryIds) => {
-    const { enabled, entries, baseline, conflict, conflictBaseline } = get();
+    const { enabled, entries, latestSavedConfig, conflict, conflictBaseline } = get();
     if (!enabled) return true;
     // A stale/dismissed dialog cannot authorize a new save or rebase.
     if (conflict === null || conflictBaseline === null) return false;
@@ -331,7 +329,7 @@ export const useStagedConfigStore = create<StagedConfigState>((set, get) => ({
     const kept = entries.filter((e) => !contested.has(e.id) || keep.has(e.id));
     // 弹窗展示的是 conflictBaseline 那一版磁盘。裁决后拿它当新基准再走正常冲突检测：磁盘未再变
     // 不会重复询问；弹窗停留期间若同一实体又变了，则会基于新变化重新提示。
-    const resolvedBaseline = conflictBaseline ?? baseline;
+    const resolvedBaseline = kept.length === 0 ? latestSavedConfig ?? conflictBaseline : conflictBaseline;
     set({
       entries: kept,
       conflict: null,
@@ -395,19 +393,12 @@ export const useStagedConfigStore = create<StagedConfigState>((set, get) => ({
   },
 
   hydrate: (config) => {
-    const { enabled, hydrated, entries, baseVersion: current } = get();
+    const { enabled, hydrated, entries } = get();
     if (!enabled) return;
     const baseVersion = configBaseVersion(config);
     if (hydrated) {
-      // 有 staged 在手 ⇒ baseline 冻住（它是冲突比对的基准）；没有 ⇒ 跟到新盘值当下一批的原点。
-      // **必须排在版本短路之前**：「重置」把条目清空时盘的版本往往没变，此时若被短路挡住，
-      // 那份冻住的旧 baseline 就永远释放不掉，下一批编辑会拿它当基准。
-      if (entries.length === 0) set({ baseline: config });
-      if (current === baseVersion) return;
-      set({ baseVersion });
-      // 这里**不回写存储**：载荷里已经没有跟着盘走的字段了（baseline 冻着、entries 没动），
-      // 回写只会把一份与现存字节完全相同、且与 config 同量级的载荷再塞一遍 —— 后台写盘多频繁，
-      // 这条就多频繁地白白逼近配额。
+      // 保留这批草稿的比较基准，同时记住盘值供重置或撤销最后一条时使用。
+      set({ baseVersion, latestSavedConfig: config, ...(entries.length === 0 ? { baseline: config } : {}) });
       return;
     }
     const stored = readPersisted();
@@ -421,7 +412,7 @@ export const useStagedConfigStore = create<StagedConfigState>((set, get) => ({
       restored.length > 0 && stored !== null
         ? (stored.baseline as unknown as UserConfig)
         : config;
-    set({ hydrated: true, baseVersion, baseline: restoredBaseline, entries: restored });
+    set({ hydrated: true, baseVersion, latestSavedConfig: config, baseline: restoredBaseline, entries: restored });
     // 没有可恢复的载荷（没存过 / 畸形 / 老形态无 baseline）⇒ 清掉残留；有 ⇒ 原样回写（幂等）。
     persist(restoredBaseline, restored);
   },
@@ -453,7 +444,7 @@ async function performSaveLocked(
   get: GetState,
   autoApply: boolean
 ): Promise<boolean> {
-  const { enabled, entries, baseline } = get();
+  const { enabled, entries, baseline, latestSavedConfig } = get();
   // 没有 staged ⇒ 没有要落盘的东西。这不是失败：`clean × pending` 那一格的「立即应用」正是走这条腿。
   if (!enabled) return true;
   if (entries.length === 0) {
@@ -487,6 +478,7 @@ async function performSaveLocked(
     return false;
   }
   const diskVersion = configBaseVersion(disk);
+  if (get().latestSavedConfig === latestSavedConfig) set({ baseVersion: diskVersion, latestSavedConfig: disk });
   /** 合并结果 = 把 staged 重放到磁盘现值上。落盘、弹窗里的「用我的」、成功后的新 baseline 同一个值。 */
   const merged = replay(disk, entries);
 
@@ -565,6 +557,7 @@ async function performSaveLocked(
     conflict: null,
     conflictBaseline: null,
     baseVersion: outcome.version,
+    latestSavedConfig: outcome.config,
     baseline: remainingBaseline,
   });
   persist(remainingBaseline, remaining);
