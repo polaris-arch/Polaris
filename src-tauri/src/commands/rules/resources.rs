@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
 use serde_json::{json, Value};
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State};
 
 use crate::commands::config::{broadcast_config_changed, emit_config_changed_signal};
 use crate::commands::rules::new_uuid;
@@ -12,6 +12,7 @@ use crate::events::{broadcast, channel::EVENT_RULE_RESOURCE_PROGRESS};
 use crate::response::ApiResponse;
 use crate::runtime::config::{Decision, DeferredConfigDeletion};
 use crate::runtime::http::{app_user_agent, SystemDnsLookup};
+use crate::runtime::proxy::runtime_config::StagedSaveOwner;
 use crate::runtime::subscription_scheduler::now_ms;
 use crate::runtime::AppRuntime;
 use polaris_config_engine::user_config::builtin_geo_rulesets::{
@@ -650,7 +651,7 @@ pub fn rule_resources_get_cached_catalog(
 
 /// 上游 `RULE_RESOURCES_REDOWNLOAD`：按 id 重新下载已登记资源（**真下载**）。
 ///
-/// 从 `config.ruleResources` 取该资源的 `sourceUrl`/`format`/`fileName`（保留原 id，覆盖写盘），
+/// 从 `config.ruleResources` 取该资源的 `sourceUrl`/`format`/`fileName`，保留原 id。
 /// 返回单个 `RuleResourceDownloadResult`（前端契约 `redownload(id): Promise<RuleResourceDownloadResult>`）。
 /// 资源不在册 → `ok:false` + `RULE_RESOURCE_NOT_FOUND`（业务态在 data，信封仍 success）。
 #[tauri::command]
@@ -881,35 +882,21 @@ pub async fn rule_resources_download(
             mode: ProgressMode::Live,
         };
         let expected = resource_record(&initial, &plan.id).cloned();
-        let outcome =
-            download_registered_resource(
-                &sink,
-                http.as_ref(),
-                &SystemDnsLookup,
-                &plan,
-                &res_dir,
-                |resource, staged| match state.config().update(|config| {
-                    match commit_download_resource(
-                        config,
-                        expected.as_ref(),
-                        resource,
-                        staged,
-                        &res_dir,
-                    ) {
-                        Ok(apply) => Decision::Write(Ok(apply)),
-                        Err(error) => Decision::Skip(Err(error)),
-                    }
-                }) {
-                    Ok((Ok(apply), Some(config))) => {
-                        changes.record(config, apply);
-                        Ok(())
-                    }
-                    Ok((Err(error), _)) => Err(error),
-                    Ok(_) => Err("资源提交未写入".into()),
-                    Err(error) => Err(format!("保存资源配置失败: {error}")),
-                },
-            )
-            .await;
+        let outcome = download_registered_resource(
+            &sink,
+            http.as_ref(),
+            &SystemDnsLookup,
+            &plan,
+            &res_dir,
+            |resource, staged| {
+                let saved = save_resource_change(&state, |config| {
+                    commit_download_resource(config, expected.as_ref(), resource, staged, &res_dir)
+                })?;
+                changes.record(saved);
+                Ok(())
+            },
+        )
+        .await;
         results.push(outcome.into_value(&plan));
     }
     changes.publish(&app);
@@ -1249,14 +1236,14 @@ async fn update_builtin_with_mode(
 }
 
 /// Existing resources are downloaded into an isolated directory. The config writer decides
-/// whether the original record is still current before any live path is touched.
+/// whether the original record is still current before publishing the new version.
 async fn download_registered_resource<H: HttpClient, L: DnsLookup>(
     sink: &dyn ProgressSink,
     client: &H,
     lookup: &L,
     plan: &ResourcePlan,
     res_dir: &Path,
-    commit: impl FnOnce(&RuleResource, &Path) -> Result<(), String>,
+    commit: impl FnOnce(&mut RuleResource, &Path) -> Result<(), String>,
 ) -> DownloadOutcome {
     let stage = match ResourceStageDir::create(res_dir) {
         Ok(stage) => stage,
@@ -1278,11 +1265,11 @@ async fn download_registered_resource<H: HttpClient, L: DnsLookup>(
     };
     let outcome =
         download_with_progress(&PendingResourceCommit(sink), client, lookup, plan, &stage.0).await;
-    let DownloadOutcome::Stored { resource, .. } = outcome else {
+    let DownloadOutcome::Stored { mut resource, .. } = outcome else {
         return outcome;
     };
     let existed_before = res_dir.join(&plan.file_name).is_file();
-    match commit(&resource, &stage.0.join(&plan.file_name)) {
+    match commit(&mut resource, &stage.0.join(&plan.file_name)) {
         Ok(()) => {
             emit_resource_progress(
                 sink,
@@ -1407,7 +1394,7 @@ fn resource_affects_runtime(config: &Value, downloaded: &RuleResource) -> bool {
 fn commit_download_resource(
     config: &mut Value,
     expected: Option<&Value>,
-    downloaded: &RuleResource,
+    downloaded: &mut RuleResource,
     staged: &Path,
     res_dir: &Path,
 ) -> Result<bool, String> {
@@ -1432,20 +1419,69 @@ fn commit_download_resource(
 fn publish_download_file(
     config: &Value,
     expected: Option<&RuleResource>,
-    downloaded: &RuleResource,
+    downloaded: &mut RuleResource,
     staged: &Path,
     res_dir: &Path,
 ) -> Result<bool, String> {
-    let live = res_dir.join(&downloaded.file_name);
-    let same_bytes = same_resource_bytes(staged, &live);
-    let same_identity = expected.is_some_and(|old| {
-        old.file_name == downloaded.file_name && old.format == downloaded.format
-    });
-    let apply = !(same_bytes && same_identity) && resource_affects_runtime(config, downloaded);
-    if !same_bytes {
-        std::fs::rename(staged, live).map_err(|error| format!("替换资源文件失败: {error}"))?;
+    if let Some(old) = expected.filter(|old| {
+        old.format == downloaded.format
+            && sanitize_file_stem(&old.file_name) == old.file_name
+            && !RESERVED_RESOURCE_FILE_NAMES.contains(&old.file_name.as_str())
+            && same_resource_bytes(staged, &res_dir.join(&old.file_name))
+    }) {
+        downloaded.file_name.clone_from(&old.file_name);
+        return Ok(false);
     }
+
+    let apply = resource_affects_runtime(config, downloaded);
+    // Publish an already complete file without replacing an older path. A running
+    // Core can watch that path even after its registration has changed in D.
+    let mut file_name = downloaded.file_name.clone();
+    if expected.is_some() {
+        file_name = versioned_resource_file_name(downloaded.format);
+    }
+    loop {
+        match publish_resource_at_unused_path(staged, &res_dir.join(&file_name)) {
+            Ok(()) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                file_name = versioned_resource_file_name(downloaded.format);
+            }
+            Err(error) => return Err(format!("发布规则资源失败: {error}")),
+        }
+    }
+    let _ = std::fs::remove_file(staged);
+    downloaded.file_name = file_name;
     Ok(apply)
+}
+
+fn publish_resource_at_unused_path(staged: &Path, target: &Path) -> std::io::Result<()> {
+    match std::fs::hard_link(staged, target) {
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            // Some user data volumes do not support hard links. The exclusive
+            // destination is still unreferenced until the config writer commits.
+            let mut source = std::fs::File::open(staged)?;
+            let mut output = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(target)?;
+            let result = std::io::copy(&mut source, &mut output).and_then(|_| output.sync_all());
+            drop(output);
+            if result.is_err() {
+                let _ = std::fs::remove_file(target);
+            }
+            result
+        }
+        result => result,
+    }
+}
+
+fn versioned_resource_file_name(format: RuleResourceFormat) -> String {
+    format!("rule-{}.{}", new_uuid(), ext_for(format))
 }
 
 /// Called only inside ConfigManager::update. An absent or changed record is never upserted,
@@ -1454,7 +1490,7 @@ fn publish_download_file(
 fn commit_registered_resource(
     config: &mut Value,
     expected: &RuleResource,
-    downloaded: &RuleResource,
+    downloaded: &mut RuleResource,
     staged: &Path,
     res_dir: &Path,
 ) -> Result<bool, String> {
@@ -1473,8 +1509,8 @@ fn commit_registered_resource(
     {
         return Err("资源在下载期间已变化，旧下载已丢弃，请重试".to_owned());
     }
-    let replacement = serde_json::to_value(downloaded).map_err(|error| error.to_string())?;
     let apply = publish_download_file(config, Some(expected), downloaded, staged, res_dir)?;
+    let replacement = serde_json::to_value(downloaded).map_err(|error| error.to_string())?;
     config["ruleResources"][index] = replacement;
     Ok(apply)
 }
@@ -1483,25 +1519,16 @@ fn persist_registered_resource(
     app: &AppHandle,
     state: &AppRuntime,
     expected: &RuleResource,
-    downloaded: &RuleResource,
+    downloaded: &mut RuleResource,
     staged: &Path,
     broadcast: BroadcastMode<'_>,
 ) -> Result<(), String> {
     let res_dir = state.config().dir().join("rule-resource");
-    match state.config().update(|config| {
-        match commit_registered_resource(config, expected, downloaded, staged, &res_dir) {
-            Ok(apply) => Decision::Write(Ok(apply)),
-            Err(error) => Decision::Skip(Err(error)),
-        }
-    }) {
-        Ok((Ok(apply), Some(config))) => {
-            broadcast.record(app, config, apply);
-            Ok(())
-        }
-        Ok((Err(error), None)) => Err(error),
-        Ok(_) => Err("规则资源更新事务返回非法状态".to_owned()),
-        Err(error) => Err(format!("资源文件已更新，但保存配置失败: {error}")),
-    }
+    let saved = save_resource_change(state, |config| {
+        commit_registered_resource(config, expected, downloaded, staged, &res_dir)
+    })?;
+    broadcast.record(app, saved);
+    Ok(())
 }
 
 /// 同 tag 的手动、后台和 all 更新共用这把锁，覆盖下载、替换与元数据保存。
@@ -1701,16 +1728,13 @@ fn persist_builtin_geo_updated(
     operation: &BuiltinUpdateOperation,
 ) -> Result<(), String> {
     let (staged, live) = paths;
-    match state.config().update(|cfg| {
+    let saved = save_resource_change(state, |cfg| {
         let Some(obj) = cfg.as_object_mut() else {
-            return Decision::Skip(Err("配置不是对象".to_owned()));
+            return Err("配置不是对象".to_owned());
         };
         // The writer also fences deferred cleanup. No live path is touched until
         // admission, and no reset/cleanup can interleave publication and metadata.
-        let apply = match publish_builtin_file(operation, staged, live) {
-            Ok(apply) => apply,
-            Err(error) => return Decision::Skip(Err(error)),
-        };
+        let apply = publish_builtin_file(operation, staged, live)?;
         let meta = obj
             .entry("builtinGeoMeta")
             .or_insert_with(|| json!({}))
@@ -1724,18 +1748,10 @@ fn persist_builtin_geo_updated(
                 json!({ tag: { "updatedAt": updated_at } }),
             );
         }
-        Decision::Write(Ok(apply))
-    }) {
-        Ok((Ok(apply), Some(cfg))) => {
-            broadcast.record(app, cfg, apply);
-            Ok(())
-        }
-        Ok((Err(error), None)) => Err(error),
-        Ok(_) => Err(format!("内置 geo `{tag}` 更新标记事务返回非法状态")),
-        Err(e) => Err(format!(
-            "内置 geo `{tag}` 已更新到盘上，但保存 config 失败（更新标记未落）: {e}"
-        )),
-    }
+        Ok(apply)
+    })?;
+    broadcast.record(app, saved);
+    Ok(())
 }
 
 /// ISO8601 当前时间（上游 `new Date().toISOString()`）。落进 `config.ruleResources[].downloadedAt`
@@ -2322,30 +2338,78 @@ pub enum ProgressMode {
     Silent,
 }
 
-/// Batch publication describes only resources that actually committed.
-#[derive(Default, PartialEq, Eq, Debug)]
-pub(crate) enum ResourceChanges {
-    #[default]
-    None,
-    Refresh,
-    Apply(Value),
+struct ResourceSave {
+    previous: Value,
+    candidate: Value,
+    owner: StagedSaveOwner,
+    apply: bool,
+}
+
+fn save_resource_change(
+    state: &AppRuntime,
+    edit: impl FnOnce(&mut Value) -> Result<bool, String>,
+) -> Result<ResourceSave, String> {
+    let owner = StagedSaveOwner::capture(state.proxy(), 0);
+    let (result, saved, revision) = state
+        .config()
+        .update_with_cleanup_revision(false, |config| {
+            let previous = config.clone();
+            match edit(config) {
+                Ok(apply) => Decision::Write(Ok((previous, apply))),
+                Err(error) => Decision::Skip(Err(error)),
+            }
+        })
+        .map_err(|error| format!("保存规则资源配置失败: {error}"))?;
+    let (previous, apply) = result?;
+    Ok(ResourceSave {
+        previous,
+        candidate: saved.ok_or_else(|| "规则资源更新事务未写入".to_owned())?,
+        owner: StagedSaveOwner { revision, ..owner },
+        apply,
+    })
+}
+
+/// A batch can authorize only its own uninterrupted series of commits.
+#[derive(Default)]
+pub(crate) struct ResourceChanges {
+    saved: bool,
+    apply: Option<ResourceSave>,
 }
 
 impl ResourceChanges {
-    fn record(&mut self, saved: Value, apply: bool) {
-        *self = if apply || matches!(self, Self::Apply(_)) {
-            Self::Apply(saved)
-        } else {
-            Self::Refresh
-        };
+    fn record(&mut self, next: ResourceSave) {
+        self.saved = true;
+        if let Some(prior) = self.apply.as_mut().filter(|prior| {
+            prior.owner.revision.checked_add(1) == Some(next.owner.revision)
+                && prior.owner.generation == next.owner.generation
+                && prior.owner.intent == next.owner.intent
+                && prior.candidate == next.previous
+        }) {
+            prior.candidate = next.candidate;
+            prior.owner = next.owner;
+            return;
+        }
+        self.apply = next.apply.then_some(next);
     }
 
     pub(crate) fn publish(self, app: &AppHandle) {
-        match self {
-            Self::None => {}
-            Self::Refresh => emit_config_changed_signal(app),
-            Self::Apply(saved) => broadcast_config_changed(app, &saved),
+        if !self.saved {
+            return;
         }
+        emit_config_changed_signal(app);
+        let Some(state) = app.try_state::<AppRuntime>() else {
+            return;
+        };
+        let Some(saved) = self.apply else {
+            state.proxy().push_pending_changes();
+            return;
+        };
+        let proxy = state.proxy.clone();
+        tauri::async_runtime::spawn(async move {
+            proxy
+                .apply_staged_save_if_current(saved.previous, saved.candidate, saved.owner, |_| {})
+                .await;
+        });
     }
 }
 
@@ -2355,11 +2419,14 @@ enum BroadcastMode<'a> {
 }
 
 impl BroadcastMode<'_> {
-    fn record(self, app: &AppHandle, config: Value, apply: bool) {
+    fn record(self, app: &AppHandle, saved: ResourceSave) {
         match self {
-            Self::Immediate if apply => broadcast_config_changed(app, &config),
-            Self::Immediate => emit_config_changed_signal(app),
-            Self::Deferred(changes) => changes.record(config, apply),
+            Self::Immediate => {
+                let mut changes = ResourceChanges::default();
+                changes.record(saved);
+                changes.publish(app);
+            }
+            Self::Deferred(changes) => changes.record(saved),
         }
     }
 }

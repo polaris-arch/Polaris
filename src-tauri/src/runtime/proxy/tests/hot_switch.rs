@@ -5291,6 +5291,95 @@ async fn real_core_staged_save_hot_applies_safe_graph_in_the_same_generation() {
         .all(|frame| !frame.pending_apply));
 }
 
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the paired real Core, uses only loopback traffic"]
+async fn real_core_registered_resource_replacement_requires_its_hot_receipt() {
+    let _real_core_guard = lock_real_core_tests().await;
+    let (rt, _dir, _core, _cleanup) = real_core_runtime();
+    let res_dir = rt.config.dir().join("rule-resource");
+    std::fs::create_dir_all(&res_dir).unwrap();
+    let old = br#"{"version":3,"rules":[{"ip_cidr":["192.0.2.1/32"]}]}"#;
+    let new = br#"{"version":3,"rules":[{"ip_cidr":["192.0.2.2/32"]}]}"#;
+    std::fs::write(res_dir.join("previous.json"), old).unwrap();
+    let mixed = free_port();
+    let (port_a, _, serve_a) = controlled_socks_http_listener("old-source".into()).await;
+    let (port_b, _, serve_b) = controlled_socks_http_listener("new-source".into()).await;
+    let mut servers = tokio::task::JoinSet::new();
+    servers.spawn(serve_a);
+    servers.spawn(serve_b);
+    let mut initial = two_node_config_ports(mixed, "node-b", port_a, port_b);
+    initial["servers"] = serde_json::json!([
+        { "id": "node-a", "name": "Node A", "protocol": "socks", "address": "127.0.0.1", "port": port_a },
+        { "id": "node-b", "name": "Node B", "protocol": "socks", "address": "127.0.0.1", "port": port_b },
+    ]);
+    initial["singboxDashboard"] = false.into();
+    initial["proxyMode"] = "smart".into();
+    initial["ruleResources"] = serde_json::json!([{
+        "id": "fixture", "name": "Fixture", "category": "custom",
+        "sourceUrl": "https://example.invalid/fixture.json", "fileName": "previous.json",
+        "format": "source", "size": old.len(), "downloadedAt": "previous",
+    }]);
+    initial["trafficRules"] = serde_json::json!([
+        {
+            "id": "fixture-rule", "type": "ruleSet", "values": ["res:fixture"],
+            "action": "proxy", "enabled": true, "targetServerId": "node-a",
+        },
+        {
+            "id": "fixture-fallback", "type": "ipCidr", "values": ["192.0.2.1/32"],
+            "action": "proxy", "enabled": true, "targetServerId": "node-b",
+        },
+    ]);
+    rt.config.save_full(&initial).unwrap();
+    let before = rt.config.current().unwrap();
+    let started = rt.start(before.clone()).await.expect("start paired Core");
+    let generation = rt.core_generation();
+    let status = || async {
+        rt.management_api()
+            .await
+            .rule_set_status(vec!["local-rs-fixture".into()])
+            .await
+            .expect("read exact Core rule set")
+            .rule_sets[0]
+            .clone()
+    };
+    let observed_before = status().await;
+    assert!(controlled_http_request(mixed, "before")
+        .await
+        .ends_with("old-source"));
+
+    std::fs::write(res_dir.join("next.json"), new).unwrap();
+    let mut candidate = before.clone();
+    candidate["ruleResources"][0]["fileName"] = "next.json".into();
+    rt.config.save_full(&candidate).unwrap();
+    let candidate = rt.config.current().unwrap();
+    assert!(rt.pending_changes().pending_apply);
+    assert_eq!(status().await, observed_before);
+    assert!(controlled_http_request(mixed, "saved")
+        .await
+        .ends_with("old-source"));
+    let owner = crate::runtime::proxy::runtime_config::StagedSaveOwner::capture(
+        &rt,
+        rt.config.saved_revision(),
+    );
+    let receipt = rt
+        .apply_staged_save_if_current(before, candidate.clone(), owner, |_| {})
+        .await
+        .expect("Core must receipt the exact source replacement");
+    assert_eq!(receipt.status, "hotApplied");
+    assert_eq!(receipt.core_state, Some("committed"));
+    assert_eq!(receipt.configuration_durable, Some(true));
+    assert_eq!(receipt.runtime_generation, Some(generation));
+    assert_eq!(rt.status().pid, started.pid);
+    assert_eq!(rt.current_config_snapshot(), Some(candidate));
+    assert!(!rt.pending_changes().pending_apply);
+    assert_eq!(status().await.watcher_state, "inline");
+    assert_eq!(std::fs::read(res_dir.join("previous.json")).unwrap(), old);
+    assert!(controlled_http_request(mixed, "applied")
+        .await
+        .ends_with("new-source"));
+    rt.stop().await.expect("stop paired Core");
+}
+
 /// 真核回归：自动故障治理走它自己的零重启事务，真实 gRPC PUT + groups 首帧回读均成功；同时
 /// D 中已保存未 Apply 的结构字段不得进入 R。节点只拨本机监听器，不接管宿主网络。
 #[tokio::test(flavor = "multi_thread")]

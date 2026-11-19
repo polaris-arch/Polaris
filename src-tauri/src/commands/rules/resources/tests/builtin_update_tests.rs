@@ -301,7 +301,7 @@ fn reset_and_publish_share_writer_fence_and_capture_precedes_queue() {
     assert!(!update.contains("std::fs::rename"));
     let persist = top_level_fn_body(&src, "fn persist_builtin_geo_updated(");
     assert!(
-        persist.find("state.config().update(|cfg|").unwrap()
+        persist.find("save_resource_change(state, |cfg|").unwrap()
             < persist.find("publish_builtin_file(").unwrap()
     );
     assert!(

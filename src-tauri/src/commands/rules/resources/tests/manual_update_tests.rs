@@ -102,7 +102,7 @@ fn registered_fixture() -> (TestDir, ConfigManager, RuleResource) {
 fn guarded_test_commit(
     manager: &ConfigManager,
     expected: &RuleResource,
-    downloaded: &RuleResource,
+    downloaded: &mut RuleResource,
     staged: &Path,
     res_dir: &Path,
 ) -> Result<(), String> {
@@ -193,7 +193,7 @@ async fn delayed_registered_refresh_cannot_resurrect_deleted_or_changed_resource
 }
 
 #[tokio::test]
-async fn unchanged_registered_refresh_commits_before_done_and_rejects_older_metadata() {
+async fn changed_registered_refresh_publishes_new_path_before_done_and_rejects_older_metadata() {
     let (dir, manager, resource) = registered_fixture();
     let res_dir = dir.path().join("rule-resource");
     let plan = plan_from_resource(&resource);
@@ -249,11 +249,16 @@ async fn unchanged_registered_refresh_commits_before_done_and_rejects_older_meta
             guarded_test_commit(&manager, &resource, downloaded, staged, &res_dir)?;
             assert_eq!(
                 std::fs::read(res_dir.join(&resource.file_name)).unwrap(),
+                EMPTY_SRS_V2
+            );
+            assert_ne!(downloaded.file_name, resource.file_name);
+            assert_eq!(
+                std::fs::read(res_dir.join(&downloaded.file_name)).unwrap(),
                 EMPTY_SRS_V1
             );
             assert_eq!(
-                manager.load_full().unwrap()["ruleResources"][0]["downloadedAt"],
-                downloaded.downloaded_at
+                manager.load_full().unwrap()["ruleResources"][0],
+                json!(downloaded)
             );
             Ok(())
         },
@@ -274,15 +279,17 @@ async fn unchanged_registered_refresh_commits_before_done_and_rejects_older_meta
     // A second response that captured the original record cannot replace the newer commit.
     let stale = res_dir.join("late.srs");
     std::fs::write(&stale, b"SRS-late").unwrap();
-    assert!(guarded_test_commit(&manager, &resource, &resource, &stale, &res_dir).is_err());
+    assert!(
+        guarded_test_commit(&manager, &resource, &mut resource.clone(), &stale, &res_dir).is_err()
+    );
     assert_eq!(
         std::fs::read(res_dir.join(&resource.file_name)).unwrap(),
-        EMPTY_SRS_V1
+        EMPTY_SRS_V2
     );
 }
 
 #[tokio::test]
-async fn registered_refresh_rename_failure_never_reports_done_or_changes_metadata() {
+async fn registered_refresh_publish_failure_never_reports_done_or_changes_metadata() {
     let (dir, manager, resource) = registered_fixture();
     let res_dir = dir.path().join("rule-resource");
     let live = res_dir.join(&resource.file_name);
@@ -300,7 +307,10 @@ async fn registered_refresh_rename_failure_never_reports_done_or_changes_metadat
         &ResourcePublicLookup,
         &plan,
         &res_dir,
-        |downloaded, staged| guarded_test_commit(&manager, &resource, downloaded, staged, &res_dir),
+        |downloaded, staged| {
+            std::fs::remove_file(staged).unwrap();
+            guarded_test_commit(&manager, &resource, downloaded, staged, &res_dir)
+        },
     )
     .await;
     assert!(matches!(outcome, DownloadOutcome::Failed { .. }));
@@ -364,9 +374,11 @@ fn registered_refresh_paths_share_staged_transaction_commit_instead_of_upsert() 
     }
     let persist = top_level_fn_body(&code, "fn persist_registered_resource(");
     assert!(
-        persist.find("state.config().update(").unwrap()
+        persist.find("save_resource_change(").unwrap()
             < persist.find("commit_registered_resource(").unwrap()
     );
+    let save = top_level_fn_body(&code, "fn save_resource_change(");
+    assert!(save.contains(".update_with_cleanup_revision("));
     let delete = top_level_fn_body(&code, "pub fn rule_resources_delete(");
     assert!(
         delete.find("return Decision::Skip(plan)").unwrap()
@@ -376,7 +388,7 @@ fn registered_refresh_paths_share_staged_transaction_commit_instead_of_upsert() 
 }
 
 #[test]
-fn only_changed_runtime_resources_request_apply_and_batches_keep_the_last_commit() {
+fn only_changed_runtime_resources_request_apply() {
     let (dir, manager, resource) = registered_fixture();
     let mut config = manager.load_full().unwrap();
     let res_dir = dir.path().join("rule-resource");
@@ -384,8 +396,6 @@ fn only_changed_runtime_resources_request_apply_and_batches_keep_the_last_commit
     let stage = res_dir.join("fixture.srs");
     let mut downloaded = resource.clone();
     downloaded.downloaded_at = "after".into();
-    let mut batch = ResourceChanges::default();
-    assert_eq!(batch, ResourceChanges::None);
 
     let rule = json!({
         "id": "active", "type": "ruleSet", "values": [format!("res:{}", resource.id)],
@@ -395,15 +405,15 @@ fn only_changed_runtime_resources_request_apply_and_batches_keep_the_last_commit
     config["trafficRules"] = json!([rule]);
     std::fs::write(&stage, EMPTY_SRS_V2).unwrap();
     let apply =
-        commit_registered_resource(&mut config, &resource, &downloaded, &stage, &res_dir).unwrap();
+        commit_registered_resource(&mut config, &resource, &mut downloaded, &stage, &res_dir)
+            .unwrap();
     assert!(!apply);
     assert!(
         stage.is_file(),
         "equal content must not replace the live file"
     );
     assert_eq!(config["ruleResources"][0]["downloadedAt"], "after");
-    batch.record(config.clone(), apply);
-    assert_eq!(batch, ResourceChanges::Refresh);
+    assert_eq!(downloaded.file_name, resource.file_name);
 
     config["proxyMode"] = json!("global");
     assert!(!resource_affects_runtime(&config, &resource));
@@ -412,12 +422,16 @@ fn only_changed_runtime_resources_request_apply_and_batches_keep_the_last_commit
     assert!(!resource_affects_runtime(&config, &resource));
     config["trafficRules"][0]["enabled"] = json!(true);
     std::fs::write(&stage, EMPTY_SRS_V1).unwrap();
+    let mut next = downloaded.clone();
     let apply =
-        commit_registered_resource(&mut config, &downloaded, &resource, &stage, &res_dir).unwrap();
+        commit_registered_resource(&mut config, &downloaded, &mut next, &stage, &res_dir).unwrap();
     assert!(apply);
-    assert_eq!(std::fs::read(&live).unwrap(), EMPTY_SRS_V1);
-    batch.record(config.clone(), apply);
-    assert_eq!(batch, ResourceChanges::Apply(config.clone()));
+    assert_eq!(std::fs::read(&live).unwrap(), EMPTY_SRS_V2);
+    assert_ne!(next.file_name, downloaded.file_name);
+    assert_eq!(
+        std::fs::read(res_dir.join(&next.file_name)).unwrap(),
+        EMPTY_SRS_V1
+    );
 
     config["proxyMode"] = json!("direct");
     config["dnsRules"] = json!([{
@@ -426,8 +440,40 @@ fn only_changed_runtime_resources_request_apply_and_batches_keep_the_last_commit
         "effects": {"dns": {"resolver": "direct", "answerMode": "real"}}, "enabled": true,
     }]);
     assert!(resource_affects_runtime(&config, &resource));
-    batch.record(config.clone(), false);
-    assert_eq!(batch, ResourceChanges::Apply(config));
+}
+
+#[test]
+fn resource_apply_batch_only_spans_its_own_contiguous_commits() {
+    let save = |before: &str, after: &str, revision, intent, apply| ResourceSave {
+        previous: json!({"source": before}),
+        candidate: json!({"source": after}),
+        owner: StagedSaveOwner {
+            generation: 1,
+            intent,
+            revision,
+        },
+        apply,
+    };
+    let mut batch = ResourceChanges::default();
+    batch.record(save("original", "metadata", 1, 0, false));
+    assert!(batch.saved);
+    assert!(batch.apply.is_none());
+
+    batch.record(save("metadata", "new source", 2, 0, true));
+    batch.record(save("new source", "fresh metadata", 3, 0, false));
+    let combined = batch.apply.as_ref().unwrap();
+    assert_eq!(combined.previous, json!({"source": "metadata"}));
+    assert_eq!(combined.candidate, json!({"source": "fresh metadata"}));
+    assert_eq!(combined.owner.revision, 3);
+
+    // An external write can save the same bytes with a different revision.
+    batch.record(save("fresh metadata", "later source", 5, 0, true));
+    assert_eq!(
+        batch.apply.as_ref().unwrap().previous,
+        json!({"source": "fresh metadata"})
+    );
+    batch.record(save("later source", "later metadata", 6, 1, false));
+    assert!(batch.apply.is_none());
 }
 
 #[test]
