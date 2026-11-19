@@ -128,6 +128,7 @@ describe('接线：主窗里的配置事务必须都在闸门内', () => {
       'lib/auto-select-actions.ts',
       'store/app-store.ts',
       'store/staged-config-store.ts',
+      'tray/TrayMenu.tsx',
     ]);
     const tray = stripComments(readFileSync(join(SRC, 'tray/TrayMenu.tsx'), 'utf8'));
     expect(tray).toContain('await api.config.updateMode(mode)');
@@ -142,7 +143,7 @@ describe('接线：主窗里的配置事务必须都在闸门内', () => {
     // Tray delegates to the single locked switch/readback implementation.
     expect(tray).toContain('useAppStore.getState().switchServer(id)');
     expect(tray).not.toContain('api.server.switch(');
-    expect((tray.match(/withConfigWriteLock\((?:async )?\(\) =>/g) ?? []).length).toBe(0);
+    expect((tray.match(/withConfigWriteLock\((?:async )?\(\) =>/g) ?? []).length).toBe(1);
   });
 
   it('mutation entry is in the actual locked callback; moving it outside or nesting a lock fails', () => {

@@ -168,6 +168,7 @@ async fn save_tailscale_login_profile(
         Ok(HotConfigEditOutcome::Saved {
             runtime_apply,
             revision,
+            ..
         }) => {
             let ready = match runtime_apply {
                 Some(receipt) => {

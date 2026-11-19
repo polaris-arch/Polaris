@@ -607,7 +607,7 @@ export interface StagedClassification {
  * `baseVersion` 是整份保存的必填事务基准；缺失时后端 fail-closed。即时设置不走本联合，改用原子 patch。
  */
 export type SaveOutcome =
-  | { status: 'saved'; version: string; config: UserConfig; runtimeApply?: PendingApplyResult }
+  | { status: 'saved'; version: string; config: UserConfig; runtimeApply?: PendingApplyResult; savedOffline?: boolean }
   | { status: 'needsManual'; restartRequired?: boolean; reasons?: PendingApplyResult['reasons'] }
   | { status: 'blockedByPending' | 'retryable' | 'rejected' }
   | { status: 'conflict'; diskVersion: string };

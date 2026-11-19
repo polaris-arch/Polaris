@@ -377,6 +377,8 @@ pub enum SaveOutcome {
         config: Value,
         #[serde(rename = "runtimeApply", skip_serializing_if = "Option::is_none")]
         runtime_apply: Option<Value>,
+        #[serde(rename = "savedOffline", skip_serializing_if = "std::ops::Not::not")]
+        saved_offline: bool,
     },
     /// 磁盘现值 ≠ `base_version` ⇒ **一个字节都没写**。`diskVersion` 供前端定位它该基于哪一版重放。
     #[serde(rename_all = "camelCase")]
@@ -555,6 +557,7 @@ async fn config_save_hot_only(
         Ok(HotConfigEditOutcome::Saved {
             runtime_apply,
             revision,
+            saved_offline,
         }) => {
             if edit.previous != edit.candidate {
                 log_invalidated_validators(invalidated);
@@ -580,6 +583,7 @@ async fn config_save_hot_only(
                 version: config_content_hash(&frontend),
                 config: frontend,
                 runtime_apply: runtime_apply.and_then(|receipt| serde_json::to_value(receipt).ok()),
+                saved_offline: saved_offline && config.saved_revision() == revision,
             })
         }
         Err(error @ polaris_store::StoreError::CommitUncertain(_)) => {
@@ -1137,6 +1141,7 @@ fn config_save_core(
                     version: config_version(&saved),
                     config: frontend,
                     runtime_apply: None,
+                    saved_offline: false,
                 },
                 Some(CommittedSave { previous, revision }),
             ))

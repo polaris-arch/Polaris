@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it, vi } from 'vitest';
+import { withConfigWriteLock } from '../lib/config-write-lock';
 
 // Execute the real production handler body, with boundary services supplied as
 // fixtures. No rewritten test implementation of the tray transaction.
@@ -26,27 +27,55 @@ describe('UIP03 stale tray snapshot cannot roll back concurrent DNS edits', () =
 });
 
 describe('tray proxy mode feedback', () => {
-  it.each([
-    [{ status: 'saved' }, 'tray.modeGlobal'],
-    [{ status: 'saved', runtimeApply: { status: 'hotApplied', configurationDurable: true } }, 'tray.modeGlobal'],
-    [{ status: 'saved', runtimeApply: { status: 'pending', pendingApply: true } }, 'tray.manageInMain'],
-    [{ status: 'needsManual' }, 'tray.manageInMain'],
-  ])('shows the result for %o', async (outcome, expected) => {
-    const modeStart = source.indexOf('  const setMode = async (mode: ProxyMode) => {');
-    const modeEnd = source.indexOf('\n  };', modeStart);
-    if (modeStart < 0 || modeEnd < 0) throw new Error('Tray mode handler extraction failed');
-    const modeHandler = source.slice(modeStart, modeEnd + '\n  };'.length).replace('(mode: ProxyMode)', '(mode)');
-    const api = { config: { updateMode: vi.fn(async () => outcome) } };
+  const modeStart = source.indexOf('  const setMode = async (mode: ProxyMode) => {');
+  const modeEnd = source.indexOf('\n  };', modeStart);
+  if (modeStart < 0 || modeEnd < 0) throw new Error('Tray mode handler extraction failed');
+  const modeHandler = source.slice(modeStart, modeEnd + '\n  };'.length).replace('(mode: ProxyMode)', '(mode)');
+  const make = new Function(
+    'api', 'trayLifecycle', 'interactionEpoch', 'mounted', 'interactionActive', 'modeIntent',
+    'withConfigWriteLock', 'setNotice', 'MODES', 'noticeActionFailure', 't',
+    `${modeHandler}\nreturn setMode;`,
+  );
+  const modeFixture = (updateMode: (mode: string) => Promise<unknown>) => {
     const setNotice = vi.fn();
-    const make = new Function(
-      'api', 'config', 'trayLifecycle', 'interactionEpoch', 'mounted', 'interactionActive',
-      'setNotice', 'MODES', 'noticeActionFailure', 't', `${modeHandler}\nreturn setMode;`,
-    );
     const change = make(
-      api, { proxyMode: 'smart' }, { current: 1 }, { current: 1 }, { current: true }, { current: true },
-      setNotice, [{ v: 'global', k: 'tray.modeGlobal' }], vi.fn(), (key: string) => key,
+      { config: { updateMode } }, { current: 1 }, { current: 1 }, { current: true }, { current: true },
+      { current: 0 }, withConfigWriteLock, setNotice,
+      [{ v: 'global', k: 'tray.modeGlobal' }, { v: 'smart', k: 'tray.modeSmart' }],
+      vi.fn(), (key: string) => key,
     );
+    return { change, setNotice };
+  };
+
+  it.each([
+    [{ status: 'saved', savedOffline: true }, [['tray.modeGlobal']]],
+    [{ status: 'saved' }, []],
+    [{ status: 'saved', runtimeApply: { status: 'hotApplied', configurationDurable: true } }, [['tray.modeGlobal']]],
+    [{ status: 'saved', runtimeApply: { status: 'hotApplied', configurationDurable: false } }, []],
+    [{ status: 'saved', runtimeApply: { status: 'pending', pendingApply: true } }, [['tray.manageInMain']]],
+    [{ status: 'needsManual' }, [['tray.manageInMain']]],
+  ])('shows the result for %o', async (outcome, expected) => {
+    const { change, setNotice } = modeFixture(async () => outcome);
     await change('global');
-    expect(setNotice.mock.calls).toEqual([[expected]]);
+    expect(setNotice.mock.calls).toEqual(expected);
+  });
+
+  it('saves a reversal after the in-flight mode without showing the older result', async () => {
+    let finishFirst!: () => void;
+    const firstReceipt = new Promise<void>((resolve) => { finishFirst = resolve; });
+    const updateMode = vi.fn(async (mode: string) => {
+      if (mode === 'global') await firstReceipt;
+      return { status: 'saved', savedOffline: true };
+    });
+    const { change, setNotice } = modeFixture(updateMode);
+    const first = change('global');
+    await Promise.resolve();
+    expect(updateMode.mock.calls).toEqual([['global']]);
+    const second = change('smart');
+    expect(updateMode.mock.calls).toEqual([['global']]);
+    finishFirst();
+    await Promise.all([first, second]);
+    expect(updateMode.mock.calls).toEqual([['global'], ['smart']]);
+    expect(setNotice.mock.calls).toEqual([['tray.modeSmart']]);
   });
 });

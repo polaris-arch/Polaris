@@ -723,6 +723,7 @@ pub(crate) enum HotConfigEditOutcome {
     Saved {
         runtime_apply: Option<RuntimeApplyResult>,
         revision: u64,
+        saved_offline: bool,
     },
     NeedsManual {
         restart_required: bool,
@@ -1964,6 +1965,7 @@ impl ProxyRuntime {
                 Some(revision) => HotConfigEditOutcome::Saved {
                     runtime_apply: None,
                     revision,
+                    saved_offline: !unchanged,
                 },
                 None => not_committed(HotConfigEditOutcome::Retryable),
             });
@@ -2059,6 +2061,7 @@ impl ProxyRuntime {
         Ok(HotConfigEditOutcome::Saved {
             runtime_apply,
             revision,
+            saved_offline: false,
         })
     }
 

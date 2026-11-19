@@ -6,6 +6,7 @@ import { MeasurementLabel } from '@/mobile/MeasurementLabel';
 import { useAppStore, acquireConfigSync, refreshConfig } from '@/store/app-store';
 import { autoSelectT } from './auto-select-labels';
 import { AutoSelectControls } from '@/mobile/AutoSelectControls';
+import { withConfigWriteLock } from '@/lib/config-write-lock';
 /**
  * 托盘自绘浮层 UI（原型 `.tray-menu` L2905-2963 移植）——**真实接线，无假 UI**。
  *
@@ -194,6 +195,7 @@ export default function TrayMenu() {
   // 浮层内的一次性提示行（浮层无 toast 层、无 dialog 层 —— 这是它唯一的可回显表面）。
   // 用于：测速集为空、检查更新的"已是最新/失败"、切 TUN 自动开 FakeIP 的告知。
   const [notice, setNotice] = useState('');
+  const modeIntent = useRef(0);
   // 「检查更新」在飞（互斥闸：连点会并发发多次 GitHub 请求）。
   const [checking, setChecking] = useState(false);
   // 检查结果属于「检查更新」这一行自身，不进上方 tray-note：提示条会改变自然高，受平台高度上限
@@ -557,27 +559,31 @@ export default function TrayMenu() {
   // 每点一次就收起会逼用户反复唤出托盘。射程与原型逐条对齐：只有「选节点」关。
   const setMode = async (mode: ProxyMode) => {
     const life = trayLifecycle.current, operation = interactionEpoch.current;
-    if (mode === config?.proxyMode) return;
-    try {
-      const result = await api.config.updateMode(mode);
-      if (!mounted.current || !interactionActive.current || life !== trayLifecycle.current || operation !== interactionEpoch.current) return;
-      if (result.status === 'needsManual' || result.status === 'blockedByPending') {
-        setNotice(t('tray.manageInMain'));
-      } else if (result.status !== 'saved') {
-        noticeActionFailure(t('tray.groupMode'), result.status);
-      } else if (result.runtimeApply?.pendingApply) {
-        setNotice(t('tray.manageInMain'));
-      } else if (
-        !result.runtimeApply
-        || (result.runtimeApply.status === 'hotApplied' && result.runtimeApply.configurationDurable === true)
-      ) {
-        const label = MODES.find((option) => option.v === mode);
-        if (label) setNotice(t(label.k));
+    const intent = ++modeIntent.current;
+    const current = () => mounted.current && interactionActive.current && life === trayLifecycle.current
+      && operation === interactionEpoch.current && intent === modeIntent.current;
+    return withConfigWriteLock(async () => {
+      if (!current()) return;
+      try {
+        const result = await api.config.updateMode(mode);
+        if (!current()) return;
+        if (result.status === 'needsManual' || result.status === 'blockedByPending') {
+          setNotice(t('tray.manageInMain'));
+        } else if (result.status !== 'saved') {
+          noticeActionFailure(t('tray.groupMode'), result.status);
+        } else if (result.runtimeApply?.pendingApply) {
+          setNotice(t('tray.manageInMain'));
+        } else if (
+          result.savedOffline
+          || (result.runtimeApply?.status === 'hotApplied' && result.runtimeApply.configurationDurable === true)
+        ) {
+          const label = MODES.find((option) => option.v === mode);
+          if (label) setNotice(t(label.k));
+        }
+      } catch (error) {
+        if (current()) noticeActionFailure(t('tray.groupMode'), error);
       }
-    } catch (err) {
-      if (mounted.current && interactionActive.current && life === trayLifecycle.current && operation === interactionEpoch.current) noticeActionFailure(t('tray.groupMode'), err);
-      return; // 失败保持浮层开着（W14），成功才落到下面的正常路径
-    }
+    });
   };
 
   // 与首页复用后端最新配置事务；只发送用户选择的mode，不发送托盘旧DNS快照。
