@@ -17,8 +17,8 @@ import { MOBILE_FIELD_HINT_SUMMARIES } from './FormFields';
  *  · `FormSheet` —— 外壳：换成探针，抓 `onSubmit`，并把 children 原样画出来；
  *  · `FormGroup` —— 折叠段：恒展开（本仓 vitest 是 `environment:'node'`、点不了组头；
  *    被验的是组里的字段，不是折叠这件事 —— 折叠另有 `reveal.test.ts` 与各屏门）；
- *  · `@/ipc` 的节点写入与写后 `config.get` —— 同一 backend fixture 保存并返回完整新快照，
- *    被验的是「**交给它什么**」与真 store 的写后刷新；
+ *  · `@/ipc` 的配置读写 —— 同一 backend fixture 保存并返回完整新快照，
+ *    被验的是交给 native admission 的节点与 store 收到的保存结果；
  *  · `protoCodec[*].fromConfig` —— **只在 ⑥-c 一条里**叠一层草稿补丁，模拟「用户在扩展 JSON 里删掉了
  *    一个键」（SSR 下无法真的输入）。`toConfig` 与面板的装配逻辑全是真身；⑥-c 还带一条正面对照
  *    证明补丁真的打上了（不打补丁时那个键**应当**被保留）。
@@ -33,6 +33,7 @@ import i18n, { i18nReady } from '@/i18n';
 import { PROTO_OPTIONS, allFields, nodeFormGroups, type NodeProto } from '@/components/dialogs/node-spec';
 import { draftFromSpecs } from '@/components/dialogs/field-spec';
 import { isAddresslessProtocol } from '@/domain/server-completeness';
+import { configBaseVersion } from '@/lib/staged-config';
 import { useAppStore } from '@/store/app-store';
 import { useStagedConfigStore } from '@/store/staged-config-store';
 
@@ -55,6 +56,7 @@ const probe = vi.hoisted(() => ({
   update: [] as unknown[],
   backend: null as UserConfig | null,
   get: vi.fn<() => Promise<UserConfig>>(),
+  save: vi.fn<typeof import('@/ipc').api.config.save>(),
 }));
 
 vi.mock('./FormSheet', () => ({
@@ -79,7 +81,7 @@ vi.mock('@/ipc', async (importOriginal) => {
     ...real,
     api: {
       ...real.api,
-      config: { ...real.api.config, get: probe.get },
+      config: { ...real.api.config, get: probe.get, save: probe.save },
       server: {
         ...real.api.server,
         add: (s: unknown): Promise<void> => {
@@ -138,9 +140,13 @@ function reset(): void {
     if (!probe.backend) throw Error('backend fixture not seeded');
     return probe.backend;
   });
+  probe.save.mockReset().mockImplementation(async (config) => {
+    probe.backend = config;
+    return { status: 'saved', config, version: configBaseVersion(config) };
+  });
   useMobileFormStore.getState().closeAll();
-  useStagedConfigStore.setState({ entries: [] });
-  useAppStore.setState({ servers: [], config: null });
+  useStagedConfigStore.setState({ enabled: true, entries: [], latestSavedConfig: null, savedRuntimeApply: null });
+  useAppStore.setState({ servers: [], config: null, proxyStatus: { running: false }, proxyStarting: false, proxyStopping: false });
   mirror();
 }
 
@@ -162,6 +168,7 @@ const renderNew = (proto: NodeProto): string =>
 const renderEdit = (base: ServerConfig): string => {
   probe.backend = { ...probe.backend!, servers: [base] };
   useAppStore.setState({ config: probe.backend });
+  useStagedConfigStore.setState({ latestSavedConfig: probe.backend });
   expect(useAppStore.getState().servers).toEqual([base]);
   mirror();
   return renderToStaticMarkup(<NodeFormPanel instanceId="nf-edit" serverId={base.id} />);
@@ -379,22 +386,29 @@ describe('⑥ 提交：抓住真的提交闭包，看写出去的 ServerConfig',
     } as ServerConfig);
     expect(probe.update, '不合法的 Tailcat 节点被写出去了 —— store 会把它静默丢掉').toEqual([]);
     expect(probe.add).toEqual([]);
+    expect(probe.save).not.toHaveBeenCalled();
   });
 
   it('a′. 正面对照：合法 Tailcat 节点照常写出；无地址协议写空地址 + 0 端口', async () => {
-    await submitEdit({
+    const base = {
       id: 'tc-ok', name: 'tc', protocol: 'tailcat', address: 'stale.example', port: 443,
       tailcatSettings: { serverPublicKey: KEY('A'), serverDiscoKey: KEY('B'), derpRegion: 1 },
-    } as ServerConfig);
-    expect(probe.update).toHaveLength(1);
-    const out = probe.update[0] as ServerConfig;
+    } as ServerConfig;
+    await submitEdit(base);
+    expect(probe.save).toHaveBeenCalledTimes(1);
+    const [config, staged, version, autoApply, hotOnly] = probe.save.mock.calls[0];
+    expect([staged, version, autoApply, hotOnly]).toEqual([
+      true, configBaseVersion({ ...probe.backend!, servers: [base] }), true, true,
+    ]);
+    expect(probe.update).toEqual([]);
+    const out = config.servers[0];
     expect(out.address).toBe('');
     expect(out.port).toBe(0);
     expect(out.tailcatSettings?.serverPublicKey).toBe(KEY('A'));
     expect(probe.get).toHaveBeenCalledTimes(1);
     expect(probe.backend?.servers).toEqual([out]);
-    expect(useAppStore.getState().config).toBe(probe.backend);
-    expect(useAppStore.getState().servers).toEqual([out]);
+    expect(useStagedConfigStore.getState().latestSavedConfig).toBe(probe.backend);
+    expect(useStagedConfigStore.getState().savedRuntimeApply).toBeNull();
   });
 
   const TOR_BASE = {
@@ -402,18 +416,18 @@ describe('⑥ 提交：抓住真的提交闭包，看写出去的 ServerConfig',
     torSettings: { executablePath: '/usr/bin/tor', drop_me: 'd', keep_me: 'k', username: 'x' },
   } as unknown as ServerConfig;
   const torOut = (): Record<string, unknown> =>
-    (probe.update[0] as unknown as { torSettings: Record<string, unknown> }).torSettings;
+    probe.save.mock.calls[0][0].servers[0].torSettings as unknown as Record<string, unknown>;
 
   it('b. 正面对照：不动扩展 JSON 时，袋键原样保留（证明下一条的补丁是唯一变量）', async () => {
     await submitEdit(TOR_BASE);
-    expect(probe.update).toHaveLength(1);
+    expect(probe.save).toHaveBeenCalledTimes(1);
     expect(torOut()).toMatchObject({ drop_me: 'd', keep_me: 'k', username: 'x' });
   });
 
   it('c. 🔴 modeledOf：扩展 JSON 里删掉的键，保存后不从已存节点复活', async () => {
     probe.draftPatch = { extraJson: JSON.stringify({ keep_me: 'k' }) };
     await submitEdit(TOR_BASE);
-    expect(probe.update).toHaveLength(1);
+    expect(probe.save).toHaveBeenCalledTimes(1);
     const out = torOut();
     expect(out, '删掉的袋键从已存节点复活了').not.toHaveProperty('drop_me');
     expect(out.keep_me).toBe('k');

@@ -329,17 +329,16 @@ it('independent: does not use pre-await direct route after the core starts', asy
   expect(ipc.add).not.toHaveBeenCalled();
 });
 
-it.each(['stopping', 'entries'] as const)('rechecks staging after %s changes during admission', async change => {
+it('rechecks the feature switch during regex validation while the renderer reports stopped', async () => {
   let resolve!: (v: boolean[]) => void;
   ipc.validateRegex.mockImplementationOnce(() => new Promise<boolean[]>(yes => { resolve = yes; }));
   ipc.add.mockClear();
-  useStagedConfigStore.setState({ enabled: true, entries: [] });
-  useAppStore.setState({ proxyStarting: false, proxyStopping: false, proxyStatus: undefined });
+  useStagedConfigStore.setState({ enabled: false, entries: [] });
+  useAppStore.setState({ proxyStarting: false, proxyStopping: false, proxyStatus: { running: false } });
   const close = vi.fn();
   const request = args({ stagingEnabled: false, conds: [{ t: 'domainRegex', v: 'example' }], close });
   const operation = submitRule(request.a);
-  if (change === 'stopping') useAppStore.setState({ proxyStopping: true });
-  else useStagedConfigStore.setState({ entries: [{ id: 'other', kind: 'rule', label: 'other', entityPath: ['trafficRules', 'other'], nextValue: base }] });
+  useStagedConfigStore.setState({ enabled: true });
   resolve([true]);
   await operation;
   expect(ipc.add).not.toHaveBeenCalled();

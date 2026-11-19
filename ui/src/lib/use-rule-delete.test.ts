@@ -9,6 +9,7 @@ import { createRoot } from 'react-dom/client';
 import { useRuleDelete } from '/src/lib/use-rule-delete';
 import { useAppStore } from '/src/store/app-store';
 import { useStagedConfigStore } from '/src/store/staged-config-store';
+import { configBaseVersion } from '/src/lib/staged-config';
 import { api } from '/src/ipc';
 import i18n, { i18nReady } from '/src/i18n';
 await i18nReady; await i18n.changeLanguage('en-US');
@@ -16,13 +17,24 @@ const plane = new URLSearchParams(location.search).get('plane') === 'dns' ? 'dns
 const collection = plane === 'dns' ? 'dnsRules' : 'trafficRules';
 const rule = { id:'r',type:'domain',values:['a.example'],action:'proxy',enabled:true };
 const config = { servers:[], trafficRules: plane==='route'?[rule]:[], dnsRules: plane==='dns'?[rule]:[] };
-const test = window.__n1 = { calls: [], rule, plane, entries: () => useStagedConfigStore.getState().entries };
+const test = window.__n1 = { calls: [], saves: [], rule, plane, entries: () => useStagedConfigStore.getState().entries };
 api.rules.delete = async (...args) => { test.calls.push(args); };
+api.config.get = async () => config;
+api.config.save = async (...args) => {
+  test.saves.push(args);
+  return { status: 'saved', config: args[0], version: configBaseVersion(args[0]) };
+};
 api.config.setStagedPending = async () => {};
 useAppStore.setState({ config, rules:config.trafficRules, dnsRules:config.dnsRules, loadConfig: async () => {} });
 useStagedConfigStore.setState({enabled:false, entries:[], baseline:config});
 test.change = () => useAppStore.setState(plane==='dns'?{dnsRules:[{...rule,remarks:'changed'}]}:{rules:[{...rule,remarks:'changed'}]});
 test.staged = () => { useAppStore.setState({proxyStatus:{running:true}}); useStagedConfigStore.setState({enabled:true}); };
+test.cold = () => {
+  useAppStore.setState({proxyStatus:{running:false},proxyStarting:false,proxyStopping:false});
+  useStagedConfigStore.setState({enabled:true,latestSavedConfig:config});
+};
+test.expectedColdSave = () => [{ ...config, [collection]: [] }, true, configBaseVersion(config), true, true];
+test.savedRuntimeApply = () => useStagedConfigStore.getState().savedRuntimeApply;
 test.newRule = () => { useAppStore.setState({rules:[],dnsRules:[]}); useStagedConfigStore.getState().stage({id:'rule:r',kind:'rule',label:'new',entityPath:[collection,'r'],nextValue:rule}); };
 test.editStaged = () => useStagedConfigStore.getState().stage({id:'rule:r',kind:'rule',label:'edit',entityPath:[collection,'r'],nextValue:{...rule,remarks:'staged change'}});
 function App(){ test.remove=useRuleDelete(plane); return <p>Ready</p>; }
@@ -48,6 +60,22 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('N1 real component tra
   afterAll(async () => { await browser?.close(); await server?.close(); });
 
   for (const plane of ['route','dns']) {
+    it(`${plane}: stopped removal sends exact-version native admission with no hot receipt`, async () => {
+      const page = await browser.newPage();
+      try {
+        await page.goto(origin + '/__n1?plane=' + plane); await page.getByText('Ready').waitFor();
+        const result = await page.evaluate(async () => {
+          const t = (window as any).__n1;
+          t.cold();
+          await t.remove(t.rule);
+          return { saves: t.saves, expected: t.expectedColdSave(), calls: t.calls, entries: t.entries(), receipt: t.savedRuntimeApply() };
+        });
+        expect(result.saves).toEqual([result.expected]);
+        expect(result.calls).toEqual([]);
+        expect(result.entries).toEqual([]);
+        expect(result.receipt).toBeNull();
+      } finally { await page.close(); }
+    });
     it(`${plane}: direct deletion sends its expected snapshot and stale displayed rules are rejected`, async () => {
       const page = await browser.newPage();
       try {

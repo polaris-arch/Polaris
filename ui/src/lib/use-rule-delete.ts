@@ -32,8 +32,8 @@ import type { Rule } from '@/contracts/types';
 import { api } from '@/ipc';
 import { effectiveCollection, useAppStore, useEffectiveRules } from '@/store/app-store';
 import { useStagedConfigStore } from '@/store/staged-config-store';
-import { useStagingActive } from '@/store/use-staging-active';
-import { configCanonicalText, editRoute, splitStagedOnly, stagedOnlyIds, stagingActive } from '@/lib/staged-config';
+import { getStagingActive } from '@/store/use-staging-active';
+import { configCanonicalText, editRoute, splitStagedOnly, stagedOnlyIds } from '@/lib/staged-config';
 
 /** 删一条规则；失败抛出（调用点自己决定怎么报）。 */
 export type DeleteRuleFn = (rule: Rule) => Promise<void>;
@@ -41,7 +41,6 @@ export type DeleteRuleFn = (rule: Rule) => Promise<void>;
 export function useRuleDelete(plane: 'route' | 'dns' = 'route'): DeleteRuleFn {
   const { t } = useTranslation();
   const loadConfig = useAppStore((s) => s.loadConfig);
-  const stagingEnabled = useStagingActive();
   const submitEdit = useStagedConfigStore((s) => s.submit);
   /** 撤销腿的入参（`ENTITY_ACTION_TABLE` 的 `revert` 策略）。总开关关着时两者恒空 ⇒ 走直落盘那条路径。 */
   const stagedEntries = useStagedConfigStore((s) => s.entries);
@@ -61,9 +60,7 @@ export function useRuleDelete(plane: 'route' | 'dns' = 'route'): DeleteRuleFn {
       const disk = plane === 'dns' ? state.dnsRules : state.rules;
       const staged = useStagedConfigStore.getState();
       const entries = staged.entries;
-      const stagingEnabled = stagingActive(staged.enabled,
-        (state.proxyStatus?.running ?? false) || state.proxyStarting || state.proxyStopping,
-        entries.length);
+      const stagingEnabled = getStagingActive();
       const effective = effectiveCollection(collectionKey, disk, entries);
       const current = effective.find((candidate) => candidate.id === rule.id);
       if (!current || configCanonicalText(current) !== configCanonicalText(rule)) {
@@ -102,6 +99,6 @@ export function useRuleDelete(plane: 'route' | 'dns' = 'route'): DeleteRuleFn {
       // 写后端即刷 store，否则列表里被删的那条还在（store.rules 只由 loadConfig/saveConfig 写）。
       void loadConfig(true);
     },
-    [t, loadConfig, stagingEnabled, submitEdit, stagedEntries, revertStaged, stagedOnlyRuleIds, collectionKey, plane]
+    [t, loadConfig, submitEdit, stagedEntries, revertStaged, stagedOnlyRuleIds, collectionKey, plane]
   );
 }

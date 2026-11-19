@@ -831,53 +831,6 @@ export function editRoute(
   return 'staged';
 }
 
-/**
- * 暂存层此刻**活着没有** —— 喂给 [`editRoute`] 的 `enabled` 实参由本函数单点算出。
- *
- * ```
- * 活跃 := 总开关开 ∧ ¬(核没在跑 ∧ 没有已暂存条目)
- * ```
- *
- * # 为什么核没跑时要绕开暂存
- *
- * 暂存层的价值是「攒够了再一次性入核，避免连改 N 条 = 断流 N 次」。**核没在跑时那个价值为零**：
- * 改动本来就要等下次起核才生效，先落盘与先暂存对内核毫无差别，而暂存多要求用户再点一次「保存」
- * —— 用户视角就是「我改了，什么也没发生」（陈先生原话：停核期间的改动是否应该直接生效）。
- *
- * # 判据为什么是 `coreRunning === false` 而不是「这条改动需不需要重启」
- *
- * 后者是 `(old norm, new norm)` 的函数、只有 Rust 侧落盘后算得出，前端事前算不出；在前端搞一张
- * 静态白名单就是 norm 投影的第二份副本，必然漂移。
- *
- * 而 `coreRunning === false` **不是那个判据的近似，它就是那个判据的一条腿在本地求值**：
- * `classify_switch` 的 leg 0.5 正是 `if !core_running() → NotRunning`，而 `classify_staged` 把
- * `NotRunning → "noOp" → restartRequired:false`。核没跑时两者**构造上一致**，不存在漂移。
- * （更精确的超集判据是问后端 `config:classifyStaged`——它还能覆盖「核在跑但这条可热切」，
- * 代价是把写入路由异步化、且逐条答案不能为批次组合，留作后续升级。）
- *
- * # 为什么还要 `entries.length === 0` 这一条（选项 (d) 与 (b) 的分界）
- *
- * 只判 `coreRunning` 会造出**分裂态**：老的编辑还在暂存里、新的已经落了盘。那批暂存条目是相对
- * `baseline` 建立的，直写把盘从它底下抽走 ⇒ 之后保存那批会因为**用户自己造成的改动**而弹冲突窗。
- * 故「已有暂存条目」时一律继续走暂存，让那一批干干净净地被「保存」收尾。
- *
- * 代价是行为随「有没有暂存条目」而变（有时改完即生效、有时还要点保存），但那一刻条上明写着
- * 「N 项待保存」，状态是可读的。
- *
- * # 与总开关的分工（别混用）
- *
- * 本函数只用于**路由判定**。`stage`/`revert`/`reset`/`hydrate` 内部判的仍是 store 的
- * `enabled`（「这个特性开没开」）—— 拿本函数去关那些会让已暂存的条目在核停时突然无法撤销。
- */
-export function stagingActive(
-  enabled: boolean,
-  coreActive: boolean,
-  stagedCount: number
-): boolean {
-  if (!enabled) return false;
-  return coreActive || stagedCount > 0;
-}
-
 // ─────────────────────────────── 持久化编解码（Q1-b）───────────────────────────────
 
 /**
