@@ -301,6 +301,23 @@ describe('配置保存与下一次启动的事务边界', () => {
     expect(useAppStore.getState().config?.subscriptions?.[0]?.etag).toBe('concurrent-newer');
   });
 
+  it('queues a return to Smart behind a pending Global write and preserves its error', async () => {
+    getMock.mockResolvedValue(CONFIG);
+    let rejectGlobal!: (error: unknown) => void;
+    patchMock.mockImplementationOnce(() => new Promise((_resolve, reject) => { rejectGlobal = reject; }));
+    const { updateProxyMode } = useAppStore.getState();
+    const failure = { code: 'DNS_DEPENDENCY_INVALID' };
+    const global = expect(updateProxyMode('global')).rejects.toBe(failure);
+    const smart = updateProxyMode('smart');
+
+    await vi.waitFor(() => expect(patchMock.mock.calls).toEqual([[{ proxyMode: 'global' }]]));
+    rejectGlobal(failure);
+    await global;
+    await smart;
+    expect(patchMock.mock.calls).toEqual([[{ proxyMode: 'global' }], [{ proxyMode: 'smart' }]]);
+    expect(useAppStore.getState().config?.proxyMode).toBe('smart');
+  });
+
   it('节点切换采用后端事务后的整份配置，不用旧前端快照乐观覆盖', async () => {
     const backendMerged = {
       ...CONFIG,

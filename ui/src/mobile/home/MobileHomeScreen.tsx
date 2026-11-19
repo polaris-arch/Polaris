@@ -93,7 +93,7 @@ import { createTopicSubscription } from '@/lib/topic-subscription';
 import { withProxyStartClaim } from '@/lib/proxy-start-claim';
 import { editRoute, stagedOnlyIds } from '@/lib/staged-config';
 import { deriveTakeoverConnState } from '@/components/screens/home/connection-state';
-import { useConfig } from '@/components/screens/settings/use-config';
+import { configSaveErrorText } from '@/domain/action-error-text';
 import type { ServiceId } from '@/contracts/unlock-detection';
 import { UNLOCK_SERVICES, unlockBadgeSrc } from './unlock-services';
 import { createRunWrite, writeErrorsFromProxyStatus } from './write-errors';
@@ -110,7 +110,7 @@ import {
 } from './aggregate';
 import { openMobileForm } from '../forms/form-store';
 import { protocolLabel } from '@/components/screens/nodes/nodes-logic';
-import { HomeScreenView, RULE_ACTION_KEY } from './HomeScreenView';
+import { HomeScreenView, ROUTING_KEY, RULE_ACTION_KEY } from './HomeScreenView';
 import { useHomeSpeedTest } from './use-home-speed-test';
 import { switchReceiptFeedback } from '@/components/screens/shared/switch-receipt-feedback';
 import { toast } from '@/lib/error-handler';
@@ -161,6 +161,7 @@ export function MobileHomeScreen(): ReactElement {
   const { t, i18n } = useTranslation();
   const [writeErrors, setWriteErrors] = useState<WriteErrors>({});
   const mounted = useRef(false);
+  const routingIntent = useRef<{ mode: ProxyMode } | null>(null);
   const [manualCheckBusy, setManualCheckBusy] = useState(false);
   const checkRun = useRef({ generation: 0, busy: false, alive: true, backendRequested: false, requestId: null as string | null });
   const normalMainRequired = manualSpeedTestCaps(false).normalMainRequired === true;
@@ -190,7 +191,6 @@ export function MobileHomeScreen(): ReactElement {
   const latencyMap = useQualifiedLatencies(servers);
   const testedAt = useLatencyStore((s) => s.testedAt);
   const config = useEffectiveConfig();
-  const { update } = useConfig();
   /* 规则写腿的三个依赖，与桌面 `RuleSubjectMenuItems` / `ConnectionTopology` 逐字同一批：
      有效规则表（含暂存重放）、暂存总开关、入条目。两端对「这次写该不该进暂存」必须同一个答案。 */
   const rules = useEffectiveRules();
@@ -669,9 +669,23 @@ export function MobileHomeScreen(): ReactElement {
 
   const onSetRouting = useCallback(
     (v: ProxyMode) => {
-      void runWrite('routing', () => update({ proxyMode: v }));
+      const { config: savedConfig, updateProxyMode } = useAppStore.getState();
+      if (!savedConfig || (routingIntent.current?.mode ?? savedConfig.proxyMode) === v) return;
+      const intent = { mode: v };
+      routingIntent.current = intent;
+      void runWrite('routing', async () => {
+        try {
+          await updateProxyMode(v);
+          if (mounted.current) toast.success(`${t('common.saved')} · ${t(ROUTING_KEY[v])}`);
+        } catch (error) {
+          if (mounted.current) toast.error(configSaveErrorText(error, t));
+          throw error;
+        } finally {
+          if (routingIntent.current === intent) routingIntent.current = null;
+        }
+      });
     },
-    [runWrite, update],
+    [runWrite, t],
   );
 
 

@@ -496,7 +496,7 @@ export const RULE_ACTION_KEY: Readonly<Record<RuleAction, string>> = {
 /** 「新建规则」视图里三档动作的呈现序（代理最常用，阻断最危险，故排末位）。 */
 export const RULE_ACTION_ORDER: readonly RuleAction[] = ['proxy', 'direct', 'block'];
 
-const ROUTING_KEY = {
+export const ROUTING_KEY = {
   smart: 'home.routingSmart',
   global: 'home.routingGlobal',
   direct: 'home.routingDirect',

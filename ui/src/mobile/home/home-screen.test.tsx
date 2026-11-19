@@ -660,9 +660,9 @@ describe('④ 写失败必有可见回显（IA 裁定 #14）', () => {
       /\bapi\.[a-zA-Z]+\.[a-zA-Z]+\s*\(/g,
       /\bunlockApi\.[a-zA-Z]+\s*\(/g,
       /\bswitchServer\s*\(/g,
+      /\bupdateProxyMode\s*\(/g,
       /\bstartProxy\s*\(/g,
       /\bstopProxy\s*\(/g,
-      /(?<![.\w$])update\s*\(\s*\{/g,
     ];
     const spans: [number, number][] = [];
     for (const m of WIRING_TEXT.matchAll(/\brunWrite\s*\(/g)) {
@@ -1185,7 +1185,7 @@ describe('⑨ 接管方式：整颗缺席，而分流策略照旧可切', () => 
     expect(
       WIRING_RAW,
       '分流策略的写腿不见了 —— 这一屏就只剩两颗印着字的芯片，点了什么也不会发生',
-    ).toMatch(/runWrite\(\s*'routing'\s*,\s*\(\)\s*=>\s*update\(\{\s*proxyMode:\s*v\s*\}\)\s*\)/);
+    ).toMatch(/runWrite\(\s*'routing'\s*,\s*async\s*\(\)\s*=>\s*\{\s*try\s*\{\s*await updateProxyMode\(v\)/);
     // 反面：不许有任何一处写回 `proxyModeType`（那正是被移除的那条腿）。
     expect(WIRING_TEXT).not.toMatch(/update\(\{\s*proxyModeType/);
   });

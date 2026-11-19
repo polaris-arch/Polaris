@@ -348,7 +348,6 @@ const SITES: readonly Site[] = [
       'components/screens/rules/NetworkProfilePanel.tsx',
       // 移动端设置屏（F4）。走的是**同一个** `useConfig().update` 漏斗 —— 移动端没有第二套写腿，
       // 故去向与桌面那批逐字相同；分开列是因为登记粒度是「文件 + 方法」。
-      'mobile/home/MobileHomeScreen.tsx',
       'mobile/settings/DisplayPage.tsx',
       'mobile/settings/DnsPage.tsx',
       'mobile/settings/GeneralPage.tsx',

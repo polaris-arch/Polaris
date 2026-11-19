@@ -896,20 +896,17 @@ export function HomeScreen() {
     [config, connected, applyIntercept, openDialog, closeDialog, t]
   );
 
-  /* ── 分流策略切换：updateProxyMode（store 热切换，不重启）── */
+  /* 分流策略的写入回包确认配置已保存。 */
   const onRoutingChange = useCallback(
-    async (v: RoutingKind) => {
-      // 契约 L21 的本地 `routingBusy` 反馈。缺它时 seg2 在飞期间照样可点：`updateProxyMode` 是
-      // 「invoke → 回来才写 store」，按钮高亮直到应答才移动，用户读作「没点上」→ 连点 → 多条
-      // config:updateMode 并发写同一份配置，最后一条落盘的未必是最后点的那档（末次写覆盖）。
-      // 单飞守卫 + 置灰是同一件事的两半：守卫保正确性，置灰把「正在生效」说出来。
-      if (routingBusy) return;
+    async ({ v, labelKey }: (typeof ROUTING_OPTS)[number]) => {
+      const { config: savedConfig, updateProxyMode } = useAppStore.getState();
+      if (routingBusy || !savedConfig || savedConfig.proxyMode === v) return;
       setRoutingBusy(true);
       try {
-        await useAppStore.getState().updateProxyMode(v);
+        await updateProxyMode(v);
+        toast.success(`${t('common.saved')} · ${t(labelKey)}`);
       } catch (err) {
         // seg2 是受控的（跟 config 走）：写失败即按钮弹回原档，用户读作「点不动」而非「没存上」。
-        // 分流策略切换成功不报（seg2 高亮位移即反馈，原型同样只在「切回智能」那条快捷路径上 notify）。
         console.error('[home] set routing failed:', err);
         toast.error(
           t('rules.saveFailed'),
@@ -1357,10 +1354,9 @@ export function HomeScreen() {
                     <button
                       key={o.v}
                       className={config?.proxyMode === o.v ? 'on' : ''}
-                      // 在飞期间整组置灰：反馈「正在生效」+ 兜住连点（守卫在 onRoutingChange 里，
-                      // 因为托盘等其它入口不经这组按钮）。
+                      // 保存期间整组置灰，避免重复提交。
                       disabled={routingBusy}
-                      onClick={() => onRoutingChange(o.v)}
+                      onClick={() => onRoutingChange(o)}
                     >
                       {t(o.labelKey)}
                     </button>
