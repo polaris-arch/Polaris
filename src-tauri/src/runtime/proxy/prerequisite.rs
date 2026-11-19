@@ -14,6 +14,7 @@ use polaris_helper_proto::Platform;
 use serde_json::Value;
 use tokio::sync::watch;
 
+use super::management_api::select_local_http_proxy;
 use super::process_supervision::owner_proof::ProducerCell;
 use super::{lifecycle::StartLeg, LocalHttpProxy, ProxyRuntime, ProxyStatus, StartError};
 
@@ -2039,7 +2040,7 @@ impl ProxyRuntime {
             .and_then(|value| value.clone());
         let local_proxy = if status.running {
             snapshot.and_then(|snapshot| {
-                super::select_local_http_proxy(
+                select_local_http_proxy(
                     if self
                         .core_via_helper
                         .load(std::sync::atomic::Ordering::SeqCst)
@@ -2085,7 +2086,7 @@ impl ProxyRuntime {
                             .ready_main
                             .read()
                             .map_err(|_| MainPrerequisiteError::ReadyUnknown)?;
-                        let local_proxy = super::select_local_http_proxy(
+                        let local_proxy = select_local_http_proxy(
                             if self
                                 .core_via_helper
                                 .load(std::sync::atomic::Ordering::SeqCst)

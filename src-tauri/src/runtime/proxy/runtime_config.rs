@@ -6,7 +6,8 @@ use std::sync::{atomic::Ordering, Arc};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::hot_switch::SwitchOutcome;
-use super::{select_local_http_proxy, LocalHttpProxy, ProxyRuntime};
+use super::management_api::select_local_http_proxy;
+use super::{LocalHttpProxy, ProxyRuntime};
 use crate::runtime::config::{PreparedConfigEdit, SavedCommitError};
 use crate::runtime::route_binding::{
     plan_protected_runtime_bindings, protected_generated_policy_compatible, ProtectedBindingPlan,

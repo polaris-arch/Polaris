@@ -1,4 +1,4 @@
-//! 管理 API 客户端与 dashboard 连接信息。
+//! 管理 API、dashboard 连接信息与运行核回环代理绑定。
 //!
 //! 建 gRPC 管理客户端、取 Bearer secret、按节点解析管理面落点、`endpointTag ↔ serverId` 逆映射、
 //! dashboard 连接信息（供前端 `app:getSingboxDashboardConnection`）。
@@ -14,6 +14,70 @@ use serde_json::Value;
 use crate::runtime::management_api::{current_clash_api_secret, GrpcManagementApi};
 
 use super::ProxyRuntime;
+
+/// 经本机 http 代理入站出网的目标（[`ProxyRuntime::local_http_proxy`] 产出）。
+///
+/// `Debug` 不泄凭据：`InboundUser` 的 `Debug` 已抹掉口令。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalHttpProxy {
+    /// 本机 http 代理入站端口（`mixed-in` 或 `probe-proxy-in`）。
+    pub port: u16,
+    /// 该入站要求的凭据；`mixed-in` 恒零认证 ⇒ 恒 `None`。
+    pub auth: Option<InboundUser>,
+    /// 取到的是哪一个入站。两者在内核里受的路由策略不同，测速据此标注结果。
+    pub inbound: LocalInbound,
+}
+
+/// [`LocalHttpProxy`] 背后的入站。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalInbound {
+    /// `mixed-in`：不钉死，走用户的全部路由规则与 DNS 规则。
+    Mixed,
+    /// `probe-proxy-in`：被路由钉到 `proxy-selector`，用户规则不参与。
+    ProbeProxy,
+}
+
+impl LocalInbound {
+    /// 该入站在运行核里的 tag。
+    #[must_use]
+    pub const fn tag(self) -> &'static str {
+        match self {
+            Self::Mixed => polaris_config_engine::builder::helpers::MIXED_INBOUND_TAG,
+            Self::ProbeProxy => polaris_config_engine::builder::helpers::PROBE_PROXY_INBOUND_TAG,
+        }
+    }
+}
+
+/// 选「经本机 http 代理入站出网」用哪个口（**纯函数**，单测与对拍门的取材点）。
+///
+/// - `mixed_port != 0`：本平台发射了 `mixed-in`（`ProxyStatus.mixed_port` 只在
+///   `emits_mixed_inbound` 为真时非 0，见起核处的赋值）→ 用它；它零认证，凭据不带。
+/// - 否则用 `probe-proxy-in`（固定走 `proxy-selector`，Android 上带本次起核的凭据）。
+/// - 两者都没有 → `None`：调用方按「本层无从经代理出网」处理，**不**连一个不存在的口。
+///
+/// 修的缺陷（2026-09-25 α 批）：此前四条腿无条件读 `mixed_port`，而 Android 不发 mixed 入站 ⇒
+/// 解锁检测全超时、首页代理出口 IP 为空、测速回退超时，全程无报错。
+#[must_use]
+pub(super) fn select_local_http_proxy(
+    mixed_port: u16,
+    probe_proxy_port: Option<u16>,
+    loopback_auth: Option<InboundUser>,
+) -> Option<LocalHttpProxy> {
+    if mixed_port != 0 {
+        return Some(LocalHttpProxy {
+            port: mixed_port,
+            auth: None,
+            inbound: LocalInbound::Mixed,
+        });
+    }
+    probe_proxy_port
+        .filter(|port| *port != 0)
+        .map(|port| LocalHttpProxy {
+            port,
+            auth: loopback_auth,
+            inbound: LocalInbound::ProbeProxy,
+        })
+}
 
 pub(crate) struct ApiReadbackBinding {
     pub(crate) port: u16,
