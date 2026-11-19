@@ -241,7 +241,6 @@
     "deleteLegacyDone": "Old log deleted",
     "deleteLegacyFailed": "Failed to delete old log",
     "follow": "Auto-scroll",
-    "levelCoreRestartHint": " View and managed-log filtering apply immediately; the core startup diagnostic level applies after a core restart.",
     "coreLevelPending": "Core {{level}} · pending",
     "coreLevelUnavailable": "Core level can't be read",
     "coreLevelHint": "The core's current startup diagnostic level. The live stream and managed log follow this page's level.",

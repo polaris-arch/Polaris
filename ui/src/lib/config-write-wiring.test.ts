@@ -393,7 +393,7 @@ const SITES: readonly Site[] = [
     file: 'components/screens/logs/LogsScreen.tsx',
     callee: 'saveConfig(',
     route: 'staged',
-    why: 'logLevel 是 UserConfig 字段（Class B，喂 sing-box log.level 需重启核）',
+    why: 'logLevel 是 UserConfig 字段（Class B），由暂存 Save 决定是否可热应用到运行核',
   },
   {
     file: 'mobile/connections/MobileConnectionsScreen.tsx',

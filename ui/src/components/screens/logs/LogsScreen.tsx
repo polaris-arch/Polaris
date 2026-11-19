@@ -526,9 +526,7 @@ export function LogsScreen() {
   const onLevelChange = useCallback(
     async (v: LogLevel) => {
       if (!diskConfig) return;
-      // 配置暂存闸门（与 NodeDialog 同形）。`logLevel` 本轮起是 `UserConfig` 字段（Class B）——
-      // 它喂 sing-box 的 `log.level`，改了核要重启才跟上（「第四类重启」，spec §Q3-b E-3）。
-      // 此前被判豁免直落盘 ⇒ 核继续按旧级别跑而暂存条只字不提，正是要修的那条静默。
+      // 连接中先暂存；保存时由共用热应用流程判定核是否已接收级别。
       if (editRoute('logLevel', stagingEnabled) === 'staged') {
         stage({
           id: 'setting:logLevel',
@@ -865,7 +863,7 @@ export function LogsScreen() {
           <div className="log-filter-field log-level-filter">
             <span className="log-filter-label">
               <span>{t('logs.currentLevel')}</span>
-              <InfoIcon tip={`${t('logs.levelCaption')}${t('logs.levelCoreRestartHint')}`} />
+              <InfoIcon tip={t('logs.levelCaption')} />
             </span>
             <div className="log-filter-value">
               <Csel

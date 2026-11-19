@@ -241,7 +241,6 @@
     "deleteLegacyDone": "舊記錄已刪除",
     "deleteLegacyFailed": "刪除舊記錄失敗",
     "follow": "自動捲動",
-    "levelCoreRestartHint": " 頁面篩選與受管記錄立即生效；核心啟動診斷層級在核心重啟後生效。",
     "coreLevelPending": "核心 {{level}} · 待同步",
     "coreLevelUnavailable": "讀不到核心層級",
     "coreLevelHint": "核心目前啟動診斷輸出的實際層級；本頁即時串流與受管記錄依頁面層級篩選。",

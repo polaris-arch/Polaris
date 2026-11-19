@@ -1023,8 +1023,7 @@ export function MobileConnectionsScreen(): ReactElement {
   const onLevelChange = useCallback(
     (next: LogLevel) => {
       if (!diskConfig) return;
-      // 配置暂存闸门：`logLevel` 喂 sing-box 的 `log.level`，改了核要重启才跟上 ⇒ 它是暂存项，
-      // 直落盘会让核继续按旧级别跑而暂存条只字不提。
+      // 连接中先暂存；保存后由共用热应用流程同步运行核。
       if (editRoute('logLevel', stagingEnabled) === 'staged') {
         stage({
           id: 'setting:logLevel',
@@ -1310,7 +1309,7 @@ export function MobileConnectionsScreen(): ReactElement {
     if (sheet === 'logFilter') {
       return {
         title: tr('mobileConnections.logs.filter'),
-        body: `${tr('logs.levelCaption')}${tr('logs.levelCoreRestartHint')}`,
+        body: tr('logs.levelCaption'),
         error: screenError,
         items: [
           ...LEVEL_OPTIONS.map((opt): SheetItem => ({

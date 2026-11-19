@@ -241,7 +241,6 @@
     "deleteLegacyDone": "旧日志已删除",
     "deleteLegacyFailed": "删除旧日志失败",
     "follow": "自动滚动",
-    "levelCoreRestartHint": " 页面筛选与受管日志立即生效；内核启动诊断级别在内核重启后生效。",
     "coreLevelPending": "内核 {{level}} · 待同步",
     "coreLevelUnavailable": "读不到内核级别",
     "coreLevelHint": "内核当前启动诊断输出的实际级别；本页实时流与受管日志按页面级别筛选。",
