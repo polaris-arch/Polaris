@@ -83,13 +83,13 @@ export function useNodeActions({
           stage({
             id: `server:${entityId}`,
             kind: 'server',
-            label: `${t('node.addTitle')} ${cloneName}`,
+            label: t('home.stagedNodeClone', { name: cloneName }),
             entityPath: ['servers', entityId],
             nextValue: { ...rest, id: entityId, name: cloneName },
           });
-        } else {
-          await api.server.add({ ...rest, name: cloneName });
+          return;
         }
+        await api.server.add({ ...rest, name: cloneName });
         // 原型 :4514 克隆成功即 notify('已克隆节点','ok')。副本落在**自建**分组（上方剥了 subscriptionId），
         // 当前若停在订阅 tab，新卡不在本 tab 可见 → 无 toast 时点了完全没反应，比原型更需要这条反馈。
         toast.success(t('nodes.cloneSuccess'));

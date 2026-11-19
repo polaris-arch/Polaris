@@ -725,7 +725,7 @@ describe('并发保存（withConfigWriteLock）', () => {
     finishSave({ status: 'saved', version: 'v-save', config: CONFIG, runtimeApply: receipt });
     await expect(saved).resolves.toBe(true);
     await expect(applied).resolves.toMatchObject({ saved: true });
-    expect(capture).toHaveBeenCalledExactlyOnceWith(receipt);
+    expect(capture).toHaveBeenCalledExactlyOnceWith({ ...receipt, changes: [] });
     expect(applyMock).toHaveBeenCalledExactlyOnceWith('already-reviewed-restart');
   });
 
@@ -1122,6 +1122,32 @@ describe('冲突弹窗的落定（resolveConflict / dismissConflict）', () => {
 
 
 describe('save snapshot ownership across awaited reads/writes', () => {
+  it('binds operation labels and the canonical log level to changes in the committed Save', async () => {
+    const disk = { ...CONFIG, logLevel: 'info' } as UserConfig;
+    getMock.mockResolvedValue(disk);
+    const { hydrate, stage, save } = useStagedConfigStore.getState();
+    hydrate(disk);
+    stage({ ...entry('n2'), label: 'Clone node n2' });
+    stage({ ...entry('n1', 9443), label: 'Node edit omitted from canonical config' });
+    stage({ id: 'setting:mixedPort', kind: 'setting', label: 'Port already set', entityPath: ['mixedPort'], nextValue: 7890 });
+    stage({ id: 'setting:logLevel', kind: 'setting', label: 'Log level draft label', entityPath: ['logLevel'], nextValue: 'debug' });
+    let finishSave!: (outcome: SaveOutcome) => void;
+    saveMock.mockImplementationOnce(() => new Promise(resolve => { finishSave = resolve; }));
+    const saving = save();
+    await vi.waitFor(() => expect(finishSave).toBeTypeOf('function'));
+    stage({ id: 'setting:logLevel', kind: 'setting', label: 'Log level WARN', entityPath: ['logLevel'], nextValue: 'warn' });
+    const canonical = { ...disk, logLevel: 'debug', servers: [...disk.servers, { id: 'n2', name: 'n2', port: 443 }] } as UserConfig;
+    const receipt = { ok: true, status: 'hotApplied' as const, runtimeGeneration: 7,
+      coreState: 'committed' as const, configurationDurable: true };
+    finishSave({ status: 'saved', config: canonical, version: 'committed', runtimeApply: receipt });
+
+    await expect(saving).resolves.toBe(true);
+    expect(useStagedConfigStore.getState().savedRuntimeApply).toEqual({ ...receipt, changes: [
+      { label: 'Clone node n2' }, { label: 'Log level draft label', logLevel: 'DEBUG' },
+    ] });
+    expect(useStagedConfigStore.getState().entries.map(({ label }) => label)).toEqual(['Log level WARN']);
+  });
+
   it('new intent during a deferred read is never covered by the old conflict decision', async () => {
     seedStaged(9443);
     let resolveRead!: (config: UserConfig) => void;

@@ -59,6 +59,7 @@ import {
 
 /** 直接从 IPC 契约取，避免与 `pending-bar-logic.ts` 的同名联合各写一份（store 不该反向依赖组件层）。 */
 type ApplyReceipt = Awaited<ReturnType<typeof api.proxy.applyPendingChanges>>;
+export type SavedRuntimeApply = ApplyReceipt & { changes?: readonly { label: string; logLevel?: string }[] };
 type ApplyDispatch = (precedingSave: ApplyReceipt | null) => boolean;
 
 /** Order the renderer's explicit IPC dispatch after any Save already in flight. */
@@ -210,7 +211,7 @@ export interface StagedConfigState {
    */
   saveStatus: 'idle' | 'saving' | 'saveFailed';
   /** Owned receipt for the shared desktop/mobile apply observer. */
-  savedRuntimeApply: ApplyReceipt | null;
+  savedRuntimeApply: SavedRuntimeApply | null;
   /**
    * 待用户裁决的冲突集（Q8-b 第 4 步）；`null` = 无弹窗。
    *
@@ -535,10 +536,21 @@ async function performSaveLocked(
   // New/revised intents have not approved changes found on disk by this save.
   // Keep their original comparison base; the next save rechecks them conservatively.
   const remainingBaseline = remaining.length > 0 ? get().baseline : outcome.config;
+  const savedRuntimeApply = outcome.runtimeApply === undefined ? undefined : {
+    ...outcome.runtimeApply,
+    changes: entries.flatMap(({ entityPath, label }) => {
+      const before = entitySnapshot(disk, entityPath);
+      const changed = before !== entitySnapshot(merged, entityPath)
+        && before !== entitySnapshot(outcome.config, entityPath);
+      if (!changed || !label.trim()) return [];
+      const level = entityPath.length === 1 && entityPath[0] === 'logLevel' ? outcome.config.logLevel : undefined;
+      return [{ label: label.trim(), ...(typeof level === 'string' ? { logLevel: level.toUpperCase() } : {}) }];
+    }),
+  };
   set({
     entries: remaining,
     saveStatus: 'idle',
-    ...(outcome.runtimeApply === undefined ? {} : { savedRuntimeApply: outcome.runtimeApply }),
+    ...(savedRuntimeApply === undefined ? {} : { savedRuntimeApply }),
     conflict: null,
     conflictBaseline: null,
     baseVersion: outcome.version,

@@ -233,14 +233,15 @@ export function AppPolicyScreen() {
     // 条目按 **appId** 寻址 —— `AppRule` 里根本没有 `id` 字段，这一族此前表达不了正是因为
     // 模型把主键写死成了 `id`（现由 `ID_ADDRESSED_COLLECTIONS` 的集合→主键映射给出）。
     if (editRoute('appRules', stagingEnabled) === 'staged') {
+      const destination = newRule.targetAutoSelect ? autoSelectTargetLabel(config, newRule.targetAutoSelect, t)
+        : appPolicyView(newRule.action, newRule.targetServerId, servers, t).label;
       stage({
         id: `appRule:${appId}`,
         kind: 'appRule',
-        label: t('home.stagedAppPolicy', { name: appLabel(appId) }),
+        label: `${t('home.stagedAppPolicy', { name: appLabel(appId) })} · ${destination}`,
         entityPath: ['appRules', appId],
         nextValue: newRule,
       });
-      toast.success(t('appPolicy.policyUpdated'));
       return; // 零 IPC 写、零磁盘写（FR-1）
     }
     try {
@@ -300,7 +301,6 @@ export function AppPolicyScreen() {
           groupId: removeGroup,
         });
       }
-      toast.info(t('appPolicy.removed'));
       return; // 零 IPC 写、零磁盘写（FR-1）
     }
     try {
@@ -378,7 +378,7 @@ export function AppPolicyScreen() {
                 stage({
                   id: 'setting:appRoutingEnabled',
                   kind: 'setting',
-                  label: t('appPolicy.masterTip'),
+                  label: t(nextEnabled ? 'home.stagedAppRoutingOn' : 'home.stagedAppRoutingOff'),
                   entityPath: ['appRoutingEnabled'],
                   nextValue: nextEnabled,
                 });

@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { isValidElement, type ReactElement, type ReactNode } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
+import type { SavedRuntimeApply } from '@/store/staged-config-store';
 import type { NativeRetirementDebt, PendingApplyResult, PendingNodeChanges } from '@/contracts/types';
 import { ImpactApplySummary, type ImpactDisclosure } from '@/shared/ImpactApplySummary';
 import type { ApplyState } from '@/components/layout/pending-bar-logic';
@@ -17,7 +18,7 @@ const h = vi.hoisted(() => ({
   effects: [] as Array<{ deps?: readonly unknown[]; cleanup?: () => void }>,
   pendingEffects: [] as Array<() => void>,
   applyNow: vi.fn(),
-  savedRuntimeApply: null as PendingApplyResult | null,
+  savedRuntimeApply: null as SavedRuntimeApply | null,
   retryPersistence: vi.fn(),
   hostRead: vi.fn(),
   coreRead: vi.fn(),
@@ -63,7 +64,18 @@ vi.mock('react', async (original) => ({
     });
   },
 }));
-vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
+vi.mock('react-i18next', async () => {
+  const { default: { home } } = await import('@/i18n/locales/en-US.json');
+  const messages: Record<string, string> = {
+    'home.pendingSavedChangesApplied': home.pendingSavedChangesApplied,
+    'home.pendingSavedLogLevelApplied': home.pendingSavedLogLevelApplied,
+    'home.pendingSavedMoreChangesApplied': home.pendingSavedMoreChangesApplied,
+  };
+  const t = (key: string, values?: Record<string, string | number>) => messages[key] && values
+    ? messages[key].replace(/{{(\w+)}}/g, (_, field: string) => String(values[field]))
+    : key;
+  return { useTranslation: () => ({ t }) };
+});
 vi.mock('@/lib/confirm-twice', () => ({
   useConfirmTwice: () => ({ armed: null, confirmTwice: h.confirmTwice }),
 }));
@@ -101,7 +113,7 @@ vi.mock('@/store/staged-config-store', async () => {
     return admitted?.reply;
   }, useStagedConfigStore: Object.assign((selector: (value: typeof state) => unknown) => selector(state), {
     getState: () => state,
-    setState: ({ savedRuntimeApply }: { savedRuntimeApply: PendingApplyResult | null }) => { h.savedRuntimeApply = savedRuntimeApply; },
+    setState: ({ savedRuntimeApply }: { savedRuntimeApply: SavedRuntimeApply | null }) => { h.savedRuntimeApply = savedRuntimeApply; },
   }) };
 });
 vi.mock('@/lib/error-handler', () => ({
@@ -197,10 +209,10 @@ it('uses the shared Save HOT receipt and keeps durability recovery bound to its 
   h.realReconciliation = true;
   h.app.pendingChanges = { added: [], modified: [], removed: [], restartDeferred: false };
   h.savedRuntimeApply = { ok: true, status: 'hotApplied', transactionId: 'save-hot', runtimeGeneration: 7,
-    selectionIntentGeneration: 3, coreState: 'committed', configurationDurable: true };
+    selectionIntentGeneration: 3, coreState: 'committed', configurationDurable: true, changes: [{ label: 'Log level submitted', logLevel: 'INFO' }] };
   expect(renderBar()).toBeNull();
   expect(renderBar()).toBeNull();
-  expect(toast.info).toHaveBeenCalledExactlyOnceWith('home.pendingHotApplied');
+  expect(toast.info).toHaveBeenCalledExactlyOnceWith('Log level changed to INFO.');
 
   vi.useFakeTimers();
   h.savedRuntimeApply = { ok: true, status: 'hotDurabilityPending', transactionId: 'save-persist', runtimeGeneration: 7,
@@ -208,7 +220,7 @@ it('uses the shared Save HOT receipt and keeps durability recovery bound to its 
   renderBar();
   expect(markup(renderBar())).toContain('home.pendingRetryPersistenceBtn');
   expect(h.states[0]).toMatchObject({ coreRecovery: { transactionId: 'save-persist', runtimeGeneration: 7 } });
-  expect(toast.info).toHaveBeenCalledExactlyOnceWith('home.pendingHotApplied');
+  expect(toast.info).toHaveBeenCalledExactlyOnceWith('Log level changed to INFO.');
   expect(h.applyNow).not.toHaveBeenCalled();
 });
 

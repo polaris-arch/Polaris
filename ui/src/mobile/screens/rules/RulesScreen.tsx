@@ -70,7 +70,7 @@ import { asMeshRouteReport, meshRouteSummaryKey, MobileMeshRouteEvidence } from 
 import { meshRouteRuleHints } from '../../mesh-route-context';
 import { MobileInfo } from '../../MobileInfo';
 import { isMeshNode } from '@/domain/endpoint-routes';
-import { mergeAppPresets, type AppPreset } from '@/domain/app-rules-preset';
+import { mergeAppPresets } from '@/domain/app-rules-preset';
 import { categoryLabel } from '@/domain/rule-resource-catalog';
 import { resourceUpdateFeedback, resourceUpdateOutcome } from '@/domain/resource-update-outcome';
 import { defaultOpenGroupIds, groupServersBySubscription } from '@/domain/server-grouping';
@@ -543,11 +543,10 @@ export function MobileRulesScreen(): ReactElement {
           stage({
             id: `rule:${entityId}`,
             kind: 'rule',
-            label: `${tr('rules.newTitle')} ${payload.remarks ?? payload.type}`,
+            label: `${tr('rules.duplicate')} ${payload.remarks ?? payload.type}`,
             entityPath: [collectionKey, entityId],
             nextValue: { ...payload, id: entityId },
           });
-          toast.success(tr('rules.duplicated'));
           return;
         }
         await api.rules.add(payload, plane);
@@ -597,21 +596,22 @@ export function MobileRulesScreen(): ReactElement {
         stage({
           id: 'setting:regionRouting',
           kind: 'setting',
-          label: tr('home.stagedSetting', { key: 'regionRouting' }),
+          label: next.enabled ? tr(next.reverse ? 'home.stagedRegionProxy' : 'home.stagedRegionDirect', {
+            region: tr(`rules.region.${next.region}`),
+          }) : tr('home.stagedRegionOff'),
           entityPath: ['regionRouting'],
           nextValue: next,
         });
-      } else {
-        try {
-          await useAppStore.getState().saveConfig({ regionRouting: next });
-        } catch (err) {
-          // 保存失败**不回滚**（受控组件，按钮态跟着 store 走）：表现为「点了没反应」，必须报。
-          console.error('[MobileRulesScreen] regionRouting save failed:', err);
-          toast.error(tr('rules.saveFailed'));
-          // 受控组件写失败不回滚 ⇒ 表现就是「点了没反应」，必须在控件旁边说出来。
-          reportWriteError('regionRouting', tr('rules.saveFailed'));
-          return;
-        }
+        return;
+      }
+      try {
+        await useAppStore.getState().saveConfig({ regionRouting: next });
+      } catch (err) {
+        // The control keeps the previous value when the write fails.
+        console.error('[MobileRulesScreen] regionRouting save failed:', err);
+        toast.error(tr('rules.saveFailed'));
+        reportWriteError('regionRouting', tr('rules.saveFailed'));
+        return;
       }
       // 按钮的选中态只说「选中了」，说不出「选中意味着什么」——这两条 toast 才是语义。
       if (regionChanged) {
@@ -683,8 +683,7 @@ export function MobileRulesScreen(): ReactElement {
    *  · 指定了节点但节点**已删** ⇒ 显示「指定节点」，不是回落成别的词。
    */
   const appPolicyOf = useCallback(
-    (preset: AppPreset): { text: string; tone: AppRowModel['policyTone']; value: string } => {
-      const rule = appRuleById.get(preset.id);
+    (rule: AppRule | undefined): { text: string; tone: AppRowModel['policyTone']; value: string } => {
       if (!rule) return { text: tr('appPolicy.followGlobal'), tone: 'follow', value: 'follow' };
       if (appRuleDisabled(rule)) return { text: tr('rules.disabledBadge'), tone: 'follow', value: 'disabled' };
       if (rule.action === 'direct') {
@@ -706,7 +705,7 @@ export function MobileRulesScreen(): ReactElement {
       }
       return { text: tr('appPolicy.followGlobal'), tone: 'proxy', value: 'follow' };
     },
-    [appRuleById, serverNameById, tr, config],
+    [serverNameById, tr, config],
   );
 
   const appCategories = useMemo(
@@ -732,7 +731,7 @@ export function MobileRulesScreen(): ReactElement {
       ) {
         continue;
       }
-      const policy = appPolicyOf(preset);
+      const policy = appPolicyOf(appRuleById.get(preset.id));
       rows.push({
         id: preset.id,
         name,
@@ -760,7 +759,7 @@ export function MobileRulesScreen(): ReactElement {
         rows: [...list].sort((a, b) => compareLabel(a.name, b.name, i18n.language)),
       }))
       .sort((a, b) => compareLabel(a.label, b.label, i18n.language));
-  }, [allPresets, appCategory, appSearch, appPolicyOf, builtinPresetIds, t, tr, i18n.language]);
+  }, [allPresets, appCategory, appSearch, appPolicyOf, appRuleById, builtinPresetIds, t, tr, i18n.language]);
 
   const appSummary = useMemo(() => {
     let follow = 0;
@@ -790,7 +789,7 @@ export function MobileRulesScreen(): ReactElement {
       stage({
         id: 'setting:appRoutingEnabled',
         kind: 'setting',
-        label: tr('appPolicy.masterTip'),
+        label: tr(next ? 'home.stagedAppRoutingOn' : 'home.stagedAppRoutingOff'),
         entityPath: ['appRoutingEnabled'],
         nextValue: next,
       });
@@ -878,7 +877,7 @@ export function MobileRulesScreen(): ReactElement {
         stage({
           id: `appRule:${appId}`,
           kind: 'appRule',
-          label: tr('home.stagedAppPolicy', { name }),
+          label: `${tr('home.stagedAppPolicy', { name })} · ${appPolicyOf(next).text}`,
           entityPath: ['appRules', appId],
           nextValue: next,
         });
@@ -897,6 +896,7 @@ export function MobileRulesScreen(): ReactElement {
     [
       allPresets,
       builtinPresetIds,
+      appPolicyOf,
       stagingEnabled,
       stage,
       t,
@@ -927,7 +927,7 @@ export function MobileRulesScreen(): ReactElement {
           stage({
             id: `appPreset:${appId}`,
             kind: 'appPreset',
-            label: `${tr('common.delete')} ${name}`,
+            label: tr('home.stagedAppRemove', { name }),
             entityPath: ['customAppPresets', appId],
             nextValue: null,
           });
@@ -935,7 +935,7 @@ export function MobileRulesScreen(): ReactElement {
             stage({
               id: `appRule:${appId}`,
               kind: 'appRule',
-              label: `${tr('common.delete')} ${name}`,
+              label: tr('home.stagedAppRuleRemove', { name }),
               entityPath: ['appRules', appId],
               nextValue: null,
             });

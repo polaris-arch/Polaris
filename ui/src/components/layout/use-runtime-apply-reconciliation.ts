@@ -1,4 +1,5 @@
 import { useEffect, useRef, type Dispatch, type RefObject, type SetStateAction } from 'react';
+import { useTranslation } from 'react-i18next';
 import { api } from '@/ipc';
 import { useAppStore } from '@/store/app-store';
 import { useStagedConfigStore } from '@/store/staged-config-store';
@@ -36,6 +37,7 @@ export function useRuntimeApplyReconciliation(
   translate: ProxyErrorTranslate,
 ): { retryPersistence: () => Promise<void>; checkHost: () => void; checkNative: () => Promise<void> } {
   const status = useAppStore((state) => state.proxyStatus);
+  const { t: text } = useTranslation();
   const savedRuntimeApply = useStagedConfigStore((state) => state.savedRuntimeApply);
   const pendingNative = useAppStore((state) => state.pendingChanges.nativeRetirements);
   const nativeEndedBeforeGeneration = useAppStore((state) => state.nativeRetirementEndedBeforeGeneration);
@@ -98,10 +100,19 @@ export function useRuntimeApplyReconciliation(
     if (!savedRuntimeApply.ok || savedRuntimeApply.coreState !== 'committed'
         || savedRuntimeApply.nativeRetirements?.length || pendingNative?.length || apply.nativeRetirements?.length
         || apply.host && apply.host.phase !== 'settled') return;
-    if (savedRuntimeApply.status === 'hotApplied' && savedRuntimeApply.configurationDurable === true) {
-      toast.info(t.current('home.pendingHotApplied'));
+    const changes = savedRuntimeApply.changes;
+    if (savedRuntimeApply.status !== 'hotApplied' || savedRuntimeApply.configurationDurable !== true || !changes?.length) return;
+    if (changes.length === 1 && changes[0].logLevel) {
+      toast.info(text('home.pendingSavedLogLevelApplied', { level: changes[0].logLevel }));
+      return;
     }
-  }, [apply, attemptRef, pendingNative, savedRuntimeApply, setApply, status]);
+    const labels = changes.slice(0, 3).map((change) => change.logLevel
+      ? `${text('logs.currentLevel')} ${change.logLevel}` : change.label);
+    const summary = labels.join(' · ');
+    const remaining = changes.length - labels.length;
+    toast.info(remaining > 0 ? text('home.pendingSavedMoreChangesApplied', { changes: summary, count: remaining })
+      : text('home.pendingSavedChangesApplied', { changes: summary }));
+  }, [apply, attemptRef, pendingNative, savedRuntimeApply, setApply, status, text]);
   const core = apply.coreRecovery ?? (apply.reconciling && apply.transactionId
     && apply.mainGeneration !== undefined && attemptRef.current?.intentGeneration !== undefined
     ? { transactionId: apply.transactionId, runtimeGeneration: apply.mainGeneration,

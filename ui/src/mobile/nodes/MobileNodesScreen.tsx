@@ -474,7 +474,7 @@ export function MobileNodesScreen(): ReactElement {
             stage({
               id: `server:${entityId}`,
               kind: 'server',
-              label: `${t('node.addTitle')} ${cloneName}`,
+              label: t('home.stagedNodeClone', { name: cloneName }),
               entityPath: ['servers', entityId],
               nextValue: { ...rest, id: entityId, name: cloneName },
             });

@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { isValidElement, type ReactElement, type ReactNode } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
+import type { SavedRuntimeApply } from '@/store/staged-config-store';
 import type { NativeRetirementDebt, PendingApplyResult, PendingNodeChanges } from '@/contracts/types';
 import type { ApplyState } from './pending-bar-logic';
 
@@ -12,7 +13,7 @@ const h = vi.hoisted(() => ({
   pendingEffects: [] as Array<() => void>,
   applyNow: vi.fn(), freshApply: vi.fn(), hostRead: vi.fn(), coreRead: vi.fn(), nativeRead: vi.fn(),
   retryPersistence: vi.fn(), pendingRead: vi.fn(), cancelImpact: vi.fn(),
-  savedRuntimeApply: null as PendingApplyResult | null,
+  savedRuntimeApply: null as SavedRuntimeApply | null,
   armed: null as string | null, revertSaved: vi.fn(),
   lifecycleReady: vi.fn(), offLifecycle: vi.fn(), statusRead: vi.fn(),
   app: {
@@ -42,7 +43,18 @@ vi.mock('react', async original => ({
     });
   },
 }));
-vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
+vi.mock('react-i18next', async () => {
+  const { default: { home } } = await import('@/i18n/locales/en-US.json');
+  const messages: Record<string, string> = {
+    'home.pendingSavedChangesApplied': home.pendingSavedChangesApplied,
+    'home.pendingSavedLogLevelApplied': home.pendingSavedLogLevelApplied,
+    'home.pendingSavedMoreChangesApplied': home.pendingSavedMoreChangesApplied,
+  };
+  const t = (key: string, values?: Record<string, string | number>) => messages[key] && values
+    ? messages[key].replace(/{{(\w+)}}/g, (_, field: string) => String(values[field]))
+    : key;
+  return { useTranslation: () => ({ t }) };
+});
 vi.mock('@/lib/confirm-twice', () => ({
   useConfirmTwice: () => ({
     armed: h.armed,
@@ -76,7 +88,7 @@ vi.mock('@/store/staged-config-store', async () => {
     return admitted?.reply;
   }, useStagedConfigStore: Object.assign((select: (value: typeof state) => unknown) => select(state), {
     getState: () => state,
-    setState: ({ savedRuntimeApply }: { savedRuntimeApply: PendingApplyResult | null }) => { h.savedRuntimeApply = savedRuntimeApply; },
+    setState: ({ savedRuntimeApply }: { savedRuntimeApply: SavedRuntimeApply | null }) => { h.savedRuntimeApply = savedRuntimeApply; },
   }) };
 });
 vi.mock('@/lib/error-handler', () => ({ toast: { info: vi.fn(), error: vi.fn(), warning: vi.fn(), success: vi.fn() } }));
@@ -161,10 +173,10 @@ afterEach(() => { unmount(); if (vi.isFakeTimers()) vi.clearAllTimers(); vi.useR
 it.each([7, 6])('shows a single Save HOT toast only for the running generation (%s)', (generation) => {
   h.app.pendingChanges = { added: [], modified: [], removed: [], restartDeferred: false };
   h.savedRuntimeApply = { ok: true, status: 'hotApplied', transactionId: 'save-hot',
-    runtimeGeneration: generation, selectionIntentGeneration: 3, coreState: 'committed', configurationDurable: true };
+    runtimeGeneration: generation, selectionIntentGeneration: 3, coreState: 'committed', configurationDurable: true, changes: [{ label: 'Log level submitted', logLevel: 'DEBUG' }] };
   expect(renderBar()).toBeNull();
   expect(renderBar()).toBeNull();
-  if (generation === 7) expect(toast.info).toHaveBeenCalledExactlyOnceWith('home.pendingHotApplied');
+  if (generation === 7) expect(toast.info).toHaveBeenCalledExactlyOnceWith('Log level changed to DEBUG.');
   else expect(toast.info).not.toHaveBeenCalled();
   expect(h.applyNow).not.toHaveBeenCalled();
 });
@@ -173,7 +185,7 @@ it('retains an ahead-of-status Save and replaces an earlier explicit failure aft
   h.app.pendingChanges = { added: [], modified: [], removed: [], restartDeferred: false };
   h.states[0] = { phase: 'failed', reason: 'earlier explicit failure', mainGeneration: 7 } satisfies ApplyState;
   h.savedRuntimeApply = { ok: true, status: 'hotApplied', transactionId: 'save-next',
-    runtimeGeneration: 8, selectionIntentGeneration: 4, coreState: 'committed', configurationDurable: true };
+    runtimeGeneration: 8, selectionIntentGeneration: 4, coreState: 'committed', configurationDurable: true, changes: [{ label: 'Delete rule Example' }] };
   expect(markup()).toContain('home.pendingApplyFailedReason');
   expect(h.savedRuntimeApply?.transactionId).toBe('save-next');
   expect(toast.info).not.toHaveBeenCalled();
@@ -181,7 +193,7 @@ it('retains an ahead-of-status Save and replaces an earlier explicit failure aft
   renderBar();
   expect(renderBar()).toBeNull();
   expect(h.states[0]).toMatchObject({ phase: 'idle', reason: null, mainGeneration: 8 });
-  expect(toast.info).toHaveBeenCalledExactlyOnceWith('home.pendingHotApplied');
+  expect(toast.info).toHaveBeenCalledExactlyOnceWith('Delete rule Example took effect.');
 });
 
 it.each(['hotApplied', 'applied'] as const)('keeps a newer explicit %s while an older Save is queued', async (status) => {
@@ -191,7 +203,7 @@ it.each(['hotApplied', 'applied'] as const)('keeps a newer explicit %s while an 
   await microtasks();
   h.savedRuntimeApply = { ok: true, status: 'hotApplied', transactionId: 'older-save',
     runtimeGeneration: 7, selectionIntentGeneration: status === 'applied' ? 10 : 8,
-    coreState: 'committed', configurationDurable: true };
+    coreState: 'committed', configurationDurable: true, changes: [{ label: 'Rule change from Save' }] };
   renderBar();
   expect(h.savedRuntimeApply.transactionId).toBe('older-save');
   finish(status === 'applied' ? { ok: true, status, saved: true, applyId: 35 }
@@ -212,14 +224,14 @@ it.each(['hotApplied', 'applied'] as const)('keeps a newer explicit %s while an 
     expect(h.savedRuntimeApply).toBeNull();
     expect(toast.info).not.toHaveBeenCalled();
     h.savedRuntimeApply = { ok: true, status: 'hotApplied', transactionId: 'future-save',
-      runtimeGeneration: 9, selectionIntentGeneration: 11, coreState: 'committed', configurationDurable: true };
+      runtimeGeneration: 9, selectionIntentGeneration: 11, coreState: 'committed', configurationDurable: true, changes: [{ label: 'Clone node Copy' }, { label: 'Edit app policy Mail · Direct' }, { label: 'Edit rule Example' }, { label: 'Delete rule Old' }] };
     renderBar();
     expect(h.savedRuntimeApply?.transactionId).toBe('future-save');
     h.app.proxyStatus = { running: true, mainGeneration: 9 };
     renderBar();
     expect(h.savedRuntimeApply).toBeNull();
     expect(h.states[0]).toMatchObject({ phase: 'idle', mainGeneration: 9 });
-    expect(toast.info).toHaveBeenCalledExactlyOnceWith('home.pendingHotApplied');
+    expect(toast.info).toHaveBeenCalledExactlyOnceWith('Clone node Copy · Edit app policy Mail · Direct · Edit rule Example and 1 more took effect.');
   } else {
     expect(h.states[0]).toMatchObject({ phase: 'idle', transactionId: 'newer-explicit' });
     expect(h.savedRuntimeApply).toBeNull();
@@ -231,7 +243,8 @@ it('keeps polling a superseded Save owner without offering a persistence replay'
   vi.useFakeTimers();
   h.app.pendingChanges = { added: [], modified: [], removed: [], restartDeferred: true };
   h.savedRuntimeApply = { ok: true, status: 'hotDurabilityPending', transactionId: 'save-core',
-    runtimeGeneration: 7, selectionIntentGeneration: 9, coreState: 'committed', configurationDurable: false };
+    runtimeGeneration: 7, selectionIntentGeneration: 9, coreState: 'committed', configurationDurable: false,
+    changes: [{ label: 'Rule change still awaiting recovery' }] };
   renderBar();
   expect(button('home.pendingRetryPersistenceBtn').props.disabled).not.toBe(true);
   h.coreRead.mockResolvedValue({ ok: false, status: 'unconfirmed', transactionId: 'save-core', runtimeGeneration: 7,
@@ -248,7 +261,7 @@ it('keeps polling a superseded Save owner without offering a persistence replay'
 it('keeps explicit ownership over a previously queued Save with the same selector intent', async () => {
   h.app.proxyStatus = { running: true, mainGeneration: 6 };
   h.savedRuntimeApply = { ok: true, status: 'hotApplied', transactionId: 'queued-save',
-    runtimeGeneration: 7, selectionIntentGeneration: 9, coreState: 'committed', configurationDurable: true };
+    runtimeGeneration: 7, selectionIntentGeneration: 9, coreState: 'committed', configurationDurable: true, changes: [{ label: 'Rule change from Save' }] };
   h.applyNow.mockResolvedValueOnce({ ok: true, saved: true, status: 'hotApplied', transactionId: 'new-explicit',
     runtimeGeneration: 7, selectionIntentGeneration: 9, coreState: 'committed', configurationDurable: true });
   click('home.pendingApplyBtn');
@@ -265,7 +278,7 @@ it('attributes a Save already in flight before external Apply dispatches', async
   const saving = withConfigWriteLock(async () => {
     await new Promise<void>(resolve => { finishSave = resolve; });
     h.savedRuntimeApply = { ok: true, status: 'hotApplied', transactionId: 'older-in-flight',
-      runtimeGeneration: 7, selectionIntentGeneration: 9, coreState: 'committed', configurationDurable: true };
+      runtimeGeneration: 7, selectionIntentGeneration: 9, coreState: 'committed', configurationDurable: true, changes: [{ label: 'Rule change from Save' }] };
   });
   h.freshApply.mockResolvedValueOnce({ ok: true, status: 'hotApplied', transactionId: 'new-external-apply',
     runtimeGeneration: 7, selectionIntentGeneration: 9, coreState: 'committed', configurationDurable: true });
@@ -538,7 +551,7 @@ describe('desktop native listener cleanup stays independent', () => {
   it('preserves independent native debt across a same-generation Save receipt', () => {
     h.app.pendingChanges = empty();
     h.states[0] = { phase: 'failed', reason: 'prior explicit failure', nativeRetirements: [native] } satisfies ApplyState;
-    h.savedRuntimeApply = { ...receipt(), status: 'hotApplied', ok: true, transactionId: 'save-after-old-native', nativeRetirements: undefined };
+    h.savedRuntimeApply = { ...receipt(), status: 'hotApplied', ok: true, transactionId: 'save-after-old-native', nativeRetirements: undefined, changes: [{ label: 'Rule change from Save' }] };
     renderBar();
     expect(markup()).toContain('home.pendingCheckNativeBtn');
     expect(h.states[0]).toMatchObject({ phase: 'idle', nativeRetirements: [native] });

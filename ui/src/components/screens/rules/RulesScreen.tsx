@@ -386,11 +386,10 @@ export function RulesScreen({ plane = 'route' }: { plane?: 'route' | 'dns' }) {
           stage({
             id: `rule:${entityId}`,
             kind: 'rule',
-            label: `${t('rules.newTitle')} ${payload.remarks ?? payload.type}`,
+            label: `${t('rules.duplicate')} ${payload.remarks ?? payload.type}`,
             entityPath: [collectionKey, entityId],
             nextValue: { ...payload, id: entityId },
           });
-          toast.success(t('rules.duplicated'));
           return; // 零 IPC 写、零磁盘写（FR-1）
         }
         await api.rules.add(payload, plane);
@@ -456,23 +455,21 @@ export function RulesScreen({ plane = 'route' }: { plane?: 'route' | 'dns' }) {
         stage({
           id: 'setting:regionRouting',
           kind: 'setting',
-          label: t('home.stagedSetting', { key: 'regionRouting' }),
+          label: next.enabled ? t(next.reverse ? 'home.stagedRegionProxy' : 'home.stagedRegionDirect', {
+            region: t(`rules.region.${next.region}`),
+          }) : t('home.stagedRegionOff'),
           entityPath: ['regionRouting'],
           nextValue: next,
         });
-        // 下面那两条 toast 照发：它们说的是「这次选择意味着什么分流形态」，与「何时落盘」正交。
-      } else {
-        try {
-          await useAppStore.getState().saveConfig({ regionRouting: next });
-        } catch (err) {
-          // 保存失败**不回滚**（GeoCard 是受控组件，按钮态跟着 store 走，写失败即原地不动）：
-          // 表现为「点了没反应」，必须报出真实原因。
-          console.error('[RulesScreen] regionRouting save failed:', err);
-          toast.error(
-            t('rules.saveFailed'),
-          );
-          return;
-        }
+        return;
+      }
+      try {
+        await useAppStore.getState().saveConfig({ regionRouting: next });
+      } catch (err) {
+        // GeoCard is controlled and keeps the previous value when the write fails.
+        console.error('[RulesScreen] regionRouting save failed:', err);
+        toast.error(t('rules.saveFailed'));
+        return;
       }
       // 原型 :4103 geo-region → notify('<地区> · 该地区流量直连')（中性）：按钮 .on 只说「选中了」，
       // 说不出「选中意味着什么」，这条 toast 才是语义。
