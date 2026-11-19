@@ -628,7 +628,8 @@ async fn actual_debounced_restart_invalidates_before_blocked_failed_cleanup_and_
     rt.config
         .save_full(&saved)
         .expect("seed durable desired config");
-    rt.commit_coex_current_config(saved);
+    rt.commit_coex_current_config(rt.config.current().unwrap());
+    rt.status.write().unwrap().running = true;
     let token = o.begin_watcher(generation).unwrap();
     o.watcher(generation, token, true);
     o.lock().binding.phase = "ready";
