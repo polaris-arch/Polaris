@@ -11,6 +11,9 @@ pub const RUNTIME_CONFIG_MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 // Plan validates the full candidate and may fetch remote rule sources, even
 // for a small edit. This budget applies only to preparation.
 const RUNTIME_CONFIG_PLAN_DEADLINE: Duration = Duration::from_secs(12);
+// Apply prepares the candidate graph before publication. Even a log-only
+// change with a large live ruleset can take longer than Plan.
+const RUNTIME_CONFIG_APPLY_DEADLINE: Duration = Duration::from_secs(20);
 
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimeConfigError {
@@ -38,9 +41,9 @@ impl SingBoxApiClient {
             .max_decoding_message_size(RUNTIME_CONFIG_MAX_MESSAGE_BYTES)
     }
 
-    fn runtime_config_request<T>(&self, value: T) -> Request<T> {
+    fn runtime_config_request<T>(&self, value: T, deadline: Duration) -> Request<T> {
         let mut request = self.with_auth(Request::new(value));
-        request.set_timeout(UNARY_DEADLINE);
+        request.set_timeout(deadline);
         request
     }
 
@@ -50,7 +53,7 @@ impl SingBoxApiClient {
     ) -> Result<daemon::RuntimeCapabilities, RuntimeConfigError> {
         let mut client = self.runtime_config_client();
         Ok(self
-            .unary(client.get_runtime_capabilities(self.runtime_config_request(())))
+            .unary(client.get_runtime_capabilities(self.runtime_config_request((), UNARY_DEADLINE)))
             .await
             .map_err(classify)?
             .into_inner())
@@ -62,8 +65,7 @@ impl SingBoxApiClient {
         request: daemon::PlanRuntimeConfigRequest,
     ) -> Result<daemon::RuntimeConfigPlan, RuntimeConfigError> {
         let mut client = self.runtime_config_client();
-        let mut request = self.with_auth(Request::new(request));
-        request.set_timeout(RUNTIME_CONFIG_PLAN_DEADLINE);
+        let request = self.runtime_config_request(request, RUNTIME_CONFIG_PLAN_DEADLINE);
         Ok(self
             .unary_with_deadline(
                 RUNTIME_CONFIG_PLAN_DEADLINE,
@@ -81,8 +83,12 @@ impl SingBoxApiClient {
         request: daemon::ApplyRuntimeConfigRequest,
     ) -> Result<daemon::RuntimeConfigOperation, RuntimeConfigError> {
         let mut client = self.runtime_config_client();
+        let request = self.runtime_config_request(request, RUNTIME_CONFIG_APPLY_DEADLINE);
         Ok(self
-            .unary(client.apply_runtime_config(self.runtime_config_request(request)))
+            .unary_with_deadline(
+                RUNTIME_CONFIG_APPLY_DEADLINE,
+                client.apply_runtime_config(request),
+            )
             .await
             .map_err(classify)?
             .into_inner())
@@ -96,7 +102,11 @@ impl SingBoxApiClient {
     ) -> Result<daemon::RuntimeConfigOperation, RuntimeConfigError> {
         let mut client = self.runtime_config_client();
         Ok(self
-            .unary(client.retry_runtime_persistence(self.runtime_config_request(request)))
+            .unary(
+                client.retry_runtime_persistence(
+                    self.runtime_config_request(request, UNARY_DEADLINE),
+                ),
+            )
             .await
             .map_err(classify)?
             .into_inner())
@@ -110,7 +120,9 @@ impl SingBoxApiClient {
     ) -> Result<daemon::RuntimeConfigOperation, RuntimeConfigError> {
         let mut client = self.runtime_config_client();
         Ok(self
-            .unary(client.acknowledge_runtime_persistence(self.runtime_config_request(request)))
+            .unary(client.acknowledge_runtime_persistence(
+                self.runtime_config_request(request, UNARY_DEADLINE),
+            ))
             .await
             .map_err(classify)?
             .into_inner())
@@ -123,7 +135,11 @@ impl SingBoxApiClient {
     ) -> Result<daemon::RuntimeConfigStatus, RuntimeConfigError> {
         let mut client = self.runtime_config_client();
         Ok(self
-            .unary(client.get_runtime_config_status(self.runtime_config_request(request)))
+            .unary(
+                client.get_runtime_config_status(
+                    self.runtime_config_request(request, UNARY_DEADLINE),
+                ),
+            )
             .await
             .map_err(classify)?
             .into_inner())
@@ -162,7 +178,7 @@ impl SingBoxApiClient {
                 "invalid API handoff metadata",
             )))
         };
-        let mut request = self.runtime_config_request(status);
+        let mut request = self.runtime_config_request(status, UNARY_DEADLINE);
         for (name, value) in [
             ("x-polaris-api-challenge", challenge),
             ("x-polaris-api-ack", ack),

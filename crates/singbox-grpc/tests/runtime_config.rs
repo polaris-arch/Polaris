@@ -17,7 +17,7 @@ use tonic::{Code, Request, Response, Status};
 #[derive(Clone, Default)]
 struct Mock {
     code: Option<Code>,
-    plan_delay: Duration,
+    preparation_delay: Duration,
     stall_apply: bool,
     stall_retry: bool,
     no_op: bool,
@@ -178,8 +178,8 @@ impl RuntimeConfigService for Mock {
     ) -> Result<Response<daemon::RuntimeConfigPlan>, Status> {
         self.check(&request)?;
         assert_eq!(request.into_inner(), plan_request());
-        if !self.plan_delay.is_zero() {
-            tokio::time::sleep(self.plan_delay).await;
+        if !self.preparation_delay.is_zero() {
+            tokio::time::sleep(self.preparation_delay).await;
         }
         Ok(Response::new(daemon::RuntimeConfigPlan {
             plan_id: "plan".into(),
@@ -200,6 +200,9 @@ impl RuntimeConfigService for Mock {
         assert_eq!(request.into_inner(), apply_request());
         if self.stall_apply {
             std::future::pending::<()>().await;
+        }
+        if !self.preparation_delay.is_zero() {
+            tokio::time::sleep(self.preparation_delay).await;
         }
         Ok(Response::new(daemon::RuntimeConfigOperation {
             transaction_id: "transaction".into(),
@@ -436,14 +439,18 @@ async fn other_statuses_are_not_unsupported() {
         Err(RuntimeConfigError::Call(ClientError::Status(status))) if status.code() == Code::Unauthenticated));
 }
 #[tokio::test]
-async fn runtime_plan_can_finish_after_the_regular_unary_deadline() {
+async fn runtime_preparation_can_finish_after_the_regular_unary_deadline() {
     let mock = Mock {
-        plan_delay: UNARY_DEADLINE + Duration::from_millis(100),
+        preparation_delay: UNARY_DEADLINE + Duration::from_millis(100),
         ..Default::default()
     };
     let (client, _server) = start(mock, "secret").await;
-    let result = client.plan_runtime_config(plan_request()).await.unwrap();
-    assert!(result.applicable);
+    let (plan, operation) = tokio::join!(
+        client.plan_runtime_config(plan_request()),
+        client.apply_runtime_config(apply_request()),
+    );
+    assert!(plan.unwrap().applicable);
+    assert_eq!(operation.unwrap().transaction_id, "transaction");
 }
 
 #[tokio::test]
@@ -454,12 +461,21 @@ async fn apply_timeout_is_bounded_and_never_retried() {
     };
     let calls = mock.calls.clone();
     let (client, _server) = start(mock, "secret").await;
-    let result = tokio::time::timeout(
-        UNARY_DEADLINE * 2,
-        client.apply_runtime_config(apply_request()),
-    )
+    let apply = tokio::spawn(async move { client.apply_runtime_config(apply_request()).await });
+    // Establish the real loopback connection before advancing the test clock.
+    tokio::time::timeout(UNARY_DEADLINE, async {
+        while calls.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
     .await
     .unwrap();
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(21)).await;
+    let result = tokio::time::timeout(UNARY_DEADLINE, apply)
+        .await
+        .unwrap()
+        .unwrap();
     assert!(
         matches!(result, Err(RuntimeConfigError::Call(ClientError::Status(status))) if status.code() == Code::DeadlineExceeded)
     );
