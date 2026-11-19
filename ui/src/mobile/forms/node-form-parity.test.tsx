@@ -422,15 +422,22 @@ describe('⑥ 提交：抓住真的提交闭包，看写出去的 ServerConfig',
     renderEdit(TOR_BASE);
     const servers = event === 'changed' ? [{ ...TOR_BASE, name: 'edited elsewhere' }] : [];
     probe.backend = { ...probe.backend!, servers };
-    useAppStore.setState({ config: probe.backend });
     useStagedConfigStore.setState({ latestSavedConfig: probe.backend });
-    mirror();
     expect(probe.onSubmit).not.toBeNull();
     await probe.onSubmit?.();
     expect(useStagedConfigStore.getState().entries).toEqual([]);
     expect(probe.save).not.toHaveBeenCalled();
     expect(probe.update).toEqual([]);
     expect(probe.add).toEqual([]);
+  });
+
+  it('keeps a form based on the previous mirror from replacing a newly broadcast node', async () => {
+    renderEdit(TOR_BASE);
+    useAppStore.setState({ config: { ...probe.backend!, servers: [{ ...TOR_BASE, name: 'edited elsewhere' }] } });
+    mirror();
+    expect(probe.onSubmit).not.toBeNull();
+    await probe.onSubmit?.();
+    expect(probe.save).not.toHaveBeenCalled();
   });
 
   it('b. 正面对照：不动扩展 JSON 时，袋键原样保留（证明下一条的补丁是唯一变量）', async () => {

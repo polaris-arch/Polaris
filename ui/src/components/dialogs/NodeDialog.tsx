@@ -26,7 +26,7 @@ import { realityUtlsError } from '@/domain/utls';
 import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { toast } from '@/lib/error-handler';
-import { effectiveCollection, useAppStore, useEffectiveConfig, useEffectiveServers } from '@/store/app-store';
+import { getEffectiveConfig, useAppStore, useEffectiveConfig, useEffectiveServers } from '@/store/app-store';
 import { useStagedConfigStore } from '@/store/staged-config-store';
 import { useStagingActive } from '@/store/use-staging-active';
 import { configCanonicalText, editRoute } from '@/lib/staged-config';
@@ -275,9 +275,12 @@ function NodeForm({ instanceId, base, serverId, servers, initialProto }: NodeFor
 
   const handleSubmit = async () => {
     if (isEdit) {
-      const current = effectiveCollection('servers', useAppStore.getState().servers, useStagedConfigStore.getState().entries)
-        .find((node) => node.id === serverId);
-      if (!current || !openedWith || configCanonicalText(current) !== configCanonicalText(openedWith)) {
+      const current = getEffectiveConfig()?.servers.find((node) => node.id === serverId);
+      const saved = useStagedConfigStore.getState().latestSavedConfig;
+      const savedNode = saved?.servers.find((node) => node.id === serverId);
+      const opened = configCanonicalText(openedWith);
+      if (!openedWith || configCanonicalText(current) !== opened
+          || (stagingEnabled && saved && configCanonicalText(savedNode) !== opened)) {
         toast.warning(t('home.stagedConflictTitle'), { description: t('home.pendingHotConflict') });
         return;
       }

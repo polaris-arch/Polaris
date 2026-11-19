@@ -83,7 +83,7 @@ import { isAddresslessProtocol, tailcatSettingsError } from '@/domain/server-com
 import { INVALID_NODE_REASON_KEY } from '@/domain/invalid-node-reason';
 import { configCanonicalText, editRoute } from '@/lib/staged-config';
 import { buildNetworkInterfaceChoices, useNetworkInterfaces } from '@/hooks/use-network-interfaces';
-import { effectiveCollection, useAppStore, useEffectiveConfig, useEffectiveServers } from '@/store/app-store';
+import { getEffectiveConfig, useAppStore, useEffectiveConfig, useEffectiveServers } from '@/store/app-store';
 import { useStagedConfigStore } from '@/store/staged-config-store';
 import { useStagingActive } from '@/store/use-staging-active';
 import { MobileFields } from './FormFields';
@@ -333,9 +333,12 @@ export function NodeFormPanel({
 
   const submit = async (): Promise<void> => {
     if (isEdit) {
-      const current = effectiveCollection('servers', useAppStore.getState().servers, useStagedConfigStore.getState().entries)
-        .find((node) => node.id === serverId);
-      if (!current || !openedWith || configCanonicalText(current) !== configCanonicalText(openedWith)) {
+      const current = getEffectiveConfig()?.servers.find((node) => node.id === serverId);
+      const saved = useStagedConfigStore.getState().latestSavedConfig;
+      const savedNode = saved?.servers.find((node) => node.id === serverId);
+      const opened = configCanonicalText(openedWith);
+      if (!openedWith || configCanonicalText(current) !== opened
+          || (stagingEnabled && saved && configCanonicalText(savedNode) !== opened)) {
         toast.warning(t('home.stagedConflictTitle'), { description: t('home.pendingHotConflict') });
         return;
       }
