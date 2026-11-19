@@ -6,11 +6,13 @@ import java.io.IOException
 import java.lang.reflect.InvocationTargetException
 import java.lang.reflect.Method
 import java.lang.reflect.Proxy
+import java.util.concurrent.atomic.AtomicBoolean
 import org.json.JSONObject
 
 /** Typed Go V1 registration. An older selected libbox keeps its cold-only Tailscale path. */
 internal object AndroidRuntimeTailscaleBridge {
     private const val CONTRACT = "polaris-android-runtime-ts-writer-v1"
+    private const val ADMISSION_CONTRACT = "polaris-android-runtime-ts-admission-v1"
     private const val LIBBOX = "io.nekohasekai.libbox"
     private val hex64 = Regex("[0-9a-f]{64}")
 
@@ -31,20 +33,29 @@ internal object AndroidRuntimeTailscaleBridge {
         val readScope = scopeReader(scopeType)
         val ticket = checkNotNull(owner.nativeTicket)
         val ledger = AndroidNativeAdmissionGate.ledger
-        fun currentIncarnation(): String? = if (current() && isCurrent(owner, ticket, ledger)) {
+        val versionRead = AtomicBoolean()
+        fun currentIncarnation(): String? = if (current() && owner.runtimeTailscaleRegistered(server) && isCurrent(owner, ticket, ledger)) {
             owner.runtimeAdmission?.identity?.incarnation
         } else null
 
         val proxy = Proxy.newProxyInstance(platform.classLoader, arrayOf(platform)) { receiver, method, arguments ->
             val args = arguments.orEmpty()
             when (method) {
-                version -> 1
+                version -> {
+                    versionRead.set(true)
+                    1
+                }
                 validate -> runCatching {
                     val tag = args[0] as String
                     val incarnation = currentIncarnation() ?: return@runCatching false
                     if (!validTag(tag)) return@runCatching false
-                    val paths = controlledDirectories(dataDir, args[1] as String, args[2] as String) ?: return@runCatching false
-                    TransientLoginHost.validateRuntimeDirectories(owner, paths) { currentIncarnation() == incarnation }
+                    val state = args[1] as String
+                    val taildrop = args[2] as String
+                    val paths = controlledDirectories(dataDir, state, taildrop) ?: return@runCatching false
+                    TransientLoginHost.validateRuntimeDirectories(owner, paths) {
+                        currentIncarnation() == incarnation &&
+                            ledger.canRetainRuntimeWriter(ticket, owner.birthNonce, incarnation, tag, state, taildrop)
+                    }
                 }.getOrDefault(false)
                 claim -> {
                     val scope = readScope(checkNotNull(args[0]))
@@ -74,7 +85,18 @@ internal object AndroidRuntimeTailscaleBridge {
                 }
             }
         }
-        invoke(server, setter, proxy)
+        owner.registerRuntimeTailscale(server) {
+            invoke(server, setter, proxy)
+            versionRead.get()
+        }
+    }
+
+    fun checkAdmission(attempt: MainKernelAttempt<*>, ledger: AndroidNativeAdmission): JSONObject {
+        val ticket = checkNotNull(attempt.nativeTicket)
+        check(attempt.runtimeTailscaleRegistered() && attempt.ownershipState() == "acknowledged" &&
+            attempt.runtimeAdmission?.identity != null && isCurrent(attempt, ticket, ledger))
+        return JSONObject().put("contractVersion", ADMISSION_CONTRACT).put("processNonce", ledger.processNonce)
+            .put("nativeTicketId", ticket.id).put("runId", attempt.runId).put("birthNonce", attempt.birthNonce)
     }
 
     fun observe(attempt: MainKernelAttempt<*>, digest: String): JSONObject {

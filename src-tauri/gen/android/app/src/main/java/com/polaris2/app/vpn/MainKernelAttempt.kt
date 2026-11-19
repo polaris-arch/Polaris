@@ -30,6 +30,18 @@ internal class MainKernelAttempt<Server>(
         private set
     /** Published only after this attempt's current native incarnation passes protocol admission. */
     @Volatile var runtimeAdmission: RuntimeProtocolAdmission? = null
+    @Volatile private var runtimeTailscaleServer: Server? = null
+
+    fun registerRuntimeTailscale(server: Server, install: () -> Boolean): Boolean {
+        check(Thread.holdsLock(operationLock) && !revoked && prepared.getNow(null) === server)
+        check(runtimeTailscaleServer == null)
+        if (!install()) return false
+        runtimeTailscaleServer = server
+        return true
+    }
+
+    fun runtimeTailscaleRegistered(server: Any? = prepared.getNow(null)): Boolean =
+        server != null && !revoked && runtimeTailscaleServer === server
 
     fun bindTailscaleStore(ledger: AndroidNativeAdmission): AndroidTailscaleStoreCustody = synchronized(operationLock) {
         tailscaleStore ?: ledger.bindTailscaleStore(checkNotNull(nativeTicket), birthNonce).also { tailscaleStore = it }

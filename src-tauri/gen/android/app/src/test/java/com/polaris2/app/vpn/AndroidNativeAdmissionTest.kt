@@ -62,16 +62,24 @@ class AndroidNativeAdmissionTest {
         val main = ledger.reserveOwner(AndroidNativeAdmission.Kind.Main, "main")
         val sibling = ledger.reserveOwner(AndroidNativeAdmission.Kind.Login, "login")
         ledger.bindTailscaleStore(main, "birth")
+        val original = runtimeWriterScope(1)
+        fun canRetain() = ledger.canRetainRuntimeWriter(main, "birth", original.incarnation, original.tag,
+            original.stateDirectory, original.taildropDirectory)
+        assertFalse(canRetain())
         assertTrue(ledger.enterBirth(main))
+        assertTrue(canRetain())
         assertTrue(ledger.admitScopedBytes(sibling, AndroidNativeAdmission.MAX_SCOPED_BYTES))
-        assertFalse(ledger.retainRuntimeWriter(main, "birth", runtimeWriterScope(1)))
-        assertEquals(null, ledger.runtimeWriterHistory(main, "birth", runtimeWriterScope(1)))
+        assertFalse(canRetain())
+        assertFalse(ledger.retainRuntimeWriter(main, "birth", original))
+        assertEquals(null, ledger.runtimeWriterHistory(main, "birth", original))
         assertTrue(ledger.admitScopedBytes(sibling, 0))
+        assertTrue(canRetain())
         for (sequence in 1..AndroidTailscaleStoreCustody.MAX_RUNS) {
             val writer = runtimeWriterScope(sequence)
             assertTrue(ledger.retainRuntimeWriter(main, "birth", writer))
             assertTrue(ledger.settleRuntimeWriter(main, "birth", writer, false))
         }
+        assertFalse(canRetain())
         assertFalse(ledger.retainRuntimeWriter(main, "birth", runtimeWriterScope(AndroidTailscaleStoreCustody.MAX_RUNS + 1)))
         assertEquals(AndroidNativeAdmission.RuntimeWriterOutcome.NoAcquisition,
             ledger.runtimeWriterHistory(main, "birth", runtimeWriterScope(1))?.outcome)

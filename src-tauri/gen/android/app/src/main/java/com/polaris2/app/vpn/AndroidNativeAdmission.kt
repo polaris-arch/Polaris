@@ -261,18 +261,21 @@ internal class AndroidNativeAdmission(
         revision++
     }
 
+    internal fun canRetainRuntimeWriter(
+        ticket: Ticket, birthNonce: String, incarnation: String, tag: String, stateDirectory: String, taildropDirectory: String,
+    ): Boolean {
+        val bytes = runtimeWriterBytes(incarnation, tag, stateDirectory, taildropDirectory)
+        return synchronized(lock) { runtimeWriterAdmissionLocked(ticket, birthNonce, bytes) != null }
+    }
+
     internal fun retainRuntimeWriter(ticket: Ticket, birthNonce: String, scope: RuntimeTailscaleWriterScope): Boolean {
-        val bytes = JSONObject().put("scope", scope.json()).put("outcome", RuntimeWriterOutcome.ClosedConfirmed.name)
-            .toString().toByteArray(Charsets.UTF_8).size
+        val bytes = runtimeWriterBytes(scope.incarnation, scope.tag, scope.stateDirectory, scope.taildropDirectory)
         return synchronized(lock) {
-            val entry = runtimeMainEntryLocked(ticket, birthNonce) ?: return@synchronized false
-            if (entry.state != State.BirthEntered || fenceId != null || capacityClosed ||
-                entries.values.any { it.targetAction != null } ||
-                entry.runtimeWriters.size >= AndroidTailscaleStoreCustody.MAX_RUNS ||
-                entry.runtimeWriters.containsKey(scope.runNonce) ||
+            val entry = runtimeWriterAdmissionLocked(ticket, birthNonce, bytes) ?: return@synchronized false
+            if (entry.runtimeWriters.containsKey(scope.runNonce) ||
                 entry.runtimeWriters.values.any {
                     it.scope.incarnation == scope.incarnation && it.scope.resourceSequence == scope.resourceSequence
-                } || bytes > MAX_SCOPED_BYTES - scopedBytesLocked()) return@synchronized false
+                }) return@synchronized false
             val original = RuntimeWriterHistory(scope, RuntimeWriterOutcome.Held)
             entries[ticket.id] = entry.copy(
                 runtimeWriters = entry.runtimeWriters + (scope.runNonce to original),
@@ -315,6 +318,20 @@ internal class AndroidNativeAdmission(
 
     private fun runtimeMainEntryLocked(ticket: Ticket, birthNonce: String): Entry? =
         entries[ticket.id]?.takeIf { it.ticket === ticket && ticket.kind == Kind.Main && it.store?.birthNonce == birthNonce }
+
+    private fun runtimeWriterAdmissionLocked(ticket: Ticket, birthNonce: String, bytes: Int): Entry? =
+        runtimeMainEntryLocked(ticket, birthNonce)?.takeIf {
+            it.state == State.BirthEntered && fenceId == null && !capacityClosed && entries.values.none { row -> row.targetAction != null } &&
+                it.runtimeWriters.size < AndroidTailscaleStoreCustody.MAX_RUNS && bytes <= MAX_SCOPED_BYTES - scopedBytesLocked()
+        }
+
+    /** Reserve the same worst-case wire size before the Core assigns a nonce, sequence or generation. */
+    private fun runtimeWriterBytes(incarnation: String, tag: String, stateDirectory: String, taildropDirectory: String): Int {
+        val digest = "0".repeat(64)
+        val largestScope = RuntimeTailscaleWriterScope(incarnation, -1L, -1L, digest, digest, tag, stateDirectory, taildropDirectory)
+        return JSONObject().put("scope", largestScope.json()).put("outcome", RuntimeWriterOutcome.ClosedConfirmed.name)
+            .toString().toByteArray(Charsets.UTF_8).size
+    }
 
     private fun runtimeWriterHistoryLocked(ticket: Ticket, birthNonce: String, scope: RuntimeTailscaleWriterScope): RuntimeWriterHistory? =
         runtimeMainEntryLocked(ticket, birthNonce)?.runtimeWriters?.get(scope.runNonce)?.takeIf { it.scope == scope }

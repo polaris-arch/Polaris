@@ -22,6 +22,43 @@ class MainKernelAttemptTest {
         skippedPackages = emptyList(),
     )
 
+    @Test fun runtimeTailscaleCapabilityRequiresSuccessfulOriginalRegistration() {
+        val ledger = AndroidNativeAdmission("process").also { it.bootstrap(RequiredMarkerProof.Absent) }
+        val ticket = ledger.reserveOwner(AndroidNativeAdmission.Kind.Main, "original")
+        val attempt = MainKernelAttempt<Any>(runId = ticket.logicalId, nativeTicket = ticket)
+        val server = Any()
+        attempt.bindTailscaleStore(ledger)
+        assertTrue(ledger.enterBirth(ticket))
+        attempt.publish(server)
+        attempt.runtimeAdmission = RuntimeProtocolAdmission("m", RuntimeProtocolAdmission.Identity("incarnation", "1", "d"), "0", emptyList())
+        assertTrue(MainKernelAttemptRegistry.claim(attempt))
+        try {
+            assertTrue(runCatching { AndroidRuntimeTailscaleBridge.checkAdmission(attempt, ledger) }.isFailure)
+            synchronized(attempt.operationLock) {
+                assertTrue(runCatching { attempt.registerRuntimeTailscale(Any()) { true } }.isFailure)
+                assertFalse(attempt.registerRuntimeTailscale(server) { false })
+                assertTrue(runCatching { attempt.registerRuntimeTailscale(server) { error("native registration failed") } }.isFailure)
+            }
+            assertTrue(runCatching { AndroidRuntimeTailscaleBridge.checkAdmission(attempt, ledger) }.isFailure)
+            synchronized(attempt.operationLock) { assertTrue(attempt.registerRuntimeTailscale(server) { true }) }
+            assertTrue(runCatching { AndroidRuntimeTailscaleBridge.checkAdmission(attempt, ledger) }.isFailure)
+            attempt.acknowledgeStart()
+            val receipt = AndroidRuntimeTailscaleBridge.checkAdmission(attempt, ledger)
+            assertEquals("polaris-android-runtime-ts-admission-v1", receipt.getString("contractVersion"))
+            assertEquals(ledger.processNonce, receipt.getString("processNonce"))
+            assertEquals(ticket.id, receipt.getString("nativeTicketId"))
+            assertEquals(attempt.runId, receipt.getString("runId"))
+            assertEquals(attempt.birthNonce, receipt.getString("birthNonce"))
+            assertFalse(attempt.runtimeTailscaleRegistered(Any()))
+            attempt.revokeAndDetachTun()
+            assertTrue(runCatching { AndroidRuntimeTailscaleBridge.checkAdmission(attempt, ledger) }.isFailure)
+        } finally {
+            attempt.closeOnce { }
+            attempt.closed.get(2, TimeUnit.SECONDS)
+            assertTrue(MainKernelAttemptRegistry.completeAfterClose(attempt) { })
+        }
+    }
+
     @Test fun stopBeforeFactoryPublishesWaitsForThatServerAndClosesExactlyOnce() {
         val attempt = MainKernelAttempt<Any>()
         val server = Any()
