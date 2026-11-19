@@ -7,6 +7,7 @@ import hashlib
 import os
 from pathlib import Path
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -153,6 +154,37 @@ def admit():
     print('APPLE_RUNNER_TOOL_ADMISSION=' + json.dumps(facts, sort_keys=True), flush=True)
 
 
+def run_build_settings(root, env):
+    command = ['node', ROOT / 'scripts/mobile-core/apple-admission.mjs', '--build-settings', root]
+    child = None
+    interrupted = None
+
+    def relay(signum, _frame):
+        nonlocal interrupted
+        if interrupted is None:
+            interrupted = signum
+        if child is not None:
+            child.send_signal(signum)
+
+    # Python alone may receive cancellation. Wait for the Node owner, which
+    # in turn waits for its detached Xcode group, before leaving this phase.
+    previous = {kind: signal.getsignal(kind) for kind in (signal.SIGTERM, signal.SIGINT)}
+    try:
+        for kind in previous:
+            signal.signal(kind, relay)
+        with subprocess.Popen(command, cwd=ROOT, env=env, start_new_session=True) as child:
+            if interrupted is not None:
+                child.send_signal(interrupted)
+            status = child.wait()
+    finally:
+        for kind, handler in previous.items():
+            signal.signal(kind, handler)
+    if interrupted is not None:
+        raise SystemExit(128 + interrupted)
+    if status:
+        raise subprocess.CalledProcessError(status, command)
+
+
 def prepare():
     value = load()
     identity = producer_code()
@@ -160,8 +192,7 @@ def prepare():
     expected = os.environ['POLARIS_APP_CANDIDATE']
     require(run(['git', 'rev-parse', 'HEAD'], cwd=ROOT).strip() == expected, 'hosted App candidate differs')
     developer, env, xcode = selected_apple_tools(value)
-    subprocess.run(['node', ROOT / 'scripts/mobile-core/apple-admission.mjs', '--build-settings', root],
-                   cwd=ROOT, env=env, check=True)
+    run_build_settings(root, env)
     tools = private_dir(root / 'tools')
     tool_cache = private_dir(root / 'tool-cache')
     go = Path(shutil.which('go')).resolve(strict=True)

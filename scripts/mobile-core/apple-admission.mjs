@@ -4,6 +4,7 @@ import { closeSync, constants, fsyncSync, lstatSync, mkdirSync, openSync, readFi
   realpathSync, renameSync, rmSync, statSync, writeFileSync, writeSync } from 'node:fs';
 import { loadavg } from 'node:os';
 import { performance } from 'node:perf_hooks';
+import { setTimeout as delay } from 'node:timers/promises';
 import { basename, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -270,7 +271,7 @@ function runXcodeSettings(args, { repo, env, slot }) {
     const child = spawn('xcodebuild', args, { cwd: repo, env, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
     const output = [];
     let stdoutBytes = 0, stderrBytes = 0, stderrTail = Buffer.alloc(0);
-    let failure, terminateTimer, heartbeat;
+    let failure, cleanupDeadline, termTimer, cleanupTimer, heartbeat, settling = false;
 
     const observe = event => {
       const processRunning = child.exitCode === null && child.signalCode === null;
@@ -286,16 +287,25 @@ function runXcodeSettings(args, { repo, env, slot }) {
       if (!child.pid) return false;
       try { process.kill(-child.pid, signal); return true; }
       catch (error) {
-        if (error.code !== 'ESRCH') failure ??= new Error('Xcode build-settings process group retirement failed');
-        return false;
+        if (error.code === 'ESRCH') return false;
+        failure ??= new Error('Xcode build-settings process group retirement failed');
+        return true;
       }
     }
 
     function stop(cause) {
-      if (failure) return;
-      failure = cause;
+      failure ??= cause;
+      if (cleanupDeadline !== undefined) return;
+      cleanupDeadline = performance.now() + 2 * XCODE_TERMINATION_MS;
       signalGroup('SIGTERM');
-      terminateTimer = setTimeout(() => signalGroup('SIGKILL'), XCODE_TERMINATION_MS);
+      termTimer = setTimeout(() => signalGroup('SIGKILL'), XCODE_TERMINATION_MS);
+      cleanupTimer = setTimeout(() => {
+        // A failed cleanup must also terminate the local wait on the pipe.
+        child.stdout.destroy();
+        child.stderr.destroy();
+        child.unref();
+        void finish(null);
+      }, 2 * XCODE_TERMINATION_MS);
     }
 
     function progress(event) {
@@ -324,25 +334,33 @@ function runXcodeSettings(args, { repo, env, slot }) {
       stderrBytes += chunk.length;
       stderrTail = Buffer.concat([stderrTail, chunk]).subarray(-4 * 8192);
     });
-    child.once('close', (code) => {
+    async function finish(code) {
+      if (settling) return;
+      settling = true;
       clearTimeout(deadline);
-      clearTimeout(terminateTimer);
       clearInterval(heartbeat);
-      process.off('SIGTERM', interrupt);
-      process.off('SIGINT', interrupt);
-      if (signalGroup(0)) {
-        failure ??= new Error('native session still owns descendants; Apple build-settings rejected');
-        signalGroup('SIGKILL');
-      }
-      if (failure) { reject(failure); return; }
       try {
+        // The primary and its pipes can already be closed while descendants
+        // remain. Observe the entire group after TERM/KILL before settling.
+        if (signalGroup(0)) {
+          stop(new Error('native session still owns descendants; Apple build-settings rejected'));
+          while (performance.now() < cleanupDeadline && signalGroup(0)) await delay(50);
+          requireSetting(!signalGroup(0), failure.message + '; Xcode process group cleanup incomplete');
+        }
+        if (failure) throw failure;
         observe('end');
         requireSetting(code === 0, 'actual tool failed (xcodebuild): ' + stderrTail.toString('utf8').slice(-8192));
         complete(Buffer.from(xcodeDecoder.decode(Buffer.concat(output)).replace(/\r\n?/g, '\n')));
       } catch (error) {
         reject(error);
+      } finally {
+        clearTimeout(termTimer);
+        clearTimeout(cleanupTimer);
+        process.off('SIGTERM', interrupt);
+        process.off('SIGINT', interrupt);
       }
-    });
+    }
+    child.once('close', finish);
   });
 }
 

@@ -1,11 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { appendFileSync, copyFileSync, existsSync, mkdtempSync, readFileSync, realpathSync, writeFileSync, mkdirSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { delimiter, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
+import { once } from 'node:events';
+import { setTimeout as delay } from 'node:timers/promises';
 import { boundedDownload, DOWNLOAD_TIMEOUT_MS } from './lib/bounded-download.mjs';
 import { verifyDashboardArchive, dashboardInventory, dashboardFresh } from './fetch-dashboard.mjs';
 import { inspectAppleArchitecture } from './mobile-core/apple-admission.mjs';
@@ -265,7 +267,7 @@ test('Apple architecture admission rechecks the explicit extension and retains s
 
 test('Apple settings entry pins inputs, probes both targets and preserves bounded observation receipts', {
   skip: process.platform === 'win32',
-}, () => {
+}, async t => {
   const directory = realpathSync(mkdtempSync(join(tmpdir(), 'polaris-apple-settings-')));
   try {
     const repo = join(directory, 'checkout'), output = join(directory, 'output'), bin = join(directory, 'bin');
@@ -302,15 +304,28 @@ const settings = {
 };
 const normalized = JSON.stringify([{ target: args[1], buildSettings: settings }], null, 2) + '\n';
 fs.appendFileSync(FIXTURE_TRACE, JSON.stringify({ args, cwd: process.cwd(), DEVELOPER_DIR, normalized }) + '\n');
+if (FIXTURE_MODE === 'interrupt') {
+  process.on('SIGTERM', () => process.exit(0));
+  const child = require('node:child_process').spawn(process.execPath, ['-e', [
+    "const fs = require('node:fs')",
+    "process.on('SIGTERM', () => setTimeout(() => { fs.writeFileSync(process.env.FIXTURE_SIGNAL_DONE, 'terminated'); process.exit(0); }, 200))",
+    "fs.writeFileSync(process.env.FIXTURE_SIGNAL_READY, JSON.stringify({group: Number(process.env.FIXTURE_XCODE_PID), owner: Number(process.env.FIXTURE_OWNER_PID)}))",
+    "setInterval(() => {}, 1000)",
+  ].join(';')], { stdio: 'ignore', env: { ...process.env, FIXTURE_XCODE_PID: String(process.pid), FIXTURE_OWNER_PID: String(process.ppid) } });
+  child.unref();
+  setInterval(() => {}, 1000);
+  return;
+}
 if (FIXTURE_MODE === 'drift' && extension) fs.appendFileSync(args[args.indexOf('-project') + 1] + '/project.pbxproj', 'drift');
 if (FIXTURE_MODE === 'oversize') process.stdout.write('x'.repeat(2 * 1024 ** 2 + 1));
 else process.stdout.write(normalized.replace(/\n/g, '\r\n'));
 `, { mode: 0o700 });
+    const invokeEnv = (scope, mode) => ({
+      ...process.env, POLARIS_APPLE_SCOPE: scope, DEVELOPER_DIR: developer, FIXTURE_MODE: mode, FIXTURE_TRACE: trace,
+      PATH: bin + delimiter + process.env.PATH,
+    });
     const invoke = (scope, mode, location) => spawnSync(process.execPath, [script, '--build-settings', location], {
-      cwd: directory,
-      encoding: 'utf8',
-      env: { ...process.env, POLARIS_APPLE_SCOPE: scope, DEVELOPER_DIR: developer, FIXTURE_MODE: mode, FIXTURE_TRACE: trace,
-        PATH: bin + delimiter + process.env.PATH },
+      cwd: directory, encoding: 'utf8', env: invokeEnv(scope, mode),
     });
     const recorded = () => readFileSync(trace, 'utf8').trim().split('\n').map(line => JSON.parse(line));
     const receipt = (location, name) => JSON.parse(readFileSync(join(location, name), 'utf8'));
@@ -377,6 +392,48 @@ else process.stdout.write(normalized.replace(/\n/g, '\r\n'));
       }
       if (mode === 'wrong-arch') assert.doesNotMatch(result.stderr, /withheld\/path/);
     }
+
+    await t.test('Python-only SIGTERM waits for the detached Xcode group', async () => {
+      const location = join(output, 'interrupt');
+      const signalReady = join(directory, 'xcode-child-ready'), signalDone = join(directory, 'xcode-child-done');
+      mkdirSync(location);
+      const mobileCore = fileURLToPath(new URL('./mobile-core', import.meta.url));
+      const python = spawn('python3', ['-B', '-c', [
+        'import sys', 'from pathlib import Path', 'sys.path.insert(0, sys.argv[1])', 'import ci_apple',
+        'ci_apple.ROOT = Path(sys.argv[2])', 'ci_apple.run_build_settings(Path(sys.argv[3]), dict(ci_apple.os.environ))',
+      ].join('; '), mobileCore, repo, location], {
+        stdio: ['ignore', 'pipe', 'pipe'], env: {
+          ...invokeEnv('device-only', 'interrupt'), FIXTURE_SIGNAL_READY: signalReady, FIXTURE_SIGNAL_DONE: signalDone,
+        },
+      });
+      python.stdout.resume();
+      const diagnostics = [];
+      python.stderr.on('data', bytes => diagnostics.push(bytes));
+      const deadline = AbortSignal.timeout(15000);
+      const terminal = once(python, 'close', { signal: deadline });
+      terminal.catch(() => {});
+      let observed;
+      try {
+        while (!existsSync(signalReady) || !readFileSync(signalReady).length) await delay(10, undefined, { signal: deadline });
+        observed = JSON.parse(readFileSync(signalReady, 'utf8'));
+        // Signal only the Python PID. Neither isolated child initially receives it.
+        process.kill(python.pid, 'SIGTERM');
+        assert.deepEqual(await terminal, [143, null], Buffer.concat(diagnostics).toString('utf8'));
+        assert.match(Buffer.concat(diagnostics).toString('utf8'), /Apple build-settings observation interrupted/);
+        assert.equal(readFileSync(signalDone, 'utf8'), 'terminated');
+        assert.throws(() => process.kill(-observed.group, 0), { code: 'ESRCH' });
+        assert.equal(existsSync(join(location, 'build-settings-admission.json')), false);
+      } finally {
+        if (python.exitCode === null && python.signalCode === null) python.kill('SIGKILL');
+        if (observed) {
+          try { process.kill(-observed.group, 0); } catch (error) { if (error.code === 'ESRCH') observed = undefined; else throw error; }
+          if (observed) {
+            process.kill(-observed.group, 'SIGKILL');
+            try { process.kill(observed.owner, 'SIGTERM'); } catch (error) { if (error.code !== 'ESRCH') throw error; }
+          }
+        }
+      }
+    });
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
