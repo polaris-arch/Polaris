@@ -203,7 +203,7 @@ async fn ticket_at_mock_rpc(runtime: &Arc<ProxyRuntime>, port: u16) -> (ReadyMai
             &status,
         )
         .unwrap();
-    assert!(runtime.publish_committed_ready_main(runtime.core_generation(), || {}));
+    assert!(runtime.publish_committed_ready_main(runtime.core_generation(), |_| {}));
     let binding = ActionBinding::new(
         NormalMainAction::ManualSpeedTest,
         "mock-rpc".into(),

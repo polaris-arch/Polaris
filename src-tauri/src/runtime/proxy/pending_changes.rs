@@ -154,6 +154,19 @@ impl ProxyRuntime {
         }
     }
 
+    /// Ready publishes under the existing lifecycle fence. Reuse that claim
+    /// instead of attempting to lock it again from the ready callback.
+    pub(super) fn push_pending_changes_under_publication(
+        &self,
+        publication: &std::sync::MutexGuard<'_, ()>,
+    ) {
+        if let Some(emitter) = self.error_emitter.get() {
+            emitter.emit_pending_changes(
+                &self.pending_changes_against_with_publication(None, Some(publication)),
+            );
+        }
+    }
+
     /// 取待应用节点差集（`proxy:getPendingChanges`）：当前 config 相对**起核快照**的增 / 改 / 删。
     ///
     /// 契约 = [`PendingChangesSummary`]（`{added, modified, removed}`），pull 与 push 同一个结构。
@@ -182,6 +195,14 @@ impl ProxyRuntime {
 
     /// The pre-save snapshot distinguishes this save's edits from earlier debt.
     pub(super) fn pending_changes_against(&self, desired: Option<&Value>) -> PendingChangesSummary {
+        self.pending_changes_against_with_publication(desired, None)
+    }
+
+    fn pending_changes_against_with_publication(
+        &self,
+        desired: Option<&Value>,
+        publication: Option<&std::sync::MutexGuard<'_, ()>>,
+    ) -> PendingChangesSummary {
         // Without a startup snapshot the configuration diff has no denominator.
         // Independently proven native debt still survives until real stop-success
         // releases its original owner, including an interrupted lifecycle bump.
@@ -210,7 +231,9 @@ impl ProxyRuntime {
             baseline_pending,
             deferred,
         ) = {
-            let _publication = self.gate.lock_generation_publication();
+            let _publication = publication
+                .is_none()
+                .then(|| self.gate.lock_generation_publication());
             let Some(snap) = self.startup_snapshot.read().ok().and_then(|g| g.clone()) else {
                 return empty();
             };
@@ -315,7 +338,9 @@ impl ProxyRuntime {
             removed,
             saved_settings_revert_token: applied
                 .as_ref()
-                .filter(|_| desired.is_none() && !executing_exact_edit)
+                // The ready event already owns publication. A subsequent normal
+                // observation can preview the disk journal without that fence.
+                .filter(|_| desired.is_none() && publication.is_none() && !executing_exact_edit)
                 .and_then(|running| self.saved_settings_revert_token(current, running)),
             restart_deferred: non_node_pending
                 || selected_pending

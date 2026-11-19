@@ -1155,9 +1155,9 @@ impl ProxyRuntime {
         // `r.is_ok()`，还要本世代仍当权。世代已变就由接管方自己的 ready/failed 收口，本腿保持沉默。
         drop(inflight);
         if r.as_ref().is_ok_and(|status| status.running) {
-            self.publish_committed_ready_main(my_gen, || {
+            self.publish_committed_ready_main(my_gen, |publication| {
                 // 与 stopped 腿同一配对纪律：差集与生命周期描述同一次终态跃迁，必须相邻发布。
-                self.push_pending_changes();
+                self.push_pending_changes_under_publication(publication);
                 self.push_lifecycle(&ProxyLifecycleEvent::ready().attributed(attribution, my_gen));
                 self.coex_committed_ready(my_gen);
             });

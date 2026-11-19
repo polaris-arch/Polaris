@@ -1518,13 +1518,13 @@ impl ProxyRuntime {
     pub(super) fn publish_committed_ready_main(
         &self,
         generation: u64,
-        publish: impl FnOnce(),
+        publish: impl FnOnce(&std::sync::MutexGuard<'_, ()>),
     ) -> bool {
-        let _publication = self.gate.lock_generation_publication();
+        let publication = self.gate.lock_generation_publication();
         if !self.commit_ready_main(generation) {
             return false;
         }
-        publish();
+        publish(&publication);
         true
     }
 

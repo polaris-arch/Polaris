@@ -4102,7 +4102,7 @@ fn pending_changes_push_is_wired_on_both_sides_of_the_diff() {
     // 分母侧（运行核换了）：start 成功终态 / stop 拆除终态。
     let started = method_body(&src, "    async fn start_guarded_with_attribution(");
     assert!(
-        started.contains("self.push_pending_changes();"),
+        started.contains("self.push_pending_changes_under_publication(publication);"),
         "起核就绪腿必须推 —— 否则「立即应用」引发的重启落地后没人告诉 UI 差集已清，条停在「立即应用」"
     );
     let stopped = method_body(&src, "    async fn stop_inner_attributed(");

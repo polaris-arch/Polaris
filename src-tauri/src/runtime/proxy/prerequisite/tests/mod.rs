@@ -686,7 +686,7 @@ fn stop_at_ready_commit_boundary_prevents_commit_and_started_publication() {
         .claim_generation(None, polaris_core_supervisor::LifecycleKind::Stop)
         .unwrap();
     let published = AtomicUsize::new(0);
-    assert!(!runtime.publish_committed_ready_main(old.generation, || {
+    assert!(!runtime.publish_committed_ready_main(old.generation, |_| {
         published.fetch_add(1, Ordering::SeqCst);
     }));
     assert_eq!(published.load(Ordering::SeqCst), 0);
@@ -700,7 +700,7 @@ fn stop_at_ready_commit_boundary_prevents_commit_and_started_publication() {
     let (successor, _) = ready_for(&runtime);
     successor.committed.store(false, Ordering::SeqCst);
     assert!(
-        runtime.publish_committed_ready_main(successor.generation, || {
+        runtime.publish_committed_ready_main(successor.generation, |_| {
             // This is the production event callback boundary: ordinary readers may
             // read the gate/status/evidence because commit holds none of those locks.
             assert_eq!(runtime.status().main_generation, successor.generation);

@@ -174,7 +174,7 @@ fn lifecycle_push_is_paired_with_the_diff_push() {
     assert!(
         line_immediately_followed_by(
             &started,
-            DIFF,
+            "self.push_pending_changes_under_publication(publication);",
             "self.push_lifecycle(&ProxyLifecycleEvent::ready().attributed(attribution, my_gen));"
         ),
         "起核就绪腿：`ready` 必须紧跟差集 PUSH —— 两者描述同一次跃迁，拆开即引入可分叉的第二个时点"
