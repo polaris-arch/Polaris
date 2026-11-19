@@ -25,8 +25,10 @@ class TransientLoginHostStateTest {
         val original = File(config, "$id.cache.db").apply { check(createNewFile()) }
         val other = File(config, "tailscale-login-node_1-4.cache.db").apply { check(createNewFile()) }
         val wrongDirectory = temporary.newFile(original.name)
+        val nonExactAlias = File(config, "../polaris/${original.name}")
         assertEquals(original.canonicalFile, TransientLoginHost.requireAttemptCache(root, id, original.path))
-        for (path in listOf(other.path, wrongDirectory.path, original.name)) {
+        assertEquals(original.canonicalFile, nonExactAlias.canonicalFile)
+        for (path in listOf(other.path, wrongDirectory.path, original.name, nonExactAlias.path)) {
             assertTrue(runCatching { TransientLoginHost.requireAttemptCache(root, id, path) }.isFailure)
         }
         assertTrue(original.delete())

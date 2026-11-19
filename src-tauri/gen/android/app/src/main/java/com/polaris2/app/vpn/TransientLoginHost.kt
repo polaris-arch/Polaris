@@ -116,9 +116,11 @@ internal object TransientLoginHost {
     /** Match the cache Rust creates beside the config for this exact login instance. */
     internal fun requireAttemptCache(dataDir: File, id: String, path: String): File {
         check(attemptId.matches(id)) { "Android 登录缓存实例标识无效" }
-        val expected = File(dataDir.canonicalFile, "polaris/$id.cache.db")
+        val relative = "polaris/$id.cache.db"
+        val nominal = File(dataDir, relative).absoluteFile
+        val expected = File(dataDir.canonicalFile, relative)
         val supplied = File(path)
-        check(supplied.isAbsolute && supplied.name == expected.name && supplied.canonicalFile == expected && supplied.isFile) {
+        check((supplied == nominal || supplied == expected) && supplied.canonicalFile == expected && supplied.isFile) {
             "Android 登录缓存路径未隔离"
         }
         return expected
