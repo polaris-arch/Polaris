@@ -30,7 +30,7 @@ import {
   MANUAL_INTERVAL_HOURS,
   DEFAULT_MIXED_PORT,
   MIN_LISTEN_PORT,
-  STAGED_SETTING_SECTION_LABELS,
+  STAGED_SETTING_LABELS,
   MAX_LISTEN_PORT,
   releaseShipsDigest,
   appDownloadIntegrity,
@@ -590,13 +590,13 @@ describe('subscriptionAutoUpdateStatus', () => {
 });
 
 /**
- * 段级译名表 —— 守两条：键名不能拼错（拼错 = 静默回落裸键名，没有任何门会红），
+ * 暂存设置译名表 —— 守两条：键名不能拼错（拼错 = 静默回落裸键名，没有任何门会红），
  * 且译名必须在**五个**语种里都有（缺一个语种 = 那个语种的用户看到 i18n key 本身）。
  */
-describe('STAGED_SETTING_SECTION_LABELS', () => {
+describe('STAGED_SETTING_LABELS', () => {
   it('每个配置键都是真实的 Class B 键（拼错就静默失效）', () => {
     // 变异对照：把 `dnsConfig` 写成 `dnsConfigs` → 本条转红。
-    for (const key of Object.keys(STAGED_SETTING_SECTION_LABELS)) {
+    for (const key of Object.keys(STAGED_SETTING_LABELS)) {
       expect(USER_CONFIG_FIELDS as readonly string[], `${key} 不是 UserConfig 字段`).toContain(key);
     }
   });
@@ -607,7 +607,7 @@ describe('STAGED_SETTING_SECTION_LABELS', () => {
       const json = JSON.parse(
         readFileSync(fileURLToPath(new URL(`../../../i18n/locales/${loc}.json`, import.meta.url)), 'utf8'),
       ) as Record<string, unknown>;
-      for (const path of Object.values(STAGED_SETTING_SECTION_LABELS)) {
+      for (const path of Object.values(STAGED_SETTING_LABELS)) {
         const value = path
           .split('.')
           .reduce<unknown>((node, seg) => (node as Record<string, unknown> | undefined)?.[seg], json);

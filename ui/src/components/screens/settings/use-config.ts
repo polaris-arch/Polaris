@@ -11,7 +11,7 @@ import { useStagedConfigStore } from '@/store/staged-config-store';
 import { useStagingActive } from '@/store/use-staging-active';
 import { withConfigWriteLock } from '@/lib/config-write-lock';
 import { splitPatchByRoute } from './config-patch-route';
-import { STAGED_SETTING_SECTION_LABELS } from './settings-logic';
+import { STAGED_SETTING_LABELS } from './settings-logic';
 import {
   appRestartRequiredChanges,
   appRestartRequiredDiff,
@@ -216,9 +216,9 @@ export function useConfig(): UseConfigResult {
     const isAlive = () => alive.current && lifecycle.current === life;
     const { staged, direct } = splitPatchByRoute(patch, stagingEnabled);
     for (const [key, value] of staged) {
-      const sectionKey = STAGED_SETTING_SECTION_LABELS[key];
+      const labelKey = STAGED_SETTING_LABELS[key];
       stage({ id: `setting:${key}`, kind: 'setting',
-        label: t('home.stagedSetting', { key: sectionKey ? t(sectionKey) : key }),
+        label: t('home.stagedSetting', { key: labelKey ? t(labelKey) : key }),
         entityPath: [key], nextValue: value });
     }
     if (Object.keys(direct).length === 0) return;

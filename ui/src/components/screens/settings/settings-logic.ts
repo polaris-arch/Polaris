@@ -786,22 +786,17 @@ export function wireUpdateProgress(w: UpdateProgressWiring): () => void {
 }
 
 /* ────────────────────────────────────────────────────────────────────────────
- * 暂存条目的**段级**译名（原型 `settingLabel:4257`）
+ * 暂存设置的译名
  * ──────────────────────────────────────────────────────────────────────────── */
 
 /**
- * 聚合型配置键 → i18n 键。原型取的是**行标题文本**（`row.querySelector('.sr-tx b')`），拼成
- * 「接管系统 DNS · 开」；本仓此前直接把配置键名塞进文案 ⇒ 明细里显示「修改设置 · dnsConfig」。
- *
- * 两层退化都可感知：① 用户读不出改的是哪一项；② DNS 段全部开关经 `patchDns` 打包进**同一个**
- * `dnsConfig` 键，N 个开关的编辑**塌成一条**，而 §1.17 的单项撤销粒度跟着变粗（撤一条 = 撤整段）。
- *
- * 只覆盖**聚合键**（对象 / 列表：一个键背后是一整段设置），而不是给 29 个 Class B 键各配译文——
- * 后者是 5×N 的翻译面，而标量键的键名与它那一个开关一一对应，认得出。**撤销粒度**那一半这里修不了：
- * 要恢复到逐开关一条，需要 `entityPath` 下沉到子字段，代价大得多，另裁。
+ * 暂存设置复用桌面和移动端已有的控件标题。一次暂存可以合并整个
+ * DNS 或 TUN 对象，这类条目使用段标题。回执提示只显示字段名称。
  */
-export const STAGED_SETTING_SECTION_LABELS: Readonly<Record<string, string>> = {
+export const STAGED_SETTING_LABELS: Readonly<Record<string, string>> = {
+  speedTestUrl: 'settings.network.speedTestUrl',
   tunConfig: 'settings.section.tun',
+  networkInterfaces: 'settings.network.interfaceBlock',
   dnsConfig: 'settings.section.dns',
   dnsServers: 'settings.section.dns',
   dnsServerGroups: 'settings.section.dns',
@@ -809,11 +804,25 @@ export const STAGED_SETTING_SECTION_LABELS: Readonly<Record<string, string>> = {
   networkProfiles: 'rules.networkProfile.title',
   ruleResources: 'settings.section.ruleResources',
   regionRouting: 'settings.section.regionRouting',
-  singboxDashboard: 'settings.section.singboxDashboard',
+  singboxDashboard: 'settings.network.mgmtEnable',
+  clashApiSecret: 'settings.network.mgmtSecret',
+  allowLan: 'settings.network.allowLan',
+  bypassLAN: 'settings.advanced.bypassLAN',
   bypassLANList: 'settings.section.bypassLanList',
+  enableIPv6: 'settings.general.enableIPv6',
+  mixedPort: 'settings.network.mixedPort',
+  tlsFragment: 'settings.advanced.tlsFragment',
+  utlsPolicy: 'settings.utls.label',
+  interruptConnectionsOnSwitch: 'settings.network.interruptOnSwitch',
+  fakeIpFilter: 'settings.advanced.fakeIpFilter',
   fakeIpFilterList: 'settings.section.fakeIpFilterList',
+  blockBrowserDoh: 'settings.dns.browserDohTitle',
+  browserDohList: 'settings.dns.browserDohFold',
+  blockQuic: 'settings.advanced.blockQuic',
+  webrtcLeakProtection: 'settings.network.webrtcLeakProtection',
   bypassProcesses: 'settings.section.bypassProcesses',
   customAppPresets: 'settings.section.customAppPresets',
+  disableLogFile: 'settings.advanced.disableLogFile',
 };
 
 /** OS startup is authoritative; config is only a persisted preference mirror. */
