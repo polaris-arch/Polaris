@@ -77,7 +77,9 @@ import {
 } from '@/contracts/types';
 import { cycleSortState, type SortState } from '@/components/screens/connections/sort-cycle';
 import { connectionRuleSubjects } from '@/components/screens/connections/connection-rule-subjects';
-import { maxLogId, mergeHydration, retainAfterClear, type LogRow } from '@/components/screens/logs/logs-buffer';
+import {
+  maxLogId, mergeHydration, mergeSearchSnapshot, retainAfterClear, type LogRow, type LogSearchSnapshot,
+} from '@/components/screens/logs/logs-buffer';
 import { runtimeLevelView } from '@/components/screens/logs/runtime-level';
 import {
   isUpwardLogScrollKey,
@@ -404,7 +406,7 @@ export function MobileConnectionsScreen(): ReactElement {
 
   const [logs, setLogs] = useState<LogRow[]>([]);
   const [logSearch, setLogSearch] = useState('');
-  const [logSnapshot, setLogSnapshot] = useState<{ key: string; rows: LogRow[] } | null>(null);
+  const [logSnapshot, setLogSnapshot] = useState<LogSearchSnapshot | null>(null);
   const [logStreamReady, setLogStreamReady] = useState(false);
   const [logStreamFailed, setLogStreamFailed] = useState(false);
   const [logSearchFailed, setLogSearchFailed] = useState(false);
@@ -422,6 +424,7 @@ export function MobileConnectionsScreen(): ReactElement {
   const logsRef = useRef(logs);
   logsRef.current = logs;
   const pendingRef = useRef<LogRow[]>([]);
+  const pendingSearchRef = useRef<LogSearchSnapshot | null>(null);
   const lastIdRef = useRef(-1);
   const logReadEpoch = useRef(0);
   const lastUserScrollAtRef = useRef<number | null>(null);
@@ -474,14 +477,12 @@ export function MobileConnectionsScreen(): ReactElement {
           matchesLog(row, criteria.threshold, criteria.source, criteria.query),
         );
         if (matched.length > 0) {
-          setLogSnapshot((prev) => ({
-            key: criteria.key,
-            rows: mergeHydration(
-              prev?.key === criteria.key ? prev.rows : [],
-              matched,
-              MAX_BUFFERED_ROWS,
-            ),
-          }));
+          const next = { key: criteria.key, rows: matched };
+          if (followRef.current) {
+            setLogSnapshot((previous) => mergeSearchSnapshot(previous, next, MAX_BUFFERED_ROWS));
+          } else {
+            pendingSearchRef.current = mergeSearchSnapshot(pendingSearchRef.current, next, MAX_BUFFERED_ROWS);
+          }
         }
       }
       if (followRef.current) {
@@ -545,6 +546,8 @@ export function MobileConnectionsScreen(): ReactElement {
   /* 非空查询走后端完整保留环；页面内存上限只约束 IPC / DOM。 */
   useEffect(() => {
     if (segment !== 'logs') return;
+    const key = logSearchKey;
+    if (pendingSearchRef.current?.key !== key) pendingSearchRef.current = null;
     if (!logQuery) {
       setLogSnapshot(null);
       setLogSearchFailed(false);
@@ -553,7 +556,6 @@ export function MobileConnectionsScreen(): ReactElement {
     if (!logStreamReady) return;
     setLogSearchFailed(false);
     let alive = true;
-    const key = logSearchKey;
     const epoch = logReadEpoch.current;
     const timer = window.setTimeout(() => {
       void api.logs
@@ -561,10 +563,7 @@ export function MobileConnectionsScreen(): ReactElement {
         .then((batch) => {
           if (!alive || epoch !== logReadEpoch.current) return;
           if (!Array.isArray(batch)) throw new Error('LOG_SEARCH_SNAPSHOT_INVALID');
-          setLogSnapshot((prev) => ({
-            key,
-            rows: mergeHydration(prev?.key === key ? prev.rows : [], batch, MAX_BUFFERED_ROWS),
-          }));
+          setLogSnapshot((previous) => mergeSearchSnapshot(previous, { key, rows: batch }, MAX_BUFFERED_ROWS));
           setLogSearchFailed(false);
         })
         .catch((err) => {
@@ -711,6 +710,11 @@ export function MobileConnectionsScreen(): ReactElement {
   }, [segment, pauseFollow]);
 
   const resumeFollow = useCallback(() => {
+    const pendingSearch = pendingSearchRef.current;
+    pendingSearchRef.current = null;
+    if (pendingSearch?.key === logCriteriaRef.current.key) {
+      setLogSnapshot((previous) => mergeSearchSnapshot(previous, pendingSearch, MAX_BUFFERED_ROWS));
+    }
     if (pendingRef.current.length > 0) {
       const pending = pendingRef.current;
       pendingRef.current = [];
@@ -846,6 +850,8 @@ export function MobileConnectionsScreen(): ReactElement {
       lastIdRef.current = Math.max(lastIdRef.current, boundary - 1);
       setLogs(previous => retainAfterClear(previous, boundary));
       setLogSnapshot(previous => previous ? { ...previous, rows: retainAfterClear(previous.rows, boundary) } : null);
+      const pendingSearch = pendingSearchRef.current;
+      if (pendingSearch) pendingSearch.rows = retainAfterClear(pendingSearch.rows, boundary);
       pendingRef.current = retainAfterClear(pendingRef.current, boundary);
       setPendingCount(pendingRef.current.length);
       return true;

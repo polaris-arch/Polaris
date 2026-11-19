@@ -30,6 +30,11 @@ import type { LogEntry } from '@/contracts/types';
  */
 export type LogRow = LogEntry & { _id?: number };
 
+export interface LogSearchSnapshot {
+  key: string;
+  rows: LogRow[];
+}
+
 /** 排序键：缺 `_id` 的行（非 Tauri mock / 旧后端）排到末尾，保持「最新在下」的阅读方向。 */
 function orderKey(l: LogRow): number {
   return typeof l._id === 'number' ? l._id : Number.MAX_SAFE_INTEGER;
@@ -55,6 +60,17 @@ export function mergeHydration(prev: LogRow[], snapshot: LogRow[], max: number):
   // Array.prototype.sort 自 ES2019 起稳定 ⇒ 同键（皆缺 _id）的行保持相对次序。
   const merged = [...prev, ...fresh].sort((a, b) => orderKey(a) - orderKey(b));
   return merged.length > max ? merged.slice(-max) : merged;
+}
+
+export function mergeSearchSnapshot(
+  previous: LogSearchSnapshot | null,
+  next: LogSearchSnapshot,
+  max: number,
+): LogSearchSnapshot {
+  return {
+    key: next.key,
+    rows: mergeHydration(previous?.key === next.key ? previous.rows : [], next.rows, max),
+  };
 }
 
 /**

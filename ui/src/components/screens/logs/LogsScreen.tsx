@@ -50,7 +50,9 @@ import { editRoute } from '@/lib/staged-config';
 import { useLogRedactStore } from '@/store/use-log-redact-store';
 import { useConfirmTwice } from '@/lib/confirm-twice';
 import { redactSensitive, shouldRedactLogs } from '@/domain/privacy';
-import { mergeHydration, maxLogId, retainAfterClear, type LogRow } from './logs-buffer';
+import {
+  mergeHydration, mergeSearchSnapshot, maxLogId, retainAfterClear, type LogRow, type LogSearchSnapshot,
+} from './logs-buffer';
 import { runtimeLevelView } from './runtime-level';
 import type { LogLevel, RuntimeLogLevel } from '@/contracts/types';
 import { Csel, type CselOption } from '@/components/dialogs/Csel';
@@ -97,11 +99,6 @@ const DELETE_LEGACY_KEY = 'logs-delete-legacy';
 const RUNTIME_LEVEL_POLL_MS = 5000;
 
 type LogSource = 'all' | 'sing-box' | 'app';
-
-interface LogSearchSnapshot {
-  key: string;
-  rows: LogRow[];
-}
 
 function searchKey(query: string, level: LogLevel, source: LogSource): string {
   return `${level}\u0000${source}\u0000${query}`;
@@ -163,6 +160,7 @@ export function LogsScreen() {
   followRef.current = follow;
   /** 暂停时缓冲的新行（恢复即回填，对齐原型 logPending）；count 单独入 state 供 label 响应式渲染。 */
   const pendingRef = useRef<LogRow[]>([]);
+  const pendingSearchRef = useRef<LogSearchSnapshot | null>(null);
   const [pendingCount, setPendingCount] = useState(0);
   /** 内核级别读请求的世代号：轮询与生命周期事件并发时，只让最新一次回包落地。 */
   const runtimeReadSeqRef = useRef(0);
@@ -288,14 +286,12 @@ export function LogsScreen() {
           matchesLog(row, criteria.threshold, criteria.source, criteria.query)
         );
         if (matched.length > 0) {
-          setSearchSnapshot((previous) => ({
-            key: criteria.key,
-            rows: mergeHydration(
-              previous?.key === criteria.key ? previous.rows : [],
-              matched,
-              MAX_BUFFERED_ROWS
-            ),
-          }));
+          const next = { key: criteria.key, rows: matched };
+          if (followRef.current) {
+            setSearchSnapshot((previous) => mergeSearchSnapshot(previous, next, MAX_BUFFERED_ROWS));
+          } else {
+            pendingSearchRef.current = mergeSearchSnapshot(pendingSearchRef.current, next, MAX_BUFFERED_ROWS);
+          }
         }
       }
       if (followRef.current) {
@@ -358,29 +354,23 @@ export function LogsScreen() {
     };
   }, [dedupe, logStreamAttempt]);
 
-  /* 非空查询走后端完整保留环；结果上限只约束 IPC/DOM。直播匹配行由上方 onBatch 同步并入同一快照。 */
+  /* 非空查询走后端完整保留环；暂停期间的直播匹配行在恢复跟随时并入同一快照。 */
   useEffect(() => {
+    const key = activeSearchKey;
+    if (pendingSearchRef.current?.key !== key) pendingSearchRef.current = null;
     if (!query) {
       setSearchSnapshot(null);
       return;
     }
     if (!logStreamReady) return;
     let alive = true;
-    const key = activeSearchKey;
     const epoch = logReadEpoch.current;
     const timer = window.setTimeout(() => {
       void api.logs
         .search(query, displayLevel, source, MAX_BUFFERED_ROWS)
         .then((batch) => {
           if (!alive || epoch !== logReadEpoch.current || !Array.isArray(batch)) return;
-          setSearchSnapshot((previous) => ({
-            key,
-            rows: mergeHydration(
-              previous?.key === key ? previous.rows : [],
-              batch,
-              MAX_BUFFERED_ROWS
-            ),
-          }));
+          setSearchSnapshot((previous) => mergeSearchSnapshot(previous, { key, rows: batch }, MAX_BUFFERED_ROWS));
         })
         .catch(() => {
           /* 保持直播已命中的结果；IPC 失败会由收口层记录。 */
@@ -579,6 +569,8 @@ export function LogsScreen() {
           lastIdRef.current = Math.max(lastIdRef.current, boundary - 1);
           setLogs(previous => retainAfterClear(previous, boundary));
           setSearchSnapshot(previous => previous ? { ...previous, rows: retainAfterClear(previous.rows, boundary) } : null);
+          const pendingSearch = pendingSearchRef.current;
+          if (pendingSearch) pendingSearch.rows = retainAfterClear(pendingSearch.rows, boundary);
           pendingRef.current = retainAfterClear(pendingRef.current, boundary);
           setPendingCount(pendingRef.current.length);
           toast.info(t('logs.clearDone'));
@@ -744,6 +736,11 @@ export function LogsScreen() {
 
   /* ── 恢复跟随：回填 pending 并吸回底部（对齐原型 log-follow case）── */
   const resumeFollow = useCallback(() => {
+    const pendingSearch = pendingSearchRef.current;
+    pendingSearchRef.current = null;
+    if (pendingSearch?.key === searchCriteriaRef.current.key) {
+      setSearchSnapshot((previous) => mergeSearchSnapshot(previous, pendingSearch, MAX_BUFFERED_ROWS));
+    }
     if (pendingRef.current.length) {
       const pending = pendingRef.current;
       pendingRef.current = [];

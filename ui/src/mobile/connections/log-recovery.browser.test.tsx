@@ -166,6 +166,38 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile log ownership 
     } finally { await page.close(); }
   });
 
+  it('keeps a paused 500-result search page stable until follow resumes', async () => {
+    const page = await fixture();
+    try {
+      const rows = Array.from({ length: 500 }, (_, index) => row(index + 1, `matching ${index + 1}`));
+      await hydrate(page, 0, rows);
+      const search = page.locator('[data-conn-search] input');
+      await search.fill('matching');
+      await page.waitForFunction(() => (window as any).__mobileLogRecovery.searches.length === 1);
+      await page.evaluate(rows => (window as any).__mobileLogRecovery.searches[0].resolve(rows), rows);
+      await page.getByText('481–500 of 500', { exact: true }).waitFor();
+      await page.getByRole('button', { name: 'Previous page', exact: true }).click();
+      await page.getByText('461–480 of 500', { exact: true }).waitFor();
+      const lines = page.locator('.mc-log-line');
+      const history = await lines.allTextContents();
+      expect(history).toHaveLength(20);
+      expect(history[0]).toContain('matching 461');
+
+      await page.evaluate(rows => (window as any).__mobileLogRecovery.listeners[0].callback(rows), [row(501, 'matching 501')]);
+      await page.locator('[data-log-jump] .mc-cnt').getByText('1', { exact: true }).waitFor();
+      expect(await lines.allTextContents()).toEqual(history);
+      await page.getByText('461–480 of 500', { exact: true }).waitFor();
+
+      const noise = Array.from({ length: 500 }, (_, index) => row(502 + index, 'unrelated'));
+      await page.evaluate(rows => (window as any).__mobileLogRecovery.listeners[0].callback(rows), noise);
+      await page.locator('[data-log-jump] .mc-cnt').getByText('500', { exact: true }).waitFor();
+      await page.locator('[data-log-jump]').click();
+      await page.getByText('matching 501', { exact: true }).waitFor();
+      await page.getByText('481–500 of 500', { exact: true }).waitFor();
+      expect(await lines.count()).toBe(20);
+    } finally { await page.close(); }
+  });
+
   it('ignores late callbacks and snapshot errors after tab exit or unmount, and retires only their tokens', async () => {
     const page = await fixture();
     try {
