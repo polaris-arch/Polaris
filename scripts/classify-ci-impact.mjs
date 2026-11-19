@@ -869,6 +869,10 @@ export const ANDROID_IMPACT_SCOPES = Object.freeze({
  * 那正是完备性门 C 组固定 comment-only 合成负例要证伪的形态；原 mesh.rs 已有真实 Android 分支。
  */
 export const NO_ANDROID_IMPACT_SCOPES = Object.freeze({
+  'src-tauri/src/runtime/config.rs':
+    'Android skips the desktop legacy-start lease inside the shared saved-state restart admission. '
+    + 'ci.yml cargo check --target aarch64-linux-android -p polaris compiles that branch. '
+    + 'APK packaging does not exercise restart admission; no JNI or packaged resource changes.',
   'src-tauri/src/runtime/proxy/runtime_config/tests/mod.rs':
     'The cfg(test) fixture is excluded from APKs. Its Android field only supplies a default for the shared test data. '
     + 'ci.yml cargo check --target aarch64-linux-android -p polaris covers the corresponding production field.',
