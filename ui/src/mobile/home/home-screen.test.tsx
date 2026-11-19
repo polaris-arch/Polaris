@@ -716,9 +716,9 @@ describe('⑤ 流量采样：按秒差分、计数器归零重启缓冲', () => 
     expect(b.baseline).not.toBeNull();
   });
 
-  it('满一秒才出一个点，速率 = 增量 ÷ 实测 Δt', () => {
+  it('合并间隔过短的帧，速率 = 增量 ÷ 实测 Δt', () => {
     let b = pushTotals(EMPTY_TRAFFIC_BUFFER, 0, 0, 0);
-    b = pushTotals(b, 100, 300, 500); // 不足一秒 ⇒ 原样返回
+    b = pushTotals(b, 100, 300, 500);
     expect(b.samples).toEqual([]);
     b = pushTotals(b, 200, 600, 2000); // Δt=2s
     expect(b.samples).toEqual([{ at: 2000, up: 100, down: 300 }]);

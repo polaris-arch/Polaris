@@ -10,6 +10,18 @@ describe('traffic time axis', () => {
     expect(path).toMatch(/^M 295\.00 50\.00 C /);
     expect(path).toMatch(/300\.00 50\.00$/);
   });
+  it('keeps jittered one-second frames, including zero rates, in one segment', () => {
+    let b = pushTotals(EMPTY_TRAFFIC_BUFFER, 0, 0, 0);
+    b = pushTotals(b, 0, 0, 999);
+    b = pushTotals(b, 100, 200, 2001);
+    b = pushTotals(b, 100, 200, 3000);
+    b = pushTotals(b, 200, 400, 4002);
+    expect(b.samples.map(sample => sample.at)).toEqual([999, 2001, 3000, 4002]);
+    expect(b.samples[2]).toEqual({ at: 3000, up: 0, down: 0 });
+    const path = timedTrafficPath(b.samples, 'up', 300, 100, 200);
+    expect(path.match(/M /g)).toHaveLength(1);
+    expect(path).toContain('294.99 100.00');
+  });
   it('does not join a background gap or retain samples older than the window', () => {
     let b = pushTotals(EMPTY_TRAFFIC_BUFFER, 0, 0, 0);
     b = pushTotals(b, 10, 20, 1000);

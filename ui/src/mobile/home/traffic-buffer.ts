@@ -11,10 +11,9 @@
  * 这正是把采样写成一条规则而不是两条的理由。
  *
  * 三件被这条规则一并settle 的事（原文在 spec，此处只记结论与后果）：
- *  · **不读 `uploadSpeed` / `downloadSpeed`**：它们本身已是客户端在一个未言明的窗口上做的差分，
- *    而 relay 的聚合发射闸门是 250ms ⇒ 一秒里最多四帧。只留每秒最后一帧等于扔掉四分之三的测量。
- *  · **不按 250ms 采**：60 点铺在 358 宽的 compact 卡上约 6px 一点，平滑吃得下；240 点是过采样，
- *    且一秒重绘四次是拿电量换没人看得见的细节。
+ *  · 速率用相邻图表采样的累计值和实测间隔计算，和时间轴的窗口一致。
+ *  · 原生 Status 流约每秒一帧，WebView 收帧会有抖动。图表给略早到达的帧留出余量，
+ *    并合并间隔过短的帧。
  *  · **绝不读 sing-box 的 `Status.uplink` / `downlink`**：那不是速率（订阅循环往里写的是每 tick 的
  *    字节增量，首帧恒零，server 的 tick 间隔不在线上）。
  *
@@ -35,8 +34,9 @@ export interface RateSample {
 /** 60 点窗口（与 -60s / -45s / -30s / -15s / now 这条轴同源）。 */
 export const TRAFFIC_WINDOW = 60;
 
-/** 采样边界：累计到满一秒才出一个点。 */
+/** 原生 Status 流的请求周期。 */
 export const TRAFFIC_INTERVAL_MS = 1000;
+const TRAFFIC_MIN_SAMPLE_INTERVAL_MS = TRAFFIC_INTERVAL_MS * 0.75;
 
 /**
  * 差分缓冲。`baseline` 是上一个**已消费**的累计值与它的时刻；
@@ -56,8 +56,8 @@ export const EMPTY_TRAFFIC_BUFFER: TrafficBuffer = { samples: [], baseline: null
  * 四条分支，每条对应一个真实形态：
  *  1. 无基线 ⇒ 只记基线，不出点（第一帧没有可差分的对象）。
  *  2. 累计值**变小** ⇒ 核重启了。清空样本 + 换基线，**不出点**（那个差分不是速率）。
- *  3. 距基线不足一秒 ⇒ 原样返回（引用不变，避免无谓重渲染）。
- *  4. 满一秒 ⇒ 出一个点，速率 = 增量 ÷ 实测 Δt（不是 ÷ 1000 —— 帧不会精准落在整秒上）。
+ *  3. 距基线短于最小采样间隔 ⇒ 留待下一帧计算累计增量。
+ *  4. 达到采样间隔 ⇒ 出一个点，速率 = 增量 ÷ 实测 Δt。
  */
 export function pushTotals(
   buf: TrafficBuffer,
@@ -74,7 +74,7 @@ export function pushTotals(
     return { samples: [], baseline: { up: totalUp, down: totalDown, at: atMs } };
   }
   const dt = atMs - base.at;
-  if (dt < TRAFFIC_INTERVAL_MS) return buf;
+  if (dt < TRAFFIC_MIN_SAMPLE_INTERVAL_MS) return buf;
   const perSec = 1000 / dt;
   const next = [
     ...buf.samples,
