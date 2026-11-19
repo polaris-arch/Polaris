@@ -15,6 +15,7 @@ import { useMobileFormStore } from '/src/mobile/forms/form-store';
 import { useDialogStore } from '/src/components/dialogs/dialog-store';
 import { useTailscaleLoginProgressStore } from '/src/store/use-tailscale-login-progress-store';
 import { useStagedConfigStore } from '/src/store/staged-config-store';
+import { configBaseVersion } from '/src/lib/staged-config';
 import { TsLoginPanel } from '/src/mobile/forms/TsLoginPanel';
 import { MobileToaster } from '/src/mobile/MobileToaster';
 import { MobileFormHost } from '/src/mobile/forms/MobileFormHost';
@@ -30,6 +31,7 @@ import '/src/mobile/screens/rules/rules-redesign.css';
 import '/src/mobile/connections/connections-redesign.css';
 await i18nReady;
 const mode = new URLSearchParams(location.search).get('mode');
+const clearSettingsMode = mode?.startsWith('retained-credential-settings-');
 if (mode?.startsWith('ios')) document.documentElement.dataset.mobileOs = 'ios';
 if (mode?.startsWith('android-switch') || mode?.startsWith('android-stop-retained')) document.documentElement.dataset.mobileOs = 'android';
 const heldDesktop = mode === 'desktop-switch-held' || mode === 'credential-settings-logout-held';
@@ -152,8 +154,6 @@ useAppStore.setState({ servers: [server], selectedServerId: null, config: { serv
 api.config.get = async () => useAppStore.getState().config;
 api.server.update = async next => {
   test.saves++;
-  (test.updates ||= []).push(next);
-  if (mode?.includes('settings-fail')) throw { message: 'credentialRevisionChanged' };
   if (next.tailscaleCredentialIntent) {
     next = { ...next, tailscaleSettings: { ...next.tailscaleSettings } };
     delete next.tailscaleCredentialIntent; delete next.tailscaleSettings.authKey;
@@ -161,9 +161,42 @@ api.server.update = async next => {
   if (mode === 'delayed-save') await new Promise(resolve => { test.releaseSave = resolve; });
   useAppStore.setState({ servers: [next], config: { servers: [next], subscriptions: [], selectedServerId: null } });
 };
-if (mode?.includes('settings-staged')) useAppStore.setState({ proxyStatus: { running: true } });
+if (clearSettingsMode) {
+  useStagedConfigStore.getState().hydrate(useAppStore.getState().config);
+  api.config.setStagedPending = async () => {};
+  test.configSaves = [];
+  api.config.save = async (candidate, deferRestart, version, autoApply, hotOnly) => {
+    const disk = await api.config.get();
+    const next = candidate.servers[0];
+    const intent = next?.tailscaleCredentialIntent;
+    if (!deferRestart || !autoApply || !hotOnly || version !== configBaseVersion(disk)
+      || next?.id !== server.id || intent?.action !== 'clear') {
+      throw new Error('Expected a prospective clear for the saved Tailscale node');
+    }
+    test.configSaves.push(next);
+    if (intent.expectedCredentialRevision !== disk.servers[0].tailscaleSettings.tailscaleCredentialRevision) {
+      throw { message: 'credentialRevisionChanged' };
+    }
+    if (mode === 'retained-credential-settings-staged') return { status: 'needsManual' };
+    if (mode === 'retained-credential-settings-fail') return { status: 'retryable' };
+    const saved = { ...next, tailscaleSettings: { ...next.tailscaleSettings } };
+    delete saved.tailscaleCredentialIntent;
+    delete saved.tailscaleSettings.tailscaleCredentialRevision;
+    const savedConfig = { ...candidate, servers: [saved] };
+    return { status: 'saved', config: savedConfig, version: configBaseVersion(savedConfig) };
+  };
+  test.savedRevision = () => useStagedConfigStore.getState().latestSavedConfig.servers[0].tailscaleSettings.tailscaleCredentialRevision;
+}
+if (mode === 'retained-credential-settings-staged') useAppStore.setState({ proxyStatus: { running: true } });
 test.staged = () => useStagedConfigStore.getState().entries;
-test.setRevision = revision => { const current = useAppStore.getState().servers[0]; const next = { ...current, tailscaleSettings: { ...current.tailscaleSettings, tailscaleCredentialRevision: revision } }; useAppStore.setState({ servers: [next], config: { servers: [next], subscriptions: [], selectedServerId: null } }); };
+test.resetDraft = () => useStagedConfigStore.getState().reset();
+test.setRevision = revision => {
+  const current = useAppStore.getState().servers[0];
+  const next = { ...current, tailscaleSettings: { ...current.tailscaleSettings, tailscaleCredentialRevision: revision } };
+  const config = { servers: [next], subscriptions: [], selectedServerId: null };
+  useAppStore.setState({ servers: [next], config });
+  if (clearSettingsMode) useStagedConfigStore.getState().hydrate(config);
+};
 const off = startMobileAppWiring(key => key);
 test.emit = (name, payload) => { for (const fn of listeners.get(name) || []) fn(payload); };
 test.attempt = () => useTailscaleLoginProgressStore.getState().attempts['ts-1'];
@@ -291,14 +324,17 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile TS attempt lif
       await page.goto(`${origin}/${endpoint}?mode=retained-credential-settings-mismatch`);
       const clear = page.getByRole('button', { name: '清除', exact: true });
       await clear.click();
-      expect(await page.evaluate(() => (window as any).__tsTest.saves)).toBe(0);
+      expect(await page.evaluate(() => (window as any).__tsTest.configSaves)).toEqual([]);
       await page.getByRole('button', { name: '再点一次以清除', exact: true }).click();
       expect(await page.getByText('待清除（保存后生效）', { exact: true }).count()).toBe(1);
       await page.locator(endpoint === '__ts-login' ? '.m-form-foot .primary' : '.dlg-foot .btn.flow').click();
-      await page.waitForFunction(() => (window as any).__tsTest.saves === 1);
-      expect(await page.evaluate(() => { const t = (window as any).__tsTest; return { intent: t.updates[0].tailscaleCredentialIntent,
-        metadata: t.updates[0].tailscaleSettings.retainedAuthKeyAvailable, logouts: t.logouts, starts: t.starts }; })).toEqual({
-          intent: { action: 'clear', expectedCredentialRevision: 'revision-A' }, metadata: undefined, logouts: 0, starts: 0 });
+      await page.waitForFunction(() => {
+        const t = (window as any).__tsTest;
+        return t.configSaves.length === 1 && t.savedRevision() === undefined;
+      });
+      expect(await page.evaluate(() => { const t = (window as any).__tsTest; return { saves: t.saves, intent: t.configSaves[0].tailscaleCredentialIntent,
+        metadata: t.configSaves[0].tailscaleSettings.retainedAuthKeyAvailable, logouts: t.logouts, starts: t.starts }; })).toEqual({
+          saves: 0, intent: { action: 'clear', expectedCredentialRevision: 'revision-A' }, metadata: undefined, logouts: 0, starts: 0 });
     } finally { await page.close(); }
   }, 30_000);
 
@@ -308,21 +344,25 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile TS attempt lif
       await page.goto(`${origin}/${endpoint}?mode=retained-credential-settings-staged`);
       await page.getByRole('button', { name: '清除', exact: true }).click();
       await page.getByRole('button', { name: '再点一次以清除', exact: true }).click();
-      await page.evaluate(() => (window as any).__tsTest.setRevision('revision-B'));
-      await page.locator(endpoint === '__ts-login' ? '.m-form-foot .primary' : '.dlg-foot .btn.flow').click();
+      const save = page.locator(endpoint === '__ts-login' ? '.m-form-foot .primary' : '.dlg-foot .btn.flow');
+      await save.click();
       await page.waitForFunction(() => (window as any).__tsTest.staged().length === 1);
-      expect(await page.evaluate(() => { const t = (window as any).__tsTest; return { saves: t.saves, intent: t.staged()[0].nextValue.tailscaleCredentialIntent,
-        metadata: t.staged()[0].nextValue.tailscaleSettings.retainedAuthKeyAvailable }; })).toEqual({ saves: 0,
+      expect(await page.evaluate(() => { const t = (window as any).__tsTest; return { saves: t.saves, plans: t.configSaves.length,
+        intent: t.staged()[0].nextValue.tailscaleCredentialIntent,
+        metadata: t.staged()[0].nextValue.tailscaleSettings.retainedAuthKeyAvailable }; })).toEqual({ saves: 0, plans: 1,
           intent: { action: 'clear', expectedCredentialRevision: 'revision-A' }, metadata: undefined });
+      await page.evaluate(() => (window as any).__tsTest.resetDraft());
       await page.goto(`${origin}/${endpoint}?mode=retained-credential-settings-fail`);
       await page.getByRole('button', { name: '清除', exact: true }).click();
       await page.getByRole('button', { name: '再点一次以清除', exact: true }).click();
-      await page.locator(endpoint === '__ts-login' ? '.m-form-foot .primary' : '.dlg-foot .btn.flow').click();
-      await page.waitForFunction(() => (window as any).__tsTest.saves === 1);
+      await save.click();
+      await page.waitForFunction(() => (window as any).__tsTest.configSaves.length === 1);
       await page.evaluate(() => (window as any).__tsTest.setRevision('revision-B'));
-      await page.locator(endpoint === '__ts-login' ? '.m-form-foot .primary' : '.dlg-foot .btn.flow').click();
-      await page.waitForFunction(() => (window as any).__tsTest.saves === 2);
-      expect(await page.evaluate(() => (window as any).__tsTest.updates.map((n: any) => n.tailscaleCredentialIntent.expectedCredentialRevision))).toEqual(['revision-A', 'revision-A']);
+      await save.click();
+      await page.waitForFunction(() => (window as any).__tsTest.configSaves.length === 2);
+      expect(await page.evaluate(() => { const t = (window as any).__tsTest; return { saves: t.saves, drafts: t.staged().length, savedRevision: t.savedRevision(),
+        revisions: t.configSaves.map((n: any) => n.tailscaleCredentialIntent.expectedCredentialRevision) }; })).toEqual({
+          saves: 0, drafts: 0, savedRevision: 'revision-B', revisions: ['revision-A', 'revision-A'] });
     } finally { await page.close(); }
   }, 30_000);
 
