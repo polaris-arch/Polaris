@@ -21,7 +21,6 @@ import { fixtureTar, fixtureZip } from '../lib/formal-package-fixtures.mjs';
 import { extractNativeArchive } from './release-archive.mjs';
 
 const repo = join(dirname(fileURLToPath(import.meta.url)), '../..');
-const PYTHON = process.platform === 'win32' ? 'python' : 'python3';
 const candidate = 'c'.repeat(40), commit = '1'.repeat(40), tree = '2'.repeat(40), tagObject = '3'.repeat(40);
 const version = '1.15.0-polaris-alpha.12', tag = `v${version}`;
 const write = (p, b) => { mkdirSync(dirname(p), { recursive: true }); writeFileSync(p, b); };
@@ -323,9 +322,9 @@ test('Windows held-destination fixture preserves a continuous exclusive path whi
     assert(checkedOwner); assert.equal(journalReplacements, 3); assert.equal(held.size, 0); assert(!existsSync(lock));
   } finally { Object.assign(fs, original); syncBuiltinESMExports(); }
 }));
-test('portable canonical fingerprints retain Python ASCII encoding including Unicode and non-BMP text', () => {
+test('portable canonical fingerprints preserve the original ASCII JSON bytes', () => {
   const value = { z: '界😀\u007f', a: ['é', 0] };
-  assert.equal(portableCanonical(value), execFileSync(PYTHON, ['-B', '-c', 'import json,sys;print(json.dumps(json.load(sys.stdin),sort_keys=True,separators=(",",":")))'], { input: JSON.stringify(value), encoding: 'utf8' }).trim());
+  assert.equal(portableCanonical(value), String.raw`{"a":["\u00e9",0],"z":"\u754c\ud83d\ude00\u007f"}`);
 });
 test('release CLI parsing accepts exactly the four App architecture keys and rejects source-mode flags', () => {
   assert.deepEqual(releasePlatforms(['--platform=mac-arm64,linux', '--force']), ['mac-arm64', 'linux']);

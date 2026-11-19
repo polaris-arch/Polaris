@@ -4,7 +4,7 @@ import test from 'node:test';
 import { execFileSync } from 'node:child_process';
 import { dirname } from 'node:path';
 import { cronetFixture } from '../lib/cronet-payload.test.mjs';
-import { fixtureZip } from '../lib/formal-package-fixtures.mjs';
+import { fixtureTar, fixtureZip } from '../lib/formal-package-fixtures.mjs';
 import fs, { mkdtempSync, writeFileSync, rmSync, mkdirSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -389,18 +389,10 @@ test('published consume and packaged verification work with every Actions URL de
       + row.buildGraph.localReplacements.map(m => `\tdep\t${m.module}\t${m.version}\t${m.h1}\n\t=>\t${m.replacement.module}\t${m.replacement.version}\t${m.replacement.h1}\n`).join('')
       + Object.entries(row.buildGraph.settings).map(([k,v]) => `\tbuild\t${k}=${v}\n`).join('');
     const archive = join(root, row.archive.name);
-    if (archive.endsWith('.zip')) {
-      writeFileSync(archive, fixtureZip(Object.entries(files).map(([name, data]) => ({
-        name: `${row.archive.root}/${name}`, data, mode: 0o100755,
-      }))));
-    } else {
-      const members = Object.fromEntries(Object.entries(files).map(([name,b]) => [`${row.archive.root}/${name}`, b.toString('base64')]));
-      execFileSync(process.platform === 'win32' ? 'python' : 'python3', ['-c', `import base64,io,json,sys,tarfile
-members=json.load(sys.stdin)
-with tarfile.open(sys.argv[1],'w:gz') as z:
- for n,v in members.items():
-  b=base64.b64decode(v);i=tarfile.TarInfo(n);i.size=len(b);i.mode=0o755;z.addfile(i,io.BytesIO(b))`, archive], { input: JSON.stringify(members) });
-    }
+    const entries = Object.entries(files).map(([name, data]) => ({ name: `${row.archive.root}/${name}`, data }));
+    writeFileSync(archive, archive.endsWith('.zip')
+      ? fixtureZip(entries.map((entry) => ({ ...entry, mode: 0o100755 })))
+      : fixtureTar(entries.map((entry) => ({ ...entry, mode: 0o755 }))));
     const bytes = readFileSync(archive);
     Object.assign(row.archive, { bytes: bytes.length, sha256: digest(bytes), members: Object.fromEntries(Object.entries(files).map(([name,b]) => [`${row.archive.root}/${name}`,digest(b)])) });
     Object.assign(row.releaseAsset, { bytes: bytes.length, sha256: digest(bytes) });

@@ -904,22 +904,12 @@ jobs:
           }
           NODE
 
-      - name: Setup candidate archive verifier Python
-        if: ${{ needs.cheap_format.outputs.native_dns_formal == 'true' }}
-        uses: actions/setup-python@v6
-        with:
-          python-version: '3.12'
-
       - name: Setup verified candidate Go metadata reader
         if: ${{ needs.cheap_format.outputs.native_dns_formal == 'true' }}
         uses: actions/setup-go@v6
         with:
           go-version: ${{ steps.native_dns_host.outputs.go_version }}
           cache: false
-
-      - name: Install same-source trusted proof validator dependency
-        if: ${{ needs.cheap_format.outputs.native_dns_formal == 'true' }}
-        run: python -m pip install jsonschema==4.23.0
 
       - name: Verify exact candidate Go toolchain
         if: ${{ needs.cheap_format.outputs.native_dns_formal == 'true' }}

@@ -400,12 +400,6 @@ jobs:
         with:
           node-version: '26'
 
-      - uses: actions/setup-python@v6
-        with:
-          python-version: '3.12'
-      - name: Install same-source trusted proof validator dependency
-        run: python -m pip install jsonschema==4.23.0
-
       # pnpm：不再经 pnpm/action-setup@v4（2026-08-17）。被替掉的 action 做的就是「按 version
       # 装一份 pnpm 并加进 PATH」，`npm install -g` 等价 —— 少一次 action tarball 拉取，
       # 顺手把版本钉成精确值，工具链才谈得上可复现。
@@ -1623,12 +1617,6 @@ jobs:
           set -euo pipefail
           npm install --global "$(node -p "require('./ui/package.json').packageManager")"
           pnpm --dir ui install --frozen-lockfile --ignore-scripts
-
-      - uses: actions/setup-python@v6
-        with:
-          python-version: '3.12'
-      - name: Install same-source trusted proof validator dependency
-        run: python -m pip install jsonschema==4.23.0
 
       # 口径同 package job 的同名步（不装组件；判据见 ci.yml 那段）。
       - name: Install Rust stable (preinstalled rustup)
