@@ -21,7 +21,6 @@ import time
 import tempfile
 import unittest
 from unittest.mock import patch
-import zipfile
 
 os.sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
@@ -64,15 +63,6 @@ class Integrity(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp); current = directory / 'Polaris_1.0.0_x64-setup.exe'; current.write_bytes(b'inert')
             self.assertEqual(w.unique_installer(directory, '1.0.0'), current)
-
-    def test_fresh_portable_staging_never_overlays_residual_namespace(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp); state, app = self.fixture(root); state['owner'] = str(root)
-            legacy = root / 'staging-portable'; legacy.mkdir(); (legacy / 'old.ps1').write_bytes(b'old')
-            archive = root / 'new.zip'; w.build_portable(root, state, app, archive)
-            with zipfile.ZipFile(archive) as z: self.assertNotIn('old.ps1', z.namelist())
-            self.assertEqual((legacy / 'old.ps1').read_bytes(), b'old')
-            with self.assertRaises(FileExistsError): w.build_portable(root, state, app, archive)
 
     def test_prepare_quarantines_only_fixed_old_namespaces(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -867,17 +857,13 @@ class WindowsLongPaths(unittest.TestCase):
             self.assertEqual(w.facts(logical), expected)
             self.assertEqual(w.tree(root), {'nested/许可证/LICENSE': expected})
 
-    def test_native_long_inventory_portable_and_cargo_known_pair(self):
+    def test_native_long_inventory_and_cargo_known_pair(self):
         with self.deep_directory() as (root, native):
             expected, app = self.fixture(native)
             resources, sources = w.source_inventory(root)
             self.assertEqual(resources, expected)
             self.assertTrue(all(Path(source).is_relative_to(root) and not source.startswith('\\\\?\\')
                                 for source in sources.values()), 'logical source maps must stay unprefixed')
-            state = {'resources': resources, 'sources': sources, 'owner': str(root)}
-            archive = root / 'portable.zip'; w.build_portable(root, state, app, archive)
-            self.assertEqual(w.portable_readback(archive, w.carrier_inventory(state, app, 'zip')),
-                             w.carrier_inventory(state, app, 'zip'))
             binary = native / 'target/release/polaris.exe'; binary.parent.mkdir(parents=True); binary.write_bytes(app)
             alias = binary.parent / 'build/polaris/0/out/polaris.exe'; alias.parent.mkdir(parents=True); os.link(binary, alias)
             before = w.cargo_app_identity(root)[1]

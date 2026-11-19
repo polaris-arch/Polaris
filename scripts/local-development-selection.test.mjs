@@ -9,7 +9,7 @@ import { dirname, join } from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { crc32 } from 'node:zlib';
-import { inspectFormalArtifact, inspectPortableZip, verifyFormalArtifactBytes } from './lib/formal-package-selection.mjs';
+import { buildPortableZip, inspectFormalArtifact, inspectPortableZip, verifyFormalArtifactBytes } from './lib/formal-package-selection.mjs';
 import { fixtureTar, fixtureZip, writeFormalAssets, writeLinuxFixture } from './lib/formal-package-fixtures.mjs';
 import {
   LOCAL_MARKER, collectLocalSelection, compilerSelectionSource, localDirectory, localReceipt, prepareLocalInstallation,
@@ -316,6 +316,36 @@ test('compressed ZIP and APK selection checks executable bytes and archive paths
     writeFileSync(zip, fixtureZip([{ name: 'polaris.exe', data: 'app', flags }, { name: 'polaris-helper.exe', data: 'helper' }]));
     await inspect(zip, /encrypted\/patched member/);
   }
+}));
+
+test('portable ZIP writer uses only admitted paths and never overwrites an archive', t => fixture(async root => {
+  const powershell = spawnSync('pwsh', ['--version'], { timeout: 5_000 });
+  if (powershell.error?.code === 'ENOENT' && !process.env.GITHUB_ACTIONS) {
+    t.skip('the hosted portable writer requires PowerShell');
+    return;
+  }
+  assert.equal(powershell.status, 0, powershell.error?.message ?? powershell.stderr?.toString());
+  const staging = join(root, ...Array(6).fill('native-stage-' + 'x'.repeat(38)), '许可证-é');
+  mkdirSync(staging, { recursive: true });
+  const app = join(staging, 'first-app.bin'), source = join(staging, 'resource.bin'), empty = join(staging, 'empty');
+  const marker = 'Polaris portable fixture\n便携版';
+  const appBytes = Buffer.from('MZ inert fixture'), sourceBytes = Buffer.alloc(65_537, 0x7f);
+  for (const [path, bytes] of [[app, appBytes], [source, sourceBytes], [empty, Buffer.alloc(0)]]) writeFileSync(path, bytes);
+  const legacy = join(root, 'staging-portable');
+  mkdirSync(legacy);
+  const old = join(legacy, 'old.ps1');
+  writeFileSync(old, 'leftover fixture');
+  const member = 'resources/data/许可证-é.bin', zero = 'resources/data/empty.dat';
+  const pins = Object.fromEntries(Object.entries({ 'polaris.exe': appBytes, 'portable.marker': Buffer.from(marker),
+    [member]: sourceBytes, [zero]: Buffer.alloc(0) }).map(([name, bytes]) => [name, { bytes: bytes.length, sha256: hash(bytes) }]));
+  const sources = { ['_up_/' + member]: source, ['_up_/' + zero]: empty };
+  const archive = join(root, 'fresh.zip');
+  const result = await buildPortableZip(archive, pins, sources, app, marker);
+  const original = readFileSync(archive);
+  assert.deepEqual(result, { observed: pins, artifact: { bytes: original.length, sha256: hash(original) } });
+  assert.equal(readFileSync(old, 'utf8'), 'leftover fixture');
+  await assert.rejects(buildPortableZip(archive, pins, sources, app, marker));
+  assert.deepEqual(readFileSync(archive), original);
 }));
 
 test('portable ZIP readback verifies every byte and the exact frozen member inventory', () => fixture(async root => {

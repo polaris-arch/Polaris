@@ -23,7 +23,6 @@ import tempfile
 import threading
 import time
 import unicodedata
-import zipfile
 
 os.sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
@@ -425,15 +424,18 @@ def exact(actual, expected):
         require(actual[name] == expected[name], 'final member SHA/size differs: ' + name)
 
 
-def portable_readback(archive, expected):
+def portable_operation(action, **request):
     scanner = Path(__file__).resolve().with_name('lib') / 'formal-package-selection.mjs'
-    # Extended Windows paths and native reparse tags stay in the producer's custody.
-    request = {'archive': str(regular(archive)), 'expected': expected}
-    result = subprocess.run(['node', str(scanner), 'portable-zip'], input=json.dumps(request).encode(),
+    result = subprocess.run(['node', str(scanner), action], input=json.dumps(request).encode(),
                             capture_output=True, timeout=EXTRACT_TIMEOUT + 5)
     require(result.returncode == 0, result.stderr.decode('utf-8', errors='replace').strip())
-    regular(archive)
     return json.loads(result.stdout)
+
+
+def portable_readback(archive, expected):
+    observed = portable_operation('portable-zip', archive=str(regular(archive)), expected=expected)
+    regular(archive)
+    return observed
 
 
 def nsis_listing(text):
@@ -880,21 +882,6 @@ def nsis_inventory(root, tool, archive, expected, scratch):
             'streamedBytesIncludingNestedUninstaller': budget['bytes'],
             'extractionLimits': {'memberBytes': MAX_FILE, 'aggregateBytes': MAX_TOTAL, 'uninstallerBytes': MAX_UNINSTALLER,
                                  'listingBytes': MAX_LISTING, 'stderrBytes': MAX_STDERR, 'perUnpackSeconds': EXTRACT_TIMEOUT}}
-
-
-def build_portable(root, state, app, destination):
-    # Fresh standard-library owned staging; no overlay and no arbitrary rmtree.
-    with tempfile.TemporaryDirectory(prefix='portable-', dir=io_path(state['owner'])) as tmp:
-        staging = Path(tmp)
-        for name, source in state['sources'].items():
-            name = name[5:] if name.startswith('_up_/') else name
-            path = staging / name; io_path(path.parent).mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(io_path(regular(source)), io_path(path))
-        io_path(staging / 'polaris.exe').write_bytes(app)
-        io_path(staging / 'portable.marker').write_bytes(MARKER)
-        expected = carrier_inventory(state, app, 'zip'); exact(tree(staging), expected)
-        with zipfile.ZipFile(io_path(destination), 'x', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
-            for name in sorted(expected): archive.write(io_path(staging / name), name)
 
 
 def verify_generated_script(root, state, *, sources=None):
@@ -1479,7 +1466,7 @@ def assemble(root):
     exact(portable_readback(portable, carrier_inventory(state, app, 'zip')), receipt['portableObserved'])
 
 
-def assemble_carriers(root, state, app_path, app, source_path, source_identity, *, sources=None):
+def assemble_carriers(root, state, app_path, app, source_path, source_identity, *, sources):
     cli = tauri_identity(root)
     generated_script = verify_generated_script(root, state, sources=sources)
     raw = unique_installer(Path(state['cargo']['releaseDirectory']) / 'bundle/nsis', state['version'])
@@ -1492,14 +1479,20 @@ def assemble_carriers(root, state, app_path, app, source_path, source_identity, 
     installer = destination / f"Polaris_{state['version']}_x64-win-setup.exe"
     io_path(raw).rename(io_path(installer))
     portable = destination / f"Polaris_{state['version']}_x64-win-Portable.zip"
-    build_portable(root, state, app, portable)
-    load_state(root)
-    require(facts(app_path) == byte_facts(app), 'App changed during carrier inspection')
-    require(cargo_app_identity(root, state)[1] == source_identity, 'Cargo App changed during carrier inspection')
-    require(byte_facts(compiled_app(root, state=state)[1]) == state['cargoArtifact']['firstApp']
-            and cargo_app_identity(root, state)[1] == source_identity, 'original-byte-mismatch during carrier inspection')
     portable_expected = carrier_inventory(state, app, 'zip')
-    portable_observed = portable_readback(portable, portable_expected)
+    # The parent already holds the exact resource objects passed to Tauri.
+    # Extend that custody to the restored App snapshot and the output namespace.
+    with hold_resource(app_path.parent, directory=True), hold_resource(app_path), hold_resource(destination, directory=True):
+        observation = portable_operation('build-portable-zip', archive=str(portable), expected=portable_expected,
+                                         sources=sources, app=str(app_path), marker=MARKER.decode())
+        load_state(root)
+        require(facts(app_path) == byte_facts(app), 'App changed during carrier inspection')
+        require(cargo_app_identity(root, state)[1] == source_identity, 'Cargo App changed during carrier inspection')
+        require(byte_facts(compiled_app(root, state=state)[1]) == state['cargoArtifact']['firstApp']
+                and cargo_app_identity(root, state)[1] == source_identity, 'original-byte-mismatch during carrier inspection')
+        carrier_facts = {p.name: facts(p) for p in [installer, portable]}
+        require(carrier_facts[portable.name] == observation['artifact'], 'portable ZIP changed after inspection')
+        portable_observed = observation['observed']
     evidence = root / 'windows-package-evidence'; io_path(evidence).mkdir(exist_ok=True)
     receipt = {'schema': 'polaris-windows-static-carriers-v1', 'candidate': state['candidate'],
                'ownedStage': {'path': state['owner'], 'retainedPreviousOutputBytes': state['retainedPreviousOutputBytes'],
@@ -1511,7 +1504,7 @@ def assemble_carriers(root, state, app_path, app, source_path, source_identity, 
                'tauriCLI': cli, 'cargoContext': state['cargo'], 'cargoArtifact': state['cargoArtifact'],
                'nsisExpected': carrier_inventory(state, app, 'nsis'), 'nsisObserved': observed,
                'portableExpected': portable_expected, 'portableObserved': portable_observed,
-               'carriers': {p.name: facts(p) for p in [installer, portable]},
+               'carriers': carrier_facts,
                'nativeInstallation': 'not performed by static carrier gate'}
     io_path(evidence / 'static-carriers.json').write_text(json.dumps(receipt, indent=2) + '\n', encoding='utf-8')
     print('Actual final NSIS + portable complete member/SHA/size inventories verified')

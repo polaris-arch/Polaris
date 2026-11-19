@@ -7,7 +7,7 @@ import {
 } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
-import { dirname, extname, join, posix, resolve } from 'node:path';
+import { dirname, extname, isAbsolute, join, posix, resolve, toNamespacedPath } from 'node:path';
 import { Readable, Writable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { fileURLToPath } from 'node:url';
@@ -685,7 +685,9 @@ export function verifyFormalArtifactBytes(path, checked) {
 }
 
 // The Windows producer guards native reparse tags and passes its frozen member map.
-export async function inspectPortableZip(input, expected) {
+export async function inspectPortableZip(input, expected, {
+  pinArtifact = false, deadline = performance.now() + DEADLINE_MS,
+} = {}) {
   demand(expected && typeof expected === 'object' && !Array.isArray(expected), 'invalid portable ZIP inventory');
   const names = Object.keys(expected), directories = new Set();
   demand(names.length <= MAX_MEMBERS, 'portable ZIP expected member count budget exceeded');
@@ -694,7 +696,7 @@ export async function inspectPortableZip(input, expected) {
       directories.add(parent);
     }
   }
-  const artifact = resolve(input), deadline = performance.now() + DEADLINE_MS;
+  const artifact = resolve(input);
   const remaining = () => {
     const timeout = deadline - performance.now();
     demand(timeout > 0, 'portable ZIP inspection deadline exceeded');
@@ -731,17 +733,92 @@ export async function inspectPortableZip(input, expected) {
       actual.set(name, { bytes: size, sha256 });
     }
     demand(actual.size === names.length, 'final member set differs');
+    const pin = pinArtifact ? { bytes: Number(opened.size), sha256: scanBytes(read, Number(opened.size)) } : null;
     demand(identityMatches(fstatSync(fd, statOptions), opened, true)
       && identityMatches(regularArtifactStat(artifact), before, true), 'portable ZIP changed during inspection');
-    return Object.fromEntries(actual);
+    const observed = Object.fromEntries(actual);
+    return pin ? { observed, artifact: pin } : observed;
   } finally { closeSync(fd); }
+}
+
+// The producer retains the App/resource HANDLEs. PowerShell only provides the
+// platform ZIP encoder for those exact input paths, without walking a tree.
+export async function buildPortableZip(input, expected, sources, app, marker) {
+  const paths = new Map();
+  for (const [source, path] of Object.entries(sources)) {
+    const name = source.startsWith('_up_/') ? source.slice(5) : source;
+    demand(!paths.has(name) && name !== 'polaris.exe' && name !== 'portable.marker', 'portable ZIP source collision: ' + name);
+    paths.set(name, path);
+  }
+  paths.set('polaris.exe', app);
+  paths.set('portable.marker', null);
+  const records = new Map();
+  demand(paths.size <= MAX_MEMBERS && paths.size === Object.keys(expected).length, 'portable ZIP source/member set differs');
+  for (const [name, path] of paths) {
+    const pin = Object.hasOwn(expected, name) && expected[name];
+    demand(pin && Number.isSafeInteger(pin.bytes) && pin.bytes >= 0 && pin.bytes <= MAX_FILE &&
+      typeof pin.sha256 === 'string' && /^[a-f0-9]{64}$/.test(pin.sha256), 'invalid portable ZIP member pin: ' + name);
+    demand(name === 'portable.marker' || (typeof path === 'string' && isAbsolute(path)), 'absolute held portable source required: ' + name);
+    records.set(name, { kind: 'file', bytes: pin.bytes });
+  }
+  validateRecords(records);
+  const markerBytes = Buffer.from(marker, 'utf8'), markerPin = expected['portable.marker'];
+  demand(markerBytes.length === markerPin.bytes && createHash('sha256').update(markerBytes).digest('hex') === markerPin.sha256,
+    'portable marker differs from frozen inventory');
+  const archive = resolve(input), deadline = performance.now() + DEADLINE_MS;
+  const members = Array.from(paths, ([name, path]) => ({ name, bytes: expected[name].bytes,
+    ...(name === 'portable.marker' ? { inline: markerBytes.toString('base64') } : { path: toNamespacedPath(path) }) }));
+  members.sort((left, right) => Buffer.compare(Buffer.from(left.name), Buffer.from(right.name)));
+  execFileSync('pwsh', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', `
+    $ErrorActionPreference = 'Stop'
+    [Console]::InputEncoding = [Text.UTF8Encoding]::new($false, $true)
+    $request = [Console]::In.ReadToEnd() | ConvertFrom-Json -AsHashtable
+    $file = [IO.File]::Open($request.archive, 'CreateNew', 'Write', 'None')
+    try {
+      $zip = [IO.Compression.ZipArchive]::new($file, 'Create', $true)
+      try {
+        $block = [byte[]]::new(65536)
+        foreach ($member in $request.members) {
+          $entry = $zip.CreateEntry($member.name, 'Optimal')
+          $output = $entry.Open()
+          try {
+            if ($member.Contains('inline')) {
+              $bytes = [Convert]::FromBase64String($member.inline)
+              $output.Write($bytes, 0, $bytes.Length)
+              continue
+            }
+            $source = [IO.File]::Open($member.path, 'Open', 'Read', 'Read')
+            try {
+              $remaining = [long] $member.bytes
+              if ($source.Length -ne $remaining) { throw 'portable ZIP held member size differs' }
+              while ($remaining -gt 0) {
+                $count = $source.Read($block, 0, [int] [Math]::Min($block.Length, $remaining))
+                if ($count -eq 0) { throw 'portable ZIP held member truncated' }
+                $output.Write($block, 0, $count)
+                $remaining -= $count
+              }
+              if ($source.ReadByte() -ne -1) { throw 'portable ZIP held member grew' }
+            } finally { $source.Dispose() }
+          } finally { $output.Dispose() }
+        }
+      } finally { $zip.Dispose() }
+      $file.Flush($true)
+    } finally { $file.Dispose() }
+  `], { input: Buffer.from(JSON.stringify({ archive: toNamespacedPath(archive), members })),
+    stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, timeout: DEADLINE_MS, killSignal: 'SIGKILL', maxBuffer: MAX_STDERR });
+  const left = deadline - performance.now();
+  demand(left > 0, 'portable ZIP build deadline exceeded');
+  rejectWindowsReparsePoints(toNamespacedPath(archive), 'Windows portable ZIP artifact', Math.min(30_000, Math.ceil(left)));
+  return inspectPortableZip(archive, expected, { pinArtifact: true, deadline });
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try {
-    demand(process.argv.length === 3 && process.argv[2] === 'portable-zip', 'expected portable-zip request');
-    const { archive, expected } = JSON.parse(utf8.decode(readFileSync(0)));
-    const observed = await inspectPortableZip(archive, expected);
+    const mode = process.argv[2];
+    demand(process.argv.length === 3 && ['portable-zip', 'build-portable-zip'].includes(mode), 'expected portable ZIP request');
+    const { archive, expected, sources, app, marker } = JSON.parse(utf8.decode(readFileSync(0)));
+    const observed = mode === 'portable-zip' ? await inspectPortableZip(archive, expected) :
+      await buildPortableZip(archive, expected, sources, app, marker);
     console.log(JSON.stringify(observed));
   } catch (error) {
     console.error(error.message);
