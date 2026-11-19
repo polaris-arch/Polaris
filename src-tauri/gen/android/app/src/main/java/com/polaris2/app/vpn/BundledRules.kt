@@ -3,6 +3,7 @@ package com.polaris2.app.vpn
 import android.content.Context
 import android.util.AtomicFile
 import android.util.Log
+import java.io.DataInputStream
 import java.io.File
 
 /** Materialize APK assets before Rust startup; Rust retains ownership of runtime rule seeding. */
@@ -21,7 +22,15 @@ internal object BundledRules {
                 check(bytes.size > 3 && bytes[0] == 0x53.toByte() &&
                     bytes[1] == 0x52.toByte() && bytes[2] == 0x53.toByte()) { "Invalid SRS asset: $name" }
                 val file = File(directory, name)
-                if (runCatching { file.readBytes().contentEquals(bytes) }.getOrDefault(false)) continue
+                val matchesAsset = runCatching {
+                    DataInputStream(file.inputStream()).use { input ->
+                        // Use the APK asset length, even if the extracted file grows while open.
+                        val existing = ByteArray(bytes.size)
+                        input.readFully(existing)
+                        input.read() == -1 && existing.contentEquals(bytes)
+                    }
+                }.getOrDefault(false)
+                if (matchesAsset) continue
                 val atomic = AtomicFile(file)
                 val output = atomic.startWrite()
                 try {
