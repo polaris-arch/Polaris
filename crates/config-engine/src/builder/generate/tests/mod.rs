@@ -245,6 +245,38 @@ fn android_warm_tailscale_add_preserves_admitted_dual_mode_and_dashboard() {
         .unwrap()
         .config;
     assert!(unadmitted.experimental.unwrap().clash_api.is_none());
+
+    config.selected_server_id = Some("s1".into());
+    let accepted = generate_running_candidate(&config, &deps, &bindings, &running, Some(&anchor))
+        .unwrap()
+        .config;
+    config.servers.push(ServerConfig {
+        id: "third".into(),
+        name: "Third tailnet".into(),
+        protocol: Protocol::Tailscale,
+        tailscale_settings: Some(Box::default()),
+        ..Default::default()
+    });
+    let third = generate_running_candidate(&config, &deps, &bindings, &accepted, Some(&anchor))
+        .unwrap()
+        .config;
+    assert_eq!(third.experimental, accepted.experimental);
+    assert_eq!(third.services, accepted.services);
+    assert_eq!(third.endpoints.unwrap().len(), 3);
+
+    config
+        .servers
+        .iter_mut()
+        .find(|s| s.id == anchor)
+        .unwrap()
+        .id = "replacement".into();
+    let replaced = generate_running_candidate(&config, &deps, &bindings, &accepted, Some(&anchor))
+        .unwrap()
+        .config;
+    let base = generate_base_config(&config, &BTreeMap::new(), &deps, &bindings)
+        .unwrap()
+        .config;
+    assert_eq!(replaced, base);
 }
 
 #[test]
