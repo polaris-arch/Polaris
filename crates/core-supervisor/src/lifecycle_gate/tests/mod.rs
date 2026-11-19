@@ -229,9 +229,10 @@ fn generation_is_monotonic_per_bump() {
 }
 
 #[test]
-fn debounced_restart_claim_requeues_exact_force_id_when_busy() {
+fn debounced_restart_claim_keeps_exact_force_id_when_busy() {
     let gate = LifecycleGate::default();
     let generation = gate.generation();
+    gate.set_force_restart(41);
     gate.begin();
     assert_eq!(gate.try_begin_restart(generation, Some(41)), None);
     assert_eq!(gate.generation(), generation);
@@ -241,10 +242,13 @@ fn debounced_restart_claim_requeues_exact_force_id_when_busy() {
         panic!("the busy owner must drain the exact pending restart")
     };
     assert!(drain.schedule_restart);
+    assert_eq!(gate.pending().force_restart_id, Some(41));
+    assert_eq!(gate.try_begin_restart(generation, Some(40)), None);
     assert_eq!(
         gate.try_begin_restart(generation, Some(41)),
         Some(generation + 1)
     );
+    assert!(gate.pending().is_empty());
     assert_eq!(gate.depth(), 1);
     assert_eq!(
         gate.generation_state(),
@@ -280,6 +284,11 @@ fn stale_debounced_restart_neither_claims_nor_requeues() {
     let old = gate.generation();
     let stop = gate.claim_generation(None, LifecycleKind::Stop).unwrap();
     assert_eq!(gate.try_begin_restart(old, Some(12)), None);
+    assert_eq!(
+        gate.try_begin_restart(stop, None),
+        None,
+        "Stop owns the generation before its teardown enters"
+    );
     assert_eq!(gate.generation(), stop);
     assert!(gate.pending().is_empty());
 }

@@ -541,6 +541,7 @@ pub struct ConfigManager {
     /// `load_full_under_write_lock`（末尾取 `cache` 写锁）与保存腿（先取读锁拿旧 icon id、末尾取写锁刷缓存），
     /// 若本锁与 `cache` 是同一把，那两次调用就是自死锁。
     write_lock: Mutex<()>,
+    builtin_rule_publication: tokio::sync::Mutex<()>,
     saved_revision: AtomicU64,
     legacy_start_leases: Arc<AtomicUsize>,
     /// 配置保存与延迟删除消费的事务锁。所有 save 都经它串行，关掉「journal 已写、config 未写时被
@@ -598,6 +599,7 @@ impl ConfigManager {
             path,
             cache: RwLock::new(None),
             write_lock: Mutex::new(()),
+            builtin_rule_publication: tokio::sync::Mutex::new(()),
             saved_revision: AtomicU64::new(0),
             legacy_start_leases: Arc::new(AtomicUsize::new(0)),
             deferred_delete_lock: Mutex::new(()),
@@ -648,6 +650,10 @@ impl ConfigManager {
             .write_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.lease_legacy_start_under_write_lock()
+    }
+
+    fn lease_legacy_start_under_write_lock(&self) -> Result<LegacyStartLease, StoreError> {
         self.admit_legacy_start_under_write_lock()?;
         self.legacy_start_leases.fetch_add(1, Ordering::SeqCst);
         Ok(LegacyStartLease {
@@ -1086,6 +1092,33 @@ impl ConfigManager {
         let saved = cache.as_ref().ok_or(SavedCommitError::Cold)?;
         let _probe = ReentrancyProbe::enter();
         Ok(commit(&saved.value))
+    }
+
+    /// Serialize built-in file replacement with a restart of the applied configuration.
+    /// Take this before the saved writer. Downloads and their subsequent live Apply do not hold it.
+    pub(crate) async fn lock_builtin_rule_publication(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.builtin_rule_publication.lock().await
+    }
+
+    /// Admit and claim a debounced restart under one nonblocking saved-state fence.
+    pub(crate) fn try_with_saved_restart_commit<T>(
+        &self,
+        commit: impl FnOnce(&Value, Option<LegacyStartLease>) -> Option<T>,
+    ) -> Result<Option<T>, SavedCommitError> {
+        self.try_with_saved_commit_classified(|desired| {
+            let lease = if cfg!(target_os = "android") {
+                None
+            } else {
+                match self.lease_legacy_start_under_write_lock() {
+                    Ok(lease) => Some(lease),
+                    Err(error) => {
+                        log::warn!("去抖重启准入拒绝，保留当前内核: {error}");
+                        return None;
+                    }
+                }
+            };
+            commit(desired, lease)
+        })
     }
 
     /// 保存配置（再跑 sanitize+validate + 原子写）+ 刷缓存。上游 `saveConfig`。

@@ -80,7 +80,7 @@ async fn builtin_update_commits_live_and_metadata_before_done() {
         &PublicLookup,
         &plan,
         &dir,
-        |resource, staged, operation| {
+        async |resource, staged, operation| {
             publish_builtin_file(operation, staged, &dir.join(&plan.file_name))?;
             assert_eq!(
                 std::fs::read(dir.join(&plan.file_name)).unwrap(),
@@ -112,11 +112,15 @@ async fn builtin_http_or_invalid_content_failure_preserves_live() {
         let (plan, dir) = fixture();
         let sink = RecordingSink::default();
         let client = TestHttp::new(status, body);
-        let outcome =
-            update_builtin_resource(&sink, &client, &PublicLookup, &plan, &dir, |_, _, _| {
-                panic!("下载失败不能保存元数据")
-            })
-            .await;
+        let outcome = update_builtin_resource(
+            &sink,
+            &client,
+            &PublicLookup,
+            &plan,
+            &dir,
+            async |_, _, _| panic!("下载失败不能保存元数据"),
+        )
+        .await;
         assert!(matches!(
             outcome,
             DownloadOutcome::Failed {
@@ -144,7 +148,7 @@ async fn builtin_metadata_failure_is_retryable_error_and_never_done() {
         &PublicLookup,
         &plan,
         &dir,
-        |_, staged, operation| {
+        async |_, staged, operation| {
             publish_builtin_file(operation, staged, &dir.join(&plan.file_name))?;
             Err("保存更新标记失败，可重试".into())
         },
@@ -165,7 +169,7 @@ async fn builtin_same_tag_updates_are_serialized_and_cleanup_isolated() {
     let first = RecordingSink::default();
     let second = RecordingSink::default();
     let saved = AtomicUsize::new(0);
-    let persist = |_: &RuleResource, staged: &Path, operation: &BuiltinUpdateOperation| {
+    let persist = async |_: &RuleResource, staged: &Path, operation: &BuiltinUpdateOperation| {
         publish_builtin_file(operation, staged, &dir.join(&plan.file_name))?;
         saved.fetch_add(1, Ordering::SeqCst);
         Ok(())
@@ -341,7 +345,7 @@ async fn download_paused_across_reset_cannot_publish_or_mark_metadata_done() {
         &PublicLookup,
         &plan,
         &dir,
-        |_, staged, operation| {
+        async |_, staged, operation| {
             publish_builtin_file(operation, staged, &dir.join(&plan.file_name))?;
             saved.fetch_add(1, Ordering::SeqCst);
             Ok(())
@@ -372,10 +376,14 @@ async fn cancelling_paused_download_cleans_only_its_stage_and_releases_gate() {
     };
     let sink = RecordingSink::default();
     {
-        let update =
-            update_builtin_resource(&sink, &client, &PublicLookup, &plan, &dir, |_, _, _| {
-                panic!("cancelled download must not publish")
-            });
+        let update = update_builtin_resource(
+            &sink,
+            &client,
+            &PublicLookup,
+            &plan,
+            &dir,
+            async |_, _, _| panic!("cancelled download must not publish"),
+        );
         tokio::pin!(update);
         tokio::select! {
             _ = &mut update => panic!("download must still be paused"),
@@ -423,7 +431,7 @@ async fn concurrent_builtin_fixtures_keep_failure_live_and_stage_cleanup_isolate
         &PublicLookup,
         &success_plan,
         &success_dir,
-        |_, staged, operation| {
+        async |_, staged, operation| {
             publish_builtin_file(
                 operation,
                 staged,
@@ -454,7 +462,7 @@ async fn concurrent_builtin_fixtures_keep_failure_live_and_stage_cleanup_isolate
                 &PublicLookup,
                 &failure_plan,
                 &failure_dir,
-                |_, _, _| panic!("failed fetch must never publish or persist"),
+                async |_, _, _| panic!("failed fetch must never publish or persist"),
             ),
             update_builtin_resource(
                 &metadata_sink,
@@ -462,7 +470,7 @@ async fn concurrent_builtin_fixtures_keep_failure_live_and_stage_cleanup_isolate
                 &PublicLookup,
                 &metadata_plan,
                 &metadata_dir,
-                |_, staged, operation| {
+                async |_, staged, operation| {
                     publish_builtin_file(
                         operation,
                         staged,
@@ -633,9 +641,14 @@ async fn builtin_fixture_early_stage_failure_cannot_leave_notification_peer_wait
         resume: tokio::sync::Notify::new(),
     };
     let sink = RecordingSink::default();
-    let update = update_builtin_resource(&sink, &client, &PublicLookup, &plan, &dir, |_, _, _| {
-        panic!("stage failure must not publish")
-    });
+    let update = update_builtin_resource(
+        &sink,
+        &client,
+        &PublicLookup,
+        &plan,
+        &dir,
+        async |_, _, _| panic!("stage failure must not publish"),
+    );
     let result = tokio::time::timeout(std::time::Duration::from_millis(25), async {
         tokio::join!(update, client.entered.notified())
     })
@@ -666,9 +679,14 @@ async fn timed_out_fixture_clears_only_its_cancel_registration_after_stage_drop(
     let sink = RecordingSink::default();
     let result = tokio::time::timeout(
         std::time::Duration::from_millis(25),
-        update_builtin_resource(&sink, &client, &PublicLookup, &plan, &dir, |_, _, _| {
-            panic!("paused download cannot publish")
-        }),
+        update_builtin_resource(
+            &sink,
+            &client,
+            &PublicLookup,
+            &plan,
+            &dir,
+            async |_, _, _| panic!("paused download cannot publish"),
+        ),
     )
     .await;
     cancel_inflight(&plan.id);

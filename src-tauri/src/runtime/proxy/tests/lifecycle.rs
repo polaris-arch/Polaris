@@ -63,6 +63,9 @@ fn native_reconnect_marker_is_a_read_only_status_projection() {
 #[tokio::test]
 async fn managed_marker_rejects_legacy_start_and_restart_before_generation_or_sweep() {
     let (rt, dir) = test_runtime();
+    rt.config
+        .save_full(&two_node_config(7890, "node-a"))
+        .unwrap();
     std::fs::write(
         dir.join(polaris_store::mesh_guard::REQUIRED_MARKER_FILE),
         b"bad marker",
@@ -165,6 +168,7 @@ async fn automatic_network_recovery_restores_r_without_consuming_saved_journal()
         .unwrap();
     bootstrap["type"] = serde_json::json!("local");
     bootstrap.as_object_mut().unwrap().remove("endpoint");
+    applied["proxyMode"] = serde_json::json!("smart");
     let resource = dir.join("rule-resource/recovery-fixture.srs");
     std::fs::create_dir_all(resource.parent().unwrap()).unwrap();
     let fixture = include_bytes!("../../../../../resources/data/geosite-cn.srs");
@@ -179,7 +183,7 @@ async fn automatic_network_recovery_restores_r_without_consuming_saved_journal()
         "size": fixture.len(),
         "downloadedAt": "2026-11-19T00:00:00Z"
     }]);
-    applied["customRules"] = serde_json::json!([{
+    applied["trafficRules"] = serde_json::json!([{
         "id": "recovery-rule", "type": "ruleSet", "values": ["res:recovery-fixture"],
         "action": "direct", "enabled": true
     }]);
@@ -195,7 +199,7 @@ async fn automatic_network_recovery_restores_r_without_consuming_saved_journal()
     let mut saved = applied.clone();
     saved["selectedServerId"] = serde_json::json!("node-b");
     saved["ruleResources"] = serde_json::json!([]);
-    saved["customRules"] = serde_json::json!([]);
+    saved["trafficRules"] = serde_json::json!([]);
     saved["dnsConfig"]["nodeResolverPool"] = serde_json::json!(["unsupported-fixture"]);
     rt.config
         .save_full_deferred_cleanup(&applied, &saved)
@@ -228,6 +232,16 @@ async fn automatic_network_recovery_restores_r_without_consuming_saved_journal()
     );
     assert_eq!(rt.config.current().unwrap(), saved);
     assert_eq!(std::fs::read(journal).unwrap(), pending_delete);
+    let generated = std::fs::read_to_string(dir.join("singbox-runtime.json")).unwrap();
+    let generated: serde_json::Value = serde_json::from_str(&generated).unwrap();
+    assert!(
+        generated["route"]["rule_set"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| { entry["path"].as_str() == resource.to_str() }),
+        "restarted rules must reference the applied resource path"
+    );
     assert_eq!(std::fs::read(resource).unwrap(), fixture);
     assert!(rt.restart_deferred.load(Ordering::SeqCst));
 }

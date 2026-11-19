@@ -200,14 +200,11 @@ impl LifecycleGate {
                 })
             }
             LifecycleKind::Start | LifecycleKind::Restart => {
-                let snap = std::mem::take(&mut g.pending);
-                if snap.is_empty() {
-                    return LifecycleEndResult::Drained(PendingDrain::default());
-                }
+                let restart_pending = std::mem::take(&mut g.pending.restart_pending);
                 LifecycleEndResult::Drained(PendingDrain {
-                    replay_switch_id: snap.switch_id,
-                    // force_restart 或 restart_pending 任一待决都触发排空一次重启。
-                    schedule_restart: snap.restart_pending || snap.force_restart_id.is_some(),
+                    replay_switch_id: g.pending.switch_id.take(),
+                    // The next timer claims the exact force id; a Stop still discards it.
+                    schedule_restart: restart_pending || g.pending.force_restart_id.is_some(),
                 })
             }
         }
@@ -244,18 +241,17 @@ impl LifecycleGate {
     ) -> Option<u64> {
         let _publication = self.lock_generation_publication();
         let mut g = self.inner.lock().expect("lifecycle lock poisoned");
-        if g.generation != expected_generation {
+        if g.generation != expected_generation
+            || g.generation_owner == Some(LifecycleKind::Stop)
+            || g.pending.force_restart_id != force_id
+        {
             return None;
         }
         if g.depth != 0 {
             g.pending.restart_pending = true;
-            // Proceed already consumed this id. Requeue the same exact snapshot for drain;
-            // otherwise the next timer would see None and incorrectly read full disk D.
-            if let Some(id) = force_id {
-                g.pending.force_restart_id = Some(id);
-            }
             return None;
         }
+        g.pending.force_restart_id = None;
         g.generation = g.generation.wrapping_add(1);
         // This is an owned restart, even though its first leg stops the old core. Only a
         // separate explicit Stop claim may turn its final receipt into NotRunning and discard
@@ -387,11 +383,15 @@ impl LifecycleGate {
     /// 不是重启），一律不碰。
     pub fn debounced_restart_decision(&self, core_running: bool) -> DebouncedDecision {
         let mut g = self.inner.lock().expect("lifecycle lock poisoned");
-        Self::debounced_restart_decision_locked(&mut g, core_running)
+        let decision = Self::debounced_restart_decision_locked(&mut g, core_running);
+        if matches!(decision, DebouncedDecision::Proceed(_)) {
+            g.pending.force_restart_id = None;
+        }
+        decision
     }
 
-    /// A stale timer must not consume a newer Apply's force id while deciding to yield.
-    /// Compare the captured generation and take the id under one gate lock.
+    /// A timer observes the force id. It remains pending until its active callback claims
+    /// the same id and generation, so replacement timers can carry it forward.
     pub fn debounced_restart_decision_if_current(
         &self,
         expected_generation: u64,
@@ -418,9 +418,7 @@ impl LifecycleGate {
             g.pending.force_restart_id = None;
             return DebouncedDecision::CoreStopped;
         }
-        // 3. Proceed：调用方读 force_restart_id（优先）或 currentConfig 执行重启。
-        //    `take` 而非读 —— 见方法头「Proceed 消费」那节。
-        DebouncedDecision::Proceed(g.pending.force_restart_id.take())
+        DebouncedDecision::Proceed(g.pending.force_restart_id)
     }
 }
 

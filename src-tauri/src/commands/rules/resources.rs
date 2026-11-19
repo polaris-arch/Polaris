@@ -1187,7 +1187,8 @@ async fn update_builtin_with_mode(
         &SystemDnsLookup,
         &plan,
         &builtin_runtime_dir(state),
-        |resource, staged, operation| {
+        async |resource, staged, operation| {
+            let _publication = state.config().lock_builtin_rule_publication().await;
             persist_builtin_geo_updated(
                 app,
                 state,
@@ -1638,7 +1639,7 @@ async fn update_builtin_resource<H: HttpClient, L: DnsLookup>(
     lookup: &L,
     plan: &ResourcePlan,
     runtime_dir: &Path,
-    persist: impl FnOnce(&RuleResource, &Path, &BuiltinUpdateOperation) -> Result<(), String>,
+    persist: impl AsyncFnOnce(&RuleResource, &Path, &BuiltinUpdateOperation) -> Result<(), String>,
 ) -> DownloadOutcome {
     // Capture before awaiting the keyed gate: reset retires queued requests too.
     let operation = BuiltinUpdateOperation::begin(&plan.id);
@@ -1669,7 +1670,7 @@ async fn update_builtin_resource<H: HttpClient, L: DnsLookup>(
     };
     let live = runtime_dir.join(&plan.file_name);
     let existed_before = live.is_file();
-    let committed = persist(&resource, &stage.0.join(&plan.file_name), &operation);
+    let committed = persist(&resource, &stage.0.join(&plan.file_name), &operation).await;
     match committed {
         Ok(()) => {
             emit_resource_progress(

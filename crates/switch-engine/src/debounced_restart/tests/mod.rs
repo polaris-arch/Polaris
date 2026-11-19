@@ -87,8 +87,8 @@ async fn schedule_superseded_when_generation_changed() {
     engine.set_force_restart(42);
     let (tx, rx) = tokio::sync::oneshot::channel();
     assert!(engine
-        .schedule_with_ticket_for_generation(true, gen1, move |outcome, _| {
-            let _ = tx.send(outcome);
+        .schedule_with_ticket_for_generation(true, gen1, move |outcome, ticket| {
+            let _ = tx.send((outcome, ticket));
         })
         .is_some());
     assert!(engine
@@ -96,8 +96,21 @@ async fn schedule_superseded_when_generation_changed() {
             panic!("old generation must not register")
         })
         .is_none());
-    let outcome = rx.await.unwrap();
+    let (outcome, first_ticket) = rx.await.unwrap();
     assert!(matches!(outcome, DebouncedOutcome::Proceed(Some(42))));
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    engine.schedule_with_ticket_for_generation(true, gen1, move |outcome, ticket| {
+        let _ = tx.send((outcome, ticket));
+    });
+    assert_eq!(engine.try_claim_restart(first_ticket, gen1, Some(42)), None);
+    let (outcome, next_ticket) = rx.await.unwrap();
+    assert!(matches!(outcome, DebouncedOutcome::Proceed(Some(42))));
+    assert_eq!(
+        engine.try_claim_restart(next_ticket, gen1, Some(42)),
+        Some(gen1 + 1)
+    );
+    assert!(engine.gate.pending().is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -123,10 +136,19 @@ async fn multiple_schedules_collapse_to_single_restart() {
     let called = Arc::new(AtomicU32::new(0));
 
     let mut handles = Vec::new();
+    let generation = engine.generation();
     for _ in 0..3 {
         let called = Arc::clone(&called);
-        handles.push(engine.schedule(true, move |_| {
-            called.fetch_add(1, Ordering::SeqCst);
+        let owner = engine.clone();
+        handles.push(engine.schedule_with_ticket(true, move |outcome, ticket| {
+            if matches!(outcome, DebouncedOutcome::Proceed(Some(7)))
+                && owner
+                    .try_claim_restart(ticket, generation, Some(7))
+                    .is_some()
+            {
+                owner.end_lifecycle(LifecycleKind::Restart);
+                called.fetch_add(1, Ordering::SeqCst);
+            }
         }));
     }
     // 等所有 task 完成。
@@ -140,14 +162,9 @@ async fn multiple_schedules_collapse_to_single_restart() {
         "去抖窗口只能有最后一只 timer 回调"
     );
     assert!(!engine.is_lifecycle_busy());
-    // 头注那句「第一个 Proceed 清 force_restart_id」如今是真的：`debounced_restart_decision`
-    // 在 Proceed 腿 `take()` 该 id。此前它只读不清，于是 id 活到重启收尾的 `end()`，被当成
-    // 「还有一条待决重启」再排一次 —— 真机上每点一次「立即应用」核重启两遍。
-    //
-    // 变异对照：把 `lifecycle_gate.rs` Proceed 腿的 `.take()` 改回读取 → 本条转红。
     assert!(
         engine.gate.pending().is_empty(),
-        "Proceed 必须消费 force_restart_id，否则 end() 会把已执行的重启再排一遍"
+        "the claimed force id must not be drained into a second restart"
     );
 }
 

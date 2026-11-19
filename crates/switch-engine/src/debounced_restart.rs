@@ -95,7 +95,7 @@ fn to_outcome(decision: DebouncedDecision, gen_changed: bool) -> DebouncedOutcom
 pub struct DebouncedRestart {
     gate: Arc<LifecycleGate>,
     schedule_epoch: Arc<AtomicU64>,
-    /// Serializes ticket publication/invalidation with the gate decision that consumes a force id.
+    /// Serializes ticket publication and invalidation with timer decisions and claims.
     decision_guard: Arc<Mutex<()>>,
     active_timer: Arc<Mutex<Option<Arc<tokio::sync::Notify>>>>,
 }
@@ -200,8 +200,7 @@ impl DebouncedRestart {
                 if schedule_epoch.load(Ordering::SeqCst) != epoch {
                     return;
                 }
-                // A replacement/invalidation cannot publish a new force id between the ticket
-                // check and this consuming decision.
+                // A replacement cannot change the ticket before this timer reads the gate.
                 gate.debounced_restart_decision_if_current(gen0, core_running)
                     .map_or(DebouncedOutcome::Superseded, |decision| {
                         to_outcome(decision, false)
