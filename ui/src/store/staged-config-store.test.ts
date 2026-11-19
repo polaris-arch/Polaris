@@ -445,17 +445,30 @@ describe('edit admission before creating a manual draft', () => {
     }
   });
 
-  it.each(['needsManual', 'conflict'] as const)('keeps a cancellable draft after native returns %s', async (status) => {
+  it('keeps a cancellable draft for a verified manual edit', async () => {
     const store = useStagedConfigStore;
     await hydrateStagedConfig(CONFIG);
-    saveMock.mockResolvedValueOnce(status === 'needsManual' ? { status }
-      : { status, diskVersion: 'newer' });
+    saveMock.mockResolvedValueOnce({ status: 'needsManual' });
     const change = entry('n1', 8443);
     expect(await store.getState().submit(change)).toBe('manual');
     expect(store.getState()).toMatchObject({ entries: [change], baseline: CONFIG, saveStatus: 'idle' });
     expect(fake.getItem(STAGED_STORAGE_KEY)).not.toBeNull();
     expect(applyMock).not.toHaveBeenCalled();
     store.getState().reset();
+    expect(store.getState().entries).toEqual([]);
+  });
+
+  it('retries an edit against a concurrent unrelated metadata write', async () => {
+    const store = useStagedConfigStore;
+    await hydrateStagedConfig(CONFIG);
+    const newer = { ...CONFIG, periodicSpeedTestEnabled: true };
+    getMock.mockResolvedValueOnce(CONFIG).mockResolvedValueOnce(newer);
+    saveMock.mockResolvedValueOnce({ status: 'conflict', diskVersion: configBaseVersion(newer) });
+    expect(await store.getState().submit(entry('n1', 8443))).toBe('automatic');
+    expect(saveMock).toHaveBeenCalledTimes(2);
+    expect(saveMock.mock.calls[1]).toEqual([
+      expect.objectContaining({ periodicSpeedTestEnabled: true }), true, configBaseVersion(newer), true, true,
+    ]);
     expect(store.getState().entries).toEqual([]);
   });
 
@@ -508,12 +521,13 @@ describe('edit admission before creating a manual draft', () => {
   it('keeps edits authored before an unrelated writer changed the same entity', async () => {
     const store = useStagedConfigStore;
     await hydrateStagedConfig(CONFIG);
-    getMock.mockResolvedValueOnce({ ...CONFIG, servers: [{ ...CONFIG.servers[0], port: 10443 }] });
+    const disk = { ...CONFIG, servers: [{ ...CONFIG.servers[0], port: 10443 }] };
+    getMock.mockResolvedValueOnce(CONFIG).mockResolvedValueOnce(disk);
+    saveMock.mockResolvedValueOnce({ status: 'conflict', diskVersion: configBaseVersion(disk) });
     const change = entry('n1', 8443);
     expect(await store.getState().submit(change)).toBe('manual');
     expect(store.getState()).toMatchObject({ entries: [change], baseline: CONFIG });
-    expect(saveMock).not.toHaveBeenCalled();
-    const disk = { ...CONFIG, servers: [{ ...CONFIG.servers[0], port: 10443 }] };
+    expect(saveMock).toHaveBeenCalledOnce();
     getMock.mockResolvedValueOnce(disk);
     expect(await store.getState().save()).toBe(false);
     expect(store.getState().conflict?.map(({ entryId }) => entryId)).toEqual([change.id]);

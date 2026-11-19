@@ -1648,6 +1648,32 @@ async fn full_restart_claim_during_unchanged_readback_queues_only_current_select
 }
 
 #[test]
+fn explicit_selection_writer_does_not_wait_for_the_lifecycle_lock() {
+    let (rt, _dir, _sink, _running) = explicit_selection_fixture();
+    let generation = rt.core_generation();
+    let intent = rt.register_selector_intent();
+    let (held, ready) = std::sync::mpsc::sync_channel(0);
+    let (release, done) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        let gate = &rt.gate;
+        scope.spawn(move || {
+            gate.with_current_generation(generation, |_| {
+                held.send(()).unwrap();
+                let _ = done.recv_timeout(std::time::Duration::from_secs(1));
+            })
+            .unwrap();
+        });
+        ready.recv().unwrap();
+        let declined = rt
+            .config
+            .try_with_saved_commit(|_| rt.own_automatic_selection("node-b", intent).is_none())
+            .unwrap();
+        let _ = release.send(());
+        assert!(declined, "the writer must not wait for the lifecycle owner");
+    });
+}
+
+#[test]
 fn explicit_selection_receipt_rejects_old_pending_and_old_success() {
     let (rt, _dir, _sink, _running) = explicit_selection_fixture();
     let generation = rt.core_generation();

@@ -452,11 +452,12 @@ pub async fn config_save(
     // 不清 staged marker。前端回包后按在途新编辑的实况更新；回包丢失时保留跨入口保护。
     let owner = if auto_apply {
         let owner = previous.as_ref().and_then(|save| {
+            let owner = StagedSaveOwner::capture(state.proxy(), save.revision);
             state
                 .config()
                 .try_with_saved_commit(|latest| {
                     (latest == &config && state.config().saved_revision() == save.revision)
-                        .then(|| StagedSaveOwner::capture(state.proxy(), save.revision))
+                        .then_some(owner)
                 })
                 .ok()
                 .flatten()

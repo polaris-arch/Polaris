@@ -202,8 +202,8 @@ impl ProxyRuntime {
         server_id: &str,
         intent: u64,
     ) -> Option<AutomaticSelectionGuard<'_>> {
-        let (generation, busy) = (self.core_generation(), self.gate.is_busy());
-        if busy || !self.core_running() || !self.selector_intent_is_current(intent) {
+        let generation = self.gate.try_idle_generation()?;
+        if !self.status.try_read().ok()?.running || !self.selector_intent_is_current(intent) {
             return None;
         }
         let owner = AutomaticSelection {
@@ -212,7 +212,11 @@ impl ProxyRuntime {
             revision: self.config.saved_revision().checked_add(1)?,
             server_id: server_id.to_owned(),
         };
-        *self.selector_reconcile.automatic_selection.lock().ok()? = Some(owner.clone());
+        *self
+            .selector_reconcile
+            .automatic_selection
+            .try_lock()
+            .ok()? = Some(owner.clone());
         Some(AutomaticSelectionGuard {
             runtime: self,
             owner,

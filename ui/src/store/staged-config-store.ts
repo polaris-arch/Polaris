@@ -479,24 +479,31 @@ function submitEdit(
     if (!get().enabled) return 'ignored' as const;
     if (!authoredAgainst) return manualDraft();
     try {
-      const disk = await api.config.get();
-      if (!get().enabled) return 'ignored' as const;
-      if (dependsOnDraft(disk, get().entries, entries)) return manualDraft();
-      const merged = replay(disk, entries);
-      const diskVersion = configBaseVersion(disk);
-      const ownPrecedingEdit = preceding?.baseline === authoredAgainst
-        && preceding.committedVersion === diskVersion ? preceding : undefined;
-      const clashes = changedOnDisk(authoredAgainst, disk, merged, entries);
-      if (clashes.some((entry) => !isScalarAssignment(entry) || !ownPrecedingEdit?.fields.has(entry.entityPath[0]))) {
-        return manualDraft();
+      let retryOnConflict = true;
+      for (;;) {
+        const disk = await api.config.get();
+        if (!get().enabled) return 'ignored' as const;
+        if (dependsOnDraft(disk, get().entries, entries)) return manualDraft();
+        const merged = replay(disk, entries);
+        const diskVersion = configBaseVersion(disk);
+        const ownPrecedingEdit = preceding?.baseline === authoredAgainst
+          && preceding.committedVersion === diskVersion ? preceding : undefined;
+        const clashes = changedOnDisk(authoredAgainst, disk, merged, entries);
+        if (clashes.some((entry) => !isScalarAssignment(entry) || !ownPrecedingEdit?.fields.has(entry.entityPath[0]))) {
+          return manualDraft();
+        }
+        const observedAtDispatch = get().latestSavedConfig;
+        const outcome = await api.config.save(merged, true, diskVersion, true, true);
+        if (outcome.status === 'conflict' && retryOnConflict) {
+          retryOnConflict = false;
+          continue;
+        }
+        if (outcome.status === 'needsManual') return manualDraft();
+        if (outcome.status !== 'saved') return failed(i18n.t('common.saveFailed'), outcome.status !== 'rejected');
+        if (queued) queued.committedVersion = outcome.version;
+        completeSave(set, get, disk, merged, entries, observedAtDispatch, outcome, false);
+        return 'automatic' as const;
       }
-      const observedAtDispatch = get().latestSavedConfig;
-      const outcome = await api.config.save(merged, true, diskVersion, true, true);
-      if (outcome.status === 'needsManual' || outcome.status === 'conflict') return manualDraft();
-      if (outcome.status !== 'saved') return failed(i18n.t('common.saveFailed'), outcome.status === 'retryable');
-      if (queued) queued.committedVersion = outcome.version;
-      completeSave(set, get, disk, merged, entries, observedAtDispatch, outcome, false);
-      return 'automatic' as const;
     } catch (error) {
       console.error('[staged-config] automatic edit failed:', error);
       return failed(configSaveErrorText(error, i18n.t), true);

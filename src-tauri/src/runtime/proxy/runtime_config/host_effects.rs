@@ -1684,11 +1684,14 @@ impl ProxyRuntime {
         execution_id: String,
     ) -> RuntimeApplyResult {
         let generation = self.gate.generation();
+        let running = self.core_running();
         let cached = self.runtime_config_apply.lock().ok().and_then(|state| {
             if let Some(current) = state.host.current.as_ref().filter(|current| {
                 current.execution.execution_id == execution_id
                     && current.execution.generation == generation
-                    && self.selector_operation_is_current(generation, current.execution.intent)
+                    && running
+                    && self.gate.try_generation() == Some(generation)
+                    && self.selector_intent_is_current(current.execution.intent)
             }) {
                 return current
                     .result

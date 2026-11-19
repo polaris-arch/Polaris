@@ -3024,37 +3024,38 @@ impl ProxyRuntime {
             Ok(me
                 .config
                 .with_durable_runtime_owner(&pending.desired, |digest, revision| {
-                    me.selector_reconcile.with_intent_claim(|intent| {
-                        if intent != pending.intent
-                            || !me.saved_revision_matches(pending.saved_revision)
-                            || me.gate.generation() != pending.generation
-                            || me.gate.is_busy()
-                            || !me.core_running()
-                        {
-                            return None;
-                        }
-                        let response = handle
-                            .block_on(client.acknowledge_runtime_persistence(
-                                daemon::RuntimePersistenceAcknowledgementRequest {
-                                    contract_version: 1,
-                                    transaction_id: transaction.clone(),
-                                    active: Some(active.clone()),
-                                    control_revision,
-                                    persistence_mode: "app_authoritative_regeneration".into(),
-                                    desired_state_digest: digest.clone(),
-                                    desired_state_revision: revision.clone(),
-                                },
-                            ))
-                            .ok()?;
-                        (response.transaction_id == transaction
-                            && identity_equal(response.active.as_ref(), Some(&active))
-                            && response.control_revision == control_revision
-                            && response.persistence_mode == "app_authoritative_regeneration"
-                            && response.owner_reload_acknowledged
-                            && response.desired_state_digest == digest
-                            && response.desired_state_revision == revision)
-                            .then_some(response)
-                    })
+                    me.selector_reconcile
+                        .try_with_intent_claim(|intent| {
+                            if intent != pending.intent
+                                || !me.saved_revision_matches(pending.saved_revision)
+                                || me.gate.try_idle_generation() != Some(pending.generation)
+                                || !me.status.try_read().is_ok_and(|status| status.running)
+                            {
+                                return None;
+                            }
+                            let response = handle
+                                .block_on(client.acknowledge_runtime_persistence(
+                                    daemon::RuntimePersistenceAcknowledgementRequest {
+                                        contract_version: 1,
+                                        transaction_id: transaction.clone(),
+                                        active: Some(active.clone()),
+                                        control_revision,
+                                        persistence_mode: "app_authoritative_regeneration".into(),
+                                        desired_state_digest: digest.clone(),
+                                        desired_state_revision: revision.clone(),
+                                    },
+                                ))
+                                .ok()?;
+                            (response.transaction_id == transaction
+                                && identity_equal(response.active.as_ref(), Some(&active))
+                                && response.control_revision == control_revision
+                                && response.persistence_mode == "app_authoritative_regeneration"
+                                && response.owner_reload_acknowledged
+                                && response.desired_state_digest == digest
+                                && response.desired_state_revision == revision)
+                                .then_some(response)
+                        })
+                        .flatten()
                 })
                 .ok()
                 .flatten())
@@ -4031,7 +4032,9 @@ impl ProxyRuntime {
     }
 
     pub(crate) fn takeover_owner_is_live(&self, owner: TakeoverApplyOwner) -> bool {
-        !self.gate.is_busy() && self.selector_operation_is_current(owner.generation, owner.intent)
+        self.gate.try_idle_generation() == Some(owner.generation)
+            && self.status.try_read().is_ok_and(|status| status.running)
+            && self.selector_intent_is_current(owner.intent)
     }
 
     pub(crate) async fn apply_owned_takeover(
