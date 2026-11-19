@@ -555,7 +555,7 @@ export function LogsScreen() {
     try {
       const enabled = await api.logs.setDiagnostic(!(diagnosticMode ?? false));
       setDiagnosticMode(enabled);
-      toast.info(t(enabled ? 'logs.diagnosticEnabled' : 'logs.diagnosticDisabled'));
+      toast.success(t(enabled ? 'logs.diagnosticEnabled' : 'logs.diagnosticDisabled'));
     } catch (err) {
       console.error('[logs] toggle diagnostic failed:', err);
       toast.error(

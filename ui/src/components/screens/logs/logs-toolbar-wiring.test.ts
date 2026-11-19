@@ -30,15 +30,18 @@ describe('日志级别直接保存回执', () => {
 });
 
 describe('会话诊断模式接线', () => {
-  it('诊断切换不经过持久配置或暂存层', () => {
-    const start = SCREEN.indexOf('const onToggleDiagnostic = useCallback');
-    const end = SCREEN.indexOf('\n  }, [diagnosticBusy', start);
+  it.each([
+    { platform: '桌面', source: SCREEN, translate: 't' },
+    { platform: '移动端', source: MOBILE_SCREEN, translate: 'trRef.current' },
+  ])('$platform 诊断切换在收到回执后显示对应成功提示', ({ source, translate }) => {
+    const start = source.indexOf('const onToggleDiagnostic = useCallback');
+    const end = source.indexOf('\n  }, [diagnosticBusy', start);
     expect(start).toBeGreaterThan(-1);
     expect(end).toBeGreaterThan(start);
-    const body = SCREEN.slice(start, end);
+    const body = source.slice(start, end);
     expect(body).not.toContain('saveConfig');
     expect(body).not.toContain('stage(');
-    expect(body).toContain("toast.info(t(enabled ? 'logs.diagnosticEnabled' : 'logs.diagnosticDisabled'))");
-    expect(body.indexOf('await api.logs.setDiagnostic')).toBeLessThan(body.indexOf('toast.info'));
+    expect(body).toContain(`toast.success(${translate}(enabled ? 'logs.diagnosticEnabled' : 'logs.diagnosticDisabled'))`);
+    expect(body.indexOf('await api.logs.setDiagnostic')).toBeLessThan(body.indexOf('toast.success'));
   });
 });

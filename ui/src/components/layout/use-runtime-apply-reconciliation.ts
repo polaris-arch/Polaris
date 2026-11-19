@@ -79,7 +79,7 @@ function showSavedChanges(
   const level = changes.length === 1 ? changes[0].logLevel : undefined;
   if (level) {
     void confirmRuntimeLogLevel(level).then((confirmed) => {
-      if (current()) toast.info(text(confirmed ? 'home.pendingSavedLogLevelActive' : 'home.pendingSavedLogLevel', { level }));
+      if (current()) toast.success(text(confirmed ? 'home.pendingSavedLogLevelActive' : 'home.pendingSavedLogLevel', { level }));
     });
     return;
   }
@@ -88,7 +88,7 @@ function showSavedChanges(
     ? `${text('logs.currentLevel')} ${change.logLevel}` : change.label);
   const summary = labels.join(' · ');
   const remaining = changes.length - labels.length;
-  toast.info(remaining > 0 ? text('home.pendingSavedMoreChanges', { changes: summary, count: remaining })
+  toast.success(remaining > 0 ? text('home.pendingSavedMoreChanges', { changes: summary, count: remaining })
     : text('home.pendingSavedChanges', { changes: summary }));
 }
 

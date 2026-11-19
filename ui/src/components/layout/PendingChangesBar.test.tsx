@@ -191,10 +191,10 @@ it.each([
   await microtasks();
   if (notice) {
     expect(h.runtimeLevel).toHaveBeenCalledOnce();
-    expect(toast.info).toHaveBeenCalledExactlyOnceWith(notice);
+    expect(toast.success).toHaveBeenCalledExactlyOnceWith(notice);
   } else {
     expect(h.runtimeLevel).not.toHaveBeenCalled();
-    expect(toast.info).not.toHaveBeenCalled();
+    expect(toast.success).not.toHaveBeenCalled();
   }
   expect(h.applyNow).not.toHaveBeenCalled();
 });
@@ -205,7 +205,7 @@ it('names saved rule remarks and disabled rules in a batch without claiming they
     changes: [{ label: 'Edit remarks on Example' }, { label: 'Edit disabled rule Old' },
       { label: 'Log level submitted', logLevel: 'DEBUG' }] };
   renderBar();
-  expect(toast.info).toHaveBeenCalledExactlyOnceWith('Edit remarks on Example · Edit disabled rule Old · Log level DEBUG saved.');
+  expect(toast.success).toHaveBeenCalledExactlyOnceWith('Edit remarks on Example · Edit disabled rule Old · Log level DEBUG saved.');
   expect(h.runtimeLevel).not.toHaveBeenCalled();
 });
 
@@ -221,7 +221,7 @@ it.each(['deadline', 'newer Save'] as const)('bounds the log notice and drops la
   h.savedRuntimeApply = original;
   renderBar();
   expect(h.runtimeLevel).toHaveBeenCalledOnce();
-  expect(toast.info).not.toHaveBeenCalled();
+  expect(toast.success).not.toHaveBeenCalled();
   if (completion === 'newer Save') {
     h.completedSaveRevision = 2;
     h.baseVersion = 'latest-config';
@@ -233,7 +233,7 @@ it.each(['deadline', 'newer Save'] as const)('bounds the log notice and drops la
   }
   finishRead({ level: 'debug', reason: null });
   await microtasks();
-  expect(toast.info).toHaveBeenCalledExactlyOnceWith(completion === 'deadline' ? 'Log level saved as DEBUG.' : 'Add rule Latest saved.');
+  expect(toast.success).toHaveBeenCalledExactlyOnceWith(completion === 'deadline' ? 'Log level saved as DEBUG.' : 'Add rule Latest saved.');
 });
 
 it('retains an ahead-of-status Save and replaces an earlier explicit failure after readback', () => {
@@ -243,12 +243,12 @@ it('retains an ahead-of-status Save and replaces an earlier explicit failure aft
     runtimeGeneration: 8, selectionIntentGeneration: 4, coreState: 'committed', configurationDurable: true, changes: [{ label: 'Delete rule Example' }] };
   expect(markup()).toContain('home.pendingApplyFailedReason');
   expect(h.savedRuntimeApply?.transactionId).toBe('save-next');
-  expect(toast.info).not.toHaveBeenCalled();
+  expect(toast.success).not.toHaveBeenCalled();
   h.app.proxyStatus = { running: true, mainGeneration: 8 };
   renderBar();
   expect(renderBar()).toBeNull();
   expect(h.states[0]).toMatchObject({ phase: 'idle', reason: null, mainGeneration: 8 });
-  expect(toast.info).toHaveBeenCalledExactlyOnceWith('Delete rule Example saved.');
+  expect(toast.success).toHaveBeenCalledExactlyOnceWith('Delete rule Example saved.');
 });
 
 it.each(['hotApplied', 'applied'] as const)('keeps a newer explicit %s while an older Save is queued', async (status) => {
@@ -269,7 +269,7 @@ it.each(['hotApplied', 'applied'] as const)('keeps a newer explicit %s while an 
   if (status === 'applied') {
     expect(h.states[0]).toMatchObject({ phase: 'applying', applyId: 35 });
     expect(h.savedRuntimeApply?.transactionId).toBe('older-save');
-    expect(toast.info).not.toHaveBeenCalled();
+    expect(toast.success).not.toHaveBeenCalled();
     const listener = h.lifecycleReady.mock.calls[0][0] as (event: unknown) => void;
     listener({ kind: 'restart', phase: 'failed', terminal: true, applyId: 35, mainGeneration: 8 });
     await microtasks();
@@ -277,7 +277,7 @@ it.each(['hotApplied', 'applied'] as const)('keeps a newer explicit %s while an 
     expect(markup()).toContain('home.pendingApplyFailed');
     expect(h.states[0]).toMatchObject({ phase: 'failed', mainGeneration: 8 });
     expect(h.savedRuntimeApply).toBeNull();
-    expect(toast.info).not.toHaveBeenCalled();
+    expect(toast.success).not.toHaveBeenCalled();
     h.savedRuntimeApply = { ok: true, status: 'hotApplied', transactionId: 'future-save',
       runtimeGeneration: 9, selectionIntentGeneration: 11, coreState: 'committed', configurationDurable: true, changes: [{ label: 'Clone node Copy' }, { label: 'Edit app policy Mail · Direct' }, { label: 'Edit rule Example' }, { label: 'Delete rule Old' }] };
     renderBar();
@@ -286,11 +286,11 @@ it.each(['hotApplied', 'applied'] as const)('keeps a newer explicit %s while an 
     renderBar();
     expect(h.savedRuntimeApply).toBeNull();
     expect(h.states[0]).toMatchObject({ phase: 'idle', mainGeneration: 9 });
-    expect(toast.info).toHaveBeenCalledExactlyOnceWith('Clone node Copy · Edit app policy Mail · Direct · Edit rule Example and 1 more saved.');
+    expect(toast.success).toHaveBeenCalledExactlyOnceWith('Clone node Copy · Edit app policy Mail · Direct · Edit rule Example and 1 more saved.');
   } else {
     expect(h.states[0]).toMatchObject({ phase: 'idle', transactionId: 'newer-explicit' });
     expect(h.savedRuntimeApply).toBeNull();
-    expect(toast.info).not.toHaveBeenCalled();
+    expect(toast.success).not.toHaveBeenCalled();
   }
 });
 
@@ -310,7 +310,7 @@ it('keeps polling a superseded Save owner without offering a persistence replay'
   await vi.advanceTimersByTimeAsync(2000);
   expect(h.coreRead.mock.calls).toEqual([['save-core'], ['save-core']]);
   expect(h.retryPersistence).not.toHaveBeenCalled();
-  expect(toast.info).not.toHaveBeenCalled();
+  expect(toast.success).not.toHaveBeenCalled();
 });
 
 it.each(['hotDurabilityPending', 'unconfirmed', 'newer disk-only Save', 'external edit'] as const)(
@@ -329,7 +329,7 @@ it.each(['hotDurabilityPending', 'unconfirmed', 'newer disk-only Save', 'externa
     renderBar();
     renderBar();
     await vi.advanceTimersByTimeAsync(2000);
-    expect(toast.info).not.toHaveBeenCalled();
+    expect(toast.success).not.toHaveBeenCalled();
     if (initial === 'newer disk-only Save') h.completedSaveRevision = 3; // A → B → A keeps the canonical config version.
     if (initial === 'external edit') h.baseVersion = 'external-config';
     await vi.advanceTimersByTimeAsync(2000);
@@ -338,10 +338,10 @@ it.each(['hotDurabilityPending', 'unconfirmed', 'newer disk-only Save', 'externa
     expect(h.coreRead.mock.calls).toEqual([['save-A'], ['save-A']]);
     if (initial === 'hotDurabilityPending' || initial === 'unconfirmed') {
       expect(h.runtimeLevel).toHaveBeenCalledOnce();
-      expect(toast.info).toHaveBeenCalledExactlyOnceWith('Current core log level is DEBUG.');
+      expect(toast.success).toHaveBeenCalledExactlyOnceWith('Current core log level is DEBUG.');
     } else {
       expect(h.runtimeLevel).not.toHaveBeenCalled();
-      expect(toast.info).not.toHaveBeenCalled();
+      expect(toast.success).not.toHaveBeenCalled();
     }
   },
 );
@@ -364,7 +364,7 @@ it('shows the original named Save once when persistence retry and polling both c
   expect(h.coreRead).toHaveBeenCalledExactlyOnceWith('save-retry');
   finishRetry(terminal);
   await microtasks();
-  expect(toast.info).toHaveBeenCalledExactlyOnceWith('Delete rule Example saved.');
+  expect(toast.success).toHaveBeenCalledExactlyOnceWith('Delete rule Example saved.');
 });
 
 it('keeps explicit ownership over a previously queued Save with the same selector intent', async () => {
@@ -379,7 +379,7 @@ it('keeps explicit ownership over a previously queued Save with the same selecto
   renderBar();
   expect(h.states[0]).toMatchObject({ phase: 'idle', transactionId: 'new-explicit' });
   expect(h.savedRuntimeApply).toBeNull();
-  expect(toast.info).not.toHaveBeenCalled();
+  expect(toast.success).not.toHaveBeenCalled();
 });
 
 it('attributes a Save already in flight before external Apply dispatches', async () => {
@@ -403,7 +403,7 @@ it('attributes a Save already in flight before external Apply dispatches', async
   expect(h.freshApply).toHaveBeenCalledOnce();
   expect(h.states[0]).toMatchObject({ phase: 'idle', transactionId: 'new-external-apply' });
   expect(h.savedRuntimeApply).toBeNull();
-  expect(toast.info).not.toHaveBeenCalled();
+  expect(toast.success).not.toHaveBeenCalled();
 });
 
 it('keeps the confirmation armed only for the saved settings the user saw', async () => {
@@ -499,7 +499,7 @@ describe('desktop host execution and four-account feedback', () => {
     await vi.advanceTimersByTimeAsync(2000);
     expect((h.states[0] as ApplyState).host?.phase).toBe('pending');
     expect(markup()).toContain('home.pendingHostEffectsPending');
-    expect(toast.info).not.toHaveBeenCalled();
+    expect(toast.success).not.toHaveBeenCalled();
     expect(h.freshApply).not.toHaveBeenCalled();
     expect(h.retryPersistence).not.toHaveBeenCalled();
   });
@@ -664,7 +664,7 @@ describe('desktop native listener cleanup stays independent', () => {
     renderBar();
     expect(markup()).toContain('home.pendingCheckNativeBtn');
     expect(h.states[0]).toMatchObject({ phase: 'idle', nativeRetirements: [native] });
-    expect(toast.info).not.toHaveBeenCalled();
+    expect(toast.success).not.toHaveBeenCalled();
   });
   async function start(over: Partial<PendingApplyResult> = {}) {
     h.applyNow.mockResolvedValueOnce({ ...receipt(over), saved: true });
@@ -683,7 +683,7 @@ describe('desktop native listener cleanup stays independent', () => {
     expect(html).toContain('home.pendingCheckNativeBtn');
     expect(html).not.toContain('home.pendingRetryBtn');
     expect(html).not.toContain('home.pendingIgnoreBtn');
-    expect(toast.info).not.toHaveBeenCalled();
+    expect(toast.success).not.toHaveBeenCalled();
     expect(h.nativeRead).not.toHaveBeenCalled();
     expect(h.coreRead).not.toHaveBeenCalled();
     expect(h.applyNow).toHaveBeenCalledTimes(1);
@@ -742,7 +742,7 @@ describe('desktop native listener cleanup stays independent', () => {
     await vi.waitFor(() => expect((h.states[0] as ApplyState).configurationDurable).toBe(true));
     h.app.pendingChanges = empty();
     expect(renderBar()).toBeNull();
-    expect(toast.info).not.toHaveBeenCalled();
+    expect(toast.success).not.toHaveBeenCalled();
     h.app.pendingChanges = { ...empty(), nativeRetirements: [native] };
     expect(markup()).toContain('home.pendingNativeCleanupUnknown');
     expect((h.states[0] as ApplyState).nativeRetirements).toEqual([native]);
@@ -852,7 +852,7 @@ describe('desktop native listener cleanup stays independent', () => {
     expect((h.states[0] as ApplyState).nativeRetirements).toEqual([native]);
     expect(markup()).toContain('home.pendingNativeSavedActive');
     expect(markup()).toContain('home.pendingNativeHostSettled');
-    expect(toast.info).not.toHaveBeenCalled();
+    expect(toast.success).not.toHaveBeenCalled();
   });
 
   it('a new successful Apply racing a native feed cannot overwrite the newly observed original debt', async () => {
@@ -866,7 +866,7 @@ describe('desktop native listener cleanup stays independent', () => {
     await microtasks();
     expect((h.states[0] as ApplyState).nativeRetirements).toEqual([native]);
     expect(markup()).toContain('home.pendingNativeCleanupUnknown');
-    expect(toast.info).not.toHaveBeenCalled();
+    expect(toast.success).not.toHaveBeenCalled();
   });
 
   it('clears only after terminal process completion plus matching fresh status and rejects late A push', async () => {

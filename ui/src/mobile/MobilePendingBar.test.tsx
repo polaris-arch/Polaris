@@ -217,7 +217,7 @@ it('uses the shared readback for a Save HOT receipt and keeps durability recover
   expect(renderBar()).toBeNull();
   await microtasks();
   expect(h.runtimeLevel).toHaveBeenCalledOnce();
-  expect(toast.info).toHaveBeenCalledExactlyOnceWith('Current core log level is INFO.');
+  expect(toast.success).toHaveBeenCalledExactlyOnceWith('Current core log level is INFO.');
 
   vi.useFakeTimers();
   h.savedRuntimeApply = { ok: true, status: 'hotDurabilityPending', transactionId: 'save-persist', runtimeGeneration: 7,
@@ -225,7 +225,7 @@ it('uses the shared readback for a Save HOT receipt and keeps durability recover
   renderBar();
   expect(markup(renderBar())).toContain('home.pendingRetryPersistenceBtn');
   expect(h.states[0]).toMatchObject({ coreRecovery: { transactionId: 'save-persist', runtimeGeneration: 7 } });
-  expect(toast.info).toHaveBeenCalledExactlyOnceWith('Current core log level is INFO.');
+  expect(toast.success).toHaveBeenCalledExactlyOnceWith('Current core log level is INFO.');
   expect(h.applyNow).not.toHaveBeenCalled();
 });
 
@@ -249,7 +249,7 @@ it('polls the original Save recovery owner after a prior explicit Apply was canc
     coreRecovery: { transactionId: 'original-save', runtimeGeneration: 8, selectionIntentGeneration: 5 } });
   await vi.advanceTimersByTimeAsync(2_000);
   expect(h.coreRead).toHaveBeenCalledExactlyOnceWith('original-save');
-  expect(toast.info).not.toHaveBeenCalled();
+  expect(toast.success).not.toHaveBeenCalled();
 });
 
 describe('mobile pending restart and write feedback', () => {
@@ -687,7 +687,7 @@ describe('mobile original native listener cleanup', () => {
     expect(h.coreRead).not.toHaveBeenCalled();
     expect(h.applyNow).toHaveBeenCalledTimes(1);
     const { toast } = await import('@/lib/error-handler');
-    expect(toast.info).not.toHaveBeenCalled();
+    expect(toast.success).not.toHaveBeenCalled();
   });
 
   it('permits accepted-carrier PENDING success and later discovers UNKNOWN from the backend pending feed', async () => {
@@ -699,7 +699,7 @@ describe('mobile original native listener cleanup', () => {
     h.app.pendingChanges = empty();
     expect(renderBar()).toBeNull();
     const { toast } = await import('@/lib/error-handler');
-    expect(toast.info).not.toHaveBeenCalled();
+    expect(toast.success).not.toHaveBeenCalled();
     h.app.pendingChanges = { ...empty(), nativeRetirements: [native] };
     expect(markup(renderBar())).toContain('home.pendingNativeCleanupUnknown');
     expect((h.states[0] as ApplyState).nativeRetirements).toEqual([native]);
@@ -808,7 +808,7 @@ describe('mobile original native listener cleanup', () => {
     expect((h.states[0] as ApplyState).nativeRetirements).toEqual([native]);
     expect(markup(renderBar())).toContain('home.pendingNativeCleanupUnknown');
     const { toast } = await import('@/lib/error-handler');
-    expect(toast.info).not.toHaveBeenCalled();
+    expect(toast.success).not.toHaveBeenCalled();
   });
 
   it('a late unowned stop A cannot clear successor B native debt', async () => {

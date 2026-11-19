@@ -858,7 +858,7 @@ export function MobileConnectionsScreen(): ReactElement {
     void runWrite('screen', 'logs.diagnosticFailed', async () => {
       const enabled = await api.logs.setDiagnostic(!(diagnosticMode ?? false));
       setDiagnosticMode(enabled);
-      toast.info(trRef.current(enabled ? 'logs.diagnosticEnabled' : 'logs.diagnosticDisabled'));
+      toast.success(trRef.current(enabled ? 'logs.diagnosticEnabled' : 'logs.diagnosticDisabled'));
       return true;
     }).finally(() => setDiagnosticBusy(false));
   }, [diagnosticBusy, diagnosticMode, runWrite]);
