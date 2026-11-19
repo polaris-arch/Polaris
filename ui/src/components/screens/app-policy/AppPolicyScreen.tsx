@@ -443,8 +443,9 @@ export function AppPolicyScreen() {
             onClick={async () => {
               if (!getEffectiveConfig()) return;
               try {
-                const label = t('rules.backToSmartOk');
-                if (await useAppStore.getState().updateProxyMode('smart', label) === 'saved') toast.success(label);
+                if (await useAppStore.getState().updateProxyMode('smart', t('home.routingSmart')) === 'saved') {
+                  toast.success(t('rules.backToSmartOk'));
+                }
               } catch (err) {
                 console.error('[AppPolicyScreen] backToSmart failed:', err);
                 toast.error(t('rules.backToSmartFail'));

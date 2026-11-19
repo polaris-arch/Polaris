@@ -19,7 +19,7 @@ describe('日志级别直接保存回执', () => {
     expect(end).toBeGreaterThan(start);
     const body = source.slice(start, end);
     const write = `await saveConfig({ logLevel: ${level} });`;
-    expect(body).toMatch(/stage\(\{[\s\S]*?\}\);\s+return;/);
+    expect(body).toMatch(/submitEdit\(\{[\s\S]*?\}\);\s+return;/);
     expect(body.match(/toast\.success\(/g)).toHaveLength(1);
     const feedback = body.split(`${write}\n        `)[1]?.split('\n')[0];
     expect(feedback).toMatch(/^toast\.success\(/);
@@ -41,6 +41,7 @@ describe('会话诊断模式接线', () => {
     const body = source.slice(start, end);
     expect(body).not.toContain('saveConfig');
     expect(body).not.toContain('stage(');
+    expect(body).not.toContain('submitEdit(');
     expect(body).toContain(`toast.success(${translate}(enabled ? 'logs.diagnosticEnabled' : 'logs.diagnosticDisabled'))`);
     expect(body.indexOf('await api.logs.setDiagnostic')).toBeLessThan(body.indexOf('toast.success'));
   });

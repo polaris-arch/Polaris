@@ -507,8 +507,9 @@ export function RulesScreen({ plane = 'route' }: { plane?: 'route' | 'dns' }) {
   const handleBackToSmart = useCallback(async () => {
     if (!getEffectiveConfig()) return;
     try {
-      const label = t('rules.backToSmartOk');
-      if (await useAppStore.getState().updateProxyMode('smart', label) === 'saved') toast.success(label);
+      if (await useAppStore.getState().updateProxyMode('smart', t('home.routingSmart')) === 'saved') {
+        toast.success(t('rules.backToSmartOk'));
+      }
     } catch (err) {
       // 失败时 mode-warn 仍留在原地；同时报出真实原因，避免按钮看似无响应。
       console.error('[RulesScreen] backToSmart failed:', err);

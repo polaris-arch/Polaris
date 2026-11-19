@@ -635,8 +635,9 @@ export function MobileRulesScreen(): ReactElement {
     if (!getEffectiveConfig()) return;
     clearWriteError('proxyMode');
     try {
-      const label = tr('rules.backToSmartOk');
-      if (await useAppStore.getState().updateProxyMode('smart', label) === 'saved') toast.success(label);
+      if (await useAppStore.getState().updateProxyMode('smart', tr('home.routingSmart')) === 'saved') {
+        toast.success(tr('rules.backToSmartOk'));
+      }
     } catch (err) {
       // 失败时那条模式警告仍留在原地 —— 不报的话与「按钮失灵」同形。
       console.error('[MobileRulesScreen] backToSmart failed:', err);

@@ -1027,7 +1027,7 @@ export function MobileConnectionsScreen(): ReactElement {
   const onLevelChange = useCallback(
     (next: LogLevel) => {
       if (!diskConfig) return;
-      // 连接中先暂存；保存后由共用热应用流程同步运行核。
+      // 共用配置事务负责保存和运行核回执。
       if (editRoute('logLevel', stagingEnabled) === 'staged') {
         void submitEdit({
           id: 'setting:logLevel',
