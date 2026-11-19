@@ -693,7 +693,8 @@ function sdkFrameworkLibraries(libraries) {
     && new Set(libraries.map(row => row.LibraryIdentifier)).size === 2, 'framework device/simulator library inventory differs');
   const variants = new Set(libraries.map(row => row.SupportedPlatformVariant ?? null));
   requireSetting(variants.has(null) && variants.has('simulator'), 'framework must contain one device and one simulator library');
-  const leaf = name => typeof name === 'string' && name !== '.' && posix.basename(name) === name;
+  const leaf = name => typeof name === 'string' && name.length > 0 && name !== '.' && name !== '..'
+    && posix.basename(name) === name;
   return libraries.map(row => {
     requireSetting(row.SupportedPlatform === 'ios' && leaf(row.LibraryIdentifier) && leaf(row.LibraryPath),
       'framework must contain only device/simulator iOS');

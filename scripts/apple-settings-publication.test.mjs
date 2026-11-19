@@ -164,6 +164,8 @@ test('Apple SDK plist inventory binds separate device and simulator declarations
       [[device, { ...sim, SupportedPlatformVariant: 'maccatalyst' }], /one device and one simulator/],
       [[{ ...device, SupportedPlatform: 'macos' }, sim], /only device\/simulator iOS/],
       [[{ ...device, LibraryIdentifier: '/device' }, sim], /only device\/simulator iOS/],
+      [[{ ...device, LibraryIdentifier: '..' }, sim], /only device\/simulator iOS/],
+      [[device, { ...sim, LibraryPath: '' }], /only device\/simulator iOS/],
       [[device, { ...sim, LibraryPath: '../Libbox.framework' }], /only device\/simulator iOS/],
       [[device, { ...sim, LibraryPath: 'Libbox.framework/' }], /only device\/simulator iOS/],
       ...[[], ['arm64', 'x86_64']].map(architectures =>
