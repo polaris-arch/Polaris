@@ -696,6 +696,17 @@ if (mode === 'desktop-warp' || mode === 'mobile-warp' || mode === 'mobile-ts') {
   config.servers = [node];
   useAppStore.setState({ config: { ...config }, servers: [node] });
   useStagedConfigStore.setState({ baseline: { ...config } });
+  if (mode === 'mobile-ts' && new URLSearchParams(location.search).has('enabled')) {
+    useStagedConfigStore.getState().hydrate(config);
+    test.onDemandPlans = 0;
+    api.config.save = async (candidate, deferRestart, version, autoApply, hotOnly) => {
+      if (!deferRestart || !autoApply || !hotOnly || version !== configBaseVersion(config) || candidate.servers[0]?.id !== node.id) {
+        throw new Error('Expected a prospective edit of the existing Tailscale endpoint');
+      }
+      test.onDemandPlans++;
+      return { status: 'needsManual' };
+    };
+  }
   systemApi.listNetworkInterfaces = async () => [];
   api.server.tailscaleGetStatus = async () => ({ connected: false, statuses: [] });
   api.server.tailscaleStateExists = async () => ({ ts: false });
@@ -1751,8 +1762,11 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('App transaction inter
       await fixturePhase(page, 'on-demand-payload', () => page.waitForFunction('!!window.__transactions.payload()'));
       const payload = await page.evaluate<ServerConfig>('window.__transactions.payload()');
       expect(payload.onDemand).toBe(enabled ? undefined : true);
-      if (mode === 'mobile-ts') expect(payload.tailscaleSettings?.hostname).toBe('synthetic-ts');
-      else expect(payload.wireguardSettings?.warpDevice?.deviceId).toBe('synthetic-device');
+      if (mode === 'mobile-ts') {
+        expect(payload.tailscaleSettings?.hostname).toBe('synthetic-ts');
+        expect(await page.evaluate('window.__transactions.onDemandPlans')).toBe(1);
+        expect(await page.evaluate('window.__transactions.saved')).toBeUndefined();
+      } else expect(payload.wireguardSettings?.warpDevice?.deviceId).toBe('synthetic-device');
       await page.close();
     }
   }));
