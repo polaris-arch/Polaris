@@ -625,6 +625,7 @@ impl ProxyRuntime {
     pub(crate) fn selected_android_auth_node(
         observed: &[polaris_mesh::tailscale_state::retirement::ObservedTailscaleStoreRun],
         actual_digest: &str,
+        current_start_run_nonces: Option<&[String]>,
         tag: &str,
         directory: &str,
         export: &polaris_mesh::tailscale_state::retirement::TailscaleStoreExport,
@@ -636,29 +637,32 @@ impl ProxyRuntime {
         export
             .validate_observed_runs(observed, true)
             .map_err(|_| "nativeRetirementUnknown")?;
-        let current = observed
-            .last()
-            .filter(|run| run.config_digest == actual_digest)
-            .ok_or("profileBindingUnknown")?;
+        let current = super::android_bridge::tailscale_store::select_current_start_runs(
+            observed,
+            actual_digest,
+            current_start_run_nonces,
+        )
+        .ok_or("profileBindingUnknown")?;
         // The scope strings follow the export's own grammar, which
         // `validate_observed_runs` has just enforced as `<directory>/tailscaled.state`.
         // Joining through the host path type would spell the separator differently
         // wherever this selection is exercised off-device.
         let file = format!("{directory}/tailscaled.state");
-        let selected: Vec<_> = current
-            .scopes
-            .iter()
-            .filter(|scope| {
+        let mut matching = current.iter().filter(|run| {
+            run.scopes.iter().any(|scope| {
                 scope.tag == tag && scope.state_directory == directory && scope.state_file == file
             })
-            .collect();
-        if selected.len() != 1 {
+        });
+        let selected = matching.next().ok_or("profileBindingUnknown")?;
+        if matching.next().is_some() {
             return Err("profileBindingUnknown".into());
         }
         let node = export
             .instances()
             .iter()
-            .find(|run| run.run_nonce == current.run_nonce && run.config_digest == actual_digest)
+            .find(|run| {
+                run.run_nonce == selected.run_nonce && run.config_digest == selected.config_digest
+            })
             .and_then(|run| {
                 run.nodes.iter().find(|node| {
                     node.tag == tag && node.state_directory == directory && node.state_file == file
@@ -796,26 +800,20 @@ impl ProxyRuntime {
         let original = tailscale_store::observe_main(Some(&target)).await?;
         if Some(original.original().actual_config_digest.as_str())
             != ticket.core.raw_config_digest.as_deref()
-            || original
-                .original()
-                .original_observed_runs
-                .last()
-                .is_none_or(|run| {
-                    run.config_digest != original.original().actual_config_digest
-                        || run
-                            .scopes
-                            .iter()
-                            .map(|scope| {
-                                (
-                                    scope.tag.clone(),
-                                    scope.state_directory.clone(),
-                                    scope.state_file.clone(),
-                                )
-                            })
-                            .collect::<BTreeSet<_>>()
-                            != expected
-                        || run.scopes.len() != expected.len()
-                })
+            || original.original().current_start_runs().is_none_or(|runs| {
+                let scopes = runs.iter().flat_map(|run| &run.scopes);
+                scopes.clone().count() != expected.len()
+                    || scopes
+                        .map(|scope| {
+                            (
+                                scope.tag.clone(),
+                                scope.state_directory.clone(),
+                                scope.state_file.clone(),
+                            )
+                        })
+                        .collect::<BTreeSet<_>>()
+                        != expected
+            })
             || !self
                 .android_main_token
                 .lock()

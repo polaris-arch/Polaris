@@ -1329,6 +1329,7 @@ fn android_auth_selects_only_original_current_run_never_historical_bound() {
     let node = ProxyRuntime::selected_android_auth_node(
         &observed,
         &"c".repeat(64),
+        None,
         "selected",
         "/owned/tailscale/node",
         &export,
@@ -1339,6 +1340,7 @@ fn android_auth_selects_only_original_current_run_never_historical_bound() {
     assert!(ProxyRuntime::selected_android_auth_node(
         &observed,
         &"f".repeat(64),
+        None,
         "selected",
         "/owned/tailscale/node",
         &export
@@ -1347,6 +1349,7 @@ fn android_auth_selects_only_original_current_run_never_historical_bound() {
     assert!(ProxyRuntime::selected_android_auth_node(
         &observed,
         &"c".repeat(64),
+        None,
         "selected",
         "/foreign/tailscale/node",
         &export
@@ -1357,9 +1360,40 @@ fn android_auth_selects_only_original_current_run_never_historical_bound() {
     assert!(ProxyRuntime::selected_android_auth_node(
         &observed,
         &"c".repeat(64),
+        None,
         "selected",
         "/owned/tailscale/node",
         &export
+    )
+    .is_err());
+}
+
+#[test]
+fn android_auth_selects_the_attested_child_with_its_own_digest() {
+    use polaris_mesh::tailscale_state::retirement::TailscaleStoreExport;
+    let (mut observed, mut raw) = android_retirement_fixture();
+    observed[1].scopes.clear();
+    raw["instances"][1]["nodes"] = serde_json::json!([]);
+    raw["instances"][1]["terminal"] = serde_json::json!("NoStoreConstruction");
+    let parent = &observed[1];
+    let order = [observed[0].run_nonce.clone(), parent.run_nonce.clone()];
+    let export: TailscaleStoreExport = serde_json::from_value(raw).unwrap();
+    assert!(ProxyRuntime::selected_android_auth_node(
+        &observed,
+        &parent.config_digest,
+        Some(&order),
+        "selected",
+        "/owned/tailscale/node",
+        &export,
+    )
+    .is_ok());
+    assert!(ProxyRuntime::selected_android_auth_node(
+        &observed,
+        &parent.config_digest,
+        None,
+        "selected",
+        "/owned/tailscale/node",
+        &export,
     )
     .is_err());
 }
@@ -1372,6 +1406,7 @@ fn android_auth_rejects_partial_foreign_or_live_family_before_selecting_bound() 
     assert!(ProxyRuntime::selected_android_auth_node(
         &observed,
         &"c".repeat(64),
+        None,
         "selected",
         "/owned/tailscale/node",
         &export
@@ -1390,6 +1425,7 @@ fn android_auth_rejects_partial_foreign_or_live_family_before_selecting_bound() 
             ProxyRuntime::selected_android_auth_node(
                 &observed,
                 &"c".repeat(64),
+                None,
                 "selected",
                 "/owned/tailscale/node",
                 &export
@@ -1403,6 +1439,7 @@ fn android_auth_rejects_partial_foreign_or_live_family_before_selecting_bound() 
     assert!(ProxyRuntime::selected_android_auth_node(
         &missing,
         &"c".repeat(64),
+        None,
         "selected",
         "/owned/tailscale/node",
         &export

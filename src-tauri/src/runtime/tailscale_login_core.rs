@@ -2905,6 +2905,7 @@ impl LoginCoreRegistry {
         let node = ProxyRuntime::selected_android_auth_node(
             &retired.original().original_observed_runs,
             &retired.original().actual_config_digest,
+            retired.original().current_start_run_nonces.as_deref(),
             &tag,
             directory.to_str().ok_or("profileBindingUnknown")?,
             &export,
@@ -2981,11 +2982,10 @@ impl LoginCoreRegistry {
         let state_file = directory.join("tailscaled.state");
         let scopes: Vec<_> = original
             .original()
-            .original_observed_runs
-            .last()
+            .current_start_runs()
             .ok_or("profileBindingUnknown")?
-            .scopes
             .iter()
+            .flat_map(|run| &run.scopes)
             .filter(|scope| {
                 Some(scope.state_directory.as_str()) == directory.to_str()
                     && Some(scope.state_file.as_str()) == state_file.to_str()
@@ -3001,6 +3001,7 @@ impl LoginCoreRegistry {
         let node = ProxyRuntime::selected_android_auth_node(
             &retired.original().original_observed_runs,
             &retired.original().actual_config_digest,
+            retired.original().current_start_run_nonces.as_deref(),
             &scope.tag,
             directory.to_str().ok_or("profileBindingUnknown")?,
             &retired.retired_export()?,
@@ -3053,6 +3054,7 @@ impl LoginCoreRegistry {
         let node = ProxyRuntime::selected_android_auth_node(
             &retired.original().original_observed_runs,
             &retired.original().actual_config_digest,
+            retired.original().current_start_run_nonces.as_deref(),
             &tag,
             directory.to_str().ok_or("profileBindingUnknown")?,
             &retired.retired_export()?,

@@ -14,6 +14,8 @@ pub(crate) struct StoreData {
     pub main_birth_nonce: String,
     pub actual_config_digest: String,
     pub original_observed_runs: Vec<ObservedTailscaleStoreRun>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_start_run_nonces: Option<Vec<String>>,
     pub history_unknown: bool,
     pub terminal: bool,
     pub store_retirement: String,
@@ -133,7 +135,28 @@ pub(super) fn decode_runtime_main_writer(
     Ok(writer)
 }
 
+pub(in crate::runtime::proxy) fn select_current_start_runs<'a>(
+    observed: &'a [ObservedTailscaleStoreRun],
+    actual_digest: &str,
+    nonce_order: Option<&[String]>,
+) -> Option<&'a [ObservedTailscaleStoreRun]> {
+    let count = nonce_order.map_or(1, <[String]>::len);
+    let current = observed.get(observed.len().checked_sub(count)?..)?;
+    (current.last()?.config_digest == actual_digest
+        && nonce_order
+            .is_none_or(|nonce_order| current.iter().map(|run| &run.run_nonce).eq(nonce_order)))
+    .then_some(current)
+}
+
 impl StoreData {
+    pub(crate) fn current_start_runs(&self) -> Option<&[ObservedTailscaleStoreRun]> {
+        select_current_start_runs(
+            &self.original_observed_runs,
+            &self.actual_config_digest,
+            self.current_start_run_nonces.as_deref(),
+        )
+    }
+
     fn export(&self, terminal: bool) -> Result<TailscaleStoreExport, String> {
         if self.contract_version != "polaris-android-ts-store-custody-v1"
             || !matches!(self.producer_kind.as_str(), "Main" | "Login" | "Speedtest")
@@ -146,10 +169,8 @@ impl StoreData {
             || self.history_unknown
             || self.store_retirement.len() > MAX_BYTES
             || (terminal && !self.terminal)
-            || self
-                .original_observed_runs
-                .last()
-                .is_none_or(|run| run.config_digest != self.actual_config_digest)
+            || (self.current_start_run_nonces.is_some() && self.producer_kind != "Main")
+            || self.current_start_runs().is_none()
         {
             return Err(UNKNOWN.into());
         }
@@ -187,6 +208,7 @@ impl StoreData {
             && self.main_birth_nonce == original.main_birth_nonce
             && self.actual_config_digest == original.actual_config_digest
             && self.original_observed_runs == original.original_observed_runs
+            && self.current_start_run_nonces == original.current_start_run_nonces
     }
 }
 
@@ -617,6 +639,7 @@ pub(super) fn decode_target(
                         || data.logical_instance_id != entry.logical_instance_id
                         || data.process_nonce != snapshot.process_nonce
                         || !data.original_observed_runs.is_empty()
+                        || data.current_start_run_nonces.is_some()
                         || !data.actual_config_digest.is_empty()
                         || !data.store_retirement.is_empty()
                 })

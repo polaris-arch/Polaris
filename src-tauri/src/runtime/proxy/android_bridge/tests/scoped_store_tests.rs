@@ -47,6 +47,23 @@ fn original_scope_roundtrip_and_terminal_do_not_rebind_history() {
             "{key}"
         );
     }
+    let order = json!(["a".repeat(64), "b".repeat(64)]);
+    let mut live = store(false);
+    live["currentStartRunNonces"] = order.clone();
+    let paired = decode_store(&live.to_string(), None).unwrap();
+    assert_eq!(paired.original().current_start_runs().unwrap().len(), 2);
+    let mut final_wire = store(true);
+    assert!(decode_store(&final_wire.to_string(), Some(&paired)).is_err());
+    final_wire["currentStartRunNonces"] = order;
+    assert!(decode_store(&final_wire.to_string(), Some(&paired)).is_ok());
+    for bad in [
+        json!([]),
+        json!(["b".repeat(64), "a".repeat(64)]),
+        json!(["f".repeat(64), "b".repeat(64)]),
+    ] {
+        final_wire["currentStartRunNonces"] = bad;
+        assert!(decode_store(&final_wire.to_string(), None).is_err());
+    }
 }
 #[test]
 fn missing_extra_rebound_late_native_runs_and_schema_fail_closed() {
