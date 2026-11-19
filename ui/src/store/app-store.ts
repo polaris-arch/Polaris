@@ -121,6 +121,7 @@ export interface ConfigPublication {
   reason: string;
 }
 type ConfigScope = 'main' | 'tray';
+const PROXY_START_CONFIG_WAIT_MS = 5_000;
 type ConfigSession = {
   scope: ConfigScope;
   leases: number;
@@ -543,14 +544,19 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   startProxy: async () => {
-    // `config` 只用来判「配置加载完了没」（没加载完 = UI 还没准备好让用户点连接）。
-    // **不再作为起核载荷下发**：起核用哪份配置由后端读盘决定（见 Rust `proxy_start` 头注）——
-    // 这份内存副本靠 configChanged 异步刷新，「写盘 → 立刻点启动」会用写之前的那份。
-    if (!get().config) {
-      throw new Error(i18n.t('errors.configNotLoaded'));
-    }
+    if (get().proxyStarting) return;
     set({ proxyStarting: true });
     try {
+      // 冷启动的连接动作等待共享读盘和草稿恢复。真正起核时仍由后端读盘。
+      if (!get().config) {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), PROXY_START_CONFIG_WAIT_MS);
+        try {
+          await refreshConfig({ reason: 'proxy-start', signal: controller.signal });
+        } finally {
+          clearTimeout(timeout);
+        }
+      }
       // 停核后保留下来的 staged 仍是用户此刻在 UI 里看到的有效配置。连接是下一次运行态提交点：
       // 先复用“保存”的冲突/合并事务；保存失败或等待用户裁决时保持停止，绝不按旧磁盘配置偷偷起核。
       if (!(await useStagedConfigStore.getState().save())) return;

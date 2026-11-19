@@ -135,6 +135,63 @@ describe('配置保存与下一次启动的事务边界', () => {
     expect(useStagedConfigStore.getState().baseline).toBe(newer);
   });
 
+  it('冷启动点连接时等待正在加载的配置和草稿恢复', async () => {
+    useAppStore.setState({ config: null, configLoading: false });
+    useStagedConfigStore.setState({ hydrated: false, baseline: null, baseVersion: null });
+    let finishRead!: (config: UserConfig) => void;
+    getMock.mockImplementationOnce(() => new Promise((resolve) => { finishRead = resolve; }));
+    startMock.mockImplementationOnce(async () => {
+      expect(useAppStore.getState().config).toBe(CONFIG);
+      expect(useStagedConfigStore.getState().baseline).toBe(CONFIG);
+      expect(useStagedConfigStore.getState().hydrated).toBe(true);
+    });
+    const release = acquireConfigSync({ scope: 'main' });
+    try {
+      await vi.waitFor(() => expect(getMock).toHaveBeenCalledOnce());
+      const starting = useAppStore.getState().startProxy();
+      expect(useAppStore.getState().proxyStarting).toBe(true);
+      expect(startMock).not.toHaveBeenCalled();
+      finishRead(CONFIG);
+      await starting;
+      expect(getMock).toHaveBeenCalledOnce();
+      expect(startMock).toHaveBeenCalledOnce();
+      expect(useAppStore.getState().proxyStarting).toBe(false);
+    } finally {
+      release();
+    }
+  });
+
+  it('冷启动配置读取卡住时释放连接，迟到结果只恢复配置', async () => {
+    vi.useFakeTimers();
+    useAppStore.setState({ config: null, configLoading: false });
+    let finishRead!: (config: UserConfig) => void;
+    getMock.mockImplementationOnce(() => new Promise((resolve) => { finishRead = resolve; }));
+    const release = acquireConfigSync({ scope: 'main' });
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      expect(getMock).toHaveBeenCalledOnce();
+      const starting = useAppStore.getState().startProxy();
+      const timedOut = expect(starting).rejects.toMatchObject({ code: 'CONFIG_REFRESH_CANCELLED' });
+      await useAppStore.getState().startProxy();
+      expect(useAppStore.getState().proxyStarting).toBe(true);
+      await vi.advanceTimersByTimeAsync(5_000);
+      await timedOut;
+      expect(useAppStore.getState().proxyStarting).toBe(false);
+      expect(startMock).not.toHaveBeenCalled();
+      expect(getMock).toHaveBeenCalledOnce();
+
+      finishRead(CONFIG);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(useAppStore.getState().config).toBe(CONFIG);
+      expect(startMock).not.toHaveBeenCalled();
+      await useAppStore.getState().startProxy();
+      expect(startMock).toHaveBeenCalledOnce();
+    } finally {
+      release();
+      vi.useRealTimers();
+    }
+  });
+
   it('停止态携带草稿时，连接严格先保存、清 marker，再启动', async () => {
     seed([ENTRY]);
 
