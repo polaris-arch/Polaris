@@ -8,7 +8,6 @@ on:
         description: Exact admitted App commit from the same-commit CI caller
         type: string
         required: true
-        default: ''
 
 permissions:
   contents: read
