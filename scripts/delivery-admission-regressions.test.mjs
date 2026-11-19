@@ -143,8 +143,8 @@ function mobileBuildFixture(folder) {
   return { input, vendors: vendors.map(([name]) => name) };
 }
 
-function buildInfoText(facts) {
-  const lines = ['libbox.so: go' + facts.goVersion, '\tpath\t' + facts.path];
+function buildInfoText(facts, name = 'libbox.so') {
+  const lines = [name + ': go' + facts.goVersion, '\tpath\t' + facts.path];
   for (const [name, row] of Object.entries(facts.modules)) {
     lines.push(['', row.kind, name, row.version, row.sum ?? ''].join('\t'));
     if (Object.hasOwn(row, 'replacement')) {
@@ -156,9 +156,7 @@ function buildInfoText(facts) {
 }
 
 function verifyMobileBuildFixture({ facts, ...input }) {
-  return checkMobileBuildInfo(input.target.osName === 'android'
-    ? { ...input, raw: buildInfoText(facts) }
-    : { ...input, facts });
+  return checkMobileBuildInfo({ ...input, raw: buildInfoText(facts) });
 }
 
 test('native mobile BuildInfo admits each exact platform and preserves original module projection', { skip: process.platform === 'win32' }, () => {
@@ -167,9 +165,18 @@ test('native mobile BuildInfo admits each exact platform and preserves original 
     const { input, vendors } = mobileBuildFixture(folder);
     const script = fileURLToPath(new URL('mobile-core/source-admission.mjs', import.meta.url));
     const report = join(folder, 'report.json');
-    const verify = (target, tamper) => {
-      const { facts, ...rest } = target;
-      const evidence = target.target.osName === 'android' ? { ...rest, raw: buildInfoText(facts) } : target;
+    const appleTextFingerprint = createHash('sha256').update(
+      '{"goVersion":"' + input('ios').facts.goVersion + '","modules":{},"path":null,"settings":{"text":"\\u6a39"}}',
+    ).digest('hex');
+    const verify = (target, tamper, edit) => {
+      const { facts, graph, source, ...binding } = target;
+      const evidence = target.target.osName === 'android'
+        ? { graph, source, ...binding, raw: buildInfoText(facts) }
+        : { graph, source, appleObservations: [
+          { raw: 'observed-section: go' + facts.goVersion + '\n\tbuild\ttext="樹"' },
+          { ...binding, raw: buildInfoText(facts, 'observed-section') },
+        ] };
+      edit?.(evidence);
       const bytes = Buffer.from(JSON.stringify(evidence));
       writeFileSync(report, bytes);
       const digest = createHash('sha256').update(bytes).digest('hex');
@@ -184,25 +191,41 @@ test('native mobile BuildInfo admits each exact platform and preserves original 
       const result = verify(target);
       assert.equal(result.status, 0, result.stderr);
       assert.deepEqual(target, frozen);
-      if (target.target.osName === 'android') assert.deepEqual(JSON.parse(result.stdout), frozen.facts);
-      else assert.equal(result.stdout, '');
+      const android = target.target.osName === 'android';
+      const expected = android ? frozen.facts : [
+        { goVersion: frozen.facts.goVersion, modules: {}, settings: { text: '樹' }, path: null }, frozen.facts,
+      ];
+      assert.deepEqual(JSON.parse(result.stdout), expected);
       if (target.target.arch === 'arm64') {
         const python = execFileSync('python3', ['-B', '-c', `
 import json
 import sys
 sys.path.insert(0, sys.argv[1])
-from artifacts import verify_native_buildinfo
+from artifacts import AppleBuildInfoBatch, verify_native_buildinfo
 from producer import run
 
 evidence = json.load(sys.stdin)
-target = evidence['target']
-observed = verify_native_buildinfo(evidence.get('raw', evidence.get('facts')), evidence['source'], evidence['graph'],
-                                   os_name=target['osName'], arch=target['arch'], mode=target['mode'],
-                                   simulator=target['simulator'], expected_id=evidence['expectedId'],
-                                   actual_id=evidence['actualId'], run=run, scratch=sys.argv[2])
+if 'raw' in evidence:
+    target = evidence['target']
+    observed = verify_native_buildinfo(evidence['raw'], evidence['source'], evidence['graph'],
+                                       os_name=target['osName'], arch=target['arch'], mode=target['mode'],
+                                       simulator=target['simulator'], expected_id=evidence['expectedId'],
+                                       actual_id=evidence['actualId'], run=run, scratch=sys.argv[2])
+else:
+    batch, infos = AppleBuildInfoBatch(), []
+    for row in evidence['appleObservations']:
+        info = {'parserInput': row['raw']}
+        batch.observe(info)
+        infos.append(info)
+        if 'target' in row:
+            batch.bind(info, arch=row['target']['arch'], simulator=row['target']['simulator'],
+                       expected_id=row['expectedId'], actual_id=row['actualId'])
+    batch.verify(run=run, scratch=sys.argv[2], source=evidence['source'], graph=evidence['graph'])
+    assert infos[0]['buildInfoFingerprint'] == sys.argv[3]
+    observed = [info['parsedBuildInfo'] for info in infos]
 print(json.dumps(observed))
-`, dirname(script), folder], { input: readFileSync(report), encoding: 'utf8' });
-        assert.deepEqual(JSON.parse(python), target.target.osName === 'android' ? frozen.facts : null);
+`, dirname(script), folder, appleTextFingerprint], { input: readFileSync(report), encoding: 'utf8' });
+        assert.deepEqual(JSON.parse(python), expected);
         assert.equal(readdirSync(folder).some(name => name.startsWith('native-buildinfo-')), false);
       }
       for (const name of vendors) {
@@ -214,6 +237,18 @@ print(json.dumps(observed))
       for (const name of vendors.filter(name => !requiredNative.includes(name))) delete target.facts.modules[name];
       verifyMobileBuildFixture(target);
     }
+    const mixed = verify(input('ios'), undefined, evidence => {
+      evidence.appleObservations[0].raw += '\n\tbuild\ttext=duplicate';
+    });
+    assert.equal(mixed.status, 1);
+    assert.equal(mixed.stdout, '');
+    assert.match(mixed.stderr, /Malformed\/duplicate build setting/);
+    const misbound = verify(input('ios'), undefined, evidence => {
+      evidence.appleObservations[1].actualId = 'other-carrier';
+    });
+    assert.equal(misbound.status, 1);
+    assert.equal(misbound.stdout, '');
+    assert.match(misbound.stderr, /BuildID input differs/);
     const mutated = verify(input(), bytes => writeFileSync(report, Buffer.from(bytes.toString().replace('gobind', 'gobinx'))));
     assert.equal(mutated.status, 1);
     assert.match(mutated.stderr, /native BuildInfo evidence pin differs/);

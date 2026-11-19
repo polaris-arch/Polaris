@@ -516,10 +516,10 @@ function bindingPlans(source) {
   return { linkerFlagsPrefix: mobileLinkerFlagsPrefix(source), platforms };
 }
 
-// The textual Android observation and the parsed Apple Mach-O section
-// share contract validation. The latter's original framing/fingerprint stays
-// with the native section observer.
+// Android Go tool output and text from a validated Apple Mach-O section share
+// this projection. The native observers own the original bytes and framing.
 export function parseMobileBuildInfo(raw) {
+  demand(typeof raw === 'string', 'native BuildInfo observation kind differs');
   const lines = raw.replace(/[\u0009-\u000d\u001c-\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+$/u, '')
     .split(/\r\n|[\n\r\u000b\u000c\u001c-\u001e\u0085\u2028\u2029]/u);
   const version = /: go(\p{Nd}+\.\p{Nd}+\.\p{Nd}+)$/u.exec(lines.shift());
@@ -592,7 +592,7 @@ function declareNativeGraph(graph, module, vendors) {
   return declared;
 }
 
-export function checkMobileBuildInfo({ source: declaration, graph, target, expectedId, actualId, raw, facts }) {
+export function checkMobileBuildInfo({ source: declaration, graph, target, expectedId, actualId, raw }) {
   const source = validateMobileSource(sourceDeclaration(declaration));
   const { osName, arch, mode, simulator } = target;
   const android = osName === 'android';
@@ -600,9 +600,7 @@ export function checkMobileBuildInfo({ source: declaration, graph, target, expec
     ? mode === 'c-shared' && ['arm64', 'arm', '386', 'amd64'].includes(arch) && simulator === false
     : osName === 'ios' && mode === 'c-archive' && arch === 'arm64' && typeof simulator === 'boolean',
   'actual mobile BuildInfo target differs');
-  demand(android ? typeof raw === 'string' && facts === undefined : object(facts) && raw === undefined,
-    'native BuildInfo observation kind differs');
-  const observed = android ? parseMobileBuildInfo(raw) : facts;
+  const observed = parseMobileBuildInfo(raw);
   demand(observed.goVersion === source.goVersion, 'native Go version differs');
   const { settings, modules } = observed;
   demand(object(settings) && object(modules), 'actual native BuildInfo shape differs');
@@ -673,6 +671,22 @@ export function checkMobileBuildInfo({ source: declaration, graph, target, expec
   return observed;
 }
 
+function nativeBuildInfoReport(evidence) {
+  if (closed(evidence, ['source', 'graph', 'target', 'expectedId', 'actualId', 'raw'])
+    && evidence.target?.osName === 'android') {
+    return checkMobileBuildInfo(evidence);
+  }
+  const bound = closed(evidence, ['source', 'graph', 'appleObservations']);
+  demand((bound || closed(evidence, ['appleObservations'])) && Array.isArray(evidence.appleObservations)
+    && evidence.appleObservations.length > 0, 'invalid Apple BuildInfo observations');
+  return evidence.appleObservations.map(row => {
+    if (closed(row, ['raw'])) return parseMobileBuildInfo(row.raw);
+    demand(bound && closed(row, ['target', 'expectedId', 'actualId', 'raw']) && row.target?.osName === 'ios',
+      'invalid bound Apple BuildInfo observation');
+    return checkMobileBuildInfo({ ...row, source: evidence.source, graph: evidence.graph });
+  });
+}
+
 export function readBoundedInput(maximum) {
   const bytes = Buffer.allocUnsafe(maximum + 1);
   let received = 0;
@@ -698,8 +712,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
       const { bytes, pin } = pinned(path, limits.controlBytes);
       demand(pin.bytes === Number(size) && pin.sha256 === digest, 'native BuildInfo evidence pin differs');
       const evidence = decode(bytes, limits.controlBytes, () => limits.controlBytes);
-      const observed = checkMobileBuildInfo(evidence);
-      if (Object.hasOwn(evidence, 'raw')) console.log(JSON.stringify(observed));
+      console.log(JSON.stringify(nativeBuildInfoReport(evidence)));
     } else {
       // The producer sends its full declaration once and reuses these plans.
       demand(args.length === 0, 'usage: source-admission.mjs [--versions | --reviewed-source ROOT | --native-buildinfo PATH BYTES SHA256]');

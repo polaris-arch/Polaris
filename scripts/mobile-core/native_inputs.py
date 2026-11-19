@@ -5,15 +5,17 @@ import re
 import shlex
 
 from fork_input import require
-from artifacts import file_pin, module, tree_inventory, read_pinned
+from artifacts import AppleBuildInfoBatch, file_pin, module, tree_inventory, read_pinned
 
 
 def source_table(files, *, reader=None):
     """Build origin facts from local originals or a bounded archive reader."""
+    from producer import run
+
     reader = read_pinned if reader is None else reader
     require(0 < len(files) <= 65536, 'native source file count budget')
-    helper = module('origin_buildinfo', 'scripts/mobile-core/android-source.py')
     carrier = module('origin_container', 'scripts/apple-carrier.py')
+    buildinfo = AppleBuildInfoBatch()
     origins = defaultdict(list)
     rows = characters = 0
     def append(digest, row):
@@ -30,7 +32,7 @@ def source_table(files, *, reader=None):
             raw, actual_pin = reader(path)
             require(actual_pin == {key: pin[key] for key in ('bytes', 'sha256')},
                     'static origin changed during inspection')
-            parsed = carrier.container(raw, helper)
+            parsed = carrier.container(raw, buildinfo.observe)
             slices = parsed['slices'] if parsed['kind'] == 'fat-ar' else [{'ordinal': 0, 'archive': parsed}]
             for row in slices:
                 require(row['archive']['kind'] == 'bsd-ar', 'external runtime must be a static archive')
@@ -39,6 +41,7 @@ def source_table(files, *, reader=None):
                         append(member['sha256'], {'kind': pin['kind'], 'path': path,
                             'archiveSha256': pin['sha256'], 'sliceOrdinal': row['ordinal'],
                             'memberOrdinal': member['ordinal'], 'sha256': member['sha256']})
+    buildinfo.verify(run=run, scratch=None)
     return dict(origins)
 
 

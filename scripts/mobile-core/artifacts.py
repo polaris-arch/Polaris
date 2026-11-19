@@ -293,19 +293,52 @@ def local_replacement_aliases(replacement, source_dir, observed, name):
     return {literal, directory}, diagnostic
 
 
-def verify_native_buildinfo(observation, value, graph, *, os_name, arch, mode, expected_id, actual_id,
-                            run, scratch, simulator=False):
-    field = 'raw' if os_name == 'android' else 'facts'
-    evidence = {field: observation, 'source': value, 'graph': graph, 'expectedId': expected_id, 'actualId': actual_id,
-                'target': {'osName': os_name, 'arch': arch, 'mode': mode, 'simulator': simulator}}
+def _read_native_buildinfo(evidence, run, scratch):
     raw = b''.join(_receipt_chunks(evidence, MAX_RECEIPT))
     verifier = Path(__file__).with_name('source-admission.mjs').resolve()
     with tempfile.TemporaryDirectory(prefix='native-buildinfo-', dir=scratch) as folder:
         report = Path(folder) / 'observations.json'
         report.write_bytes(raw)
-        observed = run(['node', verifier, '--native-buildinfo', report, len(raw), sha(raw)])
-    if os_name == 'android':
-        return json.loads(observed)
+        return json.loads(run(['node', verifier, '--native-buildinfo', report, len(raw), sha(raw)]))
+
+
+def verify_native_buildinfo(observation, value, graph, *, os_name, arch, mode, expected_id, actual_id,
+                            run, scratch, simulator=False):
+    evidence = {'raw': observation, 'source': value, 'graph': graph, 'expectedId': expected_id, 'actualId': actual_id,
+                'target': {'osName': os_name, 'arch': arch, 'mode': mode, 'simulator': simulator}}
+    return _read_native_buildinfo(evidence, run, scratch)
+
+
+class AppleBuildInfoBatch:
+    """Project all raw text from one inspected carrier without crossing its ownership."""
+
+    def __init__(self):
+        self.observations = {}
+        self.text_bytes = 0
+
+    def observe(self, info):
+        raw = info['parserInput']
+        self.text_bytes += len(raw.encode())
+        require(self.text_bytes <= MAX_RECEIPT, 'Apple BuildInfo batch exceeds control byte budget')
+        self.observations[id(info)] = (info, {'raw': raw})
+
+    def bind(self, info, *, arch, simulator, expected_id, actual_id):
+        self.observations[id(info)][1].update(
+            target={'osName': 'ios', 'arch': arch, 'mode': 'c-archive', 'simulator': simulator},
+            expectedId=expected_id, actualId=actual_id)
+
+    def verify(self, *, run, scratch, source=None, graph=None):
+        if not self.observations:
+            return
+        evidence = {'appleObservations': [row for _, row in self.observations.values()]}
+        if source is not None:
+            evidence.update(source=source, graph=graph)
+        projection = _read_native_buildinfo(evidence, run, scratch)
+        for (info, _), facts in zip(self.observations.values(), projection, strict=True):
+            info['parsedBuildInfo'] = facts
+            # This field predates the UTF-8 receipt digest and uses ASCII JSON.
+            info['buildInfoFingerprint'] = sha(json.dumps(facts, sort_keys=True, separators=(',', ':'),
+                                                          ensure_ascii=True).encode())
 
 
 def inspect_aar(aar, value, graph, tools, run, scratch, expected_id):
@@ -416,8 +449,8 @@ def inspect_framework(framework, value, graph, expected_id, *, run, scratch):
 def _inspect_framework(framework, value, graph, expected_id, reads, run, scratch):
     validate(value)
     framework = Path(framework)
-    helper = module('formal_apple_buildinfo', 'scripts/mobile-core/android-source.py')
     carrier = module('formal_apple_container', 'scripts/apple-carrier.py')
+    buildinfo = AppleBuildInfoBatch()
     # Pins used by parsing are reused only within this invocation. A complete
     # fresh inventory at the final boundary detects changes to bytes/modes,
     # links and the file set without retaining multiple large binary buffers.
@@ -447,7 +480,7 @@ def _inspect_framework(framework, value, graph, expected_id, reads, run, scratch
         raw, binary_pin = read_pinned(binary, observations=reads)
         pinned[binary] = binary_pin
         try:
-            parsed = carrier.container(raw, helper)
+            parsed = carrier.container(raw, buildinfo.observe)
         except RuntimeError as error:
             # Retain the actual failing header/declared input in the original
             # log; a lipo command alone does not prove the emitted fat count.
@@ -489,9 +522,8 @@ def _inspect_framework(framework, value, graph, expected_id, reads, run, scratch
                         infos.append(section['buildInfo'])
                     ids.extend(n['value'] for n in section.get('buildIDs', []))
             require(len(infos) == len(ids) == 1, 'one original Go carrier per Apple slice required')
-            verify_native_buildinfo(infos[0]['parsedBuildInfo'], value, graph, os_name='ios', arch=spec[2],
-                                    mode='c-archive', expected_id=expected_id, actual_id=ids[0],
-                                    simulator=spec[3] == 'simulator', run=run, scratch=scratch)
+            buildinfo.bind(infos[0], arch=spec[2], simulator=spec[3] == 'simulator',
+                           expected_id=expected_id, actual_id=ids[0])
             observed[target] = {'libraryIdentifier': identifier, 'binary': binary_pin,
                 'headerSha256': {name: sha(text.encode()) for name, text in headers.items()},
                 'validationResultGetterContract': contracts['validationResultGetterContract'],
@@ -504,6 +536,7 @@ def _inspect_framework(framework, value, graph, expected_id, reads, run, scratch
                 'members': [{**{k: v for k, v in m.items() if k != 'machO'},
                              'goCarrier': any('buildInfo' in s for s in m['machO']['sections'])} for m in members]}
     require(set(observed) == set(APPLE), 'formal Apple inventory must contain exactly two arm64 platform slices')
+    buildinfo.verify(run=run, scratch=scratch, source=value, graph=graph)
     inventory = tree_inventory(framework, pinned=pinned, observations=reads)
     require([{k: v for k, v in row.items() if k not in ('bytes', 'sha256')} for row in inventory] == layout,
             'framework layout changed during original-byte inspection')

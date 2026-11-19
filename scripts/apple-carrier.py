@@ -3,6 +3,7 @@
 import re
 import struct
 import sys
+from hashlib import sha256
 
 sys.dont_write_bytecode = True
 MACHO = b'\xcf\xfa\xed\xfe'
@@ -20,6 +21,10 @@ TARGETS = {'ios-arm64': (0x100000c, 0, 2, 'arm64', 'iphoneos', None),
 def require(condition, message):
     if not condition:
         raise RuntimeError('Apple carrier: ' + message)
+
+
+def sha(data):
+    return sha256(data).hexdigest()
 
 
 def bounds(offset, size, total, label):
@@ -55,7 +60,7 @@ def inline_string(data, offset):
     raise RuntimeError('Apple carrier: inline varint overflow')
 
 
-def build_info(payload, helper):
+def build_info(payload):
     require(len(payload) >= 32 and payload[:14] == INFO, 'BuildInfo header')
     require(payload[14:32] == b'\x08\x02' + bytes(16), 'unsupported BuildInfo encoding')
     version, stop = inline_string(payload, 32)
@@ -73,13 +78,11 @@ def build_info(payload, helper):
             and raw.endswith('\n') and '\0' not in raw and '\r' not in raw, 'BuildInfo raw framing')
     # The first line is an explicit section adapter, not fabricated Go CLI output.
     adapted = 'observed-section: ' + version + '\n' + ''.join('\t' + line + '\n' for line in raw.splitlines())
-    parsed = helper.parse_build_info(adapted)
     return {'goVersionRaw': version, 'moduleRaw': raw, 'parserInput': adapted,
-            'parsedBuildInfo': parsed, 'buildInfoFingerprint': helper.digest(helper.canonical(parsed)),
             'headerHex': payload[:32].hex(), 'provenance': 'validated __DATA,__go_buildinfo inline section'}
 
 
-def macho(data, helper):
+def macho(data, observe_buildinfo):
     bounds(0, 32, len(data), 'Mach-O header')
     require(data[:4] == MACHO, 'unsupported Mach-O format')
     _, cpu, subcpu, kind, count, command_bytes, flags, reserved = struct.unpack_from('<8I', data)
@@ -147,7 +150,7 @@ def macho(data, helper):
                     require(off >= limit and off >= offset and length_s <= offset + length - off,
                             'section outside segment/header')
                     payload = data[off:off + length_s]
-                    row['sha256'] = helper.digest(payload)
+                    row['sha256'] = sha(payload)
                 sections.append(row)
         elif command == 0x32:
             require(size >= 24, 'platform command size')
@@ -209,7 +212,7 @@ def macho(data, helper):
             if length:
                 auxiliary.append((off, off + length))
             commands[-1].update(dataOffset=off, dataBytes=length,
-                                payloadSha256=helper.digest(data[off:off + length]))
+                                payloadSha256=sha(data[off:off + length]))
         elif command == 0x1d:
             # Simulator MH_EXECUTE images carry the linker's code-signature
             # blob. Preserve its bounded opaque bytes; this is not a codesign
@@ -222,7 +225,7 @@ def macho(data, helper):
             code_signature = (off, off + length)
             auxiliary.append(code_signature)
             commands[-1].update(dataOffset=off, dataBytes=length,
-                                payloadSha256=helper.digest(data[off:off + length]),
+                                payloadSha256=sha(data[off:off + length]),
                                 payloadKind='opaque-code-signature', trustValidated=False)
         elif command in (0x80000033, 0x80000034, 0x26, 0x29):
             require(size == 16, 'linkedit command size')
@@ -303,7 +306,7 @@ def macho(data, helper):
         payload = data[row['offset']:row['offset'] + row['bytes']] if not row['zeroFill'] else b''
         if row['section'] == '__go_buildinfo':
             require(row['segment'] == '__DATA' and row['flags'] & 255 == 0, 'BuildInfo locus')
-            row['buildInfo'] = build_info(payload, helper)
+            row['buildInfo'] = build_info(payload)
         if (row['segment'], row['section']) == ('__TEXT', '__text'):
             notes, cursor = [], 0
             while (found := payload.find(ID_START, cursor)) != -1:
@@ -314,18 +317,20 @@ def macho(data, helper):
                 stop = end + len(ID_END)
                 notes.append({'value': value.decode('ascii'), 'sectionOffset': found,
                               'fileOffset': row['offset'] + found, 'bytes': stop - found,
-                              'sha256': helper.digest(payload[found:stop])})
+                              'sha256': sha(payload[found:stop])})
                 cursor = stop
             row['buildIDs'] = notes
     info = [s for s in sections if 'buildInfo' in s]
     ids = [(s, note) for s in sections for note in s.get('buildIDs', [])]
     require(len(info) <= 1 and len(ids) <= 1 and bool(info) == bool(ids), 'missing/extra Go identity')
+    if info:
+        observe_buildinfo(info[0]['buildInfo'])
     return {'kind': 'Mach-O64', 'cpu': cpu, 'subCPU': subcpu, 'filetype': kind,
-            'sha256': helper.digest(data), 'bytes': len(data), 'flags': flags,
+            'sha256': sha(data), 'bytes': len(data), 'flags': flags,
             'platformCommands': platforms, 'loadCommands': commands, 'sections': sections}
 
 
-def archive(data, helper):
+def archive(data, observe_buildinfo):
     require(data.startswith(AR), 'unsupported archive format')
     position, members, symbol_payload = 8, [], None
     while position < len(data):
@@ -351,7 +356,7 @@ def archive(data, helper):
         payload = data[payload_start:end]
         row = {'ordinal': len(members), 'headerOffset': position, 'rawName': raw_name,
                'name': name, 'nameBytes': name_length, 'payloadOffset': payload_start,
-               'bytes': len(payload), 'sha256': helper.digest(payload)}
+               'bytes': len(payload), 'sha256': sha(payload)}
         if name in ('__.SYMDEF', '__.SYMDEF SORTED'):
             # The observed Apple BSD tables differ only in declared sorting.
             # Both take the same bounded table/string/member-offset predicate.
@@ -360,7 +365,7 @@ def archive(data, helper):
             symbol_payload = payload
         else:
             require(payload.startswith(MACHO), 'unsupported code member format')
-            row['classification'], row['machO'] = 'code', macho(payload, helper)
+            row['classification'], row['machO'] = 'code', macho(payload, observe_buildinfo)
             require(row['machO']['filetype'] == 1, 'ar member must be MH_OBJECT')
         if length % 2:
             bounds(end, 1, len(data), 'ar padding')
@@ -384,10 +389,10 @@ def archive(data, helper):
             require(name_offset < string_bytes and
                     symbol_payload.find(b'\0', string_offset + name_offset, string_offset + string_bytes) != -1
                     and member_offset in code_offsets, 'BSD symbol/member binding')
-    return {'kind': 'bsd-ar', 'sha256': helper.digest(data), 'bytes': len(data), 'members': members}
+    return {'kind': 'bsd-ar', 'sha256': sha(data), 'bytes': len(data), 'members': members}
 
 
-def container(data, helper):
+def container(data, observe_buildinfo):
     if data.startswith(FAT):
         bounds(0, 8, len(data), 'fat header')
         count = struct.unpack_from('>I', data, 4)[0]
@@ -414,13 +419,13 @@ def container(data, helper):
             cursor = stop
         require(cursor == len(data), 'fat trailing bytes')
         for row in slices:
-            row['archive'] = archive(data[row['offset']:row['offset'] + row['bytes']], helper)
+            row['archive'] = archive(data[row['offset']:row['offset'] + row['bytes']], observe_buildinfo)
             code = [member['machO'] for member in row['archive']['members'] if member['classification'] == 'code']
             require(code and all((obj['cpu'], obj['subCPU']) == (row['cpu'], row['subCPU']) for obj in code),
                     'fat header/payload CPU differs')
-        return {'kind': 'fat-ar', 'sha256': helper.digest(data), 'bytes': len(data), 'slices': slices}
+        return {'kind': 'fat-ar', 'sha256': sha(data), 'bytes': len(data), 'slices': slices}
     if data.startswith(AR):
-        return archive(data, helper)
+        return archive(data, observe_buildinfo)
     if data.startswith(MACHO):
-        return macho(data, helper)
+        return macho(data, observe_buildinfo)
     raise RuntimeError('Apple carrier: unsupported container format')

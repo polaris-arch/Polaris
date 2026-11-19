@@ -13,7 +13,7 @@ import sys
 sys.dont_write_bytecode = True
 os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
 
-from artifacts import file_pin, module, read_receipt
+from artifacts import AppleBuildInfoBatch, file_pin, module, read_receipt
 from consume import app_identity, verify_link
 from fork_input import ROOT, canonical, load, require, sha
 from producer import ACTIVE_FDS, private_dir, run, write_json
@@ -75,14 +75,14 @@ def target_for(platform, arches, configuration):
     return targets[(platform, arches)]
 
 
-def selected_wire_bytes(raw, triple):
+def selected_wire_bytes(raw, triple, scratch):
     """Inspect every fat entry, then select the actual Cargo architecture/platform."""
     specs = {'aarch64-apple-ios': (0x100000c, 2),
              'aarch64-apple-ios-sim': (0x100000c, 7)}
     require(triple in specs and len(raw) <= 1024 ** 3, 'bounded selected wire target required')
     parser = module('apple_selected_wire_carrier', 'scripts/apple-carrier.py')
-    helper = module('apple_selected_wire_info', 'scripts/mobile-core/android-source.py')
-    observed = parser.container(raw, helper)
+    buildinfo = AppleBuildInfoBatch()
+    observed = parser.container(raw, buildinfo.observe)
     require(observed['kind'] in ('bsd-ar', 'fat-ar'), 'actual static wire input required')
     slices = observed['slices'] if observed['kind'] == 'fat-ar' else [
         {'offset': 0, 'bytes': len(raw), 'archive': observed}]
@@ -102,6 +102,7 @@ def selected_wire_bytes(raw, triple):
     selected = matching[0]
     thin = raw[selected['offset']:selected['offset'] + selected['bytes']]
     require(thin.startswith(b'!<arch>\n'), 'selected wire slice is not a static archive')
+    buildinfo.verify(run=run, scratch=scratch)
     return thin, {'target': triple, 'cpu': cpu, 'platform': platform,
                   'offset': selected['offset'], 'bytes': selected['bytes'], 'container': observed['kind']}
 
@@ -177,7 +178,7 @@ def build_reserved():
     library = Path(link['framework']) / selected['libraryIdentifier'] / 'Libbox.framework/Libbox'
     library = library.resolve(strict=True)
     require(file_pin(library) == selected['binary'], 'actual selected wire archive differs')
-    thin, selection = selected_wire_bytes(library.read_bytes(), triple)
+    thin, selection = selected_wire_bytes(library.read_bytes(), triple, root)
     wire = root / ('wire-' + triple + '.a')
     require(not wire.exists() and not wire.is_symlink(), 'actual selected wire output already retained')
     with wire.open('xb') as stream:
@@ -264,7 +265,7 @@ def verify():
                   'aarch64-apple-ios-sim': 'ios-arm64-simulator'}[triple]
     selected = link['componentOutput']['slices'][slice_name]
     original = (Path(link['framework']) / selected['libraryIdentifier'] / 'Libbox.framework/Libbox').resolve(strict=True)
-    thin, selection = selected_wire_bytes(original.read_bytes(), triple)
+    thin, selection = selected_wire_bytes(original.read_bytes(), triple, root)
     wire = root / ('wire-' + triple + '.a')
     require(receipt['originalWireArchive'] == {'path': str(original), **selected['binary']} and
             file_pin(original) == selected['binary'] and receipt['wireSelection'] == selection and

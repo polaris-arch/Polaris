@@ -113,7 +113,7 @@ Rust download and compiled-dependency keys are independent. Download identity
 retains exact Cargo format/tool bytes and lock/manifests/source configuration.
 Compiled identity excludes the Android-only NDK installer and SDK view, including
 the historical implementation. It retains shared `ci_android.py` and
-`android-source.py`, unknown producer files, the Apple workflow, tools, SDK,
+`source-admission.mjs`, unknown producer files, the Apple workflow, tools, SDK,
 configuration and flags. The full provenance records all producer files. The
 cache excludes final App outputs.
 New key versions initially miss. These cache changes do not measure or promise

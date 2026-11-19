@@ -14,7 +14,7 @@ sys.dont_write_bytecode = True
 os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
 
 from fork_input import ROOT, canonical, load, require, sha
-from artifacts import APPLE, receipt_digest, file_pin, module, zip_entries, verify_native_buildinfo, read_receipt, inspection_stage
+from artifacts import APPLE, AppleBuildInfoBatch, receipt_digest, file_pin, module, zip_entries, read_receipt, inspection_stage
 from producer import lease, run, write_json
 from consume import app_identity, apple_resources, verify_original
 
@@ -157,8 +157,8 @@ def apple(ipa, link_path, link_sha, linkmap, receipt_path, scratch, derived, sim
     # deployment floor. Require current native facts, even with correct plists.
     minimum = apple_version_raw(value['apple']['appMinimumOS'])
     sdk = apple_version_raw(value['apple']['simulatorSDK' if simulator_arch else 'iPhoneSDK'])
-    helper = module('final_mobile_info', 'scripts/mobile-core/android-source.py')
     parser = module('final_mobile_carrier', 'scripts/apple-carrier.py')
+    buildinfo = AppleBuildInfoBatch()
     with inspection_stage('ipa-parse'):
         with zipfile.ZipFile(ipa) as archive:
             zip_entries(archive)
@@ -181,7 +181,7 @@ def apple(ipa, link_path, link_sha, linkmap, receipt_path, scratch, derived, sim
                         (['iPhoneSimulator'] if simulator_arch else ['iPhoneOS']) and
                         apple_version_raw(info['MinimumOSVersion']) == minimum, 'actual device carrier scope differs')
                 raw = archive.read(root + info['CFBundleExecutable'])
-                parsed = parser.container(raw, helper)
+                parsed = parser.container(raw, buildinfo.observe)
                 require(parsed['kind'] == 'Mach-O64' and parsed['cpu'] == cpu and parsed['filetype'] == 2,
                         'actual App binary target must be the selected thin MH_EXECUTE')
                 commands = parsed['platformCommands']
@@ -193,13 +193,12 @@ def apple(ipa, link_path, link_sha, linkmap, receipt_path, scratch, derived, sim
                     infos = [s['buildInfo'] for s in parsed['sections'] if 'buildInfo' in s]
                     ids = [n['value'] for s in parsed['sections'] for n in s.get('buildIDs', [])]
                     require(len(infos) == len(ids) == 1, 'final extension must retain original Go source carrier')
-                    verify_native_buildinfo(infos[0]['parsedBuildInfo'], value, receipt['input']['moduleGraph'],
-                                            os_name='ios', arch=simulator_arch or 'arm64', mode='c-archive',
-                                            simulator=bool(simulator_arch), run=run, scratch=scratch,
-                                            expected_id='polaris-mobile-' + receipt_digest(receipt['input']), actual_id=ids[0])
+                    buildinfo.bind(infos[0], arch=simulator_arch or 'arm64', simulator=bool(simulator_arch),
+                                   expected_id='polaris-mobile-' + receipt_digest(receipt['input']), actual_id=ids[0])
                     rows[name].update(goBuildInfo=infos[0], buildID=ids[0])
             require(not any(n.startswith(app_root) and (n.endswith('.a') or 'Libbox.framework/' in n) for n in archive.namelist()),
                     'build-only static SDK must not be copied into the installed App')
+        buildinfo.verify(run=run, scratch=scratch, source=value, graph=receipt['input']['moduleGraph'])
     original_map = Path(linkmap).read_bytes()
     text = original_map.decode('utf-8')
     selected = receipt['output']['slices'][target]

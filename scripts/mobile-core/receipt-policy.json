@@ -47,7 +47,6 @@
       "scripts/mobile-core/transaction.py",
       "scripts/mobile-core/prepare-ndk-linux.mjs",
       "scripts/mobile-core/ndk-r30-linux.json",
-      "scripts/mobile-core/android-source.py",
       "scripts/verify-apk.mjs",
       "scripts/lib/zip-archive.mjs",
       "scripts/release-assets.mjs",
