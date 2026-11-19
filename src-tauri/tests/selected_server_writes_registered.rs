@@ -1750,7 +1750,7 @@ fn finite_selection_projection_loop_is_a_registered_write_owner() {
 fn native_auto_transaction_is_guarded(body: &str) -> bool {
     let code = mask_comments(body);
     let bare = mask_comments_and_strings(body);
-    let anchor = ".update(|latest| {";
+    let anchor = ".update_with_cleanup_revision(false, |latest| {";
     if bare.matches(anchor).count() != 1 {
         return false;
     }
@@ -1774,14 +1774,25 @@ fn native_auto_transaction_is_guarded(body: &str) -> bool {
     if seed_code != "ifletSome(seed)=&seed{latest[\"selectedServerId\"]=json!(seed);}" {
         return false;
     }
-    let guard = "if*latest!=saved||self.core_generation()!=started_generation||self.core_running()!=started_running||self.selector_reconcile.intent_generation()!=started_intent{returnDecision::Skip(None);}";
+    let revision_guard = "if*latest!=saved||self.config.saved_revision()!=saved_revision{returnDecision::Skip(None);}";
+    let publication_guard = "letSome(claim)=self.gate.try_lock_generation_publication()else{returnDecision::Skip(None);};";
+    let runtime_guard = "ifself.gate.try_idle_generation()!=Some(started_generation)||!self.status.try_read().is_ok_and(|status|status.running==started_running){returnDecision::Skip(None);}";
+    let reservation = "letSome((intent_claim,generation))=self.selector_reconcile.try_register_intent(started_intent)else{returnDecision::Skip(None);};";
     let intent = "latest[polaris_store::SELECTION_INTENT_KEY]=intent.clone();";
     let seed = "ifletSome(seed)=&seed{latest[]=json!(seed);}";
-    let commit = "Decision::Write(Some(self.register_selector_intent()))";
-    let positions: Option<Vec<usize>> = [guard, intent, seed, commit]
-        .iter()
-        .map(|part| (compact.matches(part).count() == 1).then(|| compact.find(part).unwrap()))
-        .collect();
+    let commit = "publication=Some((claim,intent_claim));written_intent=Some(generation);Decision::Write(Some(generation))";
+    let positions: Option<Vec<usize>> = [
+        revision_guard,
+        publication_guard,
+        runtime_guard,
+        reservation,
+        intent,
+        seed,
+        commit,
+    ]
+    .iter()
+    .map(|part| (compact.matches(part).count() == 1).then(|| compact.find(part).unwrap()))
+    .collect();
     positions.is_some_and(|positions| positions.windows(2).all(|pair| pair[0] < pair[1]))
 }
 
@@ -1815,11 +1826,14 @@ fn explicit_native_auto_seed_and_intent_share_the_guarded_writer() {
             "",
         ),
         ("latest[\"selectedServerId\"] = json!(seed);", ""),
-        ("self.core_generation() != started_generation", "false"),
-        ("self.core_running() != started_running", "false"),
         (
-            "self.selector_reconcile.intent_generation() != started_intent",
+            "self.gate.try_idle_generation() != Some(started_generation)",
             "false",
+        ),
+        ("status.running == started_running", "false"),
+        (
+            ".try_register_intent(started_intent)",
+            ".try_register_intent(0)",
         ),
         ("return Decision::Skip(None);", "record(None);"),
     ] {

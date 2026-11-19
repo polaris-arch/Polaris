@@ -110,6 +110,21 @@ impl SelectorReconcileOwner {
         claim(self.intent_generation())
     }
 
+    /// Reserve the successor under the saved writer and keep intent publication
+    /// fenced until the caller's synchronous commit settles.
+    pub(super) fn try_register_intent(
+        &self,
+        expected: u64,
+    ) -> Option<(std::sync::MutexGuard<'_, ()>, u64)> {
+        let claim = self.intent_claim.try_lock().ok()?;
+        if self.intent_generation() != expected {
+            return None;
+        }
+        let next = expected.wrapping_add(1);
+        self.intent_generation.store(next, Ordering::SeqCst);
+        Some((claim, next))
+    }
+
     pub(super) fn try_with_intent_claim<T>(&self, claim: impl FnOnce(u64) -> T) -> Option<T> {
         let _guard = self.intent_claim.try_lock().ok()?;
         Some(claim(self.intent_generation()))

@@ -1326,10 +1326,7 @@ async fn native_node_to_auto_rejects_partial_put_or_stale_intent_without_closing
         assert!(sink.closed_ids.lock().unwrap().is_empty());
         assert_eq!(sink.connection_snapshot_calls.load(Ordering::SeqCst), 1);
         assert_eq!(rt.current_config_snapshot().unwrap(), config);
-        assert_eq!(
-            rt.config.current().unwrap()["selectionIntent"],
-            polaris_store::auto_select::intent(&AutoSelectTarget::Global),
-        );
+        assert_eq!(rt.config.current().unwrap(), config, "{race}");
         assert!(rt.pending_force_restart.read().unwrap().is_none());
         if race == "stop" || race == "intent" {
             assert_eq!(sink.calls().len(), 1, "a superseded rollback cannot PUT");
@@ -1749,10 +1746,26 @@ async fn native_new_graph_defers_without_restart_and_preserves_unrelated_desired
 
 #[tokio::test]
 async fn native_obsolete_read_or_busy_lifecycle_cannot_save_a_new_reference() {
-    for race in ["busy", "intent", "generation"] {
+    for race in [
+        "busy",
+        "intent",
+        "generation",
+        "groups-unavailable",
+        "groups-incomplete",
+    ] {
         let (rt, _dir, sink, config) = native_fixture(Some(AutoSelectTarget::Global), true);
         if race == "busy" {
             rt.gate.begin();
+        } else if race == "groups-unavailable" {
+            *sink.native_groups.lock().unwrap() = None;
+        } else if race == "groups-incomplete" {
+            let wrapper = native::wrapper_tag(&subscription_target());
+            sink.native_groups
+                .lock()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .retain(|group| group.tag != wrapper);
         } else {
             let owner = Arc::clone(&rt);
             *sink.on_groups.lock().unwrap() = Some(Box::new(move || {
@@ -1772,22 +1785,41 @@ async fn native_obsolete_read_or_busy_lifecycle_cannot_save_a_new_reference() {
         assert_eq!(rt.config.current().unwrap(), config, "{race}");
         assert!(sink.calls().is_empty(), "{race}");
         assert!(rt.pending_force_restart.read().unwrap().is_none(), "{race}");
+        assert!(!rt.restart_deferred.load(Ordering::SeqCst), "{race}");
     }
 }
 
 #[tokio::test]
-async fn native_default_partial_apply_or_intent_race_preserves_runtime_and_pending_reference() {
-    for race in ["put", "intent", "stop"] {
+async fn native_default_partial_apply_or_intent_race_does_not_save_the_reference() {
+    for race in ["put", "intent", "stop", "manual", "unrelated-write"] {
         let (rt, _dir, sink, config) = native_fixture(Some(AutoSelectTarget::Global), true);
+        let wrapper = native::wrapper_tag(&subscription_target());
+        set_native_selected(&sink, &wrapper, "Node C");
         if race == "put" {
             sink.fail_at.lock().unwrap().insert(2);
         } else {
             let owner = Arc::clone(&rt);
-            *sink.on_put.lock().unwrap() = Some(Box::new(move || {
-                if race == "stop" {
+            *sink.on_put.lock().unwrap() = Some(Box::new(move || match race {
+                "stop" => {
                     owner.gate.bump_generation();
                     owner.status.write().unwrap().running = false;
-                } else {
+                }
+                "manual" => {
+                    server_switch_core(
+                        &owner.config,
+                        "node-b",
+                        |_| Ok(()),
+                        || owner.register_selector_intent(),
+                    )
+                    .unwrap();
+                }
+                "unrelated-write" => {
+                    owner
+                        .config
+                        .set_value("logLevel", serde_json::json!("debug"))
+                        .unwrap();
+                }
+                _ => {
                     owner.register_selector_intent();
                 }
             }));
@@ -1803,15 +1835,27 @@ async fn native_default_partial_apply_or_intent_race_preserves_runtime_and_pendi
             config["selectionIntent"],
             "R must not claim a rejected apply"
         );
-        assert_eq!(
-            rt.config.current().unwrap()["selectionIntent"],
-            polaris_store::auto_select::intent(&subscription_target()),
-            "the requested reference remains retryable"
-        );
+        let mut expected = config;
+        if race == "manual" {
+            expected.as_object_mut().unwrap().remove("selectionIntent");
+            expected["selectedServerId"] = serde_json::json!("node-b");
+            expected["recentServerIds"] = serde_json::json!(["node-b"]);
+        } else if race == "unrelated-write" {
+            expected["logLevel"] = serde_json::json!("debug");
+        }
+        assert_eq!(rt.config.current().unwrap(), expected, "{race}");
         assert!(rt.pending_force_restart.read().unwrap().is_none());
-        if race == "stop" {
-            assert_eq!(sink.calls().len(), 1);
+        if matches!(race, "stop" | "intent" | "manual") {
+            assert_eq!(sink.calls().len(), 1, "{race} must not be overwritten");
         } else {
+            assert!(sink
+                .native_groups
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|group| group.tag == wrapper && group.selected == "Node C"));
             assert_eq!(
                 rt.native_auto_status().await.actual_server_id.as_deref(),
                 Some("node-a")

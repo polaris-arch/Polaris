@@ -984,6 +984,7 @@ impl ProxyRuntime {
             return Err("AUTO_SELECT_BUSY".into());
         }
         let saved = self.config.current().map_err(|error| error.to_string())?;
+        let saved_revision = self.config.saved_revision();
         let started_generation = self.core_generation();
         let started_running = self.core_running();
         let started_intent = self.selector_reconcile.intent_generation();
@@ -1003,13 +1004,15 @@ impl ProxyRuntime {
             && projected
                 .as_ref()
                 .is_some_and(|running| polaris_store::auto_select::target(running).is_none());
-        if self.core_running() {
+        let mut expects_wrapper = false;
+        if started_running {
             let runtime: UserConfig =
                 serde_json::from_value(projected.clone().ok_or("AUTO_SELECT_NO_ACTUAL_EXIT")?)
                     .map_err(|_| "AUTO_SELECT_INVALID_CONFIG")?;
             if !runtime.auto_select_enabled {
                 return Err("AUTO_SELECT_BUSY".into());
             }
+            expects_wrapper = model::referenced_targets(&runtime).contains(&target);
             let requested = model::eligible_members(&typed, &target);
             if model::eligible_members(&runtime, &target) != requested {
                 return Err("AUTO_SELECT_REQUIRES_APPLY".into());
@@ -1048,27 +1051,12 @@ impl ProxyRuntime {
                 return Err("AUTO_SELECT_REQUIRES_APPLY".into());
             }
         }
-        let (generation, _) = self
-            .config
-            .update(|latest| {
-                if *latest != saved
-                    || self.core_generation() != started_generation
-                    || self.core_running() != started_running
-                    || self.selector_reconcile.intent_generation() != started_intent
-                {
-                    return Decision::Skip(None);
-                }
-                latest[polaris_store::SELECTION_INTENT_KEY] = intent.clone();
-                if let Some(seed) = &seed {
-                    latest["selectedServerId"] = json!(seed);
-                }
-                Decision::Write(Some(self.register_selector_intent()))
-            })
-            .map_err(|error| error.to_string())?;
-        let generation = generation.ok_or("AUTO_SELECT_SWITCH_FAILED")?;
-        if self.core_running() {
+        let mut previous = Vec::new();
+        let mut pending_disconnect = None;
+        let mut attested = false;
+        if started_running {
             let projected = projected.as_mut().ok_or("AUTO_SELECT_NO_ACTUAL_EXIT")?;
-            projected[polaris_store::SELECTION_INTENT_KEY] = intent;
+            projected[polaris_store::SELECTION_INTENT_KEY] = intent.clone();
             if let Some(seed) = &seed {
                 projected["selectedServerId"] = json!(seed);
             }
@@ -1076,46 +1064,43 @@ impl ProxyRuntime {
             if projected.get("selectedServerId").is_none() {
                 projected["selectedServerId"] = Value::Null;
             }
-            let core_generation = started_generation;
-            if !self.selector_operation_is_current(core_generation, generation) {
+            if !self.selector_operation_is_current(started_generation, started_intent) {
                 return Err("AUTO_SELECT_SWITCH_FAILED".into());
             }
             let wrapper = model::wrapper_tag(&target);
             let api = self.management_api().await;
             let native = model::urltest_tag(&target);
-            let initial_groups = self.native_read_groups(&api).await;
-            let present = initial_groups.as_ref().is_ok_and(|groups| {
-                groups.iter().any(|group| {
-                    group.tag == wrapper && group.items.iter().any(|item| item.tag == native)
-                }) && groups.iter().any(|group| group.tag == native)
-                    && groups.iter().any(|group| {
-                        group.tag == "proxy-selector"
-                            && group.items.iter().any(|item| item.tag == wrapper)
-                    })
-            });
-            if present && self.selector_operation_is_current(core_generation, generation) {
-                let aligned = initial_groups.as_ref().is_ok_and(|groups| {
-                    updates_attested(
-                        groups,
-                        &[
-                            (wrapper.clone(), native.clone()),
-                            ("proxy-selector".into(), wrapper.clone()),
-                        ],
-                    )
+            let initial_groups = self
+                .native_read_groups(&api)
+                .await
+                .map_err(|_| "AUTO_SELECT_SWITCH_FAILED")?;
+            if !self.selector_operation_is_current(started_generation, started_intent)
+                || self.config.saved_revision() != saved_revision
+            {
+                return Err("AUTO_SELECT_SWITCH_FAILED".into());
+            }
+            let present = initial_groups.iter().any(|group| {
+                group.tag == wrapper && group.items.iter().any(|item| item.tag == native)
+            }) && initial_groups.iter().any(|group| group.tag == native)
+                && initial_groups.iter().any(|group| {
+                    group.tag == "proxy-selector"
+                        && group.items.iter().any(|item| item.tag == wrapper)
                 });
+            // A wrapper already owned by R cannot be treated as a new graph.
+            if !present && expects_wrapper {
+                return Err("AUTO_SELECT_SWITCH_FAILED".into());
+            }
+            if present {
                 let updates = vec![
                     (wrapper.clone(), native),
                     ("proxy-selector".into(), wrapper),
                 ];
-                let previous: Vec<_> = initial_groups
-                    .as_ref()
-                    .unwrap()
+                previous = initial_groups
                     .iter()
                     .filter(|group| updates.iter().any(|(tag, _)| tag == &group.tag))
                     .map(|group| (group.tag.clone(), group.selected.clone()))
                     .collect();
-                let mut pending_disconnect = None;
-                if !aligned {
+                if !updates_attested(&initial_groups, &updates) {
                     let plan = HotSwitchPlan {
                         kind: HotSwitchKind::Global,
                         must_restart: false,
@@ -1141,12 +1126,12 @@ impl ProxyRuntime {
                         .execute_hot_switch_plan_with_pre_switch_snapshot(
                             &plan,
                             interrupt_manual_exit,
-                            core_generation,
-                            generation,
+                            started_generation,
+                            started_intent,
                         )
                         .await;
                     if !matches!(outcome, HotSwitchOutcome::Applied { .. }) {
-                        self.restore_native_wrappers(core_generation, generation, &previous)
+                        self.restore_native_wrappers(started_generation, started_intent, &previous)
                             .await;
                         return Err("AUTO_SELECT_SWITCH_FAILED".into());
                     }
@@ -1154,40 +1139,120 @@ impl ProxyRuntime {
                 }
                 let revision = self.native_observation_revision();
                 let groups = self.native_read_groups(&api).await;
-                if !self.selector_operation_is_current(core_generation, generation)
+                if !self.selector_operation_is_current(started_generation, started_intent)
                     || !groups
                         .as_ref()
                         .is_ok_and(|groups| updates_attested(groups, &updates))
+                    || self
+                        .publish_native_groups(started_generation, revision, groups.unwrap())
+                        .is_none()
                 {
-                    self.restore_native_wrappers(core_generation, generation, &previous)
-                        .await;
+                    if pending_disconnect.is_some() {
+                        self.restore_native_wrappers(started_generation, started_intent, &previous)
+                            .await;
+                    }
                     return Err("AUTO_SELECT_SWITCH_FAILED".into());
                 }
-                if self
-                    .publish_native_groups(core_generation, revision, groups.unwrap())
-                    .is_none()
-                {
-                    self.restore_native_wrappers(core_generation, generation, &previous)
-                        .await;
-                    return Err("AUTO_SELECT_SWITCH_FAILED".into());
+                attested = true;
+            }
+        }
+
+        // Commit the isolated control only after readback, or after an exact groups
+        // read established that an explicit graph Apply is needed.
+        let (write, written_intent) = {
+            let mut publication = None;
+            let mut written_intent = None;
+            let write = self.config.update_with_cleanup_revision(false, |latest| {
+                if *latest != saved || self.config.saved_revision() != saved_revision {
+                    return Decision::Skip(None);
                 }
-                if !self.with_native_projection_claim(core_generation, generation, || {
+                let Some(claim) = self.gate.try_lock_generation_publication() else {
+                    return Decision::Skip(None);
+                };
+                if self.gate.try_idle_generation() != Some(started_generation)
+                    || !self
+                        .status
+                        .try_read()
+                        .is_ok_and(|status| status.running == started_running)
+                {
+                    return Decision::Skip(None);
+                }
+                let Some((intent_claim, generation)) =
+                    self.selector_reconcile.try_register_intent(started_intent)
+                else {
+                    return Decision::Skip(None);
+                };
+                latest[polaris_store::SELECTION_INTENT_KEY] = intent.clone();
+                if let Some(seed) = &seed {
+                    latest["selectedServerId"] = json!(seed);
+                }
+                publication = Some((claim, intent_claim));
+                written_intent = Some(generation);
+                Decision::Write(Some(generation))
+            });
+            (write, written_intent)
+        };
+        let (generation, written, revision) = match write {
+            Ok((Some(generation), Some(written), revision)) => (generation, written, revision),
+            failed => {
+                if pending_disconnect.is_some() {
+                    self.restore_native_wrappers(
+                        started_generation,
+                        written_intent.unwrap_or(started_intent),
+                        &previous,
+                    )
+                    .await;
+                }
+                return Err(failed.err().map_or_else(
+                    || "AUTO_SELECT_SWITCH_FAILED".into(),
+                    |error| error.to_string(),
+                ));
+            }
+        };
+        if let Some(projected) = projected.as_ref().filter(|_| started_running) {
+            if attested {
+                if !self.with_native_projection_claim(started_generation, generation, || {
                     self.commit_selected_projection(projected, generation)
-                }) || self.current_config_snapshot().as_ref() != Some(&*projected)
+                }) || self.current_config_snapshot().as_ref() != Some(projected)
                 {
-                    self.restore_native_wrappers(core_generation, generation, &previous)
-                        .await;
+                    let _ = self
+                        .gate
+                        .with_current_generation(started_generation, |claim| {
+                            if claim.is_busy() {
+                                return;
+                            }
+                            self.selector_reconcile.try_with_intent_claim(|current| {
+                                if current == generation {
+                                    let _ = self.config.try_update_saved(
+                                        &written,
+                                        |latest, _| {
+                                            if *latest != written
+                                                || self.config.saved_revision() != revision
+                                            {
+                                                return Decision::Skip(());
+                                            }
+                                            *latest = saved;
+                                            Decision::Write(())
+                                        },
+                                        |_, _| {},
+                                    );
+                                }
+                            });
+                        });
+                    if pending_disconnect.is_some() {
+                        self.restore_native_wrappers(started_generation, generation, &previous)
+                            .await;
+                    }
                     return Err("AUTO_SELECT_SWITCH_FAILED".into());
                 }
                 if let Some(captured) = pending_disconnect {
-                    self.finish_logical_exit_disconnect(captured, core_generation, generation)
+                    self.finish_logical_exit_disconnect(captured, started_generation, generation)
                         .await;
                 }
-                self.reconcile_emitted_exit_route(core_generation).await;
+                self.reconcile_emitted_exit_route(started_generation).await;
             } else {
-                // New reference adds native outbounds. Keep it pending for explicit
-                // graph Apply; never consume unrelated saved D or restart implicitly.
-                self.defer_selected_projection(projected, core_generation, generation);
+                // New reference adds native outbounds; request only explicit Apply.
+                self.defer_selected_projection(projected, started_generation, generation);
             }
             let _ = &serial;
         }
