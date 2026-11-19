@@ -362,6 +362,20 @@ class MainActivity : TauriActivity() {
     }
   }
 
+  override fun onNewIntent(intent: Intent) {
+    val category = intent.categories?.singleOrNull()
+    // A launcher re-entry already brings this singleTask activity forward. Sending it
+    // to Tauri can reach notification 2.8.1 before the plugin initializes its manager.
+    if (intent.action == Intent.ACTION_MAIN &&
+      (category == Intent.CATEGORY_LAUNCHER || category == Intent.CATEGORY_LEANBACK_LAUNCHER) &&
+      intent.data == null && intent.type == null && intent.clipData == null &&
+      intent.selector == null && intent.extras?.isEmpty != false
+    ) {
+      return
+    }
+    super.onNewIntent(intent)
+  }
+
   override fun onDestroy() {
     webViewTarget?.removeOnLayoutChangeListener(foldLayoutListener)
     foldViewportScript?.remove()
