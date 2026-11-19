@@ -3427,10 +3427,11 @@ impl ProxyRuntime {
             self.selector_operation_is_current(pending.generation, pending.intent)
                 && self.saved_revision_matches(pending.saved_revision)
         };
-        let publication = if pending.published {
-            Some((false, None, None))
-        } else if !still_current() {
+        let was_current = still_current();
+        let publication = if !was_current {
             None
+        } else if pending.published {
+            Some((false, None, None))
         } else if !self.protected_runtime_publication_current(pending) {
             return self.committed_runtime_without_publication(
                 pending,
@@ -3441,9 +3442,9 @@ impl ProxyRuntime {
             self.publish_committed_runtime_candidate(pending, &operation)
                 .await
         };
-        // Check again after local publication contention. A newer owner must
-        // take the same stale-receipt path as one observed before the wait.
-        if !still_current() {
+        // A supersession while waiting can prevent publication. Once the
+        // claim committed R, finish its bookkeeping and any host execution.
+        if !was_current || (publication.is_none() && !still_current()) {
             // A terminal receipt must not publish over a newer owner. Preserve
             // nondurable generic debt; only verified regeneration supersession
             // permits a corrective latest-D transaction. Invalidate stale cheap
