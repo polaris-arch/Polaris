@@ -220,20 +220,6 @@ def zip_entries(archive):
     return infos
 
 
-def module_stream(raw):
-    decoder, position, rows = json.JSONDecoder(), 0, []
-    while position < len(raw):
-        while position < len(raw) and raw[position].isspace():
-            position += 1
-        if position == len(raw):
-            break
-        value, position = decoder.raw_decode(raw, position)
-        require(isinstance(value, dict) and isinstance(value.get('Path'), str), 'invalid actual module graph')
-        rows.append(value)
-    require(rows and len({r['Path'] for r in rows}) == len(rows), 'empty/duplicate module graph')
-    return rows
-
-
 def component_output_identity(output):
     """Compare content while retaining the original verifier stdout observation.
 

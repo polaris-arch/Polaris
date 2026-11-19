@@ -11,7 +11,7 @@ from unittest.mock import Mock, patch
 import zipfile
 
 from fork_input import ROOT, canonical, load, sha
-from artifacts import component_output_identity, module, module_stream, tree_inventory, zip_entries
+from artifacts import component_output_identity, module, tree_inventory, zip_entries
 from budget import capacity_limit, native_capacity, native_environment, reservation
 from ci_android import emit_outputs, prepare
 from producer import PRODUCER_FILES, compiler_fact, equivalent_binding, executable_driver_identity
@@ -343,12 +343,6 @@ class FormalOutputs(unittest.TestCase):
             facts['modules'][name] = {'kind': 'dep', 'version': pin['version'], 'sum': '',
                 'replacement': pin['replacementPath'], 'replacementVersion': '(devel)', 'replacementSum': ''}
         return facts
-
-    def test_module_stream_requires_unique_actual_rows(self):
-        self.assertEqual(module_stream('{"Path":"a"}\n {"Path":"b"}'), [{'Path': 'a'}, {'Path': 'b'}])
-        for bad in ['', '{"Path":"a"}{"Path":"a"}', '[]', '{"Version":"v1"}']:
-            with self.subTest(raw=bad), self.assertRaises(RuntimeError):
-                module_stream(bad)
 
     def test_framework_internal_links_and_empty_resources_are_preserved(self):
         with tempfile.TemporaryDirectory() as temporary:

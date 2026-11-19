@@ -19,15 +19,16 @@ import selectors
 import signal
 import stat
 import subprocess
+import tempfile
 import time
 
 import sys
 sys.dont_write_bytecode = True
 os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
 
-from fork_input import (ROOT, bind_command, canonical, declared_plan, git_environment, load,
+from fork_input import (ROOT, SOURCE_ADMISSION, bind_command, canonical, declared_plan, git_environment, load,
                         require, require_git_root, sha, tool_environment, verify_source)
-from artifacts import RECEIPT_POLICY, receipt_digest, file_pin, inspect_aar, inspect_framework, module_stream, tree_inventory, read_receipt, failure_note
+from artifacts import RECEIPT_POLICY, receipt_digest, file_pin, inspect_aar, inspect_framework, tree_inventory, read_receipt, failure_note
 from budget import group_alive, register_group, reservation, native_capacity, native_environment
 
 ACTIVE_FDS = []
@@ -751,6 +752,22 @@ def bounded_module_download(command, *, cwd, env, expected_count, observation):
     return rows
 
 
+def actual_module_list(source, go, env, scratch):
+    # Keep Go inside the original registered process group. Private files let
+    # Node validate the complete stdout without buffering a second copy in Python.
+    with tempfile.TemporaryDirectory(prefix='module-list-', dir=scratch) as folder:
+        log = Path(folder) / 'go-list.log'
+        run([go, 'list', '-m', '-json', 'all'], cwd=source, env=env, log=log, capture='none')
+        stdout = log.with_suffix('.log.stdout.raw')
+        with (Path(folder) / 'graph.json').open('xb+') as graph:
+            result = subprocess.run(['node', SOURCE_ADMISSION, '--module-list', stdout],
+                                    stdout=graph, stderr=subprocess.PIPE, timeout=30)
+            require(result.returncode == 0,
+                    result.stderr.decode(errors='replace').strip() or 'actual module graph rejected')
+            graph.seek(0)
+            return json.load(graph)
+
+
 def admit_module_cache(source, graph, go, env, work):
     """Make already source-summed module directories observable before freezing.
 
@@ -905,11 +922,11 @@ def admitted_binding(args, value, work, cache, producer_identity, initial_source
     # private GOPATH marker directory; create it without invoking init.
     private_dir(Path(env['GOPATH']) / 'pkg/gomobile')
     run([tools['go'], 'mod', 'verify'], cwd=source, env=env, log=work / 'original-module-verify.log', capture='none')
-    graph = module_stream(run([tools['go'], 'list', '-m', '-json', 'all'], cwd=source, env=env))
+    graph = actual_module_list(source, tools['go'], env, scratch)
     admit_module_cache(source, graph, tools['go'], env, work)
     require(verify_source(source, value, generator_outputs=True) == source_observation,
             'source changed during module cache admission')
-    graph = module_stream(run([tools['go'], 'list', '-m', '-json', 'all'], cwd=source, env=env))
+    graph = actual_module_list(source, tools['go'], env, scratch)
     run([tools['go'], 'mod', 'verify'], cwd=source, env=env, log=work / 'original-module-verify.log', capture='none')
     # Keep exact paths for native BuildInfo; portable source facts stay separate.
     binding = {'schema': 'polaris-mobile-producer-input-v1', 'platform': args.platform,

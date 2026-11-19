@@ -15,6 +15,28 @@ import { checkMobileBuildInfo, parseMobileBuildInfo, reviewedSource, validateMob
 const nativeId = 'polaris-mobile-' + 'a'.repeat(64);
 const requiredNative = ['github.com/metacubex/utls', 'github.com/sagernet/sing-tun'];
 
+test('mobile module list admits exact Go rows and rejects ambiguous or incomplete output', t => {
+  const folder = mkdtempSync(join(tmpdir(), 'mobile-module-list-'));
+  t.after(() => rmSync(folder, { recursive: true, force: true }));
+  const report = join(folder, 'go list.json');
+  const verifier = fileURLToPath(new URL('./mobile-core/source-admission.mjs', import.meta.url));
+  const read = raw => {
+    writeFileSync(report, raw);
+    return spawnSync(process.execPath, [verifier, '--module-list', report], { encoding: 'utf8', timeout: 30_000 });
+  };
+  const firstRow = '{"Path":"example.org/a","Replace":{"Dir":"a } directory"},"futureNumber":9007199254740993}';
+  const secondRow = '{"Path":"example.org/b","Indirect":true}';
+  const good = read('\n' + firstRow + secondRow + '\r\n');
+  assert.equal(good.status, 0, good.stderr);
+  assert.equal(good.stdout, '[' + firstRow + ',' + secondRow + ']\n');
+  for (const bad of ['', firstRow + firstRow, '[]', '{"Version":"v1"}', firstRow + '{"Path":',
+    firstRow + 'incomplete', '{"Path":"a","\\u0050ath":"b"}']) {
+    const rejected = read(bad);
+    assert.equal(rejected.status, 1, rejected.stderr);
+    assert.equal(rejected.stdout, '');
+  }
+});
+
 test('reviewed source observes every vendor object and enforces the independent Meta binding', { skip: process.platform === 'win32' }, async t => {
   const folder = realpathSync(mkdtempSync(join(tmpdir(), 'reviewed-mobile-source-')));
   try {

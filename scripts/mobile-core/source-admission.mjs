@@ -195,7 +195,7 @@ export const characters = value => value.length === 0 ? 0 : value.length - (valu
 
 // State is local to the original receipt. Object keys are compared after
 // unescaping, and numeric types survive parsing for CPython fingerprint parity.
-export function decode(raw, maximum, receiptLimit) {
+function decodeJSON(raw, maximum, receiptLimit, acceptDocument) {
   demand(raw.length <= maximum, receiptLimit ? 'original receipt exceeds its byte budget' : 'mobile input contract is too large');
   if (receiptLimit) lexicalBudget(raw);
   const source = text(raw), whitespace = /[ \t\r\n]*/y;
@@ -258,11 +258,38 @@ export function decode(raw, maximum, receiptLimit) {
     const small = Number(integer);
     return Number.isSafeInteger(small) ? small : integer;
   }
+  if (acceptDocument) {
+    skip();
+    while (at < source.length) {
+      const start = at;
+      const document = value(0);
+      acceptDocument(document, source.slice(start, at));
+      skip();
+    }
+    return;
+  }
   const result = value(0);
   skip();
   if (at !== source.length) return fails();
   if (receiptLimit) demand(raw.length <= receiptLimit(result) && stringChars <= receiptLimit(result), 'original receipt exceeds its schema budget');
   return result;
+}
+
+export function decode(raw, maximum, receiptLimit) {
+  return decodeJSON(raw, maximum, receiptLimit);
+}
+
+function moduleList(raw) {
+  const paths = new Set(), rows = [];
+  decodeJSON(raw, limits.controlBytes, undefined, (row, document) => {
+    demand(object(row) && typeof row.Path === 'string', 'invalid actual module graph');
+    demand(!paths.has(row.Path), 'empty/duplicate module graph');
+    paths.add(row.Path);
+    rows.push(document);
+  });
+  demand(rows.length > 0, 'empty/duplicate module graph');
+  // Preserve original nested values and numeric spellings in the producer's receipt.
+  return '[' + rows.join(',') + ']';
 }
 
 function readPinnedBytes(path, maximum, observation, { allowEmpty = false, executable } = {}) {
@@ -785,6 +812,8 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
       console.log(JSON.stringify(sourceCheckout(args[1], readBoundedInput(sourceContractBytes), false, args.length === 3)));
     } else if (args.length === 3 && args[0] === '--prepare-checkout') {
       console.log(JSON.stringify(sourceCheckout(args[1], pinned(args[2], sourceContractBytes).bytes, true)));
+    } else if (args.length === 2 && args[0] === '--module-list') {
+      console.log(moduleList(readPinnedBytes(args[1], limits.controlBytes, false, { allowEmpty: true })));
     } else if (args.length === 4 && args[0] === '--native-buildinfo') {
       const [, path, size, digest] = args;
       const { bytes, pin } = pinned(path, limits.controlBytes);
@@ -793,7 +822,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
       console.log(JSON.stringify(nativeBuildInfoReport(evidence)));
     } else {
       // The producer sends its full declaration once and reuses these plans.
-      demand(args.length === 0, 'usage: source-admission.mjs [--versions | --verify-checkout ROOT [--generator-outputs] | --prepare-checkout ROOT DECLARATION | --native-buildinfo PATH BYTES SHA256]');
+      demand(args.length === 0, 'usage: source-admission.mjs [--versions | --verify-checkout ROOT [--generator-outputs] | --prepare-checkout ROOT DECLARATION | --module-list PATH | --native-buildinfo PATH BYTES SHA256]');
       console.log(JSON.stringify(bindingPlans(validateSourceBytes(readBoundedInput(sourceContractBytes)))));
     }
   } catch (error) {
