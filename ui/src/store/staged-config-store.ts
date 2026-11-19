@@ -36,7 +36,7 @@
 
 import { create } from 'zustand';
 
-import type { UserConfig } from '@/contracts/types';
+import type { SaveOutcome, UserConfig } from '@/contracts/types';
 import { api } from '@/ipc';
 import { withConfigWriteLock } from '@/lib/config-write-lock';
 import {
@@ -225,6 +225,8 @@ export interface StagedConfigState {
 
   /** 暂存一条编辑意图。同 id 覆盖。 */
   stage: (entry: StagedEntry) => void;
+  /** Submit one edit, with any related entries, for native hot admission. */
+  submit: (first: StagedEntry, ...related: StagedEntry[]) => Promise<'automatic' | 'manual' | 'ignored'>;
   /** 撤销单条（明细 popover 的红叉）。 */
   revert: (id: string) => void;
   /** 「重置」：丢弃全部草稿，从最近一次读到的已保存配置开始下一批。 */
@@ -285,6 +287,48 @@ export const useStagedConfigStore = create<StagedConfigState>((set, get) => ({
     // 不能被一份旧裁决整批重基到 conflictBaseline，否则会覆盖用户当时没被问过的磁盘改动。
     set({ entries: next, conflict: null, conflictBaseline: null });
     persist(baseline, next);
+  },
+
+  submit: (first, ...related) => {
+    const entries = [first, ...related];
+    const { enabled, latestSavedConfig: authoredAgainst } = get();
+    if (!enabled || !entries.every(isValidStagedEntry)) return Promise.resolve('ignored');
+    return withConfigWriteLock(async () => {
+      const useManualDraft = (failed = false): 'manual' | 'ignored' => {
+        const current = get();
+        if (!current.enabled) return 'ignored';
+        const baseline = current.entries.length > 0
+          ? current.baseline
+          : authoredAgainst ?? current.latestSavedConfig;
+        const next = entries.reduce(stageEntry, current.entries);
+        set({
+          entries: next,
+          baseline,
+          conflict: null,
+          conflictBaseline: null,
+          ...(failed ? { saveStatus: 'saveFailed' } : {}),
+        });
+        persist(baseline, next);
+        return 'manual';
+      };
+      if (!get().enabled) return 'ignored';
+      if (!authoredAgainst) return useManualDraft();
+      try {
+        const disk = await api.config.get();
+        if (!get().enabled) return 'ignored';
+        if (dependsOnDraft(disk, get().entries, entries)) return useManualDraft();
+        const merged = replay(disk, entries);
+        if (changedOnDisk(authoredAgainst, disk, merged, entries).length > 0) return useManualDraft();
+        const observedAtDispatch = get().latestSavedConfig;
+        const outcome = await api.config.save(merged, true, configBaseVersion(disk), true, true);
+        if (outcome.status !== 'saved') return useManualDraft();
+        completeSave(set, get, disk, merged, entries, observedAtDispatch, outcome, false);
+        return 'automatic';
+      } catch (error) {
+        console.error('[staged-config] automatic edit failed:', error);
+        return useManualDraft(true);
+      }
+    });
   },
 
   revert: (id) => {
@@ -489,9 +533,7 @@ async function performSaveLocked(
 
   // ② 冲突集：只在磁盘确实变过时才算（没变 ⇒ 恒空，省一趟 O(条目数) 的子树序列化）。
   if (diskVersion !== configBaseVersion(baseline)) {
-    const clashes = conflictingEntries(baseline, disk, entries).filter(({ entityPath }) =>
-      entitySnapshot(disk, entityPath) !== entitySnapshot(merged, entityPath)
-    );
+    const clashes = changedOnDisk(baseline, disk, merged, entries);
     if (clashes.length > 0) {
       // ④ 有冲突 ⇒ 弹窗，交给用户逐条选。`saveStatus` 退回 idle：条被弹窗盖住，不该同时转圈。
       set({
@@ -532,12 +574,49 @@ async function performSaveLocked(
     finishFailedSave();
     return false;
   }
-  if (outcome.status === 'conflict') {
+  if (outcome.status !== 'saved') {
     // 后端判冲突 = 上面那两句之间盘又被改了。**不自动重试**：重试一次就得防重试两次，
     // 而「点[重试保存]」本身就会把整条腿（含冲突检出）从头跑一遍，那是更诚实也更可控的出口。
     finishFailedSave();
     return false;
   }
+  completeSave(set, get, disk, merged, entries, observedAtDispatch, outcome, true);
+  return true;
+}
+
+function changedOnDisk(
+  baseline: UserConfig, disk: UserConfig, merged: UserConfig, entries: StagedEntry[]
+): StagedEntry[] {
+  return conflictingEntries(baseline, disk, entries).filter(({ entityPath }) =>
+    entitySnapshot(disk, entityPath) !== entitySnapshot(merged, entityPath));
+}
+
+function dependsOnDraft(disk: UserConfig, drafts: StagedEntry[], entries: StagedEntry[]): boolean {
+  return drafts.some(({ entityPath }) => {
+    const [field, id] = entityPath;
+    const newEntity = id !== undefined && isAbsentSnapshot(entitySnapshot(disk, entityPath));
+    return entries.some(({ entityPath: submitted, nextValue, selectedServerFallback }) =>
+      (submitted[0] === field && (id === undefined || submitted[1] === undefined || submitted[1] === id))
+      || (newEntity && (selectedServerFallback === id || refersTo(nextValue, id))));
+  });
+}
+
+function refersTo(value: unknown, id: string): boolean {
+  if (value === id) return true;
+  if (value === null || typeof value !== 'object') return false;
+  return Object.values(value).some((part) => refersTo(part, id));
+}
+
+function completeSave(
+  set: SetState,
+  get: GetState,
+  disk: UserConfig,
+  merged: UserConfig,
+  entries: StagedEntry[],
+  observedAtDispatch: UserConfig | null,
+  outcome: Extract<SaveOutcome, { status: 'saved' }>,
+  manualSave: boolean
+): void {
   // 成功 ⇒ 本次捕获且期间未变化的意图已经**是**磁盘现值，留着只会让计数虚高。
   // 保存 IPC 在途期间仍可继续编辑；新 id 或同 id 新版本不属于本次提交，绝不能被旧回包清掉。
   const current = get();
@@ -548,7 +627,7 @@ async function performSaveLocked(
     ? entries.filter((entry) => current.entries.includes(entry)
       || entitySnapshot(latestSaved, entry.entityPath) === entitySnapshot(outcome.config, entry.entityPath))
     : entries;
-  const remaining = remainingEntriesAfterCommit(committedEntries, current.entries);
+  const remaining = manualSave ? remainingEntriesAfterCommit(committedEntries, current.entries) : current.entries;
   // New/revised intents have not approved changes found on disk by this save.
   // Keep their original comparison base; the next save rechecks them conservatively.
   const remainingBaseline = remaining.length > 0 ? current.baseline : latestSaved;
@@ -568,17 +647,14 @@ async function performSaveLocked(
   };
   set({
     entries: remaining,
-    saveStatus: 'idle',
+    ...(manualSave ? { saveStatus: 'idle', conflict: null, conflictBaseline: null } : {}),
     completedSaveRevision: saveRevision,
     ...(savedRuntimeApply === undefined ? {} : { savedRuntimeApply }),
-    conflict: null,
-    conflictBaseline: null,
     baseVersion: observedDuringSave ? current.baseVersion : outcome.version,
     latestSavedConfig: latestSaved,
     baseline: remainingBaseline,
   });
-  persist(remainingBaseline, remaining);
-  return true;
+  if (manualSave) persist(remainingBaseline, remaining);
 }
 
 /**

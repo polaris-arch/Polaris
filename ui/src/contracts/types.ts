@@ -601,6 +601,7 @@ export interface StagedClassification {
  */
 export type SaveOutcome =
   | { status: 'saved'; version: string; config: UserConfig; runtimeApply?: PendingApplyResult }
+  | { status: 'needsManual' }
   | { status: 'conflict'; diskVersion: string };
 
 export interface UserConfig {

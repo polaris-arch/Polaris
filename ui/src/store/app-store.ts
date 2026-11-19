@@ -40,6 +40,7 @@ import { retainItemsById, retainRecordKeys } from './retain-entities';
 
 // 兼容旧的类型别名（Polaris 习惯）
 type ProxyMode = UserConfig['proxyMode'];
+const ROUTING_LABEL = { smart: 'tray.modeSmart', global: 'tray.modeGlobal', direct: 'tray.modeDirect' } as const;
 
 /**
  * 解锁检测显示态：提到 store 使其跨首页组件卸载存活（切导航离开 → 卸载但检测态留存，切回直接展示不重跑）。
@@ -419,7 +420,7 @@ export interface AppState {
   saveConfig: (patch: Partial<UserConfig>) => Promise<void>;
   /** 在后端锁内最新集合上按实体主键提交；多条 mutation 同盘提交，避免数组快照覆盖与半成功。 */
   mutateConfigEntities: (mutations: readonly ConfigEntityMutation[]) => Promise<void>;
-  updateProxyMode: (mode: ProxyMode) => Promise<void>;
+  updateProxyMode: (mode: ProxyMode, label?: string) => Promise<'automatic' | 'manual' | 'ignored' | 'saved'>;
   startProxy: () => Promise<void>;
   stopProxy: () => Promise<void>;
   switchServer: (serverId: string) => Promise<ServerSwitchReceipt | null>;
@@ -551,9 +552,22 @@ export const useAppStore = create<AppState>((set, get) => ({
     await reconcileConfigMutation().settled.catch(() => {});
   },
 
-  updateProxyMode: async (mode) => {
-    if (!get().config) return;
-    await get().saveConfig({ proxyMode: mode });
+  updateProxyMode: async (mode, label = i18n.t(ROUTING_LABEL[mode])) => {
+    if (!get().config) return 'ignored';
+    const staged = useStagedConfigStore.getState();
+    if (!staged.enabled) {
+      await get().saveConfig({ proxyMode: mode });
+      return 'saved';
+    }
+    const result = await staged.submit({
+      id: 'setting:proxyMode',
+      kind: 'setting',
+      label,
+      entityPath: ['proxyMode'],
+      nextValue: mode,
+    });
+    if (result === 'automatic') void reconcileConfigMutation().settled.catch(() => {});
+    return result;
   },
 
   startProxy: async () => {

@@ -12,7 +12,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 // IPC mock：`get` / `save` / `applyNow` 是本 store 仅有的三处外部副作用，全部经这三颗桩观测。
 // `get` 是 P5 加的：Q8-b 的第一步就是「拉磁盘现值」，保存不再拿调用方给的 config 当磁盘。
 const saveMock = vi.fn(
-  async (config: unknown, _deferRestart?: boolean, _baseVersion?: string, _autoApply?: boolean): Promise<SaveOutcome> => ({
+  async (config: unknown, _deferRestart?: boolean, _baseVersion?: string, _autoApply?: boolean, ..._hotOnly: [boolean?]): Promise<SaveOutcome> => ({
     status: 'saved',
     version: 'v-after-save',
     config: config as UserConfig,
@@ -29,7 +29,7 @@ vi.mock('@/ipc', () => ({
   api: {
     config: {
       get: () => getMock(),
-      save: (c: unknown, d?: boolean, b?: string, a?: boolean) => saveMock(c, d, b, a),
+      save: (c: unknown, d?: boolean, b?: string, a?: boolean, ...hotOnly: [boolean?]) => saveMock(c, d, b, a, ...hotOnly),
       setStagedPending: (pending: boolean) => stagedPendingMock(pending),
     },
     proxy: {
@@ -410,6 +410,91 @@ function seedStaged(port = 8443): void {
   useStagedConfigStore.getState().hydrate(CONFIG);
   useStagedConfigStore.getState().stage(entry('n1', port));
 }
+
+describe('edit admission before creating a manual draft', () => {
+  it('submits one logical edit together without saving or draft states before a confirmed receipt', async () => {
+    const store = useStagedConfigStore;
+    await hydrateStagedConfig(CONFIG);
+    await flushStagedPendingSync();
+    stagedPendingMock.mockClear();
+    let finish!: (reply: SaveOutcome) => void;
+    saveMock.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    const changes = [entry('n1', 8443), entry('n2', 9443)] as const;
+    const published: string[] = [];
+    const unsubscribe = store.subscribe((state) => published.push(`${state.saveStatus}/${state.entries.length}`));
+    try {
+      const action = store.getState().submit(...changes);
+      await vi.waitFor(() => expect(saveMock).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({ servers: [changes[0].nextValue, changes[1].nextValue] }),
+        true, configBaseVersion(CONFIG), true, true
+      ));
+      expect(fake.getItem(STAGED_STORAGE_KEY)).toBeNull();
+      expect(stagedPendingMock).not.toHaveBeenCalled();
+      const candidate = saveMock.mock.calls[0][0] as UserConfig;
+      finish({ status: 'saved', version: configBaseVersion(candidate), config: candidate,
+        runtimeApply: { ok: true, status: 'hotApplied', runtimeGeneration: 3,
+          configurationDurable: true, coreState: 'committed' } });
+      expect(await action).toBe('automatic');
+      expect(published).toEqual(['idle/0']);
+      expect(store.getState().savedRuntimeApply?.changes?.map(({ label }) => label))
+        .toEqual(changes.map(({ label }) => label));
+      expect(applyMock).not.toHaveBeenCalled();
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  it.each(['needsManual', 'conflict'] as const)('keeps a cancellable draft after native returns %s', async (status) => {
+    const store = useStagedConfigStore;
+    await hydrateStagedConfig(CONFIG);
+    saveMock.mockResolvedValueOnce(status === 'needsManual' ? { status }
+      : { status, diskVersion: 'newer' });
+    const change = entry('n1', 8443);
+    expect(await store.getState().submit(change)).toBe('manual');
+    expect(store.getState()).toMatchObject({ entries: [change], baseline: CONFIG, saveStatus: 'idle' });
+    expect(fake.getItem(STAGED_STORAGE_KEY)).not.toBeNull();
+    expect(applyMock).not.toHaveBeenCalled();
+    store.getState().reset();
+    expect(store.getState().entries).toEqual([]);
+  });
+
+  it('keeps earlier manual drafts outside an independent native candidate', async () => {
+    const store = useStagedConfigStore;
+    await hydrateStagedConfig(CONFIG);
+    const manual = { ...entry('n2'), groupId: 'prior' };
+    store.getState().stage(manual);
+    const next = entry('n1', 8443);
+    expect(await store.getState().submit(next)).toBe('automatic');
+    expect(store.getState()).toMatchObject({ entries: [manual], baseline: CONFIG });
+    expect(saveMock.mock.calls[0][0]).toMatchObject({ servers: [next.nextValue] });
+  });
+
+  it('keeps a rule referring to a node that has not been saved in the same workflow', async () => {
+    const store = useStagedConfigStore;
+    await hydrateStagedConfig(CONFIG);
+    const node = entry('n2');
+    store.getState().stage(node);
+    const rule = { id: 'rule:1', kind: 'rule', label: 'new rule', entityPath: ['trafficRules', '1'],
+      nextValue: { id: '1', outboundServerId: 'n2' } } as const;
+    expect(await store.getState().submit(rule)).toBe('manual');
+    expect(store.getState().entries).toEqual([node, rule]);
+    expect(saveMock).not.toHaveBeenCalled();
+  });
+
+  it('keeps edits authored before an unrelated writer changed the same entity', async () => {
+    const store = useStagedConfigStore;
+    await hydrateStagedConfig(CONFIG);
+    getMock.mockResolvedValueOnce({ ...CONFIG, servers: [{ ...CONFIG.servers[0], port: 10443 }] });
+    const change = entry('n1', 8443);
+    expect(await store.getState().submit(change)).toBe('manual');
+    expect(store.getState()).toMatchObject({ entries: [change], baseline: CONFIG });
+    expect(saveMock).not.toHaveBeenCalled();
+    const disk = { ...CONFIG, servers: [{ ...CONFIG.servers[0], port: 10443 }] };
+    getMock.mockResolvedValueOnce(disk);
+    expect(await store.getState().save()).toBe(false);
+    expect(store.getState().conflict?.map(({ entryId }) => entryId)).toEqual([change.id]);
+  });
+});
 
 describe('save —— 落盘但不排重启（FR-5）', () => {
   /**

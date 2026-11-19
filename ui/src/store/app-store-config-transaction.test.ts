@@ -14,7 +14,9 @@ const saveMock = vi.fn(
   async (
     config: UserConfig,
     _deferRestart: boolean,
-    _baseVersion: string
+    _baseVersion: string,
+    _autoApply?: boolean,
+    _hotOnly?: boolean
   ): Promise<SaveOutcome> => ({ status: 'saved', version: 'saved-version', config })
 );
 const patchMock = vi.fn(async (patch: Partial<UserConfig>) => ({ ...CONFIG, ...patch }));
@@ -34,8 +36,9 @@ vi.mock('@/ipc', () => ({
         configSignals.add(listener);
         return () => { configSignals.delete(listener); };
       },
-      save: (config: UserConfig, deferRestart: boolean, baseVersion: string) =>
-        saveMock(config, deferRestart, baseVersion),
+      save: (config: UserConfig, deferRestart: boolean, baseVersion: string, autoApply?: boolean, hotOnly?: boolean) =>
+        hotOnly === undefined ? saveMock(config, deferRestart, baseVersion)
+          : saveMock(config, deferRestart, baseVersion, autoApply, hotOnly),
       patch: (patch: Partial<UserConfig>) => patchMock(patch),
       setStagedPending: (pending: boolean) => pendingMarkerMock(pending),
     },
@@ -71,6 +74,7 @@ function seed(entries: StagedEntry[]): void {
     entries,
     baseVersion: configBaseVersion(CONFIG),
     baseline: CONFIG,
+    latestSavedConfig: CONFIG,
     hydrated: true,
     saveStatus: 'idle',
     conflict: null,
@@ -301,7 +305,8 @@ describe('配置保存与下一次启动的事务边界', () => {
     expect(useAppStore.getState().config?.subscriptions?.[0]?.etag).toBe('concurrent-newer');
   });
 
-  it('queues a return to Smart behind a pending Global write and preserves its error', async () => {
+  it('preserves ordered direct mode writes when staged configuration is disabled', async () => {
+    useStagedConfigStore.setState({ enabled: false });
     getMock.mockResolvedValue(CONFIG);
     let rejectGlobal!: (error: unknown) => void;
     patchMock.mockImplementationOnce(() => new Promise((_resolve, reject) => { rejectGlobal = reject; }));
@@ -316,6 +321,20 @@ describe('配置保存与下一次启动的事务边界', () => {
     await smart;
     expect(patchMock.mock.calls).toEqual([[{ proxyMode: 'global' }], [{ proxyMode: 'smart' }]]);
     expect(useAppStore.getState().config?.proxyMode).toBe('smart');
+  });
+
+  it('creates a cancellable routing draft when the active Core cannot apply the mode hot', async () => {
+    getMock.mockResolvedValue(CONFIG);
+    saveMock.mockResolvedValueOnce({ status: 'needsManual' });
+    expect(await useAppStore.getState().updateProxyMode('direct', 'Direct routing')).toBe('manual');
+    expect(saveMock).toHaveBeenCalledExactlyOnceWith(
+      { ...CONFIG, proxyMode: 'direct' }, true, configBaseVersion(CONFIG), true, true
+    );
+    expect(patchMock).not.toHaveBeenCalled();
+    expect(useAppStore.getState().config?.proxyMode).toBe('smart');
+    expect(useStagedConfigStore.getState().entries).toMatchObject([
+      { label: 'Direct routing', entityPath: ['proxyMode'], nextValue: 'direct' },
+    ]);
   });
 
   it('节点切换采用后端事务后的整份配置，不用旧前端快照乐观覆盖', async () => {

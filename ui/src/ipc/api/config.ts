@@ -62,16 +62,18 @@ export const configApi = {
 
   /**
    * 暂存事务的版本化整份保存。生产调用必须同时传 `baseVersion`；即时控件使用 `patch()`。
-   * 普通保存允许后端应用本次获证的安全热更新，显式 Apply 前的保存只落盘。
+   * hotOnly submits an edit before it becomes a draft. Native returns needsManual if
+   * the candidate requires the explicit save/apply workflow.
    */
   async save(
     config: UserConfig,
     deferRestart: boolean,
     baseVersion: string,
-    autoApply?: boolean
+    autoApply?: boolean,
+    hotOnly?: boolean
   ): Promise<SaveOutcome> {
     // 参数袋必须是对象字面量：check-ipc-args.mjs 静态核对 required 参数键。
-    return invoke(IPC_CHANNELS.CONFIG_SAVE, { config, deferRestart, baseVersion, autoApply });
+    return invoke(IPC_CHANNELS.CONFIG_SAVE, { config, deferRestart, baseVersion, autoApply, hotOnly });
   },
 
   /** 即时控件的原子顶层补丁；返回后端落盘并重新投影后的完整配置。 */
