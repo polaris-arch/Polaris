@@ -148,6 +148,9 @@ export function MobileNodesScreen(): ReactElement {
   const proxyStatus = useAppStore(s => s.proxyStatus);
   const actualId = configuredExitId(proxyStatus, savedConfig);
   const proxyRunning = useAppStore((s) => !!s.proxyStatus?.running);
+  const connectBusy = useAppStore((s) =>
+    s.proxyStatus?.starting === true || s.proxyStarting ? 'starting' : s.proxyStopping ? 'stopping' : undefined,
+  );
   const startProxy = useAppStore((s) => s.startProxy);
   const invalidNodes = useAppStore((s) => s.invalidNodes);
   const latencyMap = useQualifiedLatencies(servers);
@@ -738,7 +741,7 @@ export function MobileNodesScreen(): ReactElement {
    * （`HELPER_NOT_INSTALLED` / `HELPER_GATE_ABORTED`）会被事件腿再报一遍（后端是双出口，
    * 理由逐字见 `home/MobileHomeScreen.tsx` 的 `onToggleConnect`）。
    *
-   * **进行态回显**：动作面选中即关闭，本屏没有首页那颗按钮的 `connectBusy` 内联忙态 ⇒
+   * **进行态回显**：动作面选中即关闭，关闭后节点列表上没有那颗连接按钮 ⇒
    * 起核那几秒屏上什么都不动的话，用户会以为没点着。故这里落一条 `notice`，用的是已存在的
    * 五语种键 `home.statusStarting`（「启动中」），不新造键。起核完成后 `proxyRunning` 翻转，
    * 这颗动作从面板里消失、测速那条的置灰理由随之解除 —— 那是最终状态的回显。
@@ -757,6 +760,7 @@ export function MobileNodesScreen(): ReactElement {
         t,
         row,
         coreRunning: proxyRunning,
+        connectBusy,
         tsLoginState: tsState.id === row.server.id ? tsState.exists : null,
         disposition: (id) => ROW_ACTIONS.find((a) => a.id === id)?.disposition,
         handlers: {
@@ -771,7 +775,7 @@ export function MobileNodesScreen(): ReactElement {
           onDelete: () => deleteNode(row.server),
         },
       }),
-    [t, proxyRunning, tsState, runSpeedTest, copyLink, connectFromRow, cloneNode, deleteNode],
+    [t, proxyRunning, connectBusy, tsState, runSpeedTest, copyLink, connectFromRow, cloneNode, deleteNode],
   );
 
   return (

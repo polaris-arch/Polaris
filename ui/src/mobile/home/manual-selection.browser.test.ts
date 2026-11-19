@@ -33,7 +33,7 @@ let disk={selectedServerId:selected,proxyMode:'smart',servers,subscriptions:[]};
 if(intent!=='manual') disk.selectionIntent=intent==='null'?null:intent==='false'?false:intent==='empty'?'':intent==='unknown'?{mode:'future',scope:'unknown'}:{mode:'auto',scope:'subscription',subscriptionId:'sub-a'};
 let commandGate,readGate,proxyActionGate;
 let proxyRunning=false;
-const fixture=window.__manual={trace:[],messages:[],armed:false,failCommand:false,failRead:false,holdCommand:false,holdRead:false,
+const fixture=window.__manual={trace:[],messages:[],proxyActions:[],armed:false,failCommand:false,failRead:false,holdCommand:false,holdRead:false,
  state:()=>({config:useAppStore.getState().config,selected:useAppStore.getState().selectedServerId}),
  effective:()=>getEffectiveConfig(),disk:()=>disk,releaseCommand:()=>commandGate?.(),releaseRead:()=>readGate?.(),
  releaseProxyAction:error=>proxyActionGate(error),
@@ -62,6 +62,7 @@ api.config.meshRouteReport=async()=>null;
 api.stats.onStatsUpdated=()=>()=>{};api.stats.onConnectionsDetail=()=>()=>{};
 api.stats.subscribe=async()=>{};api.stats.unsubscribe=async()=>{};
 const runProxyAction=async(action)=>{
+ fixture.proxyActions.push(action);
  try {
   await new Promise((resolve,reject)=>{
    proxyActionGate=error=>error ? reject(new Error(error)) : resolve();
@@ -136,11 +137,12 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile explicit manua
   }, 30_000);
   afterAll(async () => { await browser?.close(); await server?.close(); });
 
-  it('keeps Home busy through a remount while a proxy action awaits the bridge', async () => {
+  it('keeps proxy actions busy across tabs while a start or stop awaits the bridge', async () => {
     const page = await browser.newPage({ viewport: { width: 390, height: 844 } });
     try {
       await page.goto(`${origin}/__manual?screen=home&intent=manual`);
       const connect = page.locator('[data-write-control="connect"]');
+      const nodeConnect = page.getByRole('dialog').getByRole('button', { name: '连接', exact: true });
       const stopFailure = 'fixture stop not confirmed';
       for (const { action, busy, settled, error } of [
         { action: 'start', busy: 'starting', settled: 'running' },
@@ -153,6 +155,13 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile explicit manua
 
         await page.evaluate(() => (window as any).__manual.showScreen('nodes'));
         await connect.waitFor({ state: 'detached' });
+        await page.locator('.mn-row-more').first().click();
+        if (action === 'start') {
+          expect(await nodeConnect.isDisabled()).toBe(true);
+          await nodeConnect.evaluate((button: HTMLButtonElement) => button.click());
+        } else {
+          expect(await nodeConnect.count()).toBe(0);
+        }
         await page.evaluate(() => (window as any).__manual.showScreen('home'));
         await connect.waitFor();
         expect(await page.locator(`.h-runchip.s-${busy}`).count()).toBe(1);
@@ -162,6 +171,11 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile explicit manua
         await page.locator(`.h-runchip.s-${settled}`).waitFor();
         expect(await connect.isEnabled()).toBe(true);
       }
+      await page.evaluate(() => (window as any).__manual.showScreen('nodes'));
+      await page.locator('.mn-row-more').first().click();
+      expect(await nodeConnect.isEnabled()).toBe(true);
+      const actions = await page.evaluate(() => (window as any).__manual.proxyActions);
+      expect(actions).toEqual(['start', 'stop', 'stop']);
       const messages = await page.evaluate(() => (window as any).__manual.messages);
       expect(messages).toEqual([['error', expect.stringContaining(stopFailure)]]);
     } finally { await page.close(); }

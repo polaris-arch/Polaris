@@ -356,6 +356,7 @@ export interface RowItemsArgs {
   readonly row: NodeRowVM;
   /** 主核在跑没有（§4.10 的能力位）。 */
   readonly coreRunning: boolean;
+  readonly connectBusy?: 'starting' | 'stopping';
   /** Native state directory evidence for this Tailscale node; null means unverified. */
   readonly tsLoginState: boolean | null;
   /* 🔴 **`editable` 2026-09-06（批 3）摘除。** 它此前表达的是「这一行是 wireguard / tailscale
@@ -373,7 +374,7 @@ export interface RowItemsArgs {
  * 「连接」紧挨着「测速为什么是灰的」那句话 —— 理由与补救相邻，用户不必去别的屏找（§4.10）。
  */
 export function buildRowItems(args: RowItemsArgs): SheetItem[] {
-  const { t, row, coreRunning, tsLoginState, disposition, handlers } = args;
+  const { t, row, coreRunning, connectBusy, tsLoginState, disposition, handlers } = args;
   const items: SheetItem[] = [
     {
       id: 'speed-test',
@@ -385,7 +386,14 @@ export function buildRowItems(args: RowItemsArgs): SheetItem[] {
     /* 核在跑时「连接」不出现 —— 一颗「连接」摆在已连接的屏上是噪音，而断开归首页那颗危险动作管。 */
     ...(coreRunning
       ? []
-      : [{ id: 'connect', label: t('mobileHome.connect'), onSelect: handlers.onConnect }]),
+      : [{
+          id: 'connect',
+          label: t('mobileHome.connect'),
+          disabledReason: connectBusy === undefined
+            ? undefined
+            : t(connectBusy === 'starting' ? 'home.statusStarting' : 'home.statusStopping'),
+          onSelect: handlers.onConnect,
+        }]),
     { id: 'copy-link', label: t('nodes.copyLink'), onSelect: handlers.onCopyLink },
   ];
   if (row.server.protocol.toLowerCase() === 'tailscale') {
