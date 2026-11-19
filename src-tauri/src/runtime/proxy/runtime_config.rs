@@ -358,6 +358,8 @@ pub(crate) struct RuntimeApplyResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub configuration_durable: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub persistence_retryable: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub persistence_transaction_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retirement_state: Option<String>,
@@ -386,6 +388,7 @@ impl RuntimeApplyResult {
             host_effects: vec![],
             core_state: None,
             configuration_durable: None,
+            persistence_retryable: None,
             persistence_transaction_id: None,
             retirement_state: None,
             native_retirements: vec![],
@@ -425,12 +428,21 @@ struct RestartChoice {
     intent: u64,
     running: Value,
 }
+
+#[derive(Clone, Copy)]
+pub(crate) struct StagedSaveOwner {
+    pub(crate) generation: u64,
+    pub(crate) intent: u64,
+    pub(crate) revision: u64,
+}
+
 #[derive(Clone)]
 struct PendingOperation {
     host_plan: Option<host_effects::HostEffectPlan>,
     api_handoff: Option<Arc<ApiChannelHandoff>>,
     pairing: RuntimePairing,
     desired: Value,
+    saved_revision: Option<u64>,
     deletion_scope: Vec<crate::runtime::config::DeferredConfigDeletion>,
     physical_route_config: UserConfig,
     protected_physical_root: Option<Arc<ProtectedPhysicalRoot>>,
@@ -449,6 +461,17 @@ struct PendingOperation {
     tailnet_suspended_token: Option<u64>,
     tailnet_bindings: BTreeMap<String, super::tailnet_rules::TailnetRouteBinding>,
 }
+
+impl PendingOperation {
+    fn staged_save_owner(&self) -> Option<StagedSaveOwner> {
+        Some(StagedSaveOwner {
+            generation: self.generation,
+            intent: self.intent,
+            revision: self.saved_revision?,
+        })
+    }
+}
+
 #[derive(Default)]
 pub(super) struct RuntimeConfigApplyState {
     kernel: Option<RuntimeKernelReceipt>,
@@ -464,8 +487,15 @@ pub(super) struct RuntimeConfigApplyState {
 struct RuntimeKernelReceipt {
     generation: u64,
     intent: u64,
-    superseded: bool,
+    publication: RuntimeReceiptPublication,
     operation: daemon::RuntimeConfigOperation,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RuntimeReceiptPublication {
+    Current,
+    RegenerationSuperseded,
+    StagedSaveSuperseded,
 }
 
 // This observer owns only the original post-K native retirement. It never owns
@@ -500,13 +530,14 @@ impl RuntimeKernelReceipt {
     fn result(&self) -> RuntimeApplyResult {
         let durable = self.operation.durable
             && self.operation.state == daemon::RuntimeOperationState::Committed as i32;
-        let mut result = RuntimeApplyResult::status(if self.superseded {
-            "conflict"
-        } else if durable {
-            "hotApplied"
-        } else {
-            "hotDurabilityPending"
-        });
+        let mut result =
+            RuntimeApplyResult::status(if self.publication != RuntimeReceiptPublication::Current {
+                "conflict"
+            } else if durable {
+                "hotApplied"
+            } else {
+                "hotDurabilityPending"
+            });
         result.transaction_id = Some(self.operation.transaction_id.clone());
         result.runtime_generation = Some(self.generation);
         result.selection_intent_generation = Some(self.intent);
@@ -514,7 +545,7 @@ impl RuntimeKernelReceipt {
         result.configuration_durable = Some(durable);
         result.persistence_mode = Some(self.operation.persistence_mode.clone());
         result.retirement_state = Some(self.operation.retirement_state.clone());
-        if self.superseded {
+        if self.publication == RuntimeReceiptPublication::RegenerationSuperseded {
             result.reasons.push(RuntimeApplyReason {
                 code: "OWNER_STATE_SUPERSEDED",
                 path: "desired".into(),
@@ -625,7 +656,7 @@ impl RuntimeConfigApplyState {
                 receipt: RuntimeKernelReceipt {
                     generation: pending.generation,
                     intent: pending.intent,
-                    superseded: false,
+                    publication: RuntimeReceiptPublication::Current,
                     operation: operation.clone(),
                 },
             },
@@ -689,7 +720,7 @@ impl RuntimeConfigApplyState {
         }) {
             // Keep local supersession separate from the original physical fact.
             kernel.operation = operation.clone();
-            updated.superseded = kernel.superseded;
+            updated.publication = kernel.publication;
         }
         if let Some(registered) = self
             .native_retirements
@@ -725,7 +756,7 @@ impl RuntimeConfigApplyState {
     ) -> bool {
         plan.no_op
             && self.kernel.as_ref().is_some_and(|kernel| {
-                kernel.superseded
+                kernel.publication == RuntimeReceiptPublication::RegenerationSuperseded
                     && kernel.generation == generation
                     && identity_equal(kernel.operation.active.as_ref(), plan.expected.as_ref())
             })
@@ -746,7 +777,7 @@ impl RuntimeConfigApplyState {
                     && !plan.effects.is_empty()
             })
             && self.kernel.as_ref().is_some_and(|kernel| {
-                !kernel.superseded
+                kernel.publication == RuntimeReceiptPublication::Current
                     && kernel.generation == next.generation
                     && kernel.intent == previous.intent
                     && kernel.operation.transaction_id == previous.plan.transaction_id
@@ -1403,19 +1434,164 @@ impl ProxyRuntime {
         result
     }
 
+    /// A Save can authorize only the freshly persisted candidate. An old saved
+    /// diff, recovery owner, or lifecycle operation remains explicit work.
+    pub(crate) async fn apply_staged_save_if_current<F>(
+        self: &Arc<Self>,
+        previous: Value,
+        candidate: Value,
+        owner: StagedSaveOwner,
+        on_current: F,
+    ) -> Option<RuntimeApplyResult>
+    where
+        F: FnOnce(&Value) + Send,
+    {
+        let _serial = self.switch_serial.lock().await;
+        let current = || {
+            self.selector_intent_is_current(owner.intent)
+                && self
+                    .config
+                    .with_current(|saved| {
+                        self.config.saved_revision() == owner.revision && saved == &candidate
+                    })
+                    .unwrap_or(false)
+        };
+        if !current() {
+            self.push_pending_changes();
+            return None;
+        }
+        on_current(&candidate);
+        if previous == candidate
+            || !self.selector_operation_is_current(owner.generation, owner.intent)
+            || self.gate.is_busy()
+            || self.selector_reconcile.is_required()
+            || !self
+                .switch_snapshot
+                .read()
+                .is_ok_and(|snapshot| snapshot.is_some())
+            || !self
+                .startup_snapshot
+                .read()
+                .is_ok_and(|snapshot| snapshot.is_some())
+            || !self
+                .current_config
+                .read()
+                .is_ok_and(|config| config.is_some())
+            || self.pending_changes_against(Some(&previous)).pending_apply
+            || !self
+                .runtime_config_apply
+                .lock()
+                .is_ok_and(|state| state.pending.is_none())
+        {
+            self.push_pending_changes();
+            return None;
+        }
+        let mut result = Box::pin(self.apply_runtime_candidate_with_policy(
+            candidate.clone(),
+            Some(&candidate),
+            Some(owner),
+        ))
+        .await;
+        let current_owner =
+            current() && self.selector_operation_is_current(owner.generation, owner.intent);
+        if current_owner
+            && matches!(
+                result.status,
+                "hotApplied" | "hotDurabilityPending" | "nativeCleanupUnknown"
+            )
+        {
+            return Some(result);
+        }
+        if !current_owner {
+            self.push_pending_changes();
+        }
+        // Retain an admitted operation's exact recovery owner across a later
+        // desired/selector intent. Stale success does not become a success toast.
+        self.retain_staged_save_recovery_receipt(owner, &mut result)
+            .then_some(result)
+    }
+
+    fn retain_staged_save_recovery_receipt(
+        &self,
+        owner: StagedSaveOwner,
+        result: &mut RuntimeApplyResult,
+    ) -> bool {
+        let Some(transaction_id) = result.transaction_id.as_deref() else {
+            return false;
+        };
+        if self.gate.generation() != owner.generation
+            || !self.core_running()
+            || !self.runtime_config_apply.lock().is_ok_and(|state| {
+                state.pending.as_ref().is_some_and(|pending| {
+                    pending.plan.transaction_id == transaction_id
+                        && pending.generation == owner.generation
+                        && pending.intent == owner.intent
+                        && pending.saved_revision == Some(owner.revision)
+                })
+            })
+        {
+            return false;
+        }
+        result.status = "unconfirmed";
+        result.ok = false;
+        result.pending_apply = true;
+        if !self.selector_operation_is_current(owner.generation, owner.intent)
+            || !self.saved_revision_matches(Some(owner.revision))
+        {
+            result.persistence_retryable = Some(false);
+        }
+        true
+    }
+
+    pub(super) fn staged_save_recovery_pending(&self) -> bool {
+        self.runtime_config_apply.lock().is_ok_and(|state| {
+            state
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.saved_revision.is_some())
+        })
+    }
+
+    fn saved_revision_matches(&self, revision: Option<u64>) -> bool {
+        revision.is_none_or(|revision| self.config.saved_revision() == revision)
+    }
+
     /// Called with switch_serial held. Does not save D or touch live source files.
     pub(super) async fn apply_runtime_candidate(
         self: &Arc<Self>,
         candidate: Value,
         expected_desired: Option<&Value>,
     ) -> RuntimeApplyResult {
+        Box::pin(self.apply_runtime_candidate_with_policy(candidate, expected_desired, None)).await
+    }
+
+    async fn apply_runtime_candidate_with_policy(
+        self: &Arc<Self>,
+        candidate: Value,
+        expected_desired: Option<&Value>,
+        staged_save_owner: Option<StagedSaveOwner>,
+    ) -> RuntimeApplyResult {
         let generation = self.gate.generation();
         let intent = self.selector_reconcile.intent_generation();
-        if self.gate.is_busy() {
+        let offer_confirmation = staged_save_owner.is_none();
+        let restart_choice = |candidate: &Value, code, paths, generation, intent| {
+            if offer_confirmation {
+                self.restart_choice(candidate, code, paths, generation, intent)
+            } else {
+                RuntimeApplyResult::status("restartRequired")
+            }
+        };
+        if staged_save_owner.is_some_and(|owner| {
+            (owner.generation, owner.intent) != (generation, intent)
+                || !self.saved_revision_matches(Some(owner.revision))
+        }) || self.gate.is_busy()
+        {
             return self.remember_runtime_result(RuntimeApplyResult::status("conflict"));
         }
         if !self.core_running() {
-            self.process_deferred_config_deletions().await;
+            if offer_confirmation {
+                self.process_deferred_config_deletions().await;
+            }
             return RuntimeApplyResult::status("skipped");
         }
         let desired = match self.config.current() {
@@ -1536,7 +1712,7 @@ impl ProxyRuntime {
             if self.current_config_snapshot().as_ref() == Some(&candidate) {
                 return self.remember_runtime_result(RuntimeApplyResult::status("unconfirmed"));
             }
-            let result = self.restart_choice(
+            let result = restart_choice(
                 &candidate,
                 "structuralChange",
                 unsupported_runtime_paths(&capabilities),
@@ -1586,7 +1762,7 @@ impl ProxyRuntime {
                 &candidate,
             )
         {
-            return self.remember_runtime_result(self.restart_choice(
+            return self.remember_runtime_result(restart_choice(
                 &candidate,
                 "structuralChange",
                 vec!["dnsConfig.takeoverSystemDns".into()],
@@ -1682,7 +1858,7 @@ impl ProxyRuntime {
                 _ => None,
             };
             let Some(proof) = proof else {
-                let result = self.restart_choice(
+                let result = restart_choice(
                     &candidate,
                     "structuralChange",
                     vec!["outbounds.physical_route_binding".into()],
@@ -1719,7 +1895,7 @@ impl ProxyRuntime {
                 .and_then(|value| serde_json::from_value::<UserConfig>(value).ok())
                 .is_some_and(|old| old.network_profiles.is_empty())
         {
-            let result = self.restart_choice(
+            let result = restart_choice(
                 &candidate,
                 "structuralChange",
                 vec!["inbounds.network-canary.listen_port".into()],
@@ -1754,7 +1930,7 @@ impl ProxyRuntime {
         if deps.observed_tailnet_addresses != baseline.deps.observed_tailnet_addresses
             && tailnet_tun_projection_changed(&baseline.generated, &outcome.config)
         {
-            return self.remember_runtime_result(self.restart_choice(
+            return self.remember_runtime_result(restart_choice(
                 &candidate,
                 "structuralChange",
                 vec!["inbounds.tun.route_exclude_address".into()],
@@ -1768,7 +1944,7 @@ impl ProxyRuntime {
         if protected_binding_plan.is_some()
             && !protected_generated_policy_compatible(&baseline.generated, &generated)
         {
-            return self.remember_runtime_result(self.restart_choice(
+            return self.remember_runtime_result(restart_choice(
                 &candidate,
                 "structuralChange",
                 vec!["outbounds.physical_route_binding".into()],
@@ -1907,7 +2083,7 @@ impl ProxyRuntime {
             let result = if paths.is_empty() {
                 RuntimeApplyResult::status("rejected")
             } else {
-                self.restart_choice(&candidate, "structuralChange", paths, generation, intent)
+                restart_choice(&candidate, "structuralChange", paths, generation, intent)
             };
             return self.remember_runtime_result(result);
         }
@@ -1946,7 +2122,7 @@ impl ProxyRuntime {
                 f.variant == "api-loopback-handoff-v1"
                     && f.update_class == daemon::RuntimeUpdateClass::LocalReplace as i32
             }) {
-                let result = self.restart_choice(
+                let result = restart_choice(
                     &candidate,
                     "structuralChange",
                     vec!["services.api".into()],
@@ -1959,7 +2135,7 @@ impl ProxyRuntime {
                 return self.remember_runtime_result(RuntimeApplyResult::status("rejected"));
             };
             if target.host != "127.0.0.1" {
-                let result = self.restart_choice(
+                let result = restart_choice(
                     &candidate,
                     "structuralChange",
                     vec!["services.api.listen".into()],
@@ -1969,7 +2145,7 @@ impl ProxyRuntime {
                 return self.remember_runtime_result(result);
             }
             let Some(projection) = self.api_saved_projection_for(&candidate, &baseline) else {
-                let result = self.restart_choice(
+                let result = restart_choice(
                     &candidate,
                     "structuralChange",
                     vec!["services.api.recipe".into()],
@@ -1994,7 +2170,7 @@ impl ProxyRuntime {
         {
             // A NoOp ticket has no persistence tail of its own and cannot borrow
             // the superseded original owner's reload/namespace acknowledgement.
-            return self.remember_runtime_result(self.restart_choice(
+            return self.remember_runtime_result(restart_choice(
                 &candidate,
                 "regenerationOwnerRequiresRestart",
                 vec!["runtime.persistence.owner".into()],
@@ -2016,7 +2192,7 @@ impl ProxyRuntime {
                     .iter()
                     .map(|reason| reason.path.clone())
                     .collect();
-                let mut choice = self.restart_choice(
+                let mut choice = restart_choice(
                     &candidate,
                     "hostEffectsRequireRestart",
                     paths,
@@ -2032,15 +2208,18 @@ impl ProxyRuntime {
             host_plan.strategy,
             host_effects::HostEffectStrategy::NeedsSnapshotBeforeCore
         ) {
-            return self.remember_runtime_result(
-                self.host_effect_restart_choice(&candidate, &host_plan, generation, intent),
-            );
+            return self.remember_runtime_result(if offer_confirmation {
+                self.host_effect_restart_choice(&candidate, &host_plan, generation, intent)
+            } else {
+                RuntimeApplyResult::status("restartRequired")
+            });
         }
         let pending = PendingOperation {
             host_plan: Some(host_plan),
             api_handoff,
             pairing: baseline.pairing.clone(),
             desired,
+            saved_revision: staged_save_owner.map(|owner| owner.revision),
             deletion_scope,
             physical_route_config: if protected_binding_plan.is_some() {
                 typed.clone()
@@ -2065,14 +2244,26 @@ impl ProxyRuntime {
         };
         if runtime_plan_needs_local_confirmation(&pending.plan)
             || pending.host_plan.as_ref().is_some_and(|plan| {
-                plan.effects
-                    .iter()
-                    .any(|effect| effect.before_digest != effect.target_digest)
+                if offer_confirmation {
+                    plan.effects
+                        .iter()
+                        .any(|effect| effect.before_digest != effect.target_digest)
+                } else {
+                    // Even matching physical facts can carry a host controller
+                    // recipe. Save authorizes the Core graph only.
+                    !plan.effects.is_empty()
+                }
             })
         {
+            if !offer_confirmation {
+                return self.remember_runtime_result(RuntimeApplyResult::status(
+                    "impactConfirmationRequired",
+                ));
+            }
             return self.remember_runtime_result(self.prepare_runtime_impact_choice(pending));
         }
-        Box::pin(self.execute_prepared_runtime_candidate(client, pending, None)).await
+        Box::pin(self.execute_prepared_runtime_candidate(client, pending, None, offer_confirmation))
+            .await
     }
 
     async fn execute_prepared_runtime_candidate(
@@ -2080,6 +2271,7 @@ impl ProxyRuntime {
         client: Arc<SingBoxApiClient>,
         mut pending: PendingOperation,
         confirmation: Option<String>,
+        offer_confirmation: bool,
     ) -> RuntimeApplyResult {
         let generation = pending.generation;
         let intent = pending.intent;
@@ -2108,6 +2300,9 @@ impl ProxyRuntime {
             return self.remember_runtime_result(RuntimeApplyResult::status("conflict"));
         }
         if !self.verify_prepared_physical_bindings(&pending).await {
+            if !offer_confirmation {
+                return self.remember_runtime_result(RuntimeApplyResult::status("restartRequired"));
+            }
             return self.remember_runtime_result(self.restart_choice(
                 &pending.candidate,
                 "structuralChange",
@@ -2125,58 +2320,62 @@ impl ProxyRuntime {
         // keeps it paused; a verified unapplied rejection alone may resume it.
         let mut tailnet_limited = false;
         let mut native_limited = false;
-        let admitted = self
-            .config
-            .with_current(|desired| {
-                if desired != &pending.desired {
+        let staged_save = pending.saved_revision.is_some();
+        let admit = |desired: &Value| {
+            if desired != &pending.desired || !self.saved_revision_matches(pending.saved_revision) {
+                return false;
+            }
+            self.selector_reconcile.with_intent_claim(|current_intent| {
+                let _publication = self.gate.lock_generation_publication();
+                if current_intent != intent
+                    || self.gate.generation() != generation
+                    || self.gate.is_busy()
+                    || !self.protected_runtime_publication_current(&pending)
+                    || expected_running.as_ref().is_some_and(|running| {
+                        self.current_config_snapshot().as_ref() != Some(running)
+                    })
+                {
                     return false;
                 }
-                self.selector_reconcile.with_intent_claim(|current_intent| {
-                    let _publication = self.gate.lock_generation_publication();
-                    if current_intent != intent
-                        || self.gate.generation() != generation
-                        || self.gate.is_busy()
-                        || !self.protected_runtime_publication_current(&pending)
-                        || expected_running.as_ref().is_some_and(|running| {
-                            self.current_config_snapshot().as_ref() != Some(running)
-                        })
-                    {
-                        return false;
-                    }
-                    // STATUS may have grown H during Plan. Check the final canonical
-                    // source before pausing the writer and admitting the Apply RPC.
-                    if !self.tailnet_bindings_within_limit(&pending.tailnet_bindings) {
-                        tailnet_limited = true;
-                        return false;
-                    }
-                    let Ok(mut state) = self.runtime_config_apply.lock() else {
-                        return false;
-                    };
-                    if state.host.has_in_flight() {
-                        return false;
-                    }
-                    if !state.native_retirement_capacity_available() {
-                        native_limited = true;
-                        return false;
-                    }
-                    if confirmation.as_deref().is_some_and(|token| {
-                        !state.impact.as_ref().is_some_and(|choice| {
-                            choice.token == token
-                                && choice.pending.plan.plan_id == pending.plan.plan_id
-                                && choice.pending.plan.impact_digest == pending.plan.impact_digest
-                        })
-                    }) {
-                        return false;
-                    }
-                    pending.tailnet_suspended_token =
-                        self.suspend_tailnet_context(&pending.tailnet_bindings);
-                    state.pending = Some(pending.clone());
-                    state.restart = None;
-                    state.impact = None;
-                    true
-                })
+                // STATUS may have grown H during Plan. Check the final canonical
+                // source before pausing the writer and admitting the Apply RPC.
+                if !self.tailnet_bindings_within_limit(&pending.tailnet_bindings) {
+                    tailnet_limited = true;
+                    return false;
+                }
+                let Ok(mut state) = self.runtime_config_apply.lock() else {
+                    return false;
+                };
+                if state.host.has_in_flight() {
+                    return false;
+                }
+                if !state.native_retirement_capacity_available() {
+                    native_limited = true;
+                    return false;
+                }
+                if confirmation.as_deref().is_some_and(|token| {
+                    !state.impact.as_ref().is_some_and(|choice| {
+                        choice.token == token
+                            && choice.pending.plan.plan_id == pending.plan.plan_id
+                            && choice.pending.plan.impact_digest == pending.plan.impact_digest
+                    })
+                }) {
+                    return false;
+                }
+                pending.tailnet_suspended_token =
+                    self.suspend_tailnet_context(&pending.tailnet_bindings);
+                state.pending = Some(pending.clone());
+                state.restart = None;
+                state.impact = None;
+                true
             })
-            .unwrap_or(false);
+        };
+        let admitted = if staged_save {
+            self.config.try_with_saved_commit(admit)
+        } else {
+            self.config.with_current(admit)
+        }
+        .unwrap_or(false);
         if !admitted {
             let mut result = RuntimeApplyResult::status(if tailnet_limited {
                 "rejected"
@@ -2355,6 +2554,7 @@ impl ProxyRuntime {
                 .with_durable_runtime_owner(&pending.desired, |digest, revision| {
                     me.selector_reconcile.with_intent_claim(|intent| {
                         if intent != pending.intent
+                            || !me.saved_revision_matches(pending.saved_revision)
                             || me.gate.generation() != pending.generation
                             || me.gate.is_busy()
                             || !me.core_running()
@@ -2658,7 +2858,22 @@ impl ProxyRuntime {
                         state.pending = None;
                     }
                 }
-                return RuntimeApplyResult::status("rejected");
+                let mut result = RuntimeApplyResult::status("rejected");
+                result.reasons.extend(
+                    [
+                        "PREPARATION_FAILED",
+                        "PREPARATION_PANIC",
+                        "PREPARATION_DEADLINE_EXCEEDED",
+                        "PREPARATION_CANCELED",
+                    ]
+                    .into_iter()
+                    .filter(|code| operation.errors.iter().any(|error| error.code == *code))
+                    .map(|code| RuntimeApplyReason {
+                        code,
+                        path: "runtime.prepare".into(),
+                    }),
+                );
+                return result;
             }
             return RuntimeApplyResult::status("unconfirmed");
         }
@@ -2717,7 +2932,11 @@ impl ProxyRuntime {
                     state.kernel = Some(RuntimeKernelReceipt {
                         generation: pending.generation,
                         intent: pending.intent,
-                        superseded,
+                        publication: if superseded {
+                            RuntimeReceiptPublication::RegenerationSuperseded
+                        } else {
+                            RuntimeReceiptPublication::Current
+                        },
                         operation: operation.clone(),
                     });
                 }
@@ -2735,7 +2954,9 @@ impl ProxyRuntime {
         }
         // The receipt proves kernel state, but obsolete local intent cannot publish R
         // over a newer owner. Consume terminal state without claiming local publication.
-        if !self.selector_operation_is_current(pending.generation, pending.intent) {
+        if !self.selector_operation_is_current(pending.generation, pending.intent)
+            || !self.saved_revision_matches(pending.saved_revision)
+        {
             // A terminal receipt must not publish over a newer owner. Preserve
             // nondurable generic debt; only verified regeneration supersession
             // permits a corrective latest-D transaction. Invalidate stale cheap
@@ -2744,9 +2965,38 @@ impl ProxyRuntime {
             // A committed graph with generic persistence failure remains owned
             // pending debt even after selection intent changes. Only an actually
             // durable receipt or verified regeneration supersession releases it.
-            if stale_receipt_releases_pending(&operation, superseded) {
+            let releases_pending = stale_receipt_releases_pending(&operation, superseded);
+            let publication = if superseded {
+                RuntimeReceiptPublication::RegenerationSuperseded
+            } else if pending.saved_revision.is_some() && releases_pending {
+                RuntimeReceiptPublication::StagedSaveSuperseded
+            } else {
+                RuntimeReceiptPublication::Current
+            };
+            if releases_pending {
                 if let Ok(mut state) = self.runtime_config_apply.lock() {
                     state.pending = None;
+                    if pending.saved_revision.is_some()
+                        && publication != RuntimeReceiptPublication::Current
+                    {
+                        if let Some(kernel) = state.kernel.as_mut().filter(|kernel| {
+                            kernel.generation == pending.generation
+                                && kernel.intent == pending.intent
+                                && kernel.operation.transaction_id == operation.transaction_id
+                        }) {
+                            kernel.publication = publication;
+                        }
+                        if let Some(native) = state
+                            .native_retirements
+                            .get_mut(&operation.transaction_id)
+                            .filter(|native| {
+                                native.receipt.generation == pending.generation
+                                    && native.receipt.intent == pending.intent
+                            })
+                        {
+                            native.receipt.publication = publication;
+                        }
+                    }
                 }
             }
             if self.gate.generation() == pending.generation {
@@ -2758,7 +3008,7 @@ impl ProxyRuntime {
             let mut result = RuntimeKernelReceipt {
                 generation: pending.generation,
                 intent: pending.intent,
-                superseded,
+                publication,
                 operation: operation.clone(),
             }
             .result();
@@ -2766,6 +3016,9 @@ impl ProxyRuntime {
             result.ok = false;
             result.pending_apply = true;
             self.annotate_runtime_native_result(&mut result);
+            if let Some(owner) = pending.staged_save_owner().filter(|_| !releases_pending) {
+                self.retain_staged_save_recovery_receipt(owner, &mut result);
+            }
             return result;
         }
         if !pending.published && !self.protected_runtime_publication_current(pending) {
@@ -2779,13 +3032,29 @@ impl ProxyRuntime {
             if pending.published {
                 (false, None, None)
             } else {
-                let Some(publication) = self.publish_prepared_runtime_candidate(
-                    pending,
-                    Some(&pending.plan.transaction_id),
-                    operation.active.clone(),
-                    operation.control_revision,
-                    None,
-                ) else {
+                let publish = || {
+                    self.publish_prepared_runtime_candidate(
+                        pending,
+                        Some(&pending.plan.transaction_id),
+                        operation.active.clone(),
+                        operation.control_revision,
+                        None,
+                    )
+                };
+                let publication = if pending.saved_revision.is_some() {
+                    self.config
+                        .try_with_saved_commit(|desired| {
+                            (desired == &pending.desired
+                                && self.saved_revision_matches(pending.saved_revision))
+                            .then(publish)
+                            .flatten()
+                        })
+                        .ok()
+                        .flatten()
+                } else {
+                    publish()
+                };
+                let Some(publication) = publication else {
                     return self.committed_runtime_without_publication(
                         pending,
                         &operation,
@@ -2819,13 +3088,13 @@ impl ProxyRuntime {
             if let Ok(mut state) = self.runtime_config_apply.lock() {
                 state.pending = None;
                 if let Some(kernel) = state.kernel.as_mut() {
-                    kernel.superseded = true;
+                    kernel.publication = RuntimeReceiptPublication::RegenerationSuperseded;
                 }
             }
             let mut result = RuntimeKernelReceipt {
                 generation: pending.generation,
                 intent: pending.intent,
-                superseded: true,
+                publication: RuntimeReceiptPublication::RegenerationSuperseded,
                 operation: operation.clone(),
             }
             .result();
@@ -2933,7 +3202,7 @@ impl ProxyRuntime {
         let publication = self
             .config
             .try_with_saved_commit(|desired| {
-                (desired == &pending.desired)
+                (desired == &pending.desired && self.saved_revision_matches(pending.saved_revision))
                     .then(|| {
                         self.publish_prepared_runtime_candidate(
                             &pending,
@@ -2980,11 +3249,9 @@ impl ProxyRuntime {
         {
             return false;
         }
-        let newer = self
-            .config
-            .current()
-            .ok()
-            .filter(|desired| desired != &pending.desired);
+        let newer = self.config.current().ok().filter(|desired| {
+            desired != &pending.desired || !self.saved_revision_matches(pending.saved_revision)
+        });
         newer.as_ref().is_some_and(|desired| {
             self.config
                 .with_durable_runtime_owner(desired, |_, _| ())
@@ -3451,6 +3718,13 @@ impl ProxyRuntime {
         result.transaction_id = Some(transaction_id);
         result.runtime_generation = Some(pending.generation);
         result.selection_intent_generation = Some(pending.intent);
+        if let Some(owner) = pending.staged_save_owner().filter(|_| {
+            result.status == "conflict"
+                && (!self.selector_operation_is_current(pending.generation, pending.intent)
+                    || !self.saved_revision_matches(pending.saved_revision))
+        }) {
+            self.retain_staged_save_recovery_receipt(owner, &mut result);
+        }
         self.remember_runtime_result(result)
     }
 
@@ -3461,6 +3735,7 @@ impl ProxyRuntime {
         if self.gate.is_busy()
             || !self.core_running()
             || !self.selector_operation_is_current(pending.generation, pending.intent)
+            || !self.saved_revision_matches(pending.saved_revision)
         {
             return RuntimeApplyResult::status("conflict");
         }
@@ -3500,6 +3775,7 @@ impl ProxyRuntime {
         };
         if self.gate.is_busy()
             || !self.selector_operation_is_current(pending.generation, pending.intent)
+            || !self.saved_revision_matches(pending.saved_revision)
         {
             return RuntimeApplyResult::status("conflict");
         }

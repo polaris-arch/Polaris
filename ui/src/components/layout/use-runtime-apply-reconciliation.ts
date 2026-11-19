@@ -1,10 +1,12 @@
 import { useEffect, useRef, type Dispatch, type RefObject, type SetStateAction } from 'react';
 import { api } from '@/ipc';
 import { normalizePendingChanges, useAppStore } from '@/store/app-store';
+import { useStagedConfigStore } from '@/store/staged-config-store';
+import { toast } from '@/lib/error-handler';
 import type { PendingApplyResult } from '@/contracts/types';
 import type { ProxyErrorTranslate } from '@/domain/proxy-error-text';
 import {
-  applyReceiptState, hostEffectsAccepted, mergeNativeRetirements, nativeRetirementDebts, runtimeApplyRejectedKey, runtimeApplyConflictKey, runtimePersistenceRecoveryEnded,
+  applyReceiptState, hostEffectsAccepted, mergeNativeRetirements, nativeRetirementDebts, preserveNativeRetirements, runtimeApplyRejectedKey, runtimeApplyConflictKey, runtimePersistenceRecoveryEnded,
   type ApplyState, type RuntimeCoreRecovery,
 } from './pending-bar-logic';
 import { runtimeApplyPollDisposition, runtimeHostPollDisposition, runtimeNativePollDisposition, startRuntimeExecutionPolling } from './runtime-apply-polling';
@@ -13,6 +15,7 @@ interface Attempt {
   cancelled: boolean;
   awaitingReply?: boolean;
   intentGeneration: number | undefined;
+  runtimeGeneration?: number;
 }
 
 function sameCore(state: ApplyState, owner: RuntimeCoreRecovery): boolean {
@@ -32,6 +35,7 @@ export function useRuntimeApplyReconciliation(
   translate: ProxyErrorTranslate,
 ): { retryPersistence: () => Promise<void>; checkHost: () => void; checkNative: () => Promise<void> } {
   const status = useAppStore((state) => state.proxyStatus);
+  const savedRuntimeApply = useStagedConfigStore((state) => state.savedRuntimeApply);
   const pendingNative = useAppStore((state) => state.pendingChanges.nativeRetirements);
   const nativeEndedBeforeGeneration = useAppStore((state) => state.nativeRetirementEndedBeforeGeneration);
   const t = useRef(translate);
@@ -51,6 +55,51 @@ export function useRuntimeApplyReconciliation(
   useEffect(() => {
     setApply((state) => mergeNativeRetirements(state, pendingNative, nativeEndedBeforeGeneration));
   }, [pendingNative, nativeEndedBeforeGeneration, setApply]);
+
+  useEffect(() => {
+    if (!savedRuntimeApply || !status) return;
+    const generation = savedRuntimeApply.runtimeGeneration;
+    const observed = status.mainGeneration;
+    const olderLifecycle = generation !== undefined && generation < (apply.mainGeneration ?? 0);
+    if (!olderLifecycle && generation !== undefined && (observed === undefined || generation > observed
+        || generation === observed && !status.running)) return;
+    const attempt = attemptRef.current;
+    if (attempt?.awaitingReply || apply.phase === 'applying') return;
+    if (useStagedConfigStore.getState().savedRuntimeApply !== savedRuntimeApply) return;
+    useStagedConfigStore.setState({ savedRuntimeApply: null });
+    const savedIntent = savedRuntimeApply.selectionIntentGeneration ?? -1;
+    const newerIntent = ((attempt?.runtimeGeneration ?? apply.mainGeneration) === generation
+        && (attempt?.intentGeneration ?? -1) > savedIntent)
+      || (apply.coreRecovery?.runtimeGeneration === generation
+        && (apply.coreRecovery?.selectionIntentGeneration ?? -1) > savedIntent);
+    if (generation === undefined || generation !== observed || !status.running || olderLifecycle || newerIntent) {
+      setApply((state) => mergeNativeRetirements(state, savedRuntimeApply.nativeRetirements));
+      return;
+    }
+    // This Save has its own runtime owner. A prior explicit Apply's terminal or
+    // cancelled attempt cannot decide this recovery.
+    attemptRef.current = null;
+    setApply((state) => {
+      const initial = preserveNativeRetirements(state, { phase: 'idle', reason: null, mainGeneration: generation,
+        ...(state.host && state.host.phase !== 'settled' ? { host: state.host, hostReconciling: state.hostReconciling } : {}) });
+      const next = applyReceiptState(initial, savedRuntimeApply, true);
+      if (savedRuntimeApply.status === 'unconfirmed' && savedRuntimeApply.transactionId
+          && Number.isSafeInteger(savedRuntimeApply.selectionIntentGeneration)) {
+        return { ...next, transactionId: savedRuntimeApply.transactionId, reconciling: true,
+          coreRecovery: { transactionId: savedRuntimeApply.transactionId,
+            runtimeGeneration: generation,
+            selectionIntentGeneration: savedRuntimeApply.selectionIntentGeneration,
+            persistenceRetryable: savedRuntimeApply.persistenceRetryable } };
+      }
+      return next;
+    });
+    if (!savedRuntimeApply.ok || savedRuntimeApply.coreState !== 'committed'
+        || savedRuntimeApply.nativeRetirements?.length || pendingNative?.length || apply.nativeRetirements?.length
+        || apply.host && apply.host.phase !== 'settled') return;
+    if (savedRuntimeApply.status === 'hotApplied' && savedRuntimeApply.configurationDurable === true) {
+      toast.info(t.current('home.pendingHotApplied'));
+    }
+  }, [apply, attemptRef, pendingNative, savedRuntimeApply, setApply, status]);
   const core = apply.coreRecovery ?? (apply.reconciling && apply.transactionId
     && apply.mainGeneration !== undefined && attemptRef.current?.intentGeneration !== undefined
     ? { transactionId: apply.transactionId, runtimeGeneration: apply.mainGeneration,
@@ -184,7 +233,8 @@ export function useRuntimeApplyReconciliation(
       const owner = latest.current.coreRecovery ?? core;
       const request = attemptRef.current;
       const live = useAppStore.getState().proxyStatus;
-      if (!owner || owner.selectionIntentGeneration === undefined || retrying.current || live?.running !== true || live.mainGeneration !== owner.runtimeGeneration) return;
+      if (!owner || owner.selectionIntentGeneration === undefined || latest.current.coreRecovery?.persistenceRetryable === false
+          || retrying.current || live?.running !== true || live.mainGeneration !== owner.runtimeGeneration) return;
       retrying.current = true;
       setApply((state) => sameCore(state, owner) ? { ...state, persistenceRetrying: true } : state);
       try {

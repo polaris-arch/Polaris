@@ -231,7 +231,7 @@ fn original_core_durability_and_host_only_execution_keep_separate_owners() {
         state.kernel = Some(super::super::RuntimeKernelReceipt {
             generation: execution.generation,
             intent: execution.intent,
-            superseded: false,
+            publication: super::super::RuntimeReceiptPublication::Current,
             operation: daemon::RuntimeConfigOperation {
                 transaction_id: "original-core".into(),
                 active: identity.clone(),
@@ -330,7 +330,7 @@ fn native_listener_owner_survives_host_success_failure_and_absent_host_paths() {
                     receipt: super::super::RuntimeKernelReceipt {
                         generation,
                         intent,
-                        superseded: false,
+                        publication: super::super::RuntimeReceiptPublication::Current,
                         operation,
                     },
                 },

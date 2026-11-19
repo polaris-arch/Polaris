@@ -168,6 +168,11 @@ impl ProxyRuntime {
     /// 三个集合都**排序**后返回：`HashSet` 的迭代序每次进程都不同，不排序会让 UI 明细列表无故重排、
     /// 也让单测只能写成集合比较。排序成本 O(n log n)、n = 节点数，可忽略。
     pub fn pending_changes(&self) -> PendingChangesSummary {
+        self.pending_changes_against(None)
+    }
+
+    /// The pre-save snapshot distinguishes this save's edits from earlier debt.
+    pub(super) fn pending_changes_against(&self, desired: Option<&Value>) -> PendingChangesSummary {
         // Without a startup snapshot the configuration diff has no denominator.
         // Independently proven native debt still survives until real stop-success
         // releases its original owner, including an interrupted lifecycle bump.
@@ -186,9 +191,15 @@ impl ProxyRuntime {
         let Some(snap) = self.startup_snapshot.read().ok().and_then(|g| g.clone()) else {
             return empty();
         };
-        let current = self.config.current().unwrap_or_else(|_| snap.clone());
+        let saved;
+        let current = if let Some(desired) = desired {
+            desired
+        } else {
+            saved = self.config.current().unwrap_or_else(|_| snap.clone());
+            &saved
+        };
         let old_ids: std::collections::HashSet<String> = server_ids(&snap);
-        let new_ids: std::collections::HashSet<String> = server_ids(&current);
+        let new_ids: std::collections::HashSet<String> = server_ids(current);
 
         let mut added: Vec<_> = new_ids.difference(&old_ids).cloned().collect();
         let mut removed: Vec<_> = old_ids.difference(&new_ids).cloned().collect();
@@ -200,7 +211,7 @@ impl ProxyRuntime {
             .ok()
             .and_then(|g| g.as_ref().map(|s| s.fingerprints.clone()))
             .unwrap_or_default();
-        let current_fps = node_fingerprints::modified_table_json(&current);
+        let current_fps = node_fingerprints::modified_table_json(current);
         let mut modified: Vec<_> = old_ids
             .intersection(&new_ids)
             .filter(|id| match (snap_fps.get(*id), current_fps.get(*id)) {
@@ -227,8 +238,10 @@ impl ProxyRuntime {
         });
         let non_node_pending = applied
             .as_ref()
-            .and_then(|runtime| non_node_runtime_debt(runtime, &current, self.helper.platform()))
+            .and_then(|runtime| non_node_runtime_debt(runtime, current, self.helper.platform()))
             .unwrap_or_else(|| self.restart_deferred.load(Ordering::SeqCst));
+        let reconcile_pending = desired.is_none() && self.selector_reconcile.is_required();
+        let recovery_pending = self.staged_save_recovery_pending();
         let pending_apply = !added.is_empty()
             || !modified.is_empty()
             || !removed.is_empty()
@@ -236,11 +249,13 @@ impl ProxyRuntime {
             || selected_pending
             || self.host_effect_pending()
             || self.has_uncommitted_rule_content()
+            || recovery_pending
+            || reconcile_pending
             || native_pending;
         let restart_required = applied.as_ref().is_some_and(|runtime| {
             super::runtime_config::structural_runtime_change(
                 runtime,
-                &current,
+                current,
                 self.helper.platform(),
             )
         });
@@ -253,11 +268,14 @@ impl ProxyRuntime {
             removed,
             saved_settings_revert_token: applied
                 .as_ref()
-                .and_then(|running| self.saved_settings_revert_token(&current, running)),
+                .filter(|_| desired.is_none())
+                .and_then(|running| self.saved_settings_revert_token(current, running)),
             restart_deferred: non_node_pending
                 || selected_pending
                 || self.host_effect_pending()
-                || self.has_uncommitted_rule_content(),
+                || self.has_uncommitted_rule_content()
+                || reconcile_pending
+                || recovery_pending,
         }
     }
 

@@ -12,6 +12,7 @@ const h = vi.hoisted(() => ({
   pendingEffects: [] as Array<() => void>,
   applyNow: vi.fn(), freshApply: vi.fn(), hostRead: vi.fn(), coreRead: vi.fn(), nativeRead: vi.fn(),
   retryPersistence: vi.fn(), pendingRead: vi.fn(), cancelImpact: vi.fn(),
+  savedRuntimeApply: null as PendingApplyResult | null,
   armed: null as string | null, revertSaved: vi.fn(),
   lifecycleReady: vi.fn(), offLifecycle: vi.fn(), statusRead: vi.fn(),
   app: {
@@ -67,8 +68,12 @@ vi.mock('@/store/app-store', () => ({
   useAppStore: Object.assign((select: (state: typeof h.app) => unknown) => select(h.app), { getState: () => h.app }),
 }));
 vi.mock('@/store/staged-config-store', () => {
-  const state = { entries: [], saveStatus: 'idle', conflict: null, applyNow: h.applyNow };
-  return { useStagedConfigStore: Object.assign((select: (value: typeof state) => unknown) => select(state), { getState: () => state }) };
+  const state = { entries: [], saveStatus: 'idle', conflict: null, applyNow: h.applyNow,
+    get savedRuntimeApply() { return h.savedRuntimeApply; } };
+  return { useStagedConfigStore: Object.assign((select: (value: typeof state) => unknown) => select(state), {
+    getState: () => state,
+    setState: ({ savedRuntimeApply }: { savedRuntimeApply: PendingApplyResult | null }) => { h.savedRuntimeApply = savedRuntimeApply; },
+  }) };
 });
 vi.mock('@/lib/error-handler', () => ({ toast: { info: vi.fn(), error: vi.fn(), warning: vi.fn(), success: vi.fn() } }));
 
@@ -128,6 +133,7 @@ async function begin(result: PendingApplyResult): Promise<void> {
 beforeEach(() => {
   unmount(); vi.resetAllMocks(); h.states = []; h.refs = [];
   h.armed = null;
+  h.savedRuntimeApply = null;
   h.app.config = null;
   h.app.nativeRetirementEndedBeforeGeneration = 0;
   h.app.pendingChanges = { added: ['node'], modified: [], removed: [], restartDeferred: false };
@@ -143,6 +149,93 @@ beforeEach(() => {
   h.hostRead.mockRejectedValue(new Error('Host status unavailable'));
 });
 afterEach(() => { unmount(); if (vi.isFakeTimers()) vi.clearAllTimers(); vi.useRealTimers(); vi.unstubAllGlobals(); });
+
+it.each([7, 6])('shows a single Save HOT toast only for the running generation (%s)', (generation) => {
+  h.app.pendingChanges = { added: [], modified: [], removed: [], restartDeferred: false };
+  h.savedRuntimeApply = { ok: true, status: 'hotApplied', transactionId: 'save-hot',
+    runtimeGeneration: generation, selectionIntentGeneration: 3, coreState: 'committed', configurationDurable: true };
+  expect(renderBar()).toBeNull();
+  expect(renderBar()).toBeNull();
+  if (generation === 7) expect(toast.info).toHaveBeenCalledExactlyOnceWith('home.pendingHotApplied');
+  else expect(toast.info).not.toHaveBeenCalled();
+  expect(h.applyNow).not.toHaveBeenCalled();
+});
+
+it('retains an ahead-of-status Save and replaces an earlier explicit failure after readback', () => {
+  h.app.pendingChanges = { added: [], modified: [], removed: [], restartDeferred: false };
+  h.states[0] = { phase: 'failed', reason: 'earlier explicit failure', mainGeneration: 7 } satisfies ApplyState;
+  h.savedRuntimeApply = { ok: true, status: 'hotApplied', transactionId: 'save-next',
+    runtimeGeneration: 8, selectionIntentGeneration: 4, coreState: 'committed', configurationDurable: true };
+  expect(markup()).toContain('home.pendingApplyFailedReason');
+  expect(h.savedRuntimeApply?.transactionId).toBe('save-next');
+  expect(toast.info).not.toHaveBeenCalled();
+  h.app.proxyStatus = { running: true, mainGeneration: 8 };
+  renderBar();
+  expect(renderBar()).toBeNull();
+  expect(h.states[0]).toMatchObject({ phase: 'idle', reason: null, mainGeneration: 8 });
+  expect(toast.info).toHaveBeenCalledExactlyOnceWith('home.pendingHotApplied');
+});
+
+it.each(['hotApplied', 'applied'] as const)('keeps a newer explicit %s while an older Save is queued', async (status) => {
+  let finish!: (result: PendingApplyResult & { saved: boolean }) => void;
+  h.applyNow.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+  click('home.pendingApplyBtn');
+  await microtasks();
+  h.savedRuntimeApply = { ok: true, status: 'hotApplied', transactionId: 'older-save',
+    runtimeGeneration: 7, selectionIntentGeneration: status === 'applied' ? 10 : 8,
+    coreState: 'committed', configurationDurable: true };
+  renderBar();
+  expect(h.savedRuntimeApply.transactionId).toBe('older-save');
+  finish(status === 'applied' ? { ok: true, status, saved: true, applyId: 35 }
+    : { ok: true, status, saved: true, transactionId: 'newer-explicit', runtimeGeneration: 7,
+      selectionIntentGeneration: 9, coreState: 'committed', configurationDurable: true });
+  await microtasks();
+  renderBar();
+  if (status === 'applied') {
+    expect(h.states[0]).toMatchObject({ phase: 'applying', applyId: 35 });
+    expect(h.savedRuntimeApply?.transactionId).toBe('older-save');
+    expect(toast.info).not.toHaveBeenCalled();
+    const listener = h.lifecycleReady.mock.calls[0][0] as (event: unknown) => void;
+    listener({ kind: 'restart', phase: 'failed', terminal: true, applyId: 35, mainGeneration: 8 });
+    await microtasks();
+    expect(h.app.proxyStatus.mainGeneration).toBe(7);
+    expect(markup()).toContain('home.pendingApplyFailed');
+    expect(h.states[0]).toMatchObject({ phase: 'failed', mainGeneration: 8 });
+    expect(h.savedRuntimeApply).toBeNull();
+    expect(toast.info).not.toHaveBeenCalled();
+    h.savedRuntimeApply = { ok: true, status: 'hotApplied', transactionId: 'future-save',
+      runtimeGeneration: 9, selectionIntentGeneration: 11, coreState: 'committed', configurationDurable: true };
+    renderBar();
+    expect(h.savedRuntimeApply?.transactionId).toBe('future-save');
+    h.app.proxyStatus = { running: true, mainGeneration: 9 };
+    renderBar();
+    expect(h.savedRuntimeApply).toBeNull();
+    expect(h.states[0]).toMatchObject({ phase: 'idle', mainGeneration: 9 });
+    expect(toast.info).toHaveBeenCalledExactlyOnceWith('home.pendingHotApplied');
+  } else {
+    expect(h.states[0]).toMatchObject({ phase: 'idle', transactionId: 'newer-explicit' });
+    expect(h.savedRuntimeApply).toBeNull();
+    expect(toast.info).toHaveBeenCalledExactlyOnceWith('home.pendingHotApplied');
+  }
+});
+
+it('keeps polling a superseded Save owner without offering a persistence replay', async () => {
+  vi.useFakeTimers();
+  h.app.pendingChanges = { added: [], modified: [], removed: [], restartDeferred: true };
+  h.savedRuntimeApply = { ok: true, status: 'hotDurabilityPending', transactionId: 'save-core',
+    runtimeGeneration: 7, selectionIntentGeneration: 9, coreState: 'committed', configurationDurable: false };
+  renderBar();
+  expect(button('home.pendingRetryPersistenceBtn').props.disabled).not.toBe(true);
+  h.coreRead.mockResolvedValue({ ok: false, status: 'unconfirmed', transactionId: 'save-core', runtimeGeneration: 7,
+    selectionIntentGeneration: 9, configurationDurable: false, persistenceRetryable: false });
+  await vi.advanceTimersByTimeAsync(2000);
+  expect(markup()).toContain('home.pendingHotDurabilityPending');
+  expect(markup()).not.toContain('home.pendingRetryPersistenceBtn');
+  await vi.advanceTimersByTimeAsync(2000);
+  expect(h.coreRead.mock.calls).toEqual([['save-core'], ['save-core']]);
+  expect(h.retryPersistence).not.toHaveBeenCalled();
+  expect(toast.info).not.toHaveBeenCalled();
+});
 
 it('keeps the confirmation armed only for the saved settings the user saw', async () => {
   h.revertSaved.mockResolvedValue(true);
@@ -394,6 +487,16 @@ describe('desktop native listener cleanup stays independent', () => {
   const receipt = (over: Partial<PendingApplyResult> = {}): PendingApplyResult => ({ ok: false,
     status: 'nativeCleanupUnknown', transactionId: 'native-A', runtimeGeneration: 7, selectionIntentGeneration: 9,
     coreState: 'committed', configurationDurable: true, retirementState: 'UNKNOWN', nativeRetirements: [native], ...over });
+
+  it('preserves independent native debt across a same-generation Save receipt', () => {
+    h.app.pendingChanges = empty();
+    h.states[0] = { phase: 'failed', reason: 'prior explicit failure', nativeRetirements: [native] } satisfies ApplyState;
+    h.savedRuntimeApply = { ...receipt(), status: 'hotApplied', ok: true, transactionId: 'save-after-old-native', nativeRetirements: undefined };
+    renderBar();
+    expect(markup()).toContain('home.pendingCheckNativeBtn');
+    expect(h.states[0]).toMatchObject({ phase: 'idle', nativeRetirements: [native] });
+    expect(toast.info).not.toHaveBeenCalled();
+  });
   async function start(over: Partial<PendingApplyResult> = {}) {
     h.applyNow.mockResolvedValueOnce({ ...receipt(over), saved: true });
     click('home.pendingApplyBtn');

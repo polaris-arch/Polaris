@@ -255,12 +255,14 @@ fn invalidation_happens_before_the_write() {
     let src = crate_code("commands/config.rs");
     let body = crate::commands::guard_scan::top_level_fn_body(&src, "fn config_save_core(");
     let transaction = body
-        .find("config.update_with_cleanup(defer_cleanup, |current|")
+        .find("config.update_with_cleanup_revision(defer_cleanup, |current|")
         .expect("全量保存必须走原子配置事务");
     let at = body
         .find("invalidate_validators_on_global_ua_change(")
         .expect("变异锁：全量保存腿的验证器作废被删了");
-    let write = body.find("*current = next").expect("事务提交腿仍在");
+    let write = body
+        .find("std::mem::replace(current, next)")
+        .expect("事务提交腿仍在");
     assert!(
         transaction < at && at < write,
         "作废必须在原子事务内、提交之前"

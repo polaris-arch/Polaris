@@ -199,6 +199,8 @@ export interface StagedConfigState {
    * `clean` / `staged` **不入此字段**——那两个由 `entries.length` 派生，多存一份就多一处会分叉的真值。
    */
   saveStatus: 'idle' | 'saving' | 'saveFailed';
+  /** Owned receipt for the shared desktop/mobile apply observer. */
+  savedRuntimeApply: ApplyReceipt | null;
   /**
    * 待用户裁决的冲突集（Q8-b 第 4 步）；`null` = 无弹窗。
    *
@@ -217,8 +219,7 @@ export interface StagedConfigState {
   reset: () => void;
   /**
    * 「保存」：Q8-b 的四步 —— 拉磁盘现值 → 算冲突集 → 无冲突静默 `replay(disk, entries)` 后落盘
-   * → 有冲突开弹窗。落盘恒带 `deferRestart=true`（不排重启，FR-5）+ `baseVersion=diskVersion`
-   * （乐观并发，最后一道 TOCTOU 闸）。
+   * → 有冲突开弹窗。通过 `baseVersion` 校验后，只有获证的安全热更新可随保存生效。
    *
    * 返回「保存这一半是否已过关」：没有 staged 也返 `true`（没有要落盘的东西 ⇒ 不算失败，
    * `applyNow` 在 `clean × pending` 那一格靠这条腿直通 apply）。**开了冲突弹窗返 `false`**
@@ -257,6 +258,7 @@ export const useStagedConfigStore = create<StagedConfigState>((set, get) => ({
   baseline: null,
   hydrated: false,
   saveStatus: 'idle',
+  savedRuntimeApply: null,
   conflict: null,
   conflictBaseline: null,
 
@@ -332,7 +334,7 @@ export const useStagedConfigStore = create<StagedConfigState>((set, get) => ({
     // Confirmation is bound to the already saved candidate. Never save newer drafts here.
     if (restartConfirmation !== undefined && impactConfirmation !== undefined) return { saved: false, status: 'conflict' };
     if (impactConfirmation === undefined) {
-      if (restartConfirmation === undefined && !(await get().save())) return { saved: false, status: null };
+      if (restartConfirmation === undefined && !(await performSave(set, get, false))) return { saved: false, status: null };
     } else if (get().entries.length > 0) {
       void api.proxy.cancelRuntimeImpact(impactConfirmation).catch(() => null);
       return { saved: true, status: 'conflict' };
@@ -414,17 +416,19 @@ type GetState = () => StagedConfigState;
  */
 function performSave(
   set: SetState,
-  get: GetState
+  get: GetState,
+  autoApply = true
 ): Promise<boolean> {
   // **整个函数体进临界区**（因果在 `withConfigWriteLock` 头注）。范围必须含开头那次 `get()`：
   // 把读 `entries` 留在临界区外，排队的第二次就会捕获 A 清空前的陈旧条目并把它们再写一遍，
   // 那是「串行了但仍在重复写」——比不串行更难查。
-  return withConfigWriteLock(() => performSaveLocked(set, get));
+  return withConfigWriteLock(() => performSaveLocked(set, get, autoApply));
 }
 
 async function performSaveLocked(
   set: SetState,
-  get: GetState
+  get: GetState,
+  autoApply: boolean
 ): Promise<boolean> {
   const { enabled, entries, baseline } = get();
   // 没有 staged ⇒ 没有要落盘的东西。这不是失败：`clean × pending` 那一格的「立即应用」正是走这条腿。
@@ -498,7 +502,7 @@ async function performSaveLocked(
       set({ saveStatus: 'idle' });
       return false;
     }
-    outcome = await api.config.save(merged, true, diskVersion);
+    outcome = await api.config.save(merged, true, diskVersion, autoApply);
   } catch (err) {
     console.error('[staged-config] save failed:', err);
     set({ saveStatus: 'saveFailed' });
@@ -519,6 +523,7 @@ async function performSaveLocked(
   set({
     entries: remaining,
     saveStatus: 'idle',
+    ...(outcome.runtimeApply === undefined ? {} : { savedRuntimeApply: outcome.runtimeApply }),
     conflict: null,
     conflictBaseline: null,
     baseVersion: outcome.version,

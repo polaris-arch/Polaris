@@ -103,7 +103,7 @@ describe('接线：主窗里的配置事务必须都在闸门内', () => {
     expect(switchTransaction).toContain('await api.config.get()');
     // performSave 是薄壳：整个函数体（**含开头读 entries**）都在临界区内。
     expect(readFileSync(join(SRC, 'store/staged-config-store.ts'), 'utf8')).toContain(
-      'withConfigWriteLock(() => performSaveLocked(set, get))'
+      'withConfigWriteLock(() => performSaveLocked(set, get, autoApply))'
     );
     expect(stripComments(readFileSync(join(SRC, 'components/screens/settings/use-config.ts'), 'utf8'))).toMatch(
       /withConfigWriteLock\(async \(\) => \{\s*beginConfigMutation\(\);\s*return configApi\.patch\(direct\);\s*\}\)/

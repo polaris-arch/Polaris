@@ -62,17 +62,16 @@ export const configApi = {
 
   /**
    * 暂存事务的版本化整份保存。生产调用必须同时传 `baseVersion`；即时控件使用 `patch()`。
-   * `deferRestart=true` 时只更新磁盘：热切、强制重启和普通重启都留给显式“应用”。
+   * 普通保存允许后端应用本次获证的安全热更新，显式 Apply 前的保存只落盘。
    */
   async save(
     config: UserConfig,
     deferRestart: boolean,
-    baseVersion: string
+    baseVersion: string,
+    autoApply?: boolean
   ): Promise<SaveOutcome> {
-    // Rust config_save(config, defer_restart: Option<bool>, base_version: Option<String>)
-    // —— 参数袋 key = `config` / `deferRestart` / `baseVersion`。
     // 参数袋必须是对象字面量：check-ipc-args.mjs 静态核对 required 参数键。
-    return invoke(IPC_CHANNELS.CONFIG_SAVE, { config, deferRestart, baseVersion });
+    return invoke(IPC_CHANNELS.CONFIG_SAVE, { config, deferRestart, baseVersion, autoApply });
   },
 
   /** 即时控件的原子顶层补丁；返回后端落盘并重新投影后的完整配置。 */

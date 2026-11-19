@@ -156,6 +156,7 @@ export interface RuntimeCoreRecovery {
   runtimeGeneration: number;
   /** Undefined until the original Core endpoint supplies its own intent; never copied from a HostOnly receipt. */
   selectionIntentGeneration?: number;
+  persistenceRetryable?: boolean;
 }
 
 export interface HostApplyState {
@@ -192,6 +193,12 @@ export interface ApplyState {
   mainGeneration?: number;
   /** 只在 `failed` 时有意义。 */
   reason: string | null;
+}
+
+export function runtimePersistenceRetryAvailable(apply: ApplyState): boolean {
+  if (apply.coreRecovery) return apply.coreRecovery.persistenceRetryable !== false;
+  return apply.configurationDurable !== true && !!apply.transactionId
+    && (apply.persistenceOnly === true || apply.phase === 'durabilityPending');
 }
 
 
@@ -247,7 +254,7 @@ export function hostRetryAvailable(host: HostApplyState | undefined): boolean {
 export function applyReceiptState(
   current: ApplyState,
   result: { status: ApplyStatus | null | undefined } & Pick<PendingApplyResult, 'transactionId' | 'persistenceTransactionId' | 'hostExecutionId' | 'hostEffects'
-    | 'runtimeGeneration' | 'selectionIntentGeneration' | 'coreState' | 'configurationDurable' | 'retirementState' | 'nativeRetirements'>,
+    | 'runtimeGeneration' | 'selectionIntentGeneration' | 'coreState' | 'configurationDurable' | 'persistenceRetryable' | 'retirementState' | 'nativeRetirements'>,
   allowNewHost = false,
 ): ApplyState {
   const next = { ...mergeNativeRetirements(current, result.nativeRetirements) };
@@ -301,6 +308,11 @@ export function applyReceiptState(
     }
   }
   if (next.coreRecovery && next.phase === 'idle') next.phase = 'durabilityPending';
+  if (result.persistenceRetryable === false && next.coreRecovery
+      && result.transactionId === next.coreRecovery.transactionId
+      && generation === next.coreRecovery.runtimeGeneration && intent === next.coreRecovery.selectionIntentGeneration) {
+    next.coreRecovery = { ...next.coreRecovery, persistenceRetryable: false };
+  }
   if (result.status === 'nativeCleanupUnknown' && !next.nativeRetirements?.length) next.phase = 'failed';
   return next;
 }
@@ -322,14 +334,14 @@ export function applyStateOnLifecycle(
   // A newer explicit user stop cancels neutrally; an old stop cannot cancel a newer Apply.
   if (event.kind === 'stop' && event.terminal === true && event.phase === 'stopped'
       && current.mainGeneration !== undefined && event.mainGeneration > current.mainGeneration) {
-    return preserveNativeRetirements(current, { phase: 'idle', reason: null });
+    return preserveNativeRetirements(current, { phase: 'idle', reason: null, mainGeneration: event.mainGeneration });
   }
   if (event.applyId !== current.applyId || event.kind !== 'restart') {
     return observed === current ? null : observed;
   }
   if (event.terminal !== true) return observed;
-  if (event.phase === 'failed') return preserveNativeRetirements(current, { phase: 'failed', reason: proxyErrorReason(event, t) });
-  if (event.phase === 'ready') return preserveNativeRetirements(current, { phase: 'idle', reason: null });
+  if (event.phase === 'failed') return preserveNativeRetirements(current, { phase: 'failed', reason: proxyErrorReason(event, t), mainGeneration: event.mainGeneration });
+  if (event.phase === 'ready') return preserveNativeRetirements(current, { phase: 'idle', reason: null, mainGeneration: event.mainGeneration });
   return observed === current ? null : observed;
 }
 
@@ -437,7 +449,7 @@ export function composeBarView(input: BarInput): BarView {
       titleVars: {},
       detailKey: '',
       // 全禁用：保存在飞时点重置会丢掉正在落盘的那批意图，点应用会叠一次 force-restart。
-      actions: gateApply([act('reset', true), act('save', true), act('apply', true)]),
+      actions: gateApply([act('reset', true), act('save', true), ...(pendingPhase === 'none' ? [] : [act('apply', true)])]),
     };
   }
   if (stagedPhase === 'saveFailed') {
@@ -563,7 +575,7 @@ export function composeBarView(input: BarInput): BarView {
         titleKey: 'home.pendingStagedTitle',
         titleVars: { count: stagedCount },
         detailKey: 'home.pendingDetailTipStaged',
-        actions: stagedActions,
+        actions: [act('reset'), act('save')],
       };
     case 'pending':
       return {

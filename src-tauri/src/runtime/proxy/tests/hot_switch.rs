@@ -4770,6 +4770,56 @@ async fn real_core_hot_switch_keeps_pid() {
     rt.stop().await.expect("停核应成功");
 }
 
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the paired real Core, uses only loopback management traffic"]
+async fn real_core_staged_save_hot_applies_safe_graph_in_the_same_generation() {
+    let _real_core_guard = lock_real_core_tests().await;
+    let (rt, _dir, _core, _cleanup) = real_core_runtime();
+    let mut config = two_node_config_ports(free_port(), "node-a", free_port(), free_port());
+    config["singboxDashboard"] = false.into();
+    rt.config.save_full(&config).unwrap();
+    let before = rt.config.current().unwrap();
+    let started = rt.start(before.clone()).await.expect("start paired Core");
+    let generation = rt.core_generation();
+    let (candidate, owner) = {
+        // Start returns before its background selector PUT. Wait for its serial
+        // boundary and attest the active member before claiming a new intent.
+        let _selector = rt.switch_serial.lock().await;
+        let groups = rt
+            .management_api()
+            .await
+            .groups_snapshot()
+            .await
+            .expect("read paired Core selector");
+        assert!(groups
+            .iter()
+            .any(|group| group.tag == PROXY_SELECTOR_TAG && group.selected == "Node A"));
+        assert!(!rt.selector_reconcile.is_required());
+        let mut candidate = before.clone();
+        candidate["logLevel"] = "debug".into();
+        rt.config.save_full(&candidate).unwrap();
+        let owner = crate::runtime::proxy::runtime_config::StagedSaveOwner {
+            generation,
+            intent: rt.register_selector_intent(),
+            revision: rt.config.saved_revision(),
+        };
+        (rt.config.current().unwrap(), owner)
+    };
+    let receipt = rt
+        .apply_staged_save_if_current(before, candidate.clone(), owner, |_| {})
+        .await
+        .expect("receipted mutation from the exact Save");
+    assert_eq!(receipt.status, "hotApplied");
+    assert_eq!(receipt.core_state, Some("committed"));
+    assert_eq!(receipt.configuration_durable, Some(true));
+    assert_eq!(receipt.runtime_generation, Some(generation));
+    assert_eq!(rt.status().pid, started.pid);
+    assert_eq!(rt.core_generation(), generation);
+    assert_eq!(rt.current_config_snapshot(), Some(candidate));
+    assert!(!rt.pending_changes().pending_apply);
+    rt.stop().await.expect("stop paired Core");
+}
+
 /// 真核回归：自动故障治理走它自己的零重启事务，真实 gRPC PUT + groups 首帧回读均成功；同时
 /// D 中已保存未 Apply 的结构字段不得进入 R。节点只拨本机监听器，不接管宿主网络。
 #[tokio::test(flavor = "multi_thread")]
@@ -4910,6 +4960,71 @@ async fn controlled_http_request(mixed: u16, nonce: &str) -> String {
         assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
         response
     }).await.expect("one controlled HTTP exchange must complete without replay")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the selected real Core; uses only loopback traffic"]
+async fn real_core_selects_saved_clone_without_applying_other_changes() {
+    let _real_core_guard = lock_real_core_tests().await;
+    let (rt, _dir, _core, _cleanup) = real_core_runtime();
+    let mixed = free_port();
+    let nonce = uuid::Uuid::new_v4().to_string();
+    let reply = format!("clone:{nonce}");
+    let (port, hits, serve) = controlled_socks_http_listener(reply.clone()).await;
+    let mut servers = tokio::task::JoinSet::new();
+    servers.spawn(serve);
+    let mut running = two_node_config_ports(mixed, "node-a", port, free_port());
+    running["singboxDashboard"] = false.into();
+    running["servers"][0] = serde_json::json!({
+        "id":"node-a", "name":"Node A", "protocol":"socks",
+        "address":"127.0.0.1", "port":port
+    });
+    rt.config.save_full(&running).unwrap();
+    let running = rt.config.current().unwrap();
+    let started = rt.start(running.clone()).await.expect("real Core starts");
+    let baseline = rt.current_config_snapshot().unwrap();
+    assert!(controlled_http_request(mixed, &nonce)
+        .await
+        .ends_with(&reply));
+
+    let mut saved = running;
+    let mut clone = saved["servers"][0].clone();
+    clone["id"] = "node-clone".into();
+    clone["name"] = "Node A copy".into();
+    saved["servers"].as_array_mut().unwrap().push(clone);
+    saved["servers"][1]["port"] = free_port().into();
+    saved["mixedPort"] = free_port().into();
+    saved["proxyMode"] = "direct".into();
+    rt.config.save_full(&saved).unwrap();
+    let (_, _, intent, _) = crate::commands::server::server_switch_core(
+        &rt.config,
+        "node-clone",
+        |_| Ok(()),
+        || rt.register_selector_intent(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        rt.switch_selected_server_if_current("node-clone", intent)
+            .await
+            .unwrap(),
+        Some(SwitchOutcome::HotSwitched)
+    );
+    rt.native_auto_status().await;
+    assert_eq!(rt.native_actual_server_id().as_deref(), Some("node-clone"));
+    assert_eq!(rt.status().pid, started.pid);
+    assert_eq!(rt.core_generation(), started.main_generation);
+    let accepted = rt.current_config_snapshot().unwrap();
+    assert_eq!(accepted["selectedServerId"], "node-clone");
+    assert_eq!(accepted["mixedPort"], baseline["mixedPort"]);
+    assert_eq!(accepted["proxyMode"], baseline["proxyMode"]);
+    assert_eq!(accepted["servers"][1], baseline["servers"][1]);
+    assert!(rt.pending_changes().pending_apply);
+    assert!(controlled_http_request(mixed, &nonce)
+        .await
+        .ends_with(&reply));
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    rt.stop().await.expect("stop owned Core");
 }
 
 /// Real failed HOT remains deferred without restarting. An explicit confirmation

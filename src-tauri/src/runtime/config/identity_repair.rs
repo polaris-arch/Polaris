@@ -248,6 +248,7 @@ impl ConfigManager {
         };
         match result {
             Ok(_) => {
+                self.saved_revision.fetch_add(1, Ordering::SeqCst);
                 // Readers see the usual normalized view, while the repair preserves
                 // the disk's unrelated legacy fields byte-for-value. The next ordinary
                 // config transaction retains its existing migration semantics.
@@ -257,6 +258,7 @@ impl ConfigManager {
                 Ok(incoming)
             }
             Err(error @ StoreError::CommitUncertain(_)) => {
+                self.saved_revision.fetch_add(1, Ordering::SeqCst);
                 self.clear_cached_config();
                 Err(error)
             }

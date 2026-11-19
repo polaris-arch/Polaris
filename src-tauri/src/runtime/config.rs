@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::AtomicBool;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use polaris_store::fs::{durable_atomic_write, durable_remove, random_tmp_suffix, ConfigFs, StdFs};
@@ -529,6 +529,7 @@ pub struct ConfigManager {
     /// `load_full_under_write_lock`（末尾取 `cache` 写锁）与保存腿（先取读锁拿旧 icon id、末尾取写锁刷缓存），
     /// 若本锁与 `cache` 是同一把，那两次调用就是自死锁。
     write_lock: Mutex<()>,
+    saved_revision: AtomicU64,
     legacy_start_leases: Arc<AtomicUsize>,
     /// 配置保存与延迟删除消费的事务锁。所有 save 都经它串行，关掉「journal 已写、config 未写时被
     /// Apply 提前消费」及「消费复核后实体又被并发加入」两类竞态；与 `write_lock` 分离以免锁层反转。
@@ -585,6 +586,7 @@ impl ConfigManager {
             path,
             cache: RwLock::new(None),
             write_lock: Mutex::new(()),
+            saved_revision: AtomicU64::new(0),
             legacy_start_leases: Arc::new(AtomicUsize::new(0)),
             deferred_delete_lock: Mutex::new(()),
             staged_mask: RwLock::new(StagedNodeMask {
@@ -1269,7 +1271,9 @@ impl ConfigManager {
             return Err(StoreError::Io("injected config persistence failure".into()));
         }
         if !mesh_guard::has_managed_fields(canonical) {
-            return ConfigStore::save(&StdFs, &self.path, canonical, &random_tmp_suffix());
+            ConfigStore::save(&StdFs, &self.path, canonical, &random_tmp_suffix())?;
+            self.saved_revision.fetch_add(1, Ordering::SeqCst);
+            return Ok(());
         }
         let content = serde_json::to_string_pretty(canonical).map_err(StoreError::from)?;
         let result = durable_atomic_write(&self.path, &content, &random_tmp_suffix());
@@ -1287,8 +1291,12 @@ impl ConfigManager {
             other => other,
         };
         match result {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                self.saved_revision.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
             Err(error @ StoreError::CommitUncertain(_)) => {
+                self.saved_revision.fetch_add(1, Ordering::SeqCst);
                 let actual = self
                     .raw_disk_for_mesh_under_write_lock()
                     .ok()
@@ -1818,6 +1826,21 @@ impl ConfigManager {
         defer_cleanup: bool,
         f: impl FnOnce(&mut Value) -> Decision<R>,
     ) -> Result<(R, Option<Value>), StoreError> {
+        self.update_with_cleanup_revision(defer_cleanup, f)
+            .map(|(result, saved, _)| (result, saved))
+    }
+
+    /// Without a revision, equal bytes produced by a different writer could
+    /// inherit a HOT grant from an older successful Save (A → B → A).
+    pub(crate) fn saved_revision(&self) -> u64 {
+        self.saved_revision.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn update_with_cleanup_revision<R>(
+        &self,
+        defer_cleanup: bool,
+        f: impl FnOnce(&mut Value) -> Decision<R>,
+    ) -> Result<(R, Option<Value>, u64), StoreError> {
         deny_inside_projection("update_with_cleanup");
         let _guard = self
             .write_lock
@@ -1827,14 +1850,14 @@ impl ConfigManager {
         let current = defer_cleanup.then(|| cfg.clone());
         match f(&mut cfg) {
             // 不写：闭包对 `cfg` 的改动一律丢弃（它拿的是本方法的局部副本）。
-            Decision::Skip(r) => Ok((r, None)),
+            Decision::Skip(r) => Ok((r, None, self.saved_revision())),
             Decision::Write(r) => {
                 let saved = if let Some(current) = current.as_ref() {
                     self.save_full_deferred_cleanup_under_write_lock(current, &cfg)?
                 } else {
                     self.save_full_under_write_lock(&cfg)?
                 };
-                Ok((r, Some(saved)))
+                Ok((r, Some(saved), self.saved_revision()))
             }
         }
     }

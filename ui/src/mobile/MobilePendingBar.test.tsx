@@ -17,6 +17,7 @@ const h = vi.hoisted(() => ({
   effects: [] as Array<{ deps?: readonly unknown[]; cleanup?: () => void }>,
   pendingEffects: [] as Array<() => void>,
   applyNow: vi.fn(),
+  savedRuntimeApply: null as PendingApplyResult | null,
   retryPersistence: vi.fn(),
   hostRead: vi.fn(),
   coreRead: vi.fn(),
@@ -92,9 +93,11 @@ vi.mock('@/store/app-store', () => ({
   }),
 }));
 vi.mock('@/store/staged-config-store', () => {
-  const state = { entries: [], saveStatus: 'idle', conflict: null, applyNow: h.applyNow };
+  const state = { entries: [], saveStatus: 'idle', conflict: null, applyNow: h.applyNow,
+    get savedRuntimeApply() { return h.savedRuntimeApply; } };
   return { useStagedConfigStore: Object.assign((selector: (value: typeof state) => unknown) => selector(state), {
     getState: () => state,
+    setState: ({ savedRuntimeApply }: { savedRuntimeApply: PendingApplyResult | null }) => { h.savedRuntimeApply = savedRuntimeApply; },
   }) };
 });
 vi.mock('@/lib/error-handler', () => ({
@@ -165,6 +168,7 @@ beforeEach(() => {
   vi.resetAllMocks();
   h.states = [];
   h.refs = [];
+  h.savedRuntimeApply = null;
   h.lifecycleReady.mockResolvedValue(h.offLifecycle);
   h.statusRead.mockImplementation(async () => h.app.proxyStatus);
   h.app.config = null;
@@ -181,6 +185,48 @@ beforeEach(() => {
   vi.spyOn(console, 'error').mockImplementation(() => undefined);
 });
 afterEach(() => { unmount(); if (vi.isFakeTimers()) vi.clearAllTimers(); vi.useRealTimers(); vi.restoreAllMocks(); });
+
+it('uses the shared Save HOT receipt and keeps durability recovery bound to its owner', () => {
+  h.realReconciliation = true;
+  h.app.pendingChanges = { added: [], modified: [], removed: [], restartDeferred: false };
+  h.savedRuntimeApply = { ok: true, status: 'hotApplied', transactionId: 'save-hot', runtimeGeneration: 7,
+    selectionIntentGeneration: 3, coreState: 'committed', configurationDurable: true };
+  expect(renderBar()).toBeNull();
+  expect(renderBar()).toBeNull();
+  expect(toast.info).toHaveBeenCalledExactlyOnceWith('home.pendingHotApplied');
+
+  vi.useFakeTimers();
+  h.savedRuntimeApply = { ok: true, status: 'hotDurabilityPending', transactionId: 'save-persist', runtimeGeneration: 7,
+    selectionIntentGeneration: 4, coreState: 'committed', configurationDurable: false };
+  renderBar();
+  expect(markup(renderBar())).toContain('home.pendingRetryPersistenceBtn');
+  expect(h.states[0]).toMatchObject({ coreRecovery: { transactionId: 'save-persist', runtimeGeneration: 7 } });
+  expect(toast.info).toHaveBeenCalledExactlyOnceWith('home.pendingHotApplied');
+  expect(h.applyNow).not.toHaveBeenCalled();
+});
+
+it('polls the original Save recovery owner after a prior explicit Apply was cancelled', async () => {
+  h.realReconciliation = true;
+  h.applyNow.mockResolvedValueOnce({ saved: true, status: 'unconfirmed' });
+  click('home.pendingApplyBtn');
+  await microtasks();
+  expect(h.states[0]).toMatchObject({ phase: 'failed' });
+  const listener = h.lifecycleReady.mock.calls[0][0] as (event: unknown) => void;
+  listener({ kind: 'stop', phase: 'stopped', terminal: true, mainGeneration: 7 });
+  await microtasks();
+  h.app.proxyStatus = { ...h.app.proxyStatus, mainGeneration: 8 };
+  h.app.pendingChanges = { added: [], modified: [], removed: [], restartDeferred: true };
+  vi.useFakeTimers();
+  h.savedRuntimeApply = { ok: false, status: 'unconfirmed', transactionId: 'original-save', runtimeGeneration: 8,
+    selectionIntentGeneration: 5, coreState: 'committed', configurationDurable: false };
+  renderBar();
+  renderBar();
+  expect(h.states[0]).toMatchObject({ phase: 'durabilityPending', mainGeneration: 8,
+    coreRecovery: { transactionId: 'original-save', runtimeGeneration: 8, selectionIntentGeneration: 5 } });
+  await vi.advanceTimersByTimeAsync(2_000);
+  expect(h.coreRead).toHaveBeenCalledExactlyOnceWith('original-save');
+  expect(toast.info).not.toHaveBeenCalled();
+});
 
 describe('mobile pending restart and write feedback', () => {
   it('reports a failed revert and offers confirmation again without entering apply retry', async () => {

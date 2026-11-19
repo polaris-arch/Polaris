@@ -32,6 +32,7 @@ use crate::events::channel::{
 };
 use crate::response::{ok_void, ApiResponse};
 use crate::runtime::config::{ConfigManager, Decision};
+use crate::runtime::proxy::runtime_config::StagedSaveOwner;
 use crate::runtime::proxy::{ProxyRuntime, StagedClassification, SwitchOutcome};
 use crate::runtime::unlock::{
     selected_exit_changed, BroadcastSink, UnlockEventSink, UnlockRuntime,
@@ -369,7 +370,12 @@ fn config_content_hash(cfg: &Value) -> String {
 pub enum SaveOutcome {
     /// 已落盘。`config` 是实际写盘规范形的渲染端投影；前端必须拿它而不是提交前 `merged` 刷新
     /// baseline，否则后端归一/派生字段会让下一批编辑基于一份磁盘上从未存在过的对象。
-    Saved { version: String, config: Value },
+    Saved {
+        version: String,
+        config: Value,
+        #[serde(rename = "runtimeApply", skip_serializing_if = "Option::is_none")]
+        runtime_apply: Option<Value>,
+    },
     /// 磁盘现值 ≠ `base_version` ⇒ **一个字节都没写**。`diskVersion` 供前端定位它该基于哪一版重放。
     #[serde(rename_all = "camelCase")]
     Conflict { disk_version: String },
@@ -379,8 +385,8 @@ const CONFIG_BASE_VERSION_REQUIRED: &str = "CONFIG_BASE_VERSION_REQUIRED";
 
 /// 上游 `CONFIG_SAVE`：保存 UserConfig + 广播 event:configChanged。
 ///
-/// `deferRestart=true` = 暂存层「保存」腿的**不改变运行态**标志（spec §2.5 Q4）：NoOp 仍保持
-/// NoOp；热切换、强制重启和普通重启全部只落盘，运行态统一由「应用」提交。
+/// `autoApply` authorizes a safe HOT transaction for this exact staged save. The
+/// save preceding an explicit Apply keeps `deferRestart` and does not auto-apply.
 ///
 /// `baseVersion` 是整份保存的必填并发基准。即时控件改走 [`config_patch`]；因此不存在一个合理的
 /// “无版本整份覆盖”调用者。缺失时 fail-closed，避免未来入口把旧快照重新接回。
@@ -389,54 +395,95 @@ const CONFIG_BASE_VERSION_REQUIRED: &str = "CONFIG_BASE_VERSION_REQUIRED";
     reason = "Tauri IPC command owns its deserialized payload across the call"
 )]
 #[tauri::command]
-pub fn config_save(
+pub async fn config_save(
     app: AppHandle,
     state: State<'_, AppRuntime>,
     config: Value,
     defer_restart: Option<bool>,
     base_version: Option<String>,
-) -> ApiResponse<SaveOutcome> {
+    auto_apply: Option<bool>,
+) -> Result<ApiResponse<SaveOutcome>, ()> {
     if base_version.is_none() {
         log::warn!("config:save 缺少 baseVersion，拒绝无版本整份覆盖");
-        return ApiResponse::err_with_code(
+        return Ok(ApiResponse::err_with_code(
             crate::i18n::t(
                 crate::i18n::app_lang(&app),
                 crate::i18n::key::NATIVE_UNKNOWN_ERROR,
             ),
             CONFIG_BASE_VERSION_REQUIRED,
-        );
+        ));
     }
     // 本地转 mut 而非参数上写 `mut config`：check-ipc-args.mjs 的 Rust 形参解析不 strip `mut`，会把
     // 参数名误读成 `mut config` 从而要求前端多传该键（运行期 Tauri 其实 strip 了、无害，但 CI 门会红）。
     let mut config = config;
-    // `deferRestart=true` 是暂存保存；即使调用方未传该标志，只要旧核仍在也不能立即清资源/state。
+    let auto_apply = auto_apply.unwrap_or(false);
+    // 暂存保存或旧核仍在时不能立即清资源/state。
     // 后者覆盖将来新增的直写入口，避免把安全性押在“前端一定经过暂存层”这一条接线上。
-    let defer_cleanup =
-        cfg!(target_os = "ios") || defer_restart.unwrap_or(false) || state.proxy().status().running;
-    match config_save_core(
+    let defer_cleanup = cfg!(target_os = "ios")
+        || auto_apply
+        || defer_restart.unwrap_or(false)
+        || state.proxy().status().running;
+    let (mut outcome, previous) = match config_save_core(
         state.config(),
         &mut config,
         base_version.as_deref(),
         defer_cleanup,
     ) {
         // 冲突腿**不广播、不入核**：磁盘没变，广播出去只会让所有窗口把一份从未落盘的配置当现值。
-        Ok((outcome @ SaveOutcome::Conflict { .. }, _)) => ApiResponse::ok(outcome),
-        Ok((outcome, old_selected)) => {
-            // 不在此处清 staged marker：后端只看到本次提交，不知道 IPC 在途期间前端是否又产生了
-            // 下一批草稿。盲清会打开托盘/自动连接按旧配置起核的窗口。前端在回包后按剩余条目
-            // 写 false/true；回包丢失时保守保留 true，下次 hydrate 剪掉磁盘已满足的意图后再清。
-            broadcast_config_changed_with(&app, &config, defer_restart.unwrap_or(false));
-            invalidate_unlock_on_exit_change(
-                state.unlock(),
-                &BroadcastSink::new(&app),
-                state.proxy().status().running,
-                old_selected.as_deref(),
-                config.get("selectedServerId").and_then(Value::as_str),
-            );
-            ApiResponse::ok(outcome)
+        Ok((outcome @ SaveOutcome::Conflict { .. }, _)) => return Ok(ApiResponse::ok(outcome)),
+        Ok(saved) => saved,
+        Err(error) => return Ok(config_store_error(error)),
+    };
+    // 不清 staged marker。前端回包后按在途新编辑的实况更新；回包丢失时保留跨入口保护。
+    let owner = if auto_apply {
+        let owner = previous.as_ref().and_then(|save| {
+            state
+                .config()
+                .try_with_saved_commit(|latest| {
+                    (latest == &config && state.config().saved_revision() == save.revision).then(
+                        || StagedSaveOwner {
+                            generation: state.proxy().core_generation(),
+                            intent: state.proxy().register_selector_intent(),
+                            revision: save.revision,
+                        },
+                    )
+                })
+                .ok()
+                .flatten()
+        });
+        emit_config_changed_signal(&app);
+        owner
+    } else {
+        broadcast_config_changed_with(&app, &config, defer_restart.unwrap_or(false));
+        None
+    };
+    invalidate_unlock_on_exit_change(
+        state.unlock(),
+        &BroadcastSink::new(&app),
+        state.proxy().status().running,
+        previous
+            .as_ref()
+            .and_then(|save| save.previous.get("selectedServerId"))
+            .and_then(Value::as_str),
+        config.get("selectedServerId").and_then(Value::as_str),
+    );
+    if auto_apply {
+        if let (Some(owner), Some(previous), SaveOutcome::Saved { runtime_apply, .. }) =
+            (owner, previous, &mut outcome)
+        {
+            *runtime_apply = Box::pin(state.proxy.apply_staged_save_if_current(
+                previous.previous,
+                config,
+                owner,
+                |current| apply_process_config_projections(&app, current),
+            ))
+            .await
+            .and_then(|receipt| serde_json::to_value(receipt).ok());
+        } else {
+            state.proxy().push_pending_changes();
         }
-        Err(e) => config_store_error(e),
     }
+    Ok(ApiResponse::ok(outcome))
 }
 
 /// `CONFIG_CLASSIFY_STAGED`（spec §2.3.4）：候选配置**若现在落盘**会走哪条腿。
@@ -759,6 +806,11 @@ pub fn config_mutate_entities(
     }
 }
 
+struct CommittedSave {
+    previous: Value,
+    revision: u64,
+}
+
 /// `config_save` 的可测核心（剥掉 `AppHandle`/`State`，单测能直接调）。
 ///
 /// **抽出来是为了让测试走生产路径**：若测试自己调 `preserve_server_owned_secrets` 再 `save_full`，
@@ -777,44 +829,43 @@ fn config_save_core(
     incoming: &mut Value,
     base_version: Option<&str>,
     defer_cleanup: bool,
-) -> Result<(SaveOutcome, Option<String>), polaris_store::StoreError> {
+) -> Result<(SaveOutcome, Option<CommittedSave>), polaris_store::StoreError> {
     enum Attempt {
         Conflict { disk_version: String },
-        Save { old_selected: Option<String> },
+        Save { previous: Value },
     }
 
     let submitted = incoming.clone();
-    let (attempt, saved) = config.update_with_cleanup(defer_cleanup, |current| {
-        if let Some(base) = base_version {
-            let disk_version = config_version(current);
-            if base != disk_version {
-                return crate::runtime::config::Decision::Skip(Attempt::Conflict { disk_version });
+    let (attempt, saved, revision) =
+        config.update_with_cleanup_revision(defer_cleanup, |current| {
+            if let Some(base) = base_version {
+                let disk_version = config_version(current);
+                if base != disk_version {
+                    return crate::runtime::config::Decision::Skip(Attempt::Conflict {
+                        disk_version,
+                    });
+                }
             }
-        }
 
-        // 与版本校验、字段合并取自同一份锁内旧态。命令层若在事务外先 `current()`，
-        // 后台 writer 可插在两者之间，让出口缓存失效拿两个不同时刻的值比较。
-        let old_selected = current
-            .get("selectedServerId")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        let mut next = submitted;
-        // 三条基于磁盘真值的策略与版本校验、最终写入处在同一个 ConfigManager 写临界区：
-        // 后台订阅/MRU 写不再能插进“校验通过 → 覆盖落盘”的窗口。
-        preserve_server_owned_secrets_from(current, &mut next);
-        enforce_backend_authoritative_fields_from(current, &mut next);
-        crate::commands::server::prune_recent_server_ids_to_existing(&mut next);
-        sync_traffic_rules_projection(&mut next);
-        log_invalidated_validators(invalidate_validators_on_global_ua_change(
-            current, &mut next,
-        ));
-        *current = next;
-        crate::runtime::config::Decision::Write(Attempt::Save { old_selected })
-    })?;
+            // 与版本校验、字段合并取自同一份锁内旧态。命令层若在事务外先 `current()`，
+            // 后台 writer 可插在两者之间，让出口缓存失效拿两个不同时刻的值比较。
+            let mut next = submitted;
+            // 三条基于磁盘真值的策略与版本校验、最终写入处在同一个 ConfigManager 写临界区：
+            // 后台订阅/MRU 写不再能插进“校验通过 → 覆盖落盘”的窗口。
+            preserve_server_owned_secrets_from(current, &mut next);
+            enforce_backend_authoritative_fields_from(current, &mut next);
+            crate::commands::server::prune_recent_server_ids_to_existing(&mut next);
+            sync_traffic_rules_projection(&mut next);
+            log_invalidated_validators(invalidate_validators_on_global_ua_change(
+                current, &mut next,
+            ));
+            let previous = std::mem::replace(current, next);
+            crate::runtime::config::Decision::Write(Attempt::Save { previous })
+        })?;
 
     match attempt {
         Attempt::Conflict { disk_version } => Ok((SaveOutcome::Conflict { disk_version }, None)),
-        Attempt::Save { old_selected } => {
+        Attempt::Save { previous } => {
             let saved = saved.expect("Decision::Write 必须返回已落盘配置");
             *incoming = saved.clone();
             let mut frontend = saved.clone();
@@ -823,8 +874,9 @@ fn config_save_core(
                 SaveOutcome::Saved {
                     version: config_version(&saved),
                     config: frontend,
+                    runtime_apply: None,
                 },
-                old_selected,
+                Some(CommittedSave { previous, revision }),
             ))
         }
     }

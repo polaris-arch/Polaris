@@ -174,7 +174,7 @@ fn multi_entity_mutation_is_all_or_nothing_and_deletion_is_journaled() {
 fn full_save_command_rejects_missing_version_before_touching_config() {
     let body = crate::commands::guard_scan::top_level_fn_body(
         &crate_code("commands/config.rs"),
-        "pub fn config_save(",
+        "pub async fn config_save(",
     );
     let guard = body
         .find("if base_version.is_none()")
@@ -187,7 +187,7 @@ fn full_save_command_rejects_missing_version_before_touching_config() {
 fn staged_full_save_never_blindly_clears_the_backend_marker() {
     let body = crate::commands::guard_scan::top_level_fn_body(
         &crate_code("commands/config.rs"),
-        "pub fn config_save(",
+        "pub async fn config_save(",
     );
     assert!(body.contains("config_save_core("), "暂存保存核心仍在");
     assert!(body.contains("SaveOutcome::Conflict"), "冲突腿必须单独返回");
@@ -259,10 +259,13 @@ fn full_save_returns_the_old_exit_from_the_same_locked_transaction() {
 
     let mut submitted = latest;
     submitted["selectedServerId"] = json!("__direct__");
-    let (_, old_selected) =
+    let (_, previous) =
         config_save_core(&manager, &mut submitted, None, false).expect("save 应成功");
 
-    assert_eq!(old_selected.as_deref(), Some("node-a"));
+    assert_eq!(
+        previous.unwrap().previous["selectedServerId"],
+        json!("node-a")
+    );
     assert_eq!(submitted["selectedServerId"], json!("__direct__"));
 }
 

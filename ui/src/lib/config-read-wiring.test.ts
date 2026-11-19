@@ -363,12 +363,6 @@ const SITES: readonly Site[] = [
     why: '入参类：节点使用按钮点击时按磁盘selectionIntent与selectedServerId判断手动同出口no-op；暂存编辑不能替代后端切换及权威读回',
   },
   {
-    file: 'components/layout/PendingChangesBar.tsx',
-    shape: 'useAppStore((s)=>s.config)',
-    route: 'disk',
-    why: '基准类：FR-9 逐条标注走 classifyStaged(replay(config,[e]))，问的是「只有这一条时要不要重启」，重放基准必须是盘',
-  },
-  {
     file: 'App.tsx',
     shape: 'useAppStore((s)=>s.config)',
     route: 'disk',
@@ -1081,7 +1075,7 @@ describe('守卫自检：扫到的确实是源码（防扫空 / 配平扫描被�
     // `useAppStore((s) => s.config?.…)` 里 `.config` 在第一个 `)` **之后**；用 `[^)]*` 正则
     // 会把它切掉 ⇒ 命中数骤降而断言仍绿。这条锚点专抓那种失配。
     const found = new Set(HITS.map(key));
-    expect(found.has('components/layout/PendingChangesBar.tsx | useAppStore((s)=>s.config)')).toBe(
+    expect(found.has('App.tsx | useAppStore((s)=>s.config)')).toBe(
       true
     );
     expect(found.has('store/app-store.ts | useAppStore.getState().config')).toBe(true);

@@ -1620,7 +1620,7 @@ impl ProxyRuntime {
         result.host_execution_id = Some(current.execution.execution_id.clone());
         if let Some(kernel) = state.kernel.as_ref().filter(|kernel| {
             kernel.generation == current.execution.generation
-                && !kernel.superseded
+                && kernel.publication == super::RuntimeReceiptPublication::Current
                 && identity_equal(
                     kernel.operation.active.as_ref(),
                     current.execution.core_active.as_ref(),

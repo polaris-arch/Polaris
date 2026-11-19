@@ -253,7 +253,7 @@ fn unverified_peers_never_receive_a_compatibility_restart_choice() {
     let source = crate::test_support::crate_code("runtime/proxy/runtime_config.rs");
     let body = crate::commands::guard_scan::impl_method_body(
         &source,
-        "    pub(super) async fn apply_runtime_candidate(",
+        "    async fn apply_runtime_candidate_with_policy(",
     );
     assert!(body.contains("paired_runtime_capabilities(&client, &baseline.pairing)"));
     assert!(!body.contains("unsupportedCore"));
@@ -487,6 +487,192 @@ async fn host_dns_consent_and_failed_admission_do_not_accept_the_saved_host_effe
     assert_eq!(rt.config.current().unwrap(), candidate);
     assert!(rt.pending_changes().pending_apply);
     assert!(rt.pending_force_restart.read().unwrap().is_none());
+}
+
+#[tokio::test]
+async fn staged_save_preserves_earlier_saved_debt_and_rejects_superseded_candidates() {
+    let (rt, _dir, running, prior_saved) = host_dns_restart_fixture();
+    let baseline = ts_pending_raw_fixture(&rt, running.clone());
+    *rt.switch_snapshot.write().unwrap() = Some(ProxyRuntime::build_switch_snapshot(
+        &baseline.typed,
+        &baseline.generated,
+        &baseline.deps,
+    ));
+    let mut next = prior_saved.clone();
+    next["logLevel"] = json!("debug");
+    rt.config.save_full(&next).unwrap();
+    let next = rt.config.current().unwrap();
+    let owner = StagedSaveOwner {
+        generation: rt.core_generation(),
+        intent: rt.register_selector_intent(),
+        revision: rt.config.saved_revision(),
+    };
+    let mut projected = false;
+    let result = rt
+        .apply_staged_save_if_current(prior_saved.clone(), next.clone(), owner, |_| {
+            projected = true
+        })
+        .await;
+    assert!(
+        projected,
+        "current App projections remain independent of runtime debt"
+    );
+    assert!(result.is_none());
+    assert!(
+        rt.runtime_config_apply.lock().unwrap().last.is_none(),
+        "older debt must stop before Core Plan"
+    );
+    assert_eq!(rt.current_config_snapshot(), Some(running.clone()));
+    assert_eq!(rt.config.current().unwrap(), next);
+    assert!(rt.pending_changes().pending_apply);
+
+    let late = rt
+        .apply_staged_save_if_current(running, prior_saved, owner, |_| {
+            panic!("stale saved candidate cannot change App projections")
+        })
+        .await;
+    assert!(late.is_none());
+    assert!(rt.pending_force_restart.read().unwrap().is_none());
+}
+
+#[tokio::test]
+async fn staged_save_never_inherits_its_grant_from_equal_bytes_written_later() {
+    let (rt, _dir, running, candidate) = host_dns_restart_fixture();
+    let owner = StagedSaveOwner {
+        generation: rt.core_generation(),
+        intent: rt.register_selector_intent(),
+        revision: rt.config.saved_revision(),
+    };
+    rt.config.save_full(&running).unwrap();
+    rt.config.save_full(&candidate).unwrap();
+    assert_eq!(rt.config.current().unwrap(), candidate);
+    assert!(rt.selector_intent_is_current(owner.intent));
+    assert!(rt.config.saved_revision() > owner.revision);
+    let receipt = rt
+        .apply_staged_save_if_current(running.clone(), candidate, owner, |_| {
+            panic!("equal bytes from a later writer do not own this Save")
+        })
+        .await;
+    assert!(receipt.is_none());
+    assert_eq!(rt.current_config_snapshot(), Some(running));
+}
+
+#[tokio::test]
+async fn staged_save_leaves_same_id_node_debt_when_verified_fingerprints_are_unavailable() {
+    let (rt, _dir, mut running, _) = host_dns_restart_fixture();
+    running["servers"] =
+        json!([{"id":"node","name":"node","protocol":"socks","address":"127.0.0.1","port":1080}]);
+    rt.config.save_full(&running).unwrap();
+    let running = rt.config.current().unwrap();
+    *rt.current_config.write().unwrap() = Some(running.clone());
+    *rt.startup_snapshot.write().unwrap() = Some(running.clone());
+    let mut older = running.clone();
+    older["servers"][0]["port"] = json!(1081);
+    rt.config.save_full(&older).unwrap();
+    let older = rt.config.current().unwrap();
+    assert!(
+        !rt.pending_changes_against(Some(&older)).pending_apply,
+        "display projection cannot classify a changed same-ID node without accepted fingerprints"
+    );
+    let mut candidate = older.clone();
+    candidate["logLevel"] = json!("debug");
+    rt.config.save_full(&candidate).unwrap();
+    let candidate = rt.config.current().unwrap();
+    let owner = StagedSaveOwner {
+        generation: rt.core_generation(),
+        intent: rt.register_selector_intent(),
+        revision: rt.config.saved_revision(),
+    };
+    let result = rt
+        .apply_staged_save_if_current(older, candidate, owner, |_| {})
+        .await;
+    assert!(result.is_none());
+    assert!(
+        rt.runtime_config_apply.lock().unwrap().last.is_none(),
+        "missing fingerprints prevent even planning"
+    );
+    assert_eq!(rt.current_config_snapshot(), Some(running));
+}
+
+#[tokio::test]
+async fn staged_save_retains_the_exact_recovery_owner_after_supersession() {
+    let (rt, _dir, running, candidate) = host_dns_restart_fixture();
+    let mut pending = ts_pending_raw_fixture(&rt, candidate);
+    pending.saved_revision = Some(rt.config.saved_revision());
+    let owner = pending.staged_save_owner().unwrap();
+    let mut operation = listener_retirement_receipt(&pending, "DRAINED");
+    operation.state = daemon::RuntimeOperationState::CommittedDurabilityPending as i32;
+    operation.durable = false;
+    operation.persistence_mode = "exact_configuration_file".into();
+    let (rpc, server) = native_retirement_rpc_peer(&rt, &pending, operation.clone()).await;
+    rt.runtime_config_apply.lock().unwrap().pending = Some(pending.clone());
+    rt.config.save_full(&running).unwrap();
+    rt.register_selector_intent();
+    let id = pending.plan.transaction_id.clone();
+    let mut receipt = RuntimeApplyResult::status("hotDurabilityPending");
+    receipt.transaction_id = Some(id.clone());
+    receipt.runtime_generation = Some(owner.generation);
+    receipt.selection_intent_generation = Some(owner.intent);
+    assert!(rt.retain_staged_save_recovery_receipt(owner, &mut receipt));
+    let poll = rt.runtime_apply_status(id.clone()).await;
+    let retry = rt.retry_runtime_persistence(id.clone()).await;
+    for result in [receipt, poll, retry] {
+        assert_eq!(result.status, "unconfirmed");
+        assert!(!result.ok);
+        assert_eq!(result.transaction_id.as_deref(), Some(id.as_str()));
+        assert_eq!(result.runtime_generation, Some(owner.generation));
+        assert_eq!(result.selection_intent_generation, Some(owner.intent));
+        assert_eq!(result.persistence_retryable, Some(false));
+    }
+    assert!(rt.pending_changes().pending_apply);
+    assert!(rt.staged_save_recovery_pending());
+    assert!(!rpc.requests.lock().unwrap().is_empty());
+    assert_eq!(rpc.mutations.load(Ordering::SeqCst), 0);
+    assert!(rpc.acknowledgements.lock().unwrap().is_empty());
+
+    operation.state = daemon::RuntimeOperationState::Committed as i32;
+    operation.durable = true;
+    *rpc.status.lock().unwrap() = native_retirement_status(operation);
+    let terminal = rt.runtime_apply_status(id.clone()).await;
+    assert_eq!(terminal.status, "conflict");
+    assert_eq!(terminal.configuration_durable, Some(true));
+    assert!(!rt.staged_save_recovery_pending());
+    let cached = rt.runtime_apply_status(id.clone()).await;
+    assert_eq!(cached.status, "conflict");
+    assert_eq!(cached.configuration_durable, Some(true));
+    assert_eq!(cached.transaction_id.as_deref(), Some(id.as_str()));
+    assert!(!cached.ok);
+    assert_eq!(rt.retry_runtime_persistence(id).await.status, "conflict");
+    assert_eq!(rt.current_config_snapshot().as_ref(), Some(&running));
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn staged_save_stale_terminal_native_observer_cannot_report_success() {
+    let (rt, _dir, running, candidate) = host_dns_restart_fixture();
+    let mut pending = ts_pending_raw_fixture(&rt, candidate);
+    pending.saved_revision = Some(rt.config.saved_revision());
+    let operation = listener_retirement_receipt(&pending, "UNKNOWN");
+    let (rpc, server) = native_retirement_rpc_peer(&rt, &pending, operation).await;
+    rt.runtime_config_apply.lock().unwrap().pending = Some(pending.clone());
+    rt.config.save_full(&running).unwrap();
+    let id = pending.plan.transaction_id.clone();
+
+    for receipt in [
+        rt.runtime_apply_status(id.clone()).await,
+        rt.runtime_apply_status(id.clone()).await,
+        rt.runtime_native_retirement_status(id).await,
+    ] {
+        assert_eq!(receipt.status, "conflict");
+        assert_eq!(receipt.configuration_durable, Some(true));
+        assert_original_native_debt(&receipt, &pending);
+    }
+    assert_eq!(rt.current_config_snapshot().as_ref(), Some(&running));
+    assert_eq!(rpc.mutations.load(Ordering::SeqCst), 0);
+    assert!(!rt.staged_save_recovery_pending());
+    server.abort();
+    let _ = server.await;
 }
 
 #[test]
@@ -728,6 +914,7 @@ pub(super) fn ts_pending_raw_fixture(rt: &Arc<ProxyRuntime>, raw: Value) -> Pend
         api_handoff: None,
         pairing,
         desired: raw.clone(),
+        saved_revision: None,
         deletion_scope: vec![],
         physical_route_config: typed.clone(),
         protected_physical_root: None,
@@ -856,7 +1043,7 @@ fn verified_kernel_receipt_survives_unrelated_last_request_and_keeps_its_owner()
     state.kernel = Some(RuntimeKernelReceipt {
         generation: 7,
         intent: 11,
-        superseded: false,
+        publication: RuntimeReceiptPublication::Current,
         operation: daemon::RuntimeConfigOperation {
             transaction_id: "original".into(),
             active: Some(active.clone()),
@@ -882,7 +1069,7 @@ fn verified_kernel_receipt_survives_unrelated_last_request_and_keeps_its_owner()
         ..Default::default()
     };
     assert!(!state.requires_regeneration_owner_restart(7, &plan));
-    state.kernel.as_mut().unwrap().superseded = true;
+    state.kernel.as_mut().unwrap().publication = RuntimeReceiptPublication::RegenerationSuperseded;
     assert!(state.requires_regeneration_owner_restart(7, &plan));
     assert_eq!(
         state.core_receipt_for("original", 7).unwrap().status,
@@ -987,7 +1174,7 @@ fn host_only_publication_preserves_the_original_kernel_persistence_owner() {
             generation: original.generation,
             intent: original.intent,
             operation,
-            superseded: false,
+            publication: RuntimeReceiptPublication::Current,
         });
         assert!(state.host_only_preserves_pending_core(&retry));
         let mut changed = retry.clone();
@@ -1037,9 +1224,29 @@ async fn ts_apply_unknown_stays_paused_only_proven_unapplied_resumes() {
         before: pending.plan.expected.clone(),
         active: pending.plan.expected.clone(),
         control_revision: 7,
-        state: daemon::RuntimeOperationState::RejectedUnapplied as i32,
+        state: daemon::RuntimeOperationState::AbortedUnapplied as i32,
+        errors: [
+            "PREPARATION_FAILED",
+            "PREPARATION_DEADLINE_EXCEEDED",
+            "PREPARATION_DEADLINE_EXCEEDED",
+            "UNRECOGNIZED_CORE_DETAIL",
+        ]
+        .into_iter()
+        .map(|code| daemon::RuntimePlanError {
+            code: code.into(),
+            effective_path: "raw Core detail".into(),
+            message: "raw Core message".into(),
+            ..Default::default()
+        })
+        .collect(),
         ..Default::default()
     };
+    let mut aborting = receipt.clone();
+    aborting.state = daemon::RuntimeOperationState::AbortingUnapplied as i32;
+    let unconfirmed = rt.settle_runtime_operation(&pending, aborting);
+    assert_eq!(unconfirmed.status, "unconfirmed");
+    assert!(unconfirmed.reasons.is_empty());
+    assert!(rt.tailnet_context().unwrap().suspended);
     let mut unknown = receipt.clone();
     unknown.candidate_digest = "wrong".into();
     assert_eq!(
@@ -1054,9 +1261,14 @@ async fn ts_apply_unknown_stays_paused_only_proven_unapplied_resumes() {
         "unconfirmed"
     );
     assert!(rt.tailnet_context().unwrap().suspended);
+    let rejected = rt.settle_runtime_operation(&pending, receipt);
+    assert_eq!(rejected.status, "rejected");
     assert_eq!(
-        rt.settle_runtime_operation(&pending, receipt).status,
-        "rejected"
+        rejected.reasons,
+        ["PREPARATION_FAILED", "PREPARATION_DEADLINE_EXCEEDED"].map(|code| RuntimeApplyReason {
+            code,
+            path: "runtime.prepare".into(),
+        })
     );
     assert!(!rt.tailnet_context().unwrap().suspended);
     assert_eq!(rt.tailnet_context().unwrap().token, old.token);
@@ -1782,7 +1994,7 @@ fn blocked_noop_publication_preserves_original_kernel_persistence_owner() {
                 generation: original.generation,
                 intent: original.intent,
                 operation: operation.clone(),
-                superseded: false,
+                publication: RuntimeReceiptPublication::Current,
             });
             assert!(
                 state.host_only_preserves_pending_core(&retry),
@@ -1895,7 +2107,7 @@ fn cached_kernel_receipt_retains_native_unknown_without_undoing_durable_commit()
         kernel: Some(RuntimeKernelReceipt {
             generation: pending.generation,
             intent: pending.intent,
-            superseded: false,
+            publication: RuntimeReceiptPublication::Current,
             operation: listener_retirement_receipt(&pending, "UNKNOWN"),
         }),
         ..Default::default()
@@ -2106,7 +2318,7 @@ fn original_refresh_keeps_first_unknown_and_does_not_borrow_successor_kernel_own
     state.kernel = Some(RuntimeKernelReceipt {
         generation: pending.generation,
         intent: pending.intent + 1,
-        superseded: false,
+        publication: RuntimeReceiptPublication::Current,
         operation: successor.clone(),
     });
     let mut status = native_retirement_status(listener_retirement_receipt(&pending, "UNKNOWN"));
@@ -2686,7 +2898,7 @@ fn native_failure_requires_exact_unknown_listener_code_and_inbounds_path() {
         let receipt = RuntimeKernelReceipt {
             generation: pending.generation,
             intent: pending.intent,
-            superseded: false,
+            publication: RuntimeReceiptPublication::Current,
             operation,
         };
         let result = receipt.result();
@@ -2723,7 +2935,10 @@ async fn superseded_regeneration_owner_still_retains_original_native_failure() {
         .any(|reason| reason.code == "OWNER_STATE_SUPERSEDED"));
     assert_original_native_debt(&result, &pending);
     let state = runtime.runtime_config_apply.lock().unwrap();
-    assert!(state.kernel.as_ref().unwrap().superseded);
+    assert!(
+        state.kernel.as_ref().unwrap().publication
+            == RuntimeReceiptPublication::RegenerationSuperseded
+    );
     assert!(state.pending.is_none());
     assert_eq!(
         state.native_retirements[&pending.plan.transaction_id]

@@ -60,6 +60,7 @@ import {
   nativeRetirementsAfterLifecycle,
   preserveNativeRetirements,
   dismissApplyState,
+  runtimePersistenceRetryAvailable,
   runtimePersistenceRecoveryEnded,
   applyStateOnLifecycle,
   composeBarView,
@@ -120,6 +121,7 @@ export function MobilePendingBar(): ReactElement | null {
     awaitingReply: boolean;
     cancelled: boolean;
     intentGeneration: number | undefined;
+    runtimeGeneration: number | undefined;
     early: ProxyLifecycleEvent[];
     earlyGeneration: number | undefined;
     earlyStopped: boolean;
@@ -243,8 +245,7 @@ export function MobilePendingBar(): ReactElement | null {
     applyError: apply.reason,
     coreRunning,
     coreGeneration,
-    persistenceRetryAvailable: !!apply.coreRecovery || (apply.configurationDurable !== true && !!apply.transactionId
-      && (apply.persistenceOnly === true || apply.phase === 'durabilityPending')),
+    persistenceRetryAvailable: runtimePersistenceRetryAvailable(apply),
     host: apply.host,
     nativeRetirements: mergeNativeRetirements(apply, pending.nativeRetirements).nativeRetirements,
     nativeChecking: apply.nativeChecking,
@@ -283,6 +284,7 @@ export function MobilePendingBar(): ReactElement | null {
       ...(Number.isSafeInteger(generation) && (generation ?? 0) > 0 ? { mainGeneration: generation } : {}) });
     const request = { awaitingReply: true, cancelled: false,
       intentGeneration: undefined as number | undefined,
+      runtimeGeneration: initial.mainGeneration,
       early: [] as ProxyLifecycleEvent[],
       earlyGeneration: initial.mainGeneration, earlyStopped: false };
     applyRequest.current = request;
@@ -366,6 +368,7 @@ export function MobilePendingBar(): ReactElement | null {
       const reconcileOwnerKnown = Number.isSafeInteger(result.runtimeGeneration) && (result.runtimeGeneration ?? 0) > 0
         && Number.isSafeInteger(result.selectionIntentGeneration) && (result.selectionIntentGeneration ?? -1) >= 0;
       request.intentGeneration = result.selectionIntentGeneration;
+      request.runtimeGeneration = result.runtimeGeneration ?? initial.mainGeneration;
       const outcome = applyOutcome(result.status, result.reasons);
       let next: ApplyState = { ...initial, phase: outcome.phase,
         reason: outcome.phase === 'failed' && outcome.toast ? t(outcome.toast.key) : null,

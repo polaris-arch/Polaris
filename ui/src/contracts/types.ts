@@ -600,7 +600,7 @@ export interface StagedClassification {
  * `baseVersion` 是整份保存的必填事务基准；缺失时后端 fail-closed。即时设置不走本联合，改用原子 patch。
  */
 export type SaveOutcome =
-  | { status: 'saved'; version: string; config: UserConfig }
+  | { status: 'saved'; version: string; config: UserConfig; runtimeApply?: PendingApplyResult }
   | { status: 'conflict'; diskVersion: string };
 
 export interface UserConfig {
@@ -890,6 +890,8 @@ export interface PendingApplyResult {
   hostEffects?: RuntimeHostEffectResult[];
   coreState?: 'unchanged' | 'committed';
   configurationDurable?: boolean;
+  /** False when the original transaction can be observed but no longer retried. */
+  persistenceRetryable?: boolean;
   persistenceTransactionId?: string;
   retirementState?: string;
   nativeRetirements?: NativeRetirementDebt[];

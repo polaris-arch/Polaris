@@ -12,7 +12,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 // IPC mock：`get` / `save` / `applyNow` 是本 store 仅有的三处外部副作用，全部经这三颗桩观测。
 // `get` 是 P5 加的：Q8-b 的第一步就是「拉磁盘现值」，保存不再拿调用方给的 config 当磁盘。
 const saveMock = vi.fn(
-  async (config: unknown, _deferRestart?: boolean, _baseVersion?: string): Promise<SaveOutcome> => ({
+  async (config: unknown, _deferRestart?: boolean, _baseVersion?: string, _autoApply?: boolean): Promise<SaveOutcome> => ({
     status: 'saved',
     version: 'v-after-save',
     config: config as UserConfig,
@@ -29,7 +29,7 @@ vi.mock('@/ipc', () => ({
   api: {
     config: {
       get: () => getMock(),
-      save: (c: unknown, d?: boolean, b?: string) => saveMock(c, d, b),
+      save: (c: unknown, d?: boolean, b?: string, a?: boolean) => saveMock(c, d, b, a),
       setStagedPending: (pending: boolean) => stagedPendingMock(pending),
     },
     proxy: {
@@ -108,6 +108,7 @@ function resetStore(enabled: boolean): void {
     baseline: null,
     hydrated: false,
     saveStatus: 'idle',
+    savedRuntimeApply: null,
     conflict: null,
     conflictBaseline: null,
   });
@@ -414,11 +415,11 @@ describe('save —— 落盘但不排重启（FR-5）', () => {
    * 「保存」与「立即应用」的语义差会整个消失、后者沦为装饰（Q4 结论 3）。
    * 变异对照：把 `api.config.save(cfg, true)` 的 `true` 去掉或改成 `false` → 本条转红。
    */
-  it('调 config.save 且 deferRestart === true', async () => {
+  it('requests safe auto Apply for Save without authorizing a restart', async () => {
     seedStaged();
     await expect(useStagedConfigStore.getState().save()).resolves.toBe(true);
-    expect(saveMock).toHaveBeenCalledTimes(1);
-    expect(saveMock.mock.calls[0][1]).toBe(true);
+    expect(saveMock).toHaveBeenCalledExactlyOnceWith(expect.anything(), true, configBaseVersion(CONFIG), true);
+    expect(applyMock).not.toHaveBeenCalled();
   });
 
   /**
@@ -602,6 +603,7 @@ describe('applyNow —— 保存 + force-restart（FR-6）', () => {
     });
     expect(saveMock).toHaveBeenCalledTimes(1);
     expect(applyMock).toHaveBeenCalledTimes(1);
+    expect(saveMock.mock.calls[0][3]).toBe(false);
   });
 
   /**

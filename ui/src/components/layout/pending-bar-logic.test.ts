@@ -287,11 +287,11 @@ describe('composeBarView：A=clean 那四行', () => {
 describe('composeBarView：A=staged 那三行 + 一格 spec 缺口', () => {
   // 变异对照：从 stagedActions 里去掉 'apply' → 转红。表里 staged×none 明写三颗按钮：
   // 有 staged 但差集为空时，「立即应用」= 保存 + 重启，仍是用户要的那条快路。
-  it('staged × none → 「N 项待保存」+ [重置][保存][立即应用]', () => {
+  it('staged × none → 「N 项待保存」+ [重置][保存]', () => {
     const v = composeBarView(barInput({ stagedPhase: 'staged', stagedCount: 2 }));
     expect(v).toMatchObject({ visible: true, err: false, titleKey: 'home.pendingStagedTitle' });
     expect(v.titleVars).toEqual({ count: 2 });
-    expect(ids({ stagedPhase: 'staged', stagedCount: 2 })).toEqual(['reset', 'save', 'apply']);
+    expect(ids({ stagedPhase: 'staged', stagedCount: 2 })).toEqual(['reset', 'save']);
     expect(disabledIds({ stagedPhase: 'staged', stagedCount: 2 })).toEqual([]);
   });
 
@@ -349,7 +349,7 @@ describe('composeBarView：A 的两个动作生命周期态盖住整行 B（表�
       expect(disabledIds(input), `B=${b} 保存在飞时还有可点的按钮`).toEqual([
         'reset',
         'save',
-        'apply',
+        ...(b === 'none' ? [] : ['apply']),
       ]);
     }
   });
@@ -422,8 +422,8 @@ describe('composeBarView —— coreRunning 闸门', () => {
     expect(ids(v)).toEqual(['reset', 'save']);
   });
 
-  it('核在跑 + 有 staged：三颗齐（回归对照，证明上一条不是把按钮全删了）', () => {
-    const v = composeBarView(barInput({ stagedPhase: 'staged', stagedCount: 2, coreRunning: true }));
+  it('核在跑且有已保存待应用的改动：保留显式 Apply', () => {
+    const v = composeBarView(barInput({ stagedPhase: 'staged', pendingPhase: 'pending', stagedCount: 2, coreRunning: true }));
     expect(ids(v)).toEqual(['reset', 'save', 'apply']);
   });
 
@@ -475,7 +475,7 @@ describe('applyStateOnLifecycle ownership', () => {
     // Same sequence applies to buffered events delivered before the Apply receipt is bound.
     expect(applyStateOnLifecycle(observed, { ...event, phase, mainGeneration: 11 }, t)).toBeNull();
     expect(applyStateOnLifecycle(observed, { ...event, phase, mainGeneration: 13 }, t))
-      .toEqual({ phase: phase === 'ready' ? 'idle' : 'failed', reason: null });
+      .toEqual({ phase: phase === 'ready' ? 'idle' : 'failed', reason: null, mainGeneration: 13 });
   });
   it('tracks an unattributed start without completing a deferred Apply or lowering its floor', () => {
     const observed = applyStateOnLifecycle(current, { ...event, kind: 'start', phase: 'ready', applyId: undefined, mainGeneration: 12 }, t)!;
@@ -484,7 +484,7 @@ describe('applyStateOnLifecycle ownership', () => {
     expect(applyStateOnLifecycle(observed, { ...event, phase: 'ready', applyId: 8, mainGeneration: 12 }, t)).toBeNull();
     const stopped = applyStateOnLifecycle(observed, { ...event, phase: 'stopped', terminal: false, mainGeneration: 13 }, t)!;
     expect(stopped).toEqual({ ...current, mainGeneration: 13 });
-    expect(applyStateOnLifecycle(stopped, { ...event, phase: 'ready', mainGeneration: 14 }, t)).toEqual({ phase: 'idle', reason: null });
+    expect(applyStateOnLifecycle(stopped, { ...event, phase: 'ready', mainGeneration: 14 }, t)).toEqual({ phase: 'idle', reason: null, mainGeneration: 14 });
   });
   it.each([0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1])('invalid generation %s cannot advance the floor or complete Apply', (mainGeneration) => {
     expect(applyStateOnLifecycle(current, { ...event, phase: 'ready', mainGeneration }, t)).toBeNull();
@@ -493,15 +493,17 @@ describe('applyStateOnLifecycle ownership', () => {
   it.each(['ready', 'failed'] as const)('keeps intermediate stopped until owned %s', (phase) => {
     const stopped = applyStateOnLifecycle(current, { ...event, phase: 'stopped', terminal: false }, t)!;
     expect(stopped.phase).toBe('applying');
-    expect(applyStateOnLifecycle(stopped, { ...event, phase, mainGeneration: 12 }, t)).toEqual({ phase: phase === 'ready' ? 'idle' : 'failed', reason: null });
+    expect(applyStateOnLifecycle(stopped, { ...event, phase, mainGeneration: 12 }, t))
+      .toEqual({ phase: phase === 'ready' ? 'idle' : 'failed', reason: null, mainGeneration: 12 });
   });
   it('a newer explicit stop cancels neutrally and later starts are unrelated', () => {
     const stopped = applyStateOnLifecycle(current, { ...event, kind: 'stop', phase: 'stopped', applyId: undefined }, t)!;
-    expect(stopped).toEqual({ phase: 'idle', reason: null });
+    expect(stopped).toEqual({ phase: 'idle', reason: null, mainGeneration: 11 });
     expect(applyStateOnLifecycle(stopped, { ...event, phase: 'ready', mainGeneration: 12 }, t)).toBeNull();
   });
   it.each([['HELPER_NOT_INSTALLED', 'errors.helperNotInstalledDesc'], ['STARTUP_FAILED', 'errors.startupFailed'], [undefined, null]])('localizes owned failure %s without diagnostics', (errorCode, reason) => {
-    expect(applyStateOnLifecycle(current, { ...event, phase: 'failed', errorCode: errorCode ?? undefined, message: 'private diagnostic' }, t)).toEqual({ phase: 'failed', reason });
+    expect(applyStateOnLifecycle(current, { ...event, phase: 'failed', errorCode: errorCode ?? undefined, message: 'private diagnostic' }, t))
+      .toEqual({ phase: 'failed', reason, mainGeneration: 11 });
   });
 });
 

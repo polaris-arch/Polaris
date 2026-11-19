@@ -75,7 +75,9 @@ fn matching_base_version_saves_and_returns_the_post_write_version() {
 
     let after = config_version(&ConfigManager::new(dir.clone()).load_full().unwrap());
     match outcome {
-        SaveOutcome::Saved { version, config } => {
+        SaveOutcome::Saved {
+            version, config, ..
+        } => {
             assert_ne!(version, before, "落盘改了内容，版本必须随之变化");
             assert_eq!(version, after, "返回的版本须与落盘后磁盘现值同源");
             assert_eq!(config["logLevel"], "debug", "成功响应须携事务终态投影");

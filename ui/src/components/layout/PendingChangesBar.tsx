@@ -40,7 +40,6 @@ import { useTranslation } from 'react-i18next';
 import { useAppStore } from '@/store/app-store';
 import { useStagedConfigStore } from '@/store/staged-config-store';
 import { StagedConflictDialog } from '@/components/dialogs/StagedConflictDialog';
-import { replay } from '@/lib/staged-config';
 import { api } from '@/ipc';
 import { useRuntimeApplyReconciliation } from '@/components/layout/use-runtime-apply-reconciliation';
 import { RestartApplyDialog, type RestartPrompt } from '@/components/dialogs/RestartApplyDialog';
@@ -59,6 +58,7 @@ import {
   nativeRetirementsAfterLifecycle,
   preserveNativeRetirements,
   dismissApplyState,
+  runtimePersistenceRetryAvailable,
   runtimePersistenceRecoveryEnded,
   applyStateOnLifecycle,
   composeBarView,
@@ -104,10 +104,6 @@ export default function PendingChangesBar() {
   const coreRunning = useAppStore((s) => s.proxyStatus?.running ?? false);
   const coreGeneration = useAppStore((s) => s.proxyStatus?.mainGeneration);
   const servers = useAppStore((s) => s.servers);
-  /** **裸磁盘 config**（不是 `effectiveConfig`）：下面 FR-9 那轮 `classifyStaged` 问的是
-   *  「**只有这一条**时保存后是否还待应用」，重放基准必须是盘。喂 `effectiveConfig`
-   *  等于把整批条目先叠一遍再叠这一条，逐条标注会全部失真。 */
-  const config = useAppStore((s) => s.config);
   const stagedEntries = useStagedConfigStore((s) => s.entries);
   const saveStatus = useStagedConfigStore((s) => s.saveStatus);
   const conflict = useStagedConfigStore((s) => s.conflict);
@@ -132,6 +128,7 @@ export default function PendingChangesBar() {
     awaitingReply: boolean;
     cancelled: boolean;
     intentGeneration: number | undefined;
+    runtimeGeneration: number | undefined;
     early: ProxyLifecycleEvent[];
     earlyGeneration: number | undefined;
     earlyStopped: boolean;
@@ -144,8 +141,6 @@ export default function PendingChangesBar() {
   translateRef.current = simpleT;
   /** 明细 popover 开合（原型 `.pd-pop`）。 */
   const [detailOpen, setDetailOpen] = useState(false);
-  /** staged 条目 id → 「保存后仍需应用」（FR-9）。pendingApply 与是否真正需要重启独立；缺 key = 尚未判出，不猜。 */
-  const [effects, setEffects] = useState<Record<string, boolean>>({});
   const { armed, confirmTwice } = useConfirmTwice();
   const barRef = useRef<HTMLDivElement>(null);
   const n = pendingChangesCount(pending);
@@ -239,28 +234,6 @@ export default function PendingChangesBar() {
     return () => clearTimeout(timer);
   }, [apply.phase, apply.applyId]);
 
-  /* FR-9：逐条标注「仅需保存 / 保存后仍需应用」。**只在 popover 打开时问**——它是 N 次只读 IPC，
-     挂在条目变化上会让每次表单提交都打一轮。 */
-  useEffect(() => {
-    if (!detailOpen || stagedEntries.length === 0 || config === null) return;
-    let alive = true;
-    void Promise.all(
-      stagedEntries.map(async (e) => {
-        // 单条重放后问：拿到的是「只有这一条时保存后是否还待应用」。
-        const c = await api.config.classifyStaged(replay(config, [e])).catch(() => null);
-        return [e.id, typeof c?.pendingApply === 'boolean' ? c.pendingApply : null] as const;
-      })
-    ).then((rows) => {
-      if (!alive) return;
-      setEffects(
-        Object.fromEntries(rows.filter((r): r is readonly [string, boolean] => r[1] !== null))
-      );
-    });
-    return () => {
-      alive = false;
-    };
-  }, [detailOpen, stagedEntries, config]);
-
   const view = composeBarView({
     stagedPhase: stagedPhaseOf(saveStatus, stagedEntries.length),
     pendingPhase: pendingPhaseOf(apply.phase, pending),
@@ -269,8 +242,7 @@ export default function PendingChangesBar() {
     applyError: apply.reason,
     coreRunning,
     coreGeneration,
-    persistenceRetryAvailable: !!apply.coreRecovery || (apply.configurationDurable !== true && !!apply.transactionId
-      && (apply.persistenceOnly === true || apply.phase === 'durabilityPending')),
+    persistenceRetryAvailable: runtimePersistenceRetryAvailable(apply),
     host: apply.host,
     nativeRetirements: mergeNativeRetirements(apply, pending.nativeRetirements).nativeRetirements,
     nativeChecking: apply.nativeChecking,
@@ -328,6 +300,7 @@ export default function PendingChangesBar() {
       ...(Number.isSafeInteger(generation) && (generation ?? 0) > 0 ? { mainGeneration: generation } : {}) });
     const request = { awaitingReply: true, cancelled: false,
       intentGeneration: undefined as number | undefined,
+      runtimeGeneration: initial.mainGeneration,
       early: [] as ProxyLifecycleEvent[],
       earlyGeneration: initial.mainGeneration, earlyStopped: false };
     applyRequest.current = request;
@@ -413,6 +386,7 @@ export default function PendingChangesBar() {
       const reconcileOwnerKnown = Number.isSafeInteger(result.runtimeGeneration) && (result.runtimeGeneration ?? 0) > 0
         && Number.isSafeInteger(result.selectionIntentGeneration) && (result.selectionIntentGeneration ?? -1) >= 0;
       request.intentGeneration = result.selectionIntentGeneration;
+      request.runtimeGeneration = result.runtimeGeneration ?? initial.mainGeneration;
       const outcome = applyOutcome(result.status, result.reasons);
       let next: ApplyState = { ...initial, phase: outcome.phase,
         reason: outcome.phase === 'failed' && outcome.toast ? t(outcome.toast.key) : null,
@@ -610,15 +584,6 @@ export default function PendingChangesBar() {
                   <span className="dot idle" aria-hidden />
                   <span className="pd-l" data-tip={e.label}>
                     {e.label}
-                  </span>
-                  <span className="pd-eff">
-                    {e.id in effects
-                      ? t(
-                          effects[e.id]
-                            ? 'home.pendingEffectNeedsRestart'
-                            : 'home.pendingEffectOnSave'
-                        )
-                      : ''}
                   </span>
                   <button
                     type="button"
