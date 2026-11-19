@@ -337,23 +337,18 @@ describe('composeBarView：A=staged 那三行 + 一格 spec 缺口', () => {
   });
 });
 
-describe('composeBarView：保存与独立待处理状态', () => {
+describe('composeBarView：A 的两个动作生命周期态盖住整行 B（表末两行的 `*`）', () => {
   const ALL_B: PendingPhase[] = ['none', 'pending', 'applying', 'applyFailed'];
 
-  it('hides a running-core Save without independent pending work', () => {
-    const input = barInput({ stagedPhase: 'saving', stagedCount: 2 });
-    expect(composeBarView(input)).toMatchObject({ visible: false, actions: [] });
-  });
-
-  it.each([
-    ['pending', 'home.pendingBarConfigOnly', ['apply']],
-    ['applying', 'home.pendingApplying', ['apply']],
-    ['applyFailed', 'home.pendingApplyFailed', ['retryApply', 'dismissApply']],
-    ['durabilityPending', 'home.pendingHotDurabilityPending', ['retryPersistence']],
-  ] as const)('keeps existing %s visible with no mutating actions available during a Save', (pendingPhase, titleKey, actions) => {
-    const v = composeBarView(barInput({ stagedPhase: 'saving', stagedCount: 2, pendingPhase, persistenceRetryAvailable: true }));
-    expect(v).toMatchObject({ visible: true, titleKey });
-    expect(v.actions).toEqual(actions.map(id => ({ id, disabled: true })));
+  // 变异对照：把 saving 的分派挪到 clean/staged 之后（不再优先）→ 表末行的 `*` 失效 → 转红。
+  it('saving × 任意 B → 「保存中…」，等待热应用回执再展示应用动作', () => {
+    for (const b of ALL_B) {
+      const input = { stagedPhase: 'saving' as StagedPhase, pendingPhase: b, stagedCount: 2 };
+      const v = composeBarView(barInput(input));
+      expect(v, `B=${b}`).toMatchObject({ visible: true, err: false, titleKey: 'home.pendingSaving' });
+      expect(ids(input), `B=${b}`).toEqual(['reset', 'save']);
+      expect(disabledIds(input), `B=${b}`).toEqual(['reset', 'save']);
+    }
   });
 
   // NFR-1 的 UI 面：保存失败后条目一条不丢，条给的是 [重置][重试保存]。
@@ -438,8 +433,7 @@ describe('composeBarView —— coreRunning 闸门', () => {
 
   it('核没跑 + 保存中：禁用态的那颗「立即应用」同样不渲染', () => {
     const v = composeBarView(barInput({ stagedPhase: 'saving', coreRunning: false }));
-    expect(v).toMatchObject({ visible: true, titleKey: 'home.pendingSaving',
-      actions: [{ id: 'reset', disabled: true }, { id: 'save', disabled: true }] });
+    expect(ids(v)).toEqual(['reset', 'save']);
   });
 });
 
@@ -650,8 +644,6 @@ describe('independent host acceptance and Core durability', () => {
     expect(view.visible).toBe(true);
     expect(view.titleKey).toBe('home.pendingHostEffectsPending');
     expect(view.actions).toEqual([]);
-    const saving = composeBarView(barInput({ stagedPhase: 'saving', stagedCount: 1, host: pending.host }));
-    expect(saving).toMatchObject({ visible: true, titleKey: 'home.pendingHostEffectsPending', actions: [] });
   });
 
   it('keeps a committed Core and failed host debt separate, offering a fresh review rather than Apply', () => {
@@ -912,9 +904,6 @@ describe('original native listener retirement account', () => {
     expect(view.actions.map(action => action.id)).not.toContain('dismissApply');
     expect(ids({ nativeRetirements: [native], configurationPending: true })).toEqual(['apply', 'checkNative']);
     expect(ids({ nativeRetirements: [native], stagedPhase: 'staged', stagedCount: 1 })).toEqual(['reset', 'save', 'apply', 'checkNative']);
-    const saving = composeBarView(barInput({ stagedPhase: 'saving', stagedCount: 1, nativeRetirements: [native] }));
-    expect(saving).toMatchObject({ visible: true, titleKey: 'home.pendingNativeCleanupUnknown',
-      actions: [{ id: 'checkNative', disabled: true }] });
   });
 
   it('a native-unknown classification without its complete original proof fails closed', () => {

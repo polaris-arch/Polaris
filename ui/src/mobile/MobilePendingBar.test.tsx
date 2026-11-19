@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { isValidElement, type ReactElement, type ReactNode } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
-import type { SavedRuntimeApply, StagedConflict } from '@/store/staged-config-store';
+import type { SavedRuntimeApply } from '@/store/staged-config-store';
 import type { NativeRetirementDebt, PendingApplyResult, PendingNodeChanges } from '@/contracts/types';
 import { ImpactApplySummary, type ImpactDisclosure } from '@/shared/ImpactApplySummary';
 import type { ApplyState } from '@/components/layout/pending-bar-logic';
@@ -19,9 +19,6 @@ const h = vi.hoisted(() => ({
   pendingEffects: [] as Array<() => void>,
   applyNow: vi.fn(),
   savedRuntimeApply: null as SavedRuntimeApply | null,
-  saveStatus: 'idle' as 'idle' | 'saving' | 'saveFailed',
-  stagedEntries: [] as Array<{ id: string; label: string }>,
-  conflict: null as StagedConflict[] | null,
   retryPersistence: vi.fn(),
   hostRead: vi.fn(),
   coreRead: vi.fn(),
@@ -87,7 +84,7 @@ vi.mock('@/lib/confirm-twice', () => ({
 // Existing restart tests isolate observation; host cases exercise the real shared hook and selectors.
 vi.mock('@/components/layout/use-runtime-apply-reconciliation', async (original) => {
   const actual = await original<typeof import('@/components/layout/use-runtime-apply-reconciliation')>();
-  return { ...actual, useRuntimeApplyReconciliation: (...args: Parameters<typeof actual.useRuntimeApplyReconciliation>) =>
+  return { useRuntimeApplyReconciliation: (...args: Parameters<typeof actual.useRuntimeApplyReconciliation>) =>
     h.realReconciliation ? actual.useRuntimeApplyReconciliation(...args)
       : { hasSaveRecovery: false, retryPersistence: async () => undefined, checkHost: () => undefined, checkNative: async () => undefined } };
 });
@@ -111,10 +108,7 @@ vi.mock('@/store/app-store', () => ({
 }));
 vi.mock('@/store/staged-config-store', async () => {
   const { withConfigWriteLock } = await import('@/lib/config-write-lock');
-  const state = { applyNow: h.applyNow,
-    get entries() { return h.stagedEntries; },
-    get saveStatus() { return h.saveStatus; },
-    get conflict() { return h.conflict; },
+  const state = { entries: [], saveStatus: 'idle', conflict: null, applyNow: h.applyNow,
     get savedRuntimeApply() { return h.savedRuntimeApply; } };
   return { dispatchSavedApply: async <T,>(invoke: () => Promise<T>, onDispatch: (value: PendingApplyResult | null) => boolean) => {
     const admitted = await withConfigWriteLock(async () => onDispatch(h.savedRuntimeApply) ? { reply: invoke() } : undefined);
@@ -193,9 +187,6 @@ beforeEach(() => {
   h.states = [];
   h.refs = [];
   h.savedRuntimeApply = null;
-  h.saveStatus = 'idle';
-  h.stagedEntries = [];
-  h.conflict = null;
   h.lifecycleReady.mockResolvedValue(h.offLifecycle);
   h.statusRead.mockImplementation(async () => h.app.proxyStatus);
   h.app.config = null;
@@ -215,35 +206,6 @@ beforeEach(() => {
   vi.spyOn(console, 'error').mockImplementation(() => undefined);
 });
 afterEach(() => { unmount(); if (vi.isFakeTimers()) vi.clearAllTimers(); vi.useRealTimers(); vi.restoreAllMocks(); });
-
-it('shows no running Save progress or tentative Apply without an older pending change', () => {
-  h.app.pendingChanges = { added: [], modified: [], removed: [], restartDeferred: false };
-  h.stagedEntries = [{ id: 'draft', label: 'Edit rule' }];
-  expect(markup(renderBar())).toContain('home.pendingSaveBtn');
-  h.saveStatus = 'saving';
-  h.app.pendingChanges = { ...h.app.pendingChanges, restartDeferred: true };
-  expect(renderBar()).toBeNull();
-  h.saveStatus = 'idle';
-  h.conflict = [{ entryId: 'draft', label: 'Edit rule', mine: '"mine"', disk: '"disk"' }];
-  expect(markup(renderBar())).toContain('home.stagedConflictTitle');
-  h.conflict = null;
-  h.stagedEntries = [];
-  expect(markup(renderBar())).toContain('home.pendingApplyBtn');
-});
-
-it('retains older pending work without enabling Apply or rendering the in-flight Save', () => {
-  expect(markup(renderBar())).toContain('home.pendingBarTitle');
-  h.saveStatus = 'saving';
-  h.stagedEntries = [{ id: 'draft', label: 'Edit rule' }];
-  h.app.pendingChanges = { added: [], modified: [], removed: [], restartDeferred: true };
-  const view = renderBar();
-  const html = markup(view);
-  expect(html).toContain('home.pendingBarTitle');
-  expect(html).not.toContain('home.pendingBarConfigOnly');
-  expect(html).not.toContain('home.pendingSaving');
-  const apply = elements(view).find(row => row.type === 'button' && row.props.children === 'home.pendingApplyBtn');
-  expect(apply?.props.disabled).toBe(true);
-});
 
 it('uses the shared readback for a Save HOT receipt and keeps durability recovery bound to its owner', async () => {
   h.realReconciliation = true;

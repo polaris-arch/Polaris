@@ -428,23 +428,19 @@ const act = (id: BarActionId, disabled = false): BarAction => ({ id, disabled })
  * §2.4 的「合成呈现规则」表逐行落地。
  *
  * **不能塞成一个状态机**（spec 原话）：A×B 是 16 格，硬塞会得到 8 个不可达态。这里按表分派：
- * 保存失败优先展示。运行中的常规保存暂时隐藏草稿，由 B 保留已经明确需要处理的状态。
+ * A 的两个「动作生命周期」态（saving / saveFailed）盖住整行 B（表末两行的 `*`），其余按 (A,B) 取格。
  *
  * 表里没有 `staged × applyFailed` 那一格 —— 它可达（保存成功清空 staged → apply 失败 → 用户又改了别的），
  * 落法按两个维度**各自贡献**推出：A=staged 给 [重置][保存][立即应用]，B=applyFailed 额外给 [忽略]
  * 并把条点红（「立即应用」本身就是那格里的[重试]，不重复出一颗）。**此格属 spec 缺口，已在交付里单列。**
  */
 export function composeBarView(input: BarInput): BarView {
-  const { pendingPhase, pendingCount, applyError, coreRunning } = input;
-  const quietSave = coreRunning && input.stagedPhase === 'saving';
-  const stagedPhase = quietSave ? 'clean' : input.stagedPhase;
-  const stagedCount = quietSave ? 0 : input.stagedCount;
+  const { stagedPhase, pendingPhase, stagedCount, pendingCount, applyError, coreRunning } =
+    input;
 
   /** 核没在跑 ⇒ 抹掉全部「重启核」类动作（见 `BarInput.coreRunning`）。收在一处，别逐格判。 */
-  const gateApply = (actions: BarAction[]): BarAction[] => {
-    if (quietSave) return actions.map(({ id }) => act(id, true));
-    return coreRunning ? actions : actions.filter((a) => a.id !== 'apply' && a.id !== 'retryApply' && a.id !== 'retryPersistence' && a.id !== 'retryHost' && a.id !== 'checkHost');
-  };
+  const gateApply = (actions: BarAction[]): BarAction[] =>
+    coreRunning ? actions : actions.filter((a) => a.id !== 'apply' && a.id !== 'retryApply' && a.id !== 'retryPersistence' && a.id !== 'retryHost' && a.id !== 'checkHost');
 
   // ── A 的动作生命周期态覆盖整行 B ──
   if (stagedPhase === 'saving') {
@@ -533,7 +529,7 @@ export function composeBarView(input: BarInput): BarView {
 
   if (pendingPhase === 'applyFailed' && input.persistenceOnly) {
     return { visible: true, err: true, ...applyFailedTitle, detailKey: '',
-      actions: input.persistenceRecoveryEnded ? gateApply([act('dismissApply')])
+      actions: input.persistenceRecoveryEnded ? [act('dismissApply')]
         : input.persistenceRetryAvailable ? gateApply([act('retryPersistence', input.persistenceOwnerPending === true)]) : [] };
   }
 

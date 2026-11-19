@@ -5,7 +5,7 @@ import { api } from '@/ipc';
 import { useAppStore } from '@/store/app-store';
 import { dispatchSavedApply, useStagedConfigStore, type SavedRuntimeApply } from '@/store/staged-config-store';
 import { toast } from '@/lib/error-handler';
-import type { PendingApplyResult, PendingNodeChanges } from '@/contracts/types';
+import type { PendingApplyResult } from '@/contracts/types';
 import type { ProxyErrorTranslate } from '@/domain/proxy-error-text';
 import {
   applyReceiptState, hostEffectsAccepted, mergeNativeRetirements, nativeRetirementDebts, preserveNativeRetirements, runtimeApplyRejectedKey, runtimeApplyConflictKey, runtimePersistenceRecoveryEnded,
@@ -19,23 +19,6 @@ interface Attempt {
   intentGeneration: number | undefined;
   runtimeGeneration?: number;
   precedingSave?: PendingApplyResult | null;
-}
-
-const NO_PENDING_CONFIGURATION: PendingNodeChanges = { added: [], modified: [], removed: [], restartDeferred: false };
-
-/** Save can publish the disk candidate before Core has decided whether it needs manual Apply. */
-export function usePendingConfigurationDuringSave(
-  pending: PendingNodeChanges,
-  quietSave: boolean,
-  generation: number | undefined,
-): PendingNodeChanges {
-  const previous = useRef<{ pending: PendingNodeChanges; generation: number | undefined } | null>(null);
-  useEffect(() => {
-    if (!quietSave) previous.current = { pending, generation };
-  }, [pending, quietSave, generation]);
-  if (!quietSave) return pending;
-  const before = previous.current;
-  return before && before.generation === generation ? before.pending : NO_PENDING_CONFIGURATION;
 }
 
 function sameCore(state: ApplyState, owner: RuntimeCoreRecovery): boolean {
