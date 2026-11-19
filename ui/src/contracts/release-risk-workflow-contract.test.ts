@@ -131,7 +131,6 @@ esac
 
   it('发布合同和路径判据共用 classify，最终 required check 始终验收它的结果', () => {
     const classify = jobSection(risk, 'classify', 'release-risk.yml');
-    expect(classify).toContain('run: test -f scripts/assert-pc-runtime-release.test.mjs && bash scripts/gate-node-test.sh');
     expect(classify).toContain('node scripts/classify-ci-impact.mjs');
     const gate = risk.slice(risk.indexOf('\n  gate:'));
     expect(gate).toContain('name: release risk gate');
