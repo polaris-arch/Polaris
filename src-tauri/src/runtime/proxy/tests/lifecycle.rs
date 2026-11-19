@@ -94,6 +94,7 @@ async fn managed_marker_rejects_legacy_start_and_restart_before_generation_or_sw
     ));
     assert!(rt
         .claim_debounced_restart(None, generation, ticket)
+        .unwrap()
         .is_none());
     assert_eq!(
         rt.gate.generation(),
@@ -104,14 +105,14 @@ async fn managed_marker_rejects_legacy_start_and_restart_before_generation_or_sw
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
-async fn automatic_network_recovery_keeps_pending_resource() {
+async fn automatic_network_recovery_preserves_live_core_during_pending_builtin_update() {
     let (rt, dir, _errors, events) = test_runtime_recording_lifecycle();
     rt.stale_sweep_disabled.store(true, Ordering::SeqCst);
 
     let mut applied = two_node_config(7890, "node-a");
-    applied["ruleResources"] = serde_json::json!([
-        {"id": "recovery-fixture", "fileName": "recovery-fixture.srs"}
-    ]);
+    applied["builtinGeoMeta"] = serde_json::json!({
+        "geosite-cn": {"updatedAt": "2026-11-19T00:00:00Z"}
+    });
     rt.config.save_full(&applied).unwrap();
     let applied = rt.config.current().unwrap();
     *rt.current_config.write().unwrap() = Some(applied.clone());
@@ -119,22 +120,13 @@ async fn automatic_network_recovery_keeps_pending_resource() {
     mark_running(&rt);
     let generation = rt.bump_generation();
 
-    let resource = dir.join("rule-resource/recovery-fixture.srs");
+    let resource = dir.join("rules/geosite-cn.srs");
     std::fs::create_dir_all(resource.parent().unwrap()).unwrap();
-    std::fs::write(&resource, b"running resource").unwrap();
-    let journal = dir.join("pending-config-deletions.json");
-    let mut saved = applied.clone();
-    saved["selectedServerId"] = serde_json::json!("node-b");
-    saved["ruleResources"] = serde_json::json!([]);
-    // Saved-only resolver reaches a distinct startup error before any Core spawn.
-    saved["dnsConfig"]["resolveNodeDomainsAhead"] = serde_json::json!(true);
-    saved["dnsConfig"]["nodeResolverPool"] = serde_json::json!(["unsupported-fixture"]);
-    rt.config
-        .save_full_deferred_cleanup(&applied, &saved)
-        .unwrap();
+    std::fs::write(&resource, b"new built-in resource").unwrap();
+    let mut saved = applied;
+    saved["builtinGeoMeta"]["geosite-cn"]["updatedAt"] = serde_json::json!("2026-11-20T00:00:00Z");
+    rt.config.save_full(&saved).unwrap();
     let saved = rt.config.current().unwrap();
-    assert_eq!(saved["selectedServerId"], "node-b");
-    let pending_delete = std::fs::read(&journal).unwrap();
 
     let (send, fired) = tokio::sync::oneshot::channel();
     rt.debounced
@@ -148,6 +140,7 @@ async fn automatic_network_recovery_keeps_pending_resource() {
     ));
     assert!(rt
         .claim_debounced_restart(None, generation, ticket)
+        .unwrap()
         .is_none());
 
     assert_eq!(rt.core_generation(), generation);
@@ -155,8 +148,7 @@ async fn automatic_network_recovery_keeps_pending_resource() {
     assert!(!rt.gate.is_busy());
     assert!(events.lock().unwrap().is_empty());
     assert_eq!(rt.config.current().unwrap(), saved);
-    assert_eq!(std::fs::read(resource).unwrap(), b"running resource");
-    assert_eq!(std::fs::read(journal).unwrap(), pending_delete);
+    assert_eq!(std::fs::read(resource).unwrap(), b"new built-in resource");
 }
 
 #[cfg(target_os = "linux")]
@@ -173,8 +165,24 @@ async fn automatic_network_recovery_restores_r_without_consuming_saved_journal()
         .unwrap();
     bootstrap["type"] = serde_json::json!("local");
     bootstrap.as_object_mut().unwrap().remove("endpoint");
-    applied["customAppPresets"] =
-        serde_json::json!([{"id": "recovery-icon", "name": "Fixture", "emoji": "F"}]);
+    let resource = dir.join("rule-resource/recovery-fixture.srs");
+    std::fs::create_dir_all(resource.parent().unwrap()).unwrap();
+    let fixture = include_bytes!("../../../../../resources/data/geosite-cn.srs");
+    std::fs::write(&resource, fixture).unwrap();
+    applied["ruleResources"] = serde_json::json!([{
+        "id": "recovery-fixture",
+        "name": "Recovery rule",
+        "category": "geosite",
+        "sourceUrl": "https://rules.invalid/recovery-fixture.srs",
+        "fileName": "recovery-fixture.srs",
+        "format": "binary",
+        "size": fixture.len(),
+        "downloadedAt": "2026-11-19T00:00:00Z"
+    }]);
+    applied["customRules"] = serde_json::json!([{
+        "id": "recovery-rule", "type": "ruleSet", "values": ["res:recovery-fixture"],
+        "action": "direct", "enabled": true
+    }]);
     rt.config.save_full(&applied).unwrap();
     let applied = rt.config.current().unwrap();
     *rt.current_config.write().unwrap() = Some(applied.clone());
@@ -183,12 +191,11 @@ async fn automatic_network_recovery_restores_r_without_consuming_saved_journal()
     let generation = rt.bump_generation();
     rt.restart_deferred.store(true, Ordering::SeqCst);
 
-    let icons = crate::icon_cache::icons_dir(&dir);
-    crate::icon_cache::write_icon(&icons, "recovery-icon", "png", b"PNG").unwrap();
     let journal = dir.join("pending-config-deletions.json");
     let mut saved = applied.clone();
     saved["selectedServerId"] = serde_json::json!("node-b");
-    saved["customAppPresets"] = serde_json::json!([]);
+    saved["ruleResources"] = serde_json::json!([]);
+    saved["customRules"] = serde_json::json!([]);
     saved["dnsConfig"]["nodeResolverPool"] = serde_json::json!(["unsupported-fixture"]);
     rt.config
         .save_full_deferred_cleanup(&applied, &saved)
@@ -221,7 +228,7 @@ async fn automatic_network_recovery_restores_r_without_consuming_saved_journal()
     );
     assert_eq!(rt.config.current().unwrap(), saved);
     assert_eq!(std::fs::read(journal).unwrap(), pending_delete);
-    assert!(icons.join("recovery-icon.png").exists());
+    assert_eq!(std::fs::read(resource).unwrap(), fixture);
     assert!(rt.restart_deferred.load(Ordering::SeqCst));
 }
 

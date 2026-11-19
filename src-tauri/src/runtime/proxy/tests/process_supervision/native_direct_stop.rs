@@ -806,6 +806,7 @@ async fn shutdown_fence_rejects_public_and_guarded_starts_and_runtime_restart() 
     let (_, ticket) = rx.await.unwrap();
     assert!(rt
         .claim_debounced_restart(None, generation, ticket)
+        .unwrap()
         .is_none());
     assert_eq!(rt.gate.generation(), generation);
     rt.shutdown_for_exit().await.unwrap();

@@ -931,6 +931,7 @@ async fn saved_full_config_with_mesh_control_drift_waits_for_explicit_apply() {
         ));
         let (landed, _, _lease) = rt
             .claim_debounced_restart(Some(id), generation, ticket)
+            .unwrap()
             .expect("explicit Apply must claim the saved full snapshot");
         assert_eq!(landed, saved);
         install_startup_snapshot(&rt, &landed);
@@ -4825,6 +4826,7 @@ async fn diff_is_empty_after_the_restart_that_apply_pending_scheduled_lands() {
     ));
     let (landed, _claimed_generation, _legacy_lease) = rt
         .claim_debounced_restart(Some(id), scheduled_generation, ticket)
+        .unwrap()
         .expect("去抖回调必须按同一 id/世代认领 Apply 配置");
     install_startup_snapshot(&rt, &landed);
     *rt.current_config.write().unwrap() = Some(landed);
@@ -4875,6 +4877,7 @@ async fn timer_cannot_restart_a_confirmed_config_after_an_equal_later_save() {
     let (_, ticket) = rx.await.unwrap();
     assert!(rt
         .claim_debounced_restart(Some(id), generation, ticket)
+        .unwrap()
         .is_none());
     assert_eq!(rt.gate.generation(), generation);
     assert!(rt.pending_force_restart.read().unwrap().is_none());
@@ -4936,6 +4939,7 @@ async fn timer_with_old_force_id_cannot_consume_a_new_apply_snapshot() {
     }
     assert!(rt
         .claim_debounced_restart(Some(7), generation, ticket)
+        .unwrap()
         .is_none());
     assert_eq!(
         rt.gate.generation(),

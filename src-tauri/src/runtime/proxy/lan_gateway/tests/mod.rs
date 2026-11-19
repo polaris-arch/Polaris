@@ -217,13 +217,13 @@ fn startup_and_hot_apply_share_readonly_gate_before_commit() {
         .unwrap();
     assert!(
         debounce.find("gateway_start_preflight").unwrap()
-            < debounce.find(".try_begin_restart(").unwrap()
+            < debounce.find(".try_claim_restart(").unwrap()
     );
     let rejected = debounce
         .split("gateway_start_preflight")
         .nth(1)
         .unwrap()
-        .split(".try_begin_restart(")
+        .split(".try_claim_restart(")
         .next()
         .unwrap();
     assert!(rejected.contains("self.publish_owned_restart_failure"));

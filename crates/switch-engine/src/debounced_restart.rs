@@ -135,15 +135,43 @@ impl DebouncedRestart {
     where
         F: FnOnce(DebouncedOutcome, u64) + Send + 'static,
     {
+        self.schedule_guarded(core_running, None, on_fire)
+            .expect("a schedule without a generation reservation always registers")
+    }
+
+    /// A caller already owns this generation. Reject an old event before replacing the timer.
+    pub fn schedule_with_ticket_for_generation<F>(
+        &self,
+        core_running: bool,
+        generation: u64,
+        on_fire: F,
+    ) -> Option<DebouncedHandle>
+    where
+        F: FnOnce(DebouncedOutcome, u64) + Send + 'static,
+    {
+        self.schedule_guarded(core_running, Some(generation), on_fire)
+    }
+
+    fn schedule_guarded<F>(
+        &self,
+        core_running: bool,
+        generation: Option<u64>,
+        on_fire: F,
+    ) -> Option<DebouncedHandle>
+    where
+        F: FnOnce(DebouncedOutcome, u64) + Send + 'static,
+    {
         let gate = self.gate.clone();
         let decision_guard = Arc::clone(&self.decision_guard);
         let _publication = decision_guard
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
+        let gen0 = gate.generation();
+        if generation.is_some_and(|generation| generation != gen0) {
+            return None;
+        }
         let epoch = self.schedule_epoch.fetch_add(1, Ordering::SeqCst) + 1;
         let schedule_epoch = Arc::clone(&self.schedule_epoch);
-        // 世代快照：防 timer 回调打到已换的核（Polaris scheduleConnectionFlush 同款守卫）。
-        let gen0 = gate.generation();
         // cancel 用 Notify：handle 的 Drop **不**发信号（task 继续跑、自查 gate 决策），
         // 仅显式 cancel() 才唤醒 select 提前返回。oneshot Sender Drop 会关闭 channel 误触发 cancel，
         // 故不用 oneshot——Notify 无 Drop 副作用。
@@ -181,10 +209,27 @@ impl DebouncedRestart {
             };
             on_fire(outcome, epoch);
         });
-        DebouncedHandle {
+        Some(DebouncedHandle {
             cancel: Some(cancel),
             _join: join,
+        })
+    }
+
+    /// A newer timer must not invalidate this ticket between the check and the lifecycle claim.
+    pub fn try_claim_restart(
+        &self,
+        ticket: u64,
+        generation: u64,
+        force_id: Option<u64>,
+    ) -> Option<u64> {
+        let _decision = self
+            .decision_guard
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if !self.is_current_ticket(ticket) {
+            return None;
         }
+        self.gate.try_begin_restart(generation, force_id)
     }
 
     pub fn is_current_ticket(&self, ticket: u64) -> bool {

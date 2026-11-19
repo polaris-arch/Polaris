@@ -78,9 +78,26 @@ async fn schedule_superseded_when_generation_changed() {
     });
     // 在 sleep 窗口内 bump 世代。
     tokio::time::sleep(Duration::from_millis(5)).await;
-    assert_eq!(gate.bump_generation(), gen0 + 1);
+    let gen1 = gate.bump_generation();
+    assert_eq!(gen1, gen0 + 1);
     let outcome = rx.await.unwrap();
     assert!(matches!(outcome, DebouncedOutcome::Superseded));
+
+    // A late event from gen0 must leave the successor's registered force timer intact.
+    engine.set_force_restart(42);
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    assert!(engine
+        .schedule_with_ticket_for_generation(true, gen1, move |outcome, _| {
+            let _ = tx.send(outcome);
+        })
+        .is_some());
+    assert!(engine
+        .schedule_with_ticket_for_generation(true, gen0, |_, _| {
+            panic!("old generation must not register")
+        })
+        .is_none());
+    let outcome = rx.await.unwrap();
+    assert!(matches!(outcome, DebouncedOutcome::Proceed(Some(42))));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

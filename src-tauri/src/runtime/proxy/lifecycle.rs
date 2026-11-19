@@ -34,6 +34,8 @@ use super::system_takeover::should_clear_system_proxy_between_restart;
 use super::{ProxyRuntime, ProxyStatus, StartError};
 use crate::runtime::config::{LegacyStartLease, SavedCommitError};
 
+type DebouncedRestartClaim = (Value, u64, Option<LegacyStartLease>);
+
 /// Public status failure is not a partial status or an owned Stop capability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProxyStatusReadError {
@@ -2181,52 +2183,88 @@ impl ProxyRuntime {
     pub(super) fn schedule_restart_for_generation(self: &Arc<Self>, scheduled_generation: u64) {
         let me = Arc::clone(self);
         // handle 不持有：drop 不取消 task（task 自查 gate 决策，过期自行 Superseded）。
-        let _handle =
-            self.debounced
-                .schedule_with_ticket(self.core_running(), move |outcome, ticket| {
-                    match outcome {
-                        DebouncedOutcome::Proceed(force_id) => {
-                            tokio::spawn(async move {
-                                let claim = {
-                                    // Automatic recovery freezes applied state after a live edit
-                                    // settles. A replacement timer cancels this wait.
-                                    let _switch = if force_id.is_none() {
-                                        Some(tokio::select! {
-                                            biased;
-                                            _ = me.debounced.wait_for_ticket_invalidation(ticket) => return,
-                                            guard = me.switch_serial.lock() => guard,
-                                        })
-                                    } else {
-                                        None
-                                    };
-                                    me.claim_debounced_restart(force_id, scheduled_generation, ticket)
-                                };
-                                let Some((config, claimed_generation, legacy_lease)) = claim else {
-                                    return;
-                                };
-                                #[cfg(test)]
-                                {
-                                    let hook = me.test_restart_after_claim.lock().unwrap().clone();
-                                    if let Some(hook) = hook {
-                                        hook(claimed_generation);
-                                    }
-                                }
-                                if let Err(e) = me
-                                    .restart_claimed(
-                                        config,
-                                        claimed_generation,
-                                        legacy_lease,
-                                        force_id,
-                                    )
-                                    .await
-                                {
-                                    log::error!("去抖重启失败: {e}");
-                                }
-                            });
+        let _handle = self.debounced.schedule_with_ticket_for_generation(
+            self.core_running(),
+            scheduled_generation,
+            move |outcome, ticket| match outcome {
+                DebouncedOutcome::Proceed(force_id) => {
+                    tokio::spawn(async move {
+                        let Some((config, claimed_generation, legacy_lease)) = me
+                            .await_debounced_restart(force_id, scheduled_generation, ticket)
+                            .await
+                        else {
+                            return;
+                        };
+                        #[cfg(test)]
+                        {
+                            let hook = me.test_restart_after_claim.lock().unwrap().clone();
+                            if let Some(hook) = hook {
+                                hook(claimed_generation);
+                            }
                         }
-                        other => log::info!("去抖重启未执行：{other:?}"),
-                    }
-                });
+                        if let Err(e) = me
+                            .restart_claimed(config, claimed_generation, legacy_lease, force_id)
+                            .await
+                        {
+                            log::error!("去抖重启失败: {e}");
+                        }
+                    });
+                }
+                other => log::info!("去抖重启未执行：{other:?}"),
+            },
+        );
+    }
+
+    async fn await_debounced_restart(
+        &self,
+        force_id: Option<u64>,
+        generation: u64,
+        ticket: u64,
+    ) -> Option<DebouncedRestartClaim> {
+        if force_id.is_some() {
+            return self
+                .claim_debounced_restart(force_id, generation, ticket)
+                .ok()
+                .flatten();
+        }
+        let invalidated = self.debounced.wait_for_ticket_invalidation(ticket);
+        let changed = self.gen_changed.notified();
+        tokio::pin!(invalidated, changed);
+        changed.as_mut().enable();
+        if self.gate.generation() != generation {
+            return None;
+        }
+
+        // Keep the recovery attached to this ticket while a live edit settles.
+        // A saved writer can start independently of switch_serial. Release it
+        // before sleeping so the writer's subsequent switch remains unblocked.
+        let mut retry = Duration::from_millis(20);
+        loop {
+            let claim = {
+                let _switch = tokio::select! {
+                    biased;
+                    () = &mut invalidated => return None,
+                    () = &mut changed => return None,
+                    guard = self.switch_serial.lock() => guard,
+                };
+                self.claim_debounced_restart(None, generation, ticket)
+            };
+            match claim {
+                Ok(claim) => return claim,
+                Err(SavedCommitError::WriterBusy | SavedCommitError::CacheBusy) => {}
+                Err(error) => {
+                    log::warn!("Network recovery could not read saved state: {error:?}");
+                    return None;
+                }
+            }
+            tokio::select! {
+                biased;
+                () = &mut invalidated => return None,
+                () = &mut changed => return None,
+                () = tokio::time::sleep(retry) => {}
+            }
+            retry = (retry * 2).min(Duration::from_millis(500));
+        }
     }
 
     /// Lock order: desktop admission → selector intent → force snapshot → lifecycle gate.
@@ -2238,17 +2276,23 @@ impl ProxyRuntime {
         force_id: Option<u64>,
         scheduled_generation: u64,
         ticket: u64,
-    ) -> Option<(Value, u64, Option<LegacyStartLease>)> {
-        let mut starts = self.normal_start.lock().ok()?;
-        polaris_core_supervisor::config_gate::assert_check_producer_registration().ok()?;
+    ) -> Result<Option<DebouncedRestartClaim>, SavedCommitError> {
+        let Ok(mut starts) = self.normal_start.lock() else {
+            return Ok(None);
+        };
+        if polaris_core_supervisor::config_gate::assert_check_producer_registration().is_err() {
+            return Ok(None);
+        }
         // Keep exit admission and the generation claim indivisible. A late timer must
         // never supersede the shutdown generation, even if it passed an earlier check.
         let _admission = if cfg!(target_os = "android") {
             None
         } else {
-            let closing = self.desktop_shutdown.lock().ok()?;
+            let Ok(closing) = self.desktop_shutdown.lock() else {
+                return Ok(None);
+            };
             if *closing || self.system_proxy.session_query_active() {
-                return None;
+                return Ok(None);
             }
             Some(closing)
         };
@@ -2258,81 +2302,75 @@ impl ProxyRuntime {
             Ok(lease) => lease,
             Err(error) => {
                 log::warn!("去抖重启准入拒绝，保留当前内核: {error}");
-                return None;
+                return Ok(None);
             }
         };
-        self.config
-            .try_with_saved_commit(|desired| {
-                self.selector_reconcile.with_intent_claim(|current_intent| {
-                    let mut pending = self
-                        .pending_force_restart
-                        .write()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if !self.debounced.is_current_ticket(ticket) {
-                        return None;
-                    }
-                    let snapshot = match (force_id, pending.as_ref()) {
-                        (Some(want), Some((id, value, source))) if want == *id => {
-                            if let super::ForceRestartSource::Confirmed { saved_revision, .. } =
-                                source
-                            {
-                                if value != desired
-                                    || *saved_revision != self.config.saved_revision()
-                                {
-                                    *pending = None;
-                                    self.gate.clear_force_restart();
-                                    return None;
-                                }
+        self.config.try_with_saved_commit_classified(|desired| {
+            self.selector_reconcile.with_intent_claim(|current_intent| {
+                let mut pending = self
+                    .pending_force_restart
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if !self.debounced.is_current_ticket(ticket) {
+                    return None;
+                }
+                let snapshot = match (force_id, pending.as_ref()) {
+                    (Some(want), Some((id, value, source))) if want == *id => {
+                        if let super::ForceRestartSource::Confirmed { saved_revision, .. } = source
+                        {
+                            if value != desired || *saved_revision != self.config.saved_revision() {
+                                *pending = None;
+                                self.gate.clear_force_restart();
+                                return None;
                             }
-                            if let super::ForceRestartSource::Selected { intent_generation }
-                            | super::ForceRestartSource::Confirmed {
-                                intent_generation, ..
-                            } = source
-                            {
-                                if *intent_generation != current_intent {
-                                    *pending = None;
-                                    if self.gate.pending().force_restart_id == Some(want) {
-                                        self.gate.clear_force_restart();
-                                    }
-                                    return None;
-                                }
-                            }
-                            value.clone()
                         }
-                        (None, None) => self.network_recovery_config(desired)?,
-                        // A newer Apply replaced the snapshot after the timer decided, or a force
-                        // snapshot appeared after a plain timer decided. Leave the new owner intact.
-                        _ => return None,
-                    };
-                    // Reject the exact selected snapshot before claiming a generation or
-                    // stopping the existing child; final generation checks again at Start.
-                    if let Err(error) = gateway_start_preflight(&snapshot) {
-                        self.publish_owned_restart_failure(
-                            &error,
-                            LifecycleAttribution::restart(force_id),
-                            scheduled_generation,
-                        );
-                        return None;
+                        if let super::ForceRestartSource::Selected { intent_generation }
+                        | super::ForceRestartSource::Confirmed {
+                            intent_generation, ..
+                        } = source
+                        {
+                            if *intent_generation != current_intent {
+                                *pending = None;
+                                if self.gate.pending().force_restart_id == Some(want) {
+                                    self.gate.clear_force_restart();
+                                }
+                                return None;
+                            }
+                        }
+                        value.clone()
                     }
-                    let generation = self
-                        .gate
-                        .try_begin_restart(scheduled_generation, force_id)?;
-                    // This successful claim precedes the AlreadyClaimed stop leg and every cleanup await.
-                    self.coex.claim(generation, false);
-                    starts.book_restart(
-                        Arc::clone(&self.stop_domain),
+                    (None, None) => self.network_recovery_config(desired)?,
+                    // A newer Apply replaced the snapshot after the timer decided, or a force
+                    // snapshot appeared after a plain timer decided. Leave the new owner intact.
+                    _ => return None,
+                };
+                // Reject the exact selected snapshot before claiming a generation or
+                // stopping the existing child; final generation checks again at Start.
+                if let Err(error) = gateway_start_preflight(&snapshot) {
+                    self.publish_owned_restart_failure(
+                        &error,
+                        LifecycleAttribution::restart(force_id),
                         scheduled_generation,
-                        Some(generation),
                     );
-                    self.gen_changed.notify_waiters();
-                    if force_id.is_some() {
-                        *pending = None;
-                    }
-                    Some((snapshot, generation, legacy_lease))
-                })
+                    return None;
+                }
+                let generation =
+                    self.debounced
+                        .try_claim_restart(ticket, scheduled_generation, force_id)?;
+                // This successful claim precedes the AlreadyClaimed stop leg and every cleanup await.
+                self.coex.claim(generation, false);
+                starts.book_restart(
+                    Arc::clone(&self.stop_domain),
+                    scheduled_generation,
+                    Some(generation),
+                );
+                self.gen_changed.notify_waiters();
+                if force_id.is_some() {
+                    *pending = None;
+                }
+                Some((snapshot, generation, legacy_lease))
             })
-            .ok()
-            .flatten()
+        })
     }
 
     fn network_recovery_config(&self, desired: &Value) -> Option<Value> {
@@ -2343,16 +2381,11 @@ impl ProxyRuntime {
             return None;
         }
         let applied = self.current_config_snapshot()?;
-        // External rule payloads are live paths. With a saved/runtime split
-        // we cannot attest their original bytes from either JSON snapshot.
-        if &applied != desired
-            && applied.get("ruleResources").is_some_and(|resources| {
-                resources
-                    .as_array()
-                    .is_none_or(|resources| !resources.is_empty())
-            })
-        {
-            log::info!("Network recovery held: applied external rule inputs are unverified");
+        // Downloaded resources keep their versioned paths and the deletion
+        // journal survives this restart. Built-in geo updates replace a shared
+        // path under the saved writer fence and advance its metadata.
+        if applied.get("builtinGeoMeta") != desired.get("builtinGeoMeta") {
+            log::info!("Network recovery held: a saved built-in geo update is unapplied");
             return None;
         }
         Some(applied)

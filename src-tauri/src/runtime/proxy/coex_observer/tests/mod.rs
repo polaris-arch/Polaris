@@ -666,6 +666,7 @@ async fn actual_debounced_restart_invalidates_before_blocked_failed_cleanup_and_
     ));
     let (_, claimed, _lease) = rt
         .claim_debounced_restart(None, generation, ticket)
+        .unwrap()
         .unwrap();
     let claim_state = rt.coex_state();
     let stopping = rt.clone();
