@@ -568,6 +568,8 @@ export default function TrayMenu() {
       } else if (result.runtimeApply?.status === 'hotApplied' && result.runtimeApply.configurationDurable === true) {
         const label = MODES.find((option) => option.v === mode);
         if (label) setNotice(t(label.k));
+      } else if (result.runtimeApply?.pendingApply) {
+        setNotice(t('tray.manageInMain'));
       }
     } catch (err) {
       if (mounted.current && interactionActive.current && life === trayLifecycle.current && operation === interactionEpoch.current) noticeActionFailure(t('tray.groupMode'), err);

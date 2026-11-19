@@ -1088,11 +1088,15 @@ pub(crate) fn run_menu_action(app: &tauri::AppHandle, action: MenuAction) {
                         }
                         match response.data {
                             Some(SaveOutcome::NeedsManual) => show_main_window(&app),
-                            Some(SaveOutcome::Conflict { .. }) => notify_menu_action_error(
+                            Some(
+                                SaveOutcome::Conflict { .. }
+                                | SaveOutcome::Retryable
+                                | SaveOutcome::Rejected,
+                            ) => notify_menu_action_error(
                                 &app,
                                 lang,
                                 i18n::key::TRAY_GROUP_MODE,
-                                &i18n::t(lang, i18n::key::TRAY_OPEN_MAIN),
+                                &i18n::t(lang, i18n::key::NATIVE_UNKNOWN_ERROR),
                             ),
                             _ => {}
                         }
