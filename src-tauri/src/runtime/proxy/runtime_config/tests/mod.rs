@@ -1751,6 +1751,71 @@ async fn confirmed_ts_binding_commit_replaces_token_in_same_main_generation() {
     ));
 }
 
+#[test]
+fn tailnet_activation_can_read_the_published_baseline() {
+    let (rt, _dir, _calls) = crate::runtime::proxy::tests::test_runtime_recording();
+    let original = ts_pending_fixture(&rt, "https://one.example");
+    rt.capture_runtime_config_baseline(
+        original.generation,
+        original.deps.clone(),
+        original.generated.clone(),
+        original.typed.clone(),
+        original.pairing.clone(),
+    );
+    {
+        let _publication = rt.gate.lock_generation_publication();
+        rt.activate_tailnet_context(original.generation, original.tailnet_bindings);
+    }
+    let old = rt.tailnet_context().unwrap();
+    let pending = ts_pending_fixture(&rt, "https://two.example");
+    let rule_directory = pending.deps.tailnet_rules_dir.clone();
+    let generation = pending.generation;
+
+    // Pause the real publisher after it enters its baseline write section.
+    let tailnet = rt.tailnet_routes.lock().unwrap();
+    let binding = rt.runtime_binding_state.lock().unwrap();
+    let publisher = Arc::clone(&rt);
+    let publish = std::thread::spawn(move || {
+        publisher.publish_prepared_runtime_candidate(&pending, Some("new-binding"), None, 8, None)
+    });
+    let wait = |ready: &mut dyn FnMut() -> bool, message: &str| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !ready() {
+            assert!(std::time::Instant::now() < deadline, "{message}");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    };
+    wait(
+        &mut || {
+            matches!(
+                rt.runtime_config_baseline.try_read(),
+                Err(std::sync::TryLockError::WouldBlock)
+            )
+        },
+        "publication did not enter the baseline write section",
+    );
+    drop(binding);
+    // Android's preparation reads these paths under the tailnet lock. Probe
+    // with try_read so regressing to a self-deadlock still fails in bounded time.
+    wait(
+        &mut || {
+            rt.runtime_config_baseline.try_read().is_ok_and(|baseline| {
+                baseline.as_ref().is_some_and(|live| {
+                    live.generation == generation
+                        && live.deps.tailnet_rules_dir == rule_directory
+                        && live.committed_transaction.as_deref() == Some("new-binding")
+                })
+            })
+        },
+        "tailnet activation still owns the baseline writer while it needs to read",
+    );
+    drop(tailnet);
+    publish.join().unwrap().unwrap();
+    let current = rt.tailnet_context().unwrap();
+    assert_eq!(current.generation, old.generation);
+    assert_ne!(current.token, old.token);
+}
+
 #[tokio::test]
 async fn confirmed_non_ts_graph_change_preserves_ts_token_and_known_hosts() {
     let (rt, _dir, _calls) = crate::runtime::proxy::tests::test_runtime_recording();

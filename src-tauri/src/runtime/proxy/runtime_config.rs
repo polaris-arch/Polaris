@@ -3469,6 +3469,9 @@ impl ProxyRuntime {
                 android_mesh_id: previous.android_mesh_id.clone(),
                 doh_blocked: previous.doh_blocked,
             });
+            // Android tailnet activation reads the accepted baseline's rule paths.
+            // Keep the generation publication fence, but release its baseline writer.
+            drop(baseline);
             if let Ok(mut status) = self.status.write() {
                 status.mixed_port = pending
                     .generated
