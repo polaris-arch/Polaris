@@ -206,6 +206,7 @@ export const MOBILE_FEEDS: readonly FeedEntry[] = [
      下面四条**第一次**出现在这张面上。它们一直都在（十余条应用级订阅的主流写法就是 `store().<写腿>`），
      只是取材面看不见 —— 「有一格状态没人问过谁写它」正是本表要抓的那一档，而它们自己躲在写法后面。 */
   { id: 'useAppStore.refreshProxyStatus', role: 'action', disposition: act(STORE_APP), note: '重拉连接态。`startProxy`/`stopProxy` **故意不写** `proxyStatus`（`app-store.ts:396`）—— 托盘等别的入口也能启停，只有走事件才让多处收敛，故这条重拉腿是连接态唯一的落库口。' },
+  { id: 'useAppStore.refreshPendingChanges', role: 'action', disposition: act(STORE_APP), note: '按推送顺序和运行核代次回读待应用状态；原生清理凭据按自己的归属合并。' },
   { id: 'useAppStore.setPrivacyMode', role: 'action', disposition: act(STORE_APP), note: '写隐私锁开关态。挂载时从后端回读一次（Android 会非自愿回收进程，进程内 `AtomicBool` 不足以还原），此后由进入/退出两条事件维持。' },
   { id: 'useAppStore.setTailscaleStatus', role: 'action', disposition: act(STORE_APP), note: '写 Tailscale 原始状态帧。整帧落库是刻意的：`deriveTsExitWarning` 要的 `peers` / `backendState` 都在里面，丢了它「选中的出口设备在线但没广告出口」这类形态在产品里永不可达。' },
   { id: 'useAppStore.setTailscaleLoginState', role: 'action', disposition: act(STORE_APP), note: '写折叠后的登录态。写的值先过 `isDefinitiveTsLoginFrame` 那道判决门（核启动早期的 NoState/Stopped 帧会把 loggedIn 折成 false，无条件写下去会经双写穿进 localStorage 缓存，下次冷启动显示「需登录」）。' },
@@ -227,6 +228,7 @@ export const MOBILE_FEEDS: readonly FeedEntry[] = [
   /* ── 暂存（待应用条）─────────────────────────────────────────────────── */
   { id: 'useStagedConfigStore.entries', role: 'state', disposition: fed({ file: 'ui/src/mobile/screens/rules/RulesScreen.tsx', mustContain: 'stage({' }), note: '暂存条目。写入方是各屏那些 `stage({ … })` 调用。' },
   { id: 'useStagedConfigStore.saveStatus', role: 'state', disposition: fed(STAGED_FED), note: '保存态（保存失败时条上要说话，静默失败是本仓修过的形态）。' },
+  { id: 'useStagedConfigStore.savedRuntimeApply', role: 'state', disposition: fed(STAGED_FED), note: '保存时收到的运行核回执，由共用待应用逻辑按原事务消费。' },
   { id: 'useStagedConfigStore.conflict', role: 'state', disposition: fed(STAGED_FED), note: '保存冲突（盘上被别处改过）。冲突时 save 把 saveStatus 退回 idle 并 return false —— 不报冲突就等于「什么都没发生」。' },
   { id: 'useStagedConfigStore.stage', role: 'action', disposition: act(STORE_STAGED), note: '压一条暂存（Class B 配置命中暂存腿时只记意图，真正生效留到 Apply）。' },
   { id: 'useStagedConfigStore.save', role: 'action', disposition: act(STORE_STAGED), note: '保存暂存但不重启核（冲突时把 saveStatus 退回 idle 并返回 false）。' },

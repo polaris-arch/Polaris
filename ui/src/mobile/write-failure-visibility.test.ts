@@ -183,7 +183,6 @@ const READ_CALLS: readonly string[] = [
   'api.proxy.onLifecycle',
   // The readiness-aware form only registers the same read-only lifecycle subscription.
   'api.proxy.onLifecycleReady',
-  'api.proxy.getPendingChanges',
   'api.ipInfo.get',
   'api.ruleResources.list',
   /*
