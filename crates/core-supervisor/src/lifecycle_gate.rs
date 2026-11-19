@@ -62,6 +62,8 @@ pub struct StopDiscard {
 /// 经去抖天然合并为一次）。对应 TS 的 `void this.switchMode(...)` + `scheduleDebouncedRestart()`。
 #[derive(Debug, Default, Clone)]
 pub struct PendingDrain {
+    /// The lifecycle generation observed when the gate drained.
+    pub generation: u64,
     /// 待重放的 switchMode config id（如有）。
     pub replay_switch_id: Option<u64>,
     /// 是否须排空一次尾随重启。
@@ -202,6 +204,7 @@ impl LifecycleGate {
             LifecycleKind::Start | LifecycleKind::Restart => {
                 let restart_pending = std::mem::take(&mut g.pending.restart_pending);
                 LifecycleEndResult::Drained(PendingDrain {
+                    generation: g.generation,
                     replay_switch_id: g.pending.switch_id.take(),
                     // The next timer claims the exact force id; a Stop still discards it.
                     schedule_restart: restart_pending || g.pending.force_restart_id.is_some(),

@@ -242,6 +242,7 @@ fn debounced_restart_claim_keeps_exact_force_id_when_busy() {
         panic!("the busy owner must drain the exact pending restart")
     };
     assert!(drain.schedule_restart);
+    assert_eq!(drain.generation, generation);
     assert_eq!(gate.pending().force_restart_id, Some(41));
     assert_eq!(gate.try_begin_restart(generation, Some(40)), None);
     assert_eq!(

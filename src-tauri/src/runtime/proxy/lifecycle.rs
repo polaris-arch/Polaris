@@ -2137,7 +2137,7 @@ impl ProxyRuntime {
             LifecycleEndResult::Drained(drain) => {
                 if drain.schedule_restart {
                     log::info!("depth 归零 → 排空一次尾随重启");
-                    self.schedule_restart();
+                    self.schedule_restart_for_generation(drain.generation);
                 }
                 // 排空暂存的 switchMode（上游 :1540 `void this.switchMode(pendingSwitch)`）。
                 // depth 已归零 → 重放时不会再落回 Pending 腿，可正常判热切/重启。
