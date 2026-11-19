@@ -12,7 +12,7 @@ export function validationContext(candidate, env = process.env, root = process.c
   return { runId: context.runId, attempt: context.attempt };
 }
 
-// Package's Bash setup and the Python native/final proof use the same admission
+// Package setup and native proofs use the same admission
 // function. The contract is read from actual source bytes.
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   requireGraph(process.argv.length === 3, 'Validation context requires exactly one candidate');

@@ -6,9 +6,9 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { CRONET_REQUIRED_EXPORTS, inspectCronetBytes, verifyCronetPayload } from './cronet-payload.mjs';
-import { compareCronetProofs } from '../desktop-core/native-dns-gates.mjs';
+import { checkCronetProof } from '../desktop-core/native-dns-gates.mjs';
 
-test('Cronet migration compares the admitted identity, complete native evidence and signatures', () => {
+test('The native Cronet proof binds the admitted identity, complete native evidence and signatures', () => {
   const digest = '1'.repeat(64);
   const path = 'C:\\payload with spaces\\libcronet.dll';
   const signature = { status: 'NotSigned', signerThumbprint: null };
@@ -24,21 +24,18 @@ test('Cronet migration compares the admitted identity, complete native evidence 
     actualCore: { started: true, pid: 12, mappedLibrary: { path, sha256: digest },
       configurationSha256: '2'.repeat(64), log: 'INFO sing-box started' },
   };
-  const rust = structuredClone(proof);
-  rust.actualCore.pid = 13;
-  rust.capi.symbols.Cronet_Engine_Create.address = '0x123';
-  rust.signatureAfterNative.core = { signerThumbprint: null, status: 'NotSigned' };
-  compareCronetProofs(rust, proof);
+  const {transport, input} = proof;
+  checkCronetProof(proof, transport, input);
   for (const [mutate, error] of [
     [value => value.transport.attempt = '2', /context differs/],
     [value => delete value.capi.symbols.Cronet_UrlRequest_Start, /C ABI receipt/],
     [value => value.actualCore.mappedLibrary.sha256 = '3'.repeat(64), /mapping receipt/],
-    [value => value.capi.version = '2.0', /version or observed signature/],
-    [value => value.signatureAfterNative.core = { status: 'Valid', signerThumbprint: 'F' }, /observed signature/],
+    [value => value.capi.version = '', /C ABI receipt/],
+    [value => value.signatureAfterNative.core = { status: 'Valid', signerThumbprint: 'F' }, /signature observation/],
   ]) {
-    const changed = structuredClone(rust);
+    const changed = structuredClone(proof);
     mutate(changed);
-    assert.throws(() => compareCronetProofs(changed, proof), error);
+    assert.throws(() => checkCronetProof(changed, transport, input), error);
   }
 });
 

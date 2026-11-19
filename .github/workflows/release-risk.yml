@@ -135,7 +135,6 @@ jobs:
         run: |
           set -euo pipefail
           python3 -B -m unittest discover -s scripts/mobile-core -p 'test_*.py'
-          python3 -B scripts/native-payload-proof.test.py
           python3 -B -X utf8 scripts/windows-package-integrity.test.py
 
       - name: Classify changed paths

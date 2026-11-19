@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Bounded validation of committed formal inputs; no publication authority.
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
-import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -110,9 +110,7 @@ export function gatePlan(key, root = process.cwd()) {
     })),
   ];
   if (target.library) plan.push({
-    id: 'native_cronet_payload', program: key === 'win' ? 'python' : 'python3', rustTests: false, proofRequired: true,
-    args: ['scripts/native-payload-proof.py', '--platform', key, '--core', join(root, target.core),
-      '--library', join(root, target.library), '--output', join(root, 'native-dns-evidence', key, 'native-cronet.json')],
+    id: 'native_cronet_payload', rustTests: false, proofRequired: true,
   });
   return plan;
 }
@@ -153,7 +151,8 @@ export function classifyResult(gate, raw, key) {
     logSha256: raw.logSha256 ?? null, logBytes: raw.logBytes ?? null,
     stdoutSha256: raw.stdoutSha256 ?? null, stdoutBytes: raw.stdoutBytes ?? null,
     stderrSha256: raw.stderrSha256 ?? null, stderrBytes: raw.stderrBytes ?? null,
-    ...(gate.proofRequired ? { proofValid: raw.proofValid === true } : {}) };
+    ...(gate.proofRequired ? { proofValid: raw.proofValid === true,
+      receiptSha256: raw.receiptSha256 ?? null, steps: raw.steps ?? [] } : {}) };
 }
 
 // Tests inject an in-memory executor. The CLI never accepts an alternate executor.
@@ -255,8 +254,12 @@ export function executeCommand(gate, { root, env, directory, timeout }) {
   });
 }
 
-function checkedCronetReceipt(input, capi, actual) {
-  const digest = input.library.sha256;
+export function checkCronetProof(proof, context, admittedInput) {
+  requireGate(proof?.schema === 'polaris-native-payload-proof-v1'
+    && isDeepStrictEqual(proof.transport, context) && isDeepStrictEqual(proof.input, admittedInput),
+  'Native proof input or original Actions context differs');
+  const { capi, actualCore: actual, signatureBeforeNative: before, signatureAfterNative: after } = proof;
+  const digest = admittedInput.library.sha256;
   requireGate(capi?.schema === 'polaris-cronet-capi-smoke-v1' && capi.librarySha256 === digest
     && capi.engineInitialized === true && typeof capi.version === 'string' && capi.version.length > 0
     && Object.keys(capi.symbols ?? {}).length === CRONET_REQUIRED_EXPORTS.length
@@ -268,46 +271,36 @@ function checkedCronetReceipt(input, capi, actual) {
     && actual.mappedLibrary.path.length > 0 && /^[a-f0-9]{64}$/.test(actual.configurationSha256)
     && typeof actual.log === 'string' && actual.log.includes('sing-box started'),
   'Rust Core mapping receipt disagrees with the admitted payload');
-}
-
-export function compareCronetProofs(candidate, reference) {
-  requireGate(candidate?.schema === 'polaris-native-payload-proof-v1'
-    && reference?.schema === candidate.schema && isDeepStrictEqual(candidate.transport, reference.transport)
-    && isDeepStrictEqual(candidate.input, reference.input),
-  'Native proof input or original Actions context differs');
-  checkedCronetReceipt(candidate.input, candidate.capi, candidate.actualCore);
-  checkedCronetReceipt(reference.input, reference.capi, reference.actualCore);
-  const signatures = candidate.signatureBeforeNative;
   const unsigned = (value) => value?.status === 'NotSigned' && value.signerThumbprint === null;
-  requireGate((candidate.input.platform === 'linux' && signatures?.state === 'not-applicable')
-    || (candidate.input.platform === 'win' && unsigned(signatures?.core) && unsigned(signatures?.library)),
-  'Native proof omitted the required signature observation');
-  requireGate(candidate.capi.version === reference.capi.version
-    && isDeepStrictEqual(signatures, candidate.signatureAfterNative)
-    && isDeepStrictEqual(candidate.signatureBeforeNative, reference.signatureBeforeNative)
-    && isDeepStrictEqual(candidate.signatureAfterNative, reference.signatureAfterNative),
-  'Native loader version or observed signature states differ');
+  requireGate(isDeepStrictEqual(before, after)
+    && ((admittedInput.platform === 'linux' && before?.state === 'not-applicable')
+      || (admittedInput.platform === 'win' && unsigned(before?.core) && unsigned(before?.library))),
+  'Native proof omitted or changed the required signature observation');
 }
 
-async function verifyNativeCronet(root, key, target, directory) {
-  const env = { ...process.env };
+async function verifyNativeCronet(root, key, context, env, directory, deadline) {
+  const target = TARGETS[key];
   requireGate(env.POLARIS_NATIVE_DNS_FORMAL === '1' && !Object.hasOwn(env, 'POLARIS_SINGBOX_PATH')
     && env.POLARIS_NO_KERNEL_RUN !== '1' && target.library && process.platform === target.host
     && process.arch === target.arch, 'Exact formal native runner required for the Cronet proof');
-  const context = formalGateContext(root, env);
+  const transport = {candidate: context.candidate, runId: context.runId, attempt: context.attempt};
   const core = join(root, target.core), library = join(root, target.library);
   const input = inspectNativePayload(root, key, core, library);
-  const legacy = JSON.parse(readFileSync(join(directory, 'native-cronet.json'), 'utf8'));
-  requireGate(input.candidate === context.candidate
-    && legacy.transport?.candidate === context.candidate && legacy.transport.runId === context.runId
-    && legacy.transport.attempt === context.attempt && isDeepStrictEqual(input, legacy.input),
-  'Expected the current original native proof before comparison');
-  for (const key of ['LD_PRELOAD', 'LD_LIBRARY_PATH', 'DYLD_LIBRARY_PATH', 'DYLD_INSERT_LIBRARIES']) delete env[key];
+  requireGate(input.candidate === context.candidate, 'Native proof candidate differs');
+  const receiptPath = join(directory, 'native-cronet.json');
+  rmSync(receiptPath, { force: true });
+  const childEnv = { ...env };
+  for (const key of ['LD_PRELOAD', 'LD_LIBRARY_PATH', 'DYLD_LIBRARY_PATH', 'DYLD_INSERT_LIBRARIES']) delete childEnv[key];
+  const steps = [];
+  let last;
   const observe = async (id, program, args, timeout) => {
-    const result = await executeCommand({ id, program, args }, { root, env, directory, timeout });
-    requireGate(result.status === 0 && !result.timedOut && !result.cleanupUncertain && !result.interrupted && !result.error,
-      `Native proof step ${id} failed: ${result.error ?? result.status}`);
-    return JSON.parse(result.stdout);
+    last = await executeCommand({ id, program, args }, { root, env: childEnv, directory,
+      timeout: Math.min(timeout, deadline - Date.now()) });
+    const {status, logSha256, logBytes, stdoutSha256, stdoutBytes, stderrSha256, stderrBytes} = last;
+    steps.push({ id, status, logSha256, logBytes, stdoutSha256, stdoutBytes, stderrSha256, stderrBytes });
+    requireGate(status === 0 && !last.timedOut && !last.cleanupUncertain && !last.interrupted && !last.error,
+      `Native proof step ${id} failed: ${last.error ?? status}`);
+    return JSON.parse(last.stdout);
   };
   const signatureState = async (phase) => {
     if (key !== 'win') return { state: 'not-applicable' };
@@ -320,34 +313,20 @@ async function verifyNativeCronet(root, key, target, directory) {
     }
     return result;
   };
-  const before = await signatureState('before');
-  const args = ['run', '--locked', '--quiet', '-p', 'polaris-core-supervisor', '--example', 'native_cronet_proof', '--'];
-  const capi = await observe('cronet-rust-capi', 'cargo', [...args, 'capi'], COMMAND_TIMEOUT_MS);
-  const actualCore = await observe('cronet-rust-core', 'cargo', [...args, 'core'], 90_000);
-  const after = await signatureState('after');
-  requireGate(isDeepStrictEqual(before, after)
-    && isDeepStrictEqual(input, inspectNativePayload(root, key, core, library)),
-  'Native Core or library changed during the proof');
-  checkedCronetReceipt(input, capi, actualCore);
-  const result = { schema: 'polaris-native-payload-proof-v1',
-    transport: { candidate: context.candidate, runId: context.runId, attempt: context.attempt },
-    input, signatureBeforeNative: before, signatureAfterNative: after, capi, actualCore };
-  compareCronetProofs(result, legacy);
-  writeFileSync(join(directory, 'native-cronet-rust.json'), `${JSON.stringify(result, null, 2)}\n`, { mode: 0o600 });
-}
-
-function reportCronetComparison(directory, summary) {
   try {
-    const receipt = readFileSync(join(directory, 'native-cronet-rust.json'));
-    const proof = JSON.parse(receipt);
-    const legacy = JSON.parse(readFileSync(join(directory, 'native-cronet.json'), 'utf8'));
-    requireGate(isDeepStrictEqual(proof.transport, {
-      candidate: summary.candidate, runId: summary.runId, attempt: summary.attempt,
-    }), 'Rust proof belongs to another run or attempt');
-    compareCronetProofs(proof, legacy);
-    return { state: 'passed', receiptSha256: sha256(receipt) };
-  } catch {
-    return { state: 'failed-or-incomplete' };
+    const before = await signatureState('before');
+    const args = ['run', '--locked', '--quiet', '-p', 'polaris-core-supervisor', '--example', 'native_cronet_proof', '--'];
+    const capi = await observe('cronet-rust-capi', 'cargo', [...args, 'capi'], COMMAND_TIMEOUT_MS);
+    const actualCore = await observe('cronet-rust-core', 'cargo', [...args, 'core'], 90_000);
+    const after = await signatureState('after');
+    const proof = { schema: 'polaris-native-payload-proof-v1', transport, input,
+      signatureBeforeNative: before, signatureAfterNative: after, capi, actualCore };
+    checkCronetProof(proof, transport, inspectNativePayload(root, key, core, library));
+    const receipt = `${JSON.stringify(proof, null, 2)}\n`;
+    writeFileSync(receiptPath, receipt, { flag: 'wx', mode: 0o600 });
+    return { status: 0, stdout: receipt, stderr: '', proofValid: true, receiptSha256: sha256(receipt), steps };
+  } catch (error) {
+    return { ...last, error: error.message, steps };
   }
 }
 
@@ -369,14 +348,13 @@ export function summaryFor(key, env, plan, results = [], failure = null) {
 
 async function main() {
   const [mode, platformArg, ...extra] = process.argv.slice(2);
-  requireGate(['run', 'finalize', 'verify-formal', 'verify-native-cronet'].includes(mode)
+  requireGate(['run', 'finalize', 'verify-formal'].includes(mode)
     && platformArg?.startsWith('--platform=') && extra.length === 0,
-  'Usage: native-dns-gates.mjs run|finalize|verify-formal|verify-native-cronet --platform=linux|win|mac-x64|mac-arm64');
+  'Usage: native-dns-gates.mjs run|finalize|verify-formal --platform=linux|win|mac-x64|mac-arm64');
   const key = platformArg.slice('--platform='.length), root = process.cwd(), target = TARGETS[key];
   requireGate(target, `Unsupported native platform: ${key}`);
   if (mode === 'verify-formal') { console.log(JSON.stringify(verifyFormalGatePayloads(root))); return; }
   const plan = gatePlan(key, root), directory = join(root, 'native-dns-evidence', key);
-  if (mode === 'verify-native-cronet') { await verifyNativeCronet(root, key, target, directory); return; }
   mkdirSync(directory, { recursive: true });
   const summaryPath = join(directory, 'summary.json');
   const save = (summary) => writeFileSync(summaryPath, `${JSON.stringify(summary, null, 2)}\n`);
@@ -387,13 +365,8 @@ async function main() {
       && summary.candidate === process.env.CORE_CANDIDATE && summary.runId === process.env.GITHUB_RUN_ID
       && summary.attempt === process.env.GITHUB_RUN_ATTEMPT
       && summary.selection === 'formal-default', 'Summary belongs to another candidate/run/attempt');
-    if (target.library) {
-      summary.cronetProofComparison = reportCronetComparison(directory, summary);
-      save(summary);
-    }
     if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY,
       `### Native DNS candidate: ${key}\n\nMandatory ordinary gates: ${summary.mandatoryGatesPassed ? 'passed' : 'failed or incomplete'}. App/package acceptance: false. Sealed B609 path: unvalidated.\n\n`
-      + (summary.cronetProofComparison ? `Rust Cronet proof comparison: ${summary.cronetProofComparison.state}.\n\n` : '')
       + summary.gates.map((gate) => `- ${gate.id}: ${gate.state}\n`).join('') + (summary.failure ? `\n${summary.failure}\n` : ''));
     return;
   }
@@ -416,21 +389,10 @@ async function main() {
     const deadline = Date.now() + SERIES_TIMEOUT_MS;
     const env = { ...process.env, POLARIS_REQUIRE_KERNEL_GATE: '1', POLARIS_KERNEL_GATE_TARGET: target.target,
       POLARIS_TEST_CORE: join(root, target.core), CARGO_TERM_COLOR: 'never' };
-    results = await collectGates(plan, key, async (gate) => {
-      const raw = await executeCommand(gate, { root, env: gateEnvironment(gate, key, root, env), directory,
-        timeout: Math.min(COMMAND_TIMEOUT_MS, deadline - Date.now()) });
-      if (gate.proofRequired && raw.status === 0) {
-        try {
-          const proof = JSON.parse(readFileSync(join(directory, 'native-cronet.json'), 'utf8'));
-          raw.proofValid = proof.schema === 'polaris-native-payload-proof-v1'
-            && proof.transport?.candidate === env.CORE_CANDIDATE
-            && String(proof.transport?.runId) === env.GITHUB_RUN_ID
-            && String(proof.transport?.attempt) === env.GITHUB_RUN_ATTEMPT
-            && proof.input?.candidate === env.CORE_CANDIDATE;
-        } catch (error) { raw.error = `Missing/invalid native proof: ${error.message}`; }
-      }
-      return raw;
-    }, (partial) => {
+    results = await collectGates(plan, key, (gate) => gate.proofRequired
+      ? verifyNativeCronet(root, key, context, env, directory, deadline)
+      : executeCommand(gate, { root, env: gateEnvironment(gate, key, root, env), directory,
+        timeout: Math.min(COMMAND_TIMEOUT_MS, deadline - Date.now()) }), (partial) => {
       results = [...partial]; save(summaryFor(key, process.env, plan, results, 'Validation is still in progress'));
     });
     inputEvidence.after = await verifyAll();
