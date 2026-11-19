@@ -919,8 +919,7 @@ pub(super) fn config_on_degraded() {
 
 /// 从原始 config JSON 读日志两轴（`logLevel` / `disableLogFile`），喂 `GenerateConfigDeps`。
 ///
-/// **为何从裸 JSON 读**：`UserConfig` 增量子集未建模这两字段（见 `GenerateConfigDeps` 字段注释），
-/// 与 `restartOnNodeChange`（switch_mode）同法从原始 `Value` 读，不经 `UserConfig` 结构体。
+/// `UserConfig` 保留这两个字段的原始 JSON，用于检测生成投影的变化。这里统一解释实际日志配置。
 /// - `logLevel` 缺省 / 非法字符串 → `Info`（`LogLevel` 的 `#[default]`）。
 /// - `disableLogFile` 非 `true` 一律 `false`（对齐 上游 `validateConfig` 布尔口径）。
 ///

@@ -10,6 +10,7 @@ use polaris_config_engine::builder::custom_rule_files::build_custom_rule_files;
 use polaris_config_engine::builder::helpers::{effective_app_rules, effective_custom_rules};
 use polaris_config_engine::builder::orchestration::config_generation_norm;
 use polaris_config_engine::user_config::app_config::UserConfig;
+use polaris_config_engine::user_config::auto_select::AutoSelectTarget;
 use polaris_config_engine::user_config::rule::RuleAction;
 use polaris_config_engine::user_config::ProxyMode;
 use polaris_helper_proto::Platform;
@@ -64,9 +65,11 @@ pub struct PendingChangesSummary {
     pub native_retirements: Vec<super::runtime_config::NativeRetirementDebt>,
 }
 
-/// 与 `generate_rule_selectors` 同一组有效性判据；比较目标值而非目标 id 集合，
-/// 才不会漏掉两条规则把 A/B 目标对调的保存债。
-fn effective_rule_selector_targets(config: &UserConfig) -> BTreeMap<String, Option<String>> {
+/// 与 `generate_rule_selectors` 同一组有效性判据。按规则记录节点和自动优选目标，
+/// 因为生成投影中的目标集合看不见两条规则互换同一组目标。
+fn effective_rule_selector_targets(
+    config: &UserConfig,
+) -> BTreeMap<String, (Option<String>, Option<AutoSelectTarget>)> {
     if config.proxy_mode != ProxyMode::Smart {
         return BTreeMap::new();
     }
@@ -75,7 +78,10 @@ fn effective_rule_selector_targets(config: &UserConfig) -> BTreeMap<String, Opti
         if rule.enabled && rule.route_action() == Some(RuleAction::Proxy) {
             targets.insert(
                 format!("custom:{}", rule.id),
-                rule.route_target_server_id().map(str::to_owned),
+                (
+                    rule.route_target_server_id().map(str::to_owned),
+                    rule.route_target_auto_select().cloned(),
+                ),
             );
         }
     }
@@ -85,7 +91,10 @@ fn effective_rule_selector_targets(config: &UserConfig) -> BTreeMap<String, Opti
         &config.app_rules,
     ) {
         if rule.enabled && rule.action == RuleAction::Proxy {
-            targets.insert(format!("app:{}", rule.app_id), rule.target_server_id);
+            targets.insert(
+                format!("app:{}", rule.app_id),
+                (rule.target_server_id, rule.target_auto_select),
+            );
         }
     }
     targets

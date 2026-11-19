@@ -536,6 +536,61 @@ async fn staged_save_preserves_earlier_saved_debt_and_rejects_superseded_candida
 }
 
 #[tokio::test]
+async fn staged_save_preserves_earlier_rule_auto_target_swaps() {
+    for collection in ["trafficRules", "appRules"] {
+        let (rt, _dir, mut running, _) = host_dns_restart_fixture();
+        running["autoSelectEnabled"] = json!(true);
+        running["servers"] =
+            json!([{"id":"node","name":"node","protocol":"socks","address":"127.0.0.1","port":1080}]);
+        running["proxyMode"] = json!("smart");
+        running["appRoutingEnabled"] = json!(true);
+        running[collection] = if collection == "trafficRules" {
+            json!([
+                {"id":"first","type":"domain","values":["one.example"],"action":"proxy","enabled":true,"targetAutoSelect":{"scope":"global"}},
+                {"id":"second","type":"domain","values":["two.example"],"action":"proxy","enabled":true,"targetAutoSelect":{"scope":"manual"}}
+            ])
+        } else {
+            json!([
+                {"appId":"youtube","action":"proxy","enabled":true,"targetAutoSelect":{"scope":"global"}},
+                {"appId":"telegram","action":"proxy","enabled":true,"targetAutoSelect":{"scope":"manual"}}
+            ])
+        };
+        let baseline = ts_pending_raw_fixture(&rt, running.clone());
+        *rt.current_config.write().unwrap() = Some(running.clone());
+        *rt.startup_snapshot.write().unwrap() = Some(running.clone());
+        *rt.switch_snapshot.write().unwrap() = Some(ProxyRuntime::build_switch_snapshot(
+            &baseline.typed,
+            &baseline.generated,
+            &baseline.deps,
+        ));
+        assert!(!rt.pending_changes_against(Some(&running)).pending_apply);
+
+        let mut prior_saved = running.clone();
+        prior_saved[collection][0]["targetAutoSelect"]["scope"] = json!("manual");
+        prior_saved[collection][1]["targetAutoSelect"]["scope"] = json!("global");
+        rt.config.save_full(&prior_saved).unwrap();
+        let prior_saved = rt.config.current().unwrap();
+        assert!(
+            rt.pending_changes().pending_apply,
+            "swapping existing auto targets in {collection} is pending work"
+        );
+        assert!(!rt.pending_changes().restart_required);
+
+        let mut next = prior_saved.clone();
+        next["logLevel"] = json!("debug");
+        rt.config.save_full(&next).unwrap();
+        let next = rt.config.current().unwrap();
+        let owner = StagedSaveOwner::capture(&rt, rt.config.saved_revision());
+        let result = rt
+            .apply_staged_save_if_current(prior_saved, next, owner, |_| {})
+            .await;
+        assert!(result.is_none());
+        assert!(rt.runtime_config_apply.lock().unwrap().last.is_none());
+        assert_eq!(rt.current_config_snapshot(), Some(running));
+    }
+}
+
+#[tokio::test]
 async fn staged_save_never_inherits_its_grant_from_equal_bytes_written_later() {
     let (rt, _dir, running, candidate) = host_dns_restart_fixture();
     let owner = StagedSaveOwner {

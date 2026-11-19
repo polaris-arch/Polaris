@@ -158,9 +158,9 @@ pub struct GenerateConfigDeps {
     pub has_management_api: bool,
     /// privacyProvider()：隐私模式（buildLogConfig 抬 ≥warn）。
     pub privacy_mode: bool,
-    /// buildLogConfig 输入：日志级别（Polaris config.logLevel || 'info'）。UserConfig 增量子集未含此字段。
+    /// buildLogConfig 输入：解析后的日志级别。UserConfig 保留原值用于比较生成投影。
     pub log_level: crate::user_config::LogLevel,
-    /// buildLogConfig 输入：禁用日志写盘（Polaris config.disableLogFile）。UserConfig 增量子集未含此字段。
+    /// buildLogConfig 输入：解析后的日志写盘开关。UserConfig 保留原值用于比较生成投影。
     pub disable_log_file: bool,
     /// sing-box 核心 dashboard 服务目录解析结果（resolveDashboardServeDir）。None = 不注入 dashboard.path。
     /// Polaris resolveDashboardServeDir 返回 override 或 bundled 或 null（两者皆无）。
