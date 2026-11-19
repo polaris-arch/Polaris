@@ -273,7 +273,8 @@ test('runtime receipt retains the exact owner without pretending memory is crash
   assert.doesNotMatch(owner, /\.sync\s*\{|startOrReloadService|write\(to:|saveToPreferences/);
   const start = section(provider, '    private func startRuntimeOwnedService(', '    private func sharedDirectory()');
   assert.ok(start.indexOf('runtimeRestartOwner?.revoke()') < start.indexOf('let owner = TunnelRuntimeRestartOwner'));
-  assert.match(start, /try server\.startOrReloadService\(withRetryableRuntimePersistence: config, options: LibboxOverrideOptions\(\), handler: owner\)/);
+  assert.match(start, /let options = LibboxOverrideOptions\(\)/);
+  assert.match(start, /try server\.startOrReloadService\(withRetryableRuntimePersistence: config, options: options, handler: owner\)/);
   // The Objective-C/Java selector is not the imported Swift spelling.
   assert.doesNotMatch(start, /startOrReloadServiceWith(?:Retryable)?RuntimePersistence|startOrReloadService\(config/);
   assert.match(start, /catch \{\s*owner\.revoke\(\)/);
@@ -284,8 +285,12 @@ test('managed bootstrap preserves digest and directory admission before the new 
   const managed = section(provider, '    private func handleManagedBootstrap(', '    override func sleep(');
   const digest = managed.indexOf('digest(config) == identity.configDigest');
   const activate = managed.indexOf('server.activateTailscaleDirectoryDomain(pending.ownerNonce, expectedSourceIdentity: expectedSource)');
-  const start = managed.indexOf('startRuntimeOwnedService(server, config: config, token: pending.token)');
+  const start = managed.indexOf('startRuntimeOwnedService(server, config: config, token: pending.token, managedCold: true)');
+  const retain = managed.indexOf('lifecycle.retainManagedColdStoreCohort(cohort, identity: identity, token: pending.token)');
+  const ready = managed.indexOf('lifecycle.complete(pending.token, phase: "running"');
   assert.ok(digest >= 0 && digest < activate && activate < start);
+  assert.ok(start < retain && retain < ready);
+  assert.match(managed, /if let cohort, !lifecycle\.retainManagedColdStoreCohort\(cohort, identity: identity, token: pending\.token\) \{\s*throw tunnelError/);
   assert.match(managed, /capability\["sourceIdentity"\] as\? String == expectedSource/);
   assert.match(managed, /lifecycle\.accepts\(pending\.token\)/);
 });
@@ -305,15 +310,27 @@ test('reload invalidates the previous callback generation before reading its ret
 
 test('the real capabilities bridge gates initial, managed and reload readiness', () => {
   const start = section(provider, '    private func startRuntimeOwnedService(', '    private func sharedDirectory()');
-  const birth = start.indexOf('server.startOrReloadService(withRetryableRuntimePersistence:');
+  const typedBirth = start.indexOf('let document = start(server, startSelector, config as NSString, options, owner, &error)');
+  const legacyBirth = start.indexOf('server.startOrReloadService(withRetryableRuntimePersistence:');
   const query = start.indexOf('server.runtimeCapabilities(&capabilityError)');
   const decode = start.indexOf('TunnelRuntimeAdmission.decode(document, platform: platformBuild)');
   const bind = start.indexOf('lifecycle.admitRuntimeProtocol(token, admission: admission)');
-  assert.ok(birth >= 0 && birth < query && query < decode && decode < bind);
+  assert.ok(typedBirth >= 0 && typedBirth < legacyBirth && legacyBirth < query && query < decode && decode < bind);
+  const optionalSelector = 'NSSelectorFromString("startOrReloadServiceWithTailscaleStartup:options:handler:error:")';
+  assert.ok(start.includes(optionalSelector));
+  assert.doesNotMatch(start.replace(optionalSelector, ''), /\bNSSelectorFromString\b/);
+  const managedBirth = section(start, 'if managedCold && server.responds(to: startSelector)', '} else {');
+  assert.match(managedBirth, /method_getNumberOfArguments\(method\) == 6/);
+  assert.match(managedBirth, /typealias Start = @convention\(c\) \(AnyObject, Selector, NSString, AnyObject, AnyObject,\s*AutoreleasingUnsafeMutablePointer<NSError\?>\?\) -> Unmanaged<NSString>\?/);
+  assert.match(managedBirth, /if let error \{ throw error \}/);
+  assert.match(managedBirth, /guard let document else \{ throw tunnelError/);
+  assert.match(managedBirth, /unsafeBitCast\(method_getImplementation\(method\), to: Start\.self\)/);
   assert.match(start, /if let capabilityError \{ throw capabilityError \}/);
   assert.equal((start.match(/lifecycle\.accepts\(token\), commandServer === server, runtimeRestartOwner === owner/g) ?? []).length, 2);
   assert.match(start, /platformBuild = "ios\/arm64"/);
-  assert.doesNotMatch(start, /dlsym|unsafeBitCast|perform\(|NSSelectorFromString|#if DEBUG/);
+  assert.doesNotMatch(start, /dlsym|perform\(|#if DEBUG/);
+  assert.equal((managedBirth.match(/unsafeBitCast\(/g) ?? []).length, 1);
+  assert.doesNotMatch(start.replace(managedBirth, ''), /unsafeBitCast/);
   assert.equal((provider.match(/(?:self\.)?startRuntimeOwnedService\(server, config:/g) ?? []).length, 3);
   assert.equal((provider.match(/guard (?:self\.)?lifecycle\.complete\([^\n]+phase: "running"/g) ?? []).length, 3);
 });
