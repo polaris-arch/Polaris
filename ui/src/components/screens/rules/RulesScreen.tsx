@@ -230,7 +230,8 @@ export function RulesScreen({ plane = 'route' }: { plane?: 'route' | 'dns' }) {
       ) {
         return;
       }
-      setOptimisticOrder(ordered.map((rule) => rule.id));
+      const proposedOrder = ordered.map((rule) => rule.id);
+      setOptimisticOrder(proposedOrder);
       // 当前平面规则排序无副作用，按各自 order 字段进入暂存。
       // 顺序在条目模型里是**整集合的主键序列**（`entityPath` 单段 = 集合本身），不是某个实体的字段；
       // 让它绕过暂存是错的 —— 同一个页面里「改规则」进暂存、「拖排序」直落盘，条上的「N 项待保存」
@@ -241,17 +242,20 @@ export function RulesScreen({ plane = 'route' }: { plane?: 'route' | 'dns' }) {
           ? editRoute('dnsRuleOrder', stagingEnabled)
           : editRoute('routeRuleOrder', stagingEnabled);
       if (orderEditRoute === 'staged') {
-        void submitEdit({
+        const result = await submitEdit({
           id: `order:${orderKey}`,
           kind: 'rule',
           label: t('home.stagedRuleOrder'),
           entityPath: [orderKey],
-          nextValue: ordered.map((r) => r.id),
+          nextValue: proposedOrder,
         });
+        if (result === 'ignored') {
+          setOptimisticOrder((current) => current === proposedOrder ? null : current);
+        }
         return;
       }
       try {
-        await api.rules.reorder(ordered.map((r) => r.id), plane);
+        await api.rules.reorder(proposedOrder, plane);
         // 成功腿此前是**静默**的（只做了失败腿）。原型 `:5201` 在 `#reorder-hint` 上变绿显
         // 「已重排 · 净零，未重启内核」1.6s ——「净零」这半句是专门的安抚语：拖排序会改命中优先级，
         // 用户会担心它像别的结构性改动那样重启内核。本仓没有 `#reorder-hint` 这个宿主，

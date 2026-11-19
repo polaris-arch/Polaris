@@ -970,6 +970,66 @@ const SITES: readonly Site[] = [
 
 const key = (s: { file: string; callee: string }) => `${s.file} | ${s.callee}`;
 
+describe('rule order follows the save receipt', () => {
+  it.each([
+    ['components/screens/rules/RulesScreen.tsx', false, 'route'],
+    ['mobile/screens/rules/RulesScreen.tsx', true, 'dns'],
+  ] as const)('%s restores the authoritative order only for its rejected move', async (file, mobile, plane) => {
+    const source = SOURCE.get(file)!;
+    const start = source.indexOf('  const commitOrder = useCallback(');
+    const end = source.indexOf(mobile ? '\n  const handleMove' : '\n  const handleDrop', start);
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    // Run the real screen callback in Node, supplying React state and IPC boundaries.
+    const handler = source.slice(start, end)
+      .replace("(plane: 'route' | 'dns', ordered: Rule[])", '(plane, ordered)')
+      .replace('(ordered: Rule[])', '(ordered)');
+    type Order = string[] | null | Partial<Record<'route' | 'dns', string[]>>;
+    type Outcome = 'ignored' | 'manual' | 'automatic';
+    type Row = { id: string };
+    let display: Order = mobile ? {} : null;
+    const responses: Array<(outcome: Outcome) => void> = [];
+    const orderKey = plane === 'dns' ? 'dnsRuleOrder' : 'routeRuleOrder';
+    const dependencies = {
+      useCallback: (callback: (...rows: unknown[]) => Promise<void>) => callback,
+      visibleRules: [{ id: 'a' }, { id: 'b' }, { id: 'c' }],
+      setOptimisticOrder: (next: Order | ((current: Order) => Order)) => {
+        display = typeof next === 'function' ? next(display) : next;
+      },
+      stagingEnabled: true,
+      submitEdit: () => new Promise<Outcome>(resolve => { responses.push(resolve); }),
+      editRoute,
+      t: (label: string) => label,
+      tr: (label: string) => label,
+      clearWriteError: () => {},
+      reportWriteError: () => {},
+      orderKey,
+      plane,
+    };
+    const create = new Function(...Object.keys(dependencies), `${handler}; return commitOrder;`);
+    const commit = create(...Object.values(dependencies)) as (...args: Array<Row[] | string>) => Promise<void>;
+    const move = (ids: string[]) => {
+      const rows = ids.map(id => ({ id }));
+      return mobile ? commit(plane, rows) : commit(rows);
+    };
+    const preview = () => mobile && display && !Array.isArray(display) ? display[plane] : display;
+    const first = move(['b', 'a', 'c']);
+    expect(preview()).toEqual(['b', 'a', 'c']);
+    responses.shift()!('ignored');
+    await first;
+    expect(preview()).toBe(mobile ? undefined : null);
+
+    const older = move(['b', 'a', 'c']);
+    const latest = move(['c', 'a', 'b']);
+    responses.shift()!('ignored');
+    await older;
+    expect(preview()).toEqual(['c', 'a', 'b']);
+    responses.shift()!('manual');
+    await latest;
+    expect(preview()).toEqual(['c', 'a', 'b']);
+  });
+});
+
 describe('守卫自检：扫到的确实是源码（防扫空 / 过滤过头 → 断言恒真）', () => {
   it('原子 takeover 两种 API 拼写都在写面内，读取与同名普通函数不误报', () => {
     const writes = (source: string) => PATTERNS.flatMap(([, pattern]) =>

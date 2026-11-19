@@ -399,7 +399,8 @@ export function MobileRulesScreen(): ReactElement {
     async (plane: 'route' | 'dns', ordered: Rule[]) => {
       const orderKey = plane === 'dns' ? 'dnsRuleOrder' : 'routeRuleOrder';
       clearWriteError(`order:${plane}`);
-      setOptimisticOrder((prev) => ({ ...prev, [plane]: ordered.map((r) => r.id) }));
+      const proposedOrder = ordered.map((rule) => rule.id);
+      setOptimisticOrder((prev) => ({ ...prev, [plane]: proposedOrder }));
       // 顺序在条目模型里是**整集合的主键序列**，不是某个实体的字段；让它绕过暂存是错的 ——
       // 同一页面里「改规则」进暂存、「拖排序」直落盘，条上的「N 项待保存」就说不清列表现在是什么顺序，
       // 而顺序决定命中优先级。
@@ -413,20 +414,22 @@ export function MobileRulesScreen(): ReactElement {
           ? editRoute('dnsRuleOrder', stagingEnabled) === 'staged'
           : editRoute('routeRuleOrder', stagingEnabled) === 'staged';
       if (orderStaged) {
-        void submitEdit({
+        const result = await submitEdit({
           id: `order:${orderKey}`,
           kind: 'rule',
           label: tr('home.stagedRuleOrder'),
           entityPath: [orderKey],
-          nextValue: ordered.map((r) => r.id),
+          nextValue: proposedOrder,
         });
+        if (result === 'ignored') {
+          setOptimisticOrder((current) =>
+            current[plane] === proposedOrder ? { ...current, [plane]: undefined } : current,
+          );
+        }
         return;
       }
       try {
-        await api.rules.reorder(
-          ordered.map((r) => r.id),
-          plane,
-        );
+        await api.rules.reorder(proposedOrder, plane);
         toast.success(tr('rules.reorderOk'));
       } catch (err) {
         // 乐观更新的回滚是**静默**的：行弹回原位与「拖拽功能坏了」完全同形。
