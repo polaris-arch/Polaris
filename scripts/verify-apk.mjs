@@ -566,7 +566,7 @@ export function elfPageAlignment(buf) {
   return loads ? { ok: true } : { ok: false, why: 'ELF has no LOAD segments' };
 }
 
-function aarElfFacts(raw, abi, requireAndroidNote) {
+export function aarElfFacts(raw, abi, requireAndroidNote) {
   const need = (ok, why) => { if (!ok) throw new Error(why); };
   const ident = elfIdent(raw), expected = abiSpec(abi);
   need(raw.length >= 64 && raw[5] === 1 && ident.ok && ident.elfClass === expected.elfClass
@@ -758,6 +758,13 @@ export function verifyAarInterfaces(observation) {
     const observed = [...exports].filter(symbol => symbol.startsWith('Java_') || symbol.startsWith('JNI_'));
     return [abi, observed.sort((left, right) => Buffer.compare(Buffer.from(left), Buffer.from(right)))];
   }));
+}
+
+export function aarInterfaceClasses() {
+  return {
+    javaInterfaces: Object.keys(AAR_JAVA_API),
+    hotJavaInterfaces: Object.keys(AAR_HOT_JAVA_API),
+  };
 }
 
 export function elfSectionNames(buf) {
@@ -1342,7 +1349,7 @@ function main() {
   }
   if (process.argv[2] === '--aar-interface-classes') {
     if (process.argv.length !== 3) throw new Error('usage: verify-apk.mjs --aar-interface-classes');
-    console.log(JSON.stringify({ javaInterfaces: Object.keys(AAR_JAVA_API), hotJavaInterfaces: Object.keys(AAR_HOT_JAVA_API) }));
+    console.log(JSON.stringify(aarInterfaceClasses()));
     return;
   }
   if (process.argv[2] === '--aar-interfaces') {

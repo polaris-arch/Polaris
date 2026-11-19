@@ -98,7 +98,7 @@ targets:
     preBuildScripts:
       - script: |
           if [ "${POLARIS_FORMAL_APP_BUILD:-0}" = 1 ]; then
-            python3 "$SRCROOT/../../../scripts/mobile-core/apple_rust.py" verify
+            node "$SRCROOT/../../../scripts/mobile-core/apple-rust.mjs" verify
           else
             export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
             "$SRCROOT/../../../ui/node_modules/.bin/tauri" ios xcode-script -v --platform ${PLATFORM_DISPLAY_NAME:?} --sdk-root ${SDKROOT:?} --framework-search-paths "${FRAMEWORK_SEARCH_PATHS:?}" --header-search-paths "${HEADER_SEARCH_PATHS:?}" --gcc-preprocessor-definitions "${GCC_PREPROCESSOR_DEFINITIONS:-}" --configuration ${CONFIGURATION:?} ${FORCE_COLOR} ${ARCHS:?}
@@ -156,7 +156,7 @@ targets:
       - name: Verify iOS Core
         script: |
           set -e
-          python3 "$SRCROOT/../../../scripts/mobile-core/consume.py" verify-link \
+          node "$SRCROOT/../../../scripts/mobile-core/mobile-consumption.mjs" verify-link \
             --link-input "${POLARIS_MOBILE_LINK_INPUT:?fixed formal mobile link context required}" \
             --link-input-sha256 "${POLARIS_MOBILE_LINK_INPUT_SHA256:?actual link context SHA256 required}" \
             --scratch "${POLARIS_MOBILE_SCRATCH:?fixed source verifier scratch required}"

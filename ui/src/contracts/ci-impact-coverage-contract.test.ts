@@ -482,18 +482,12 @@ describe('CI 影响分类器的完备性（fail-open 根治）', () => {
 
     expect(invoked.filter(([, workflow]) => workflow === 'apple.yml').map(([script]) => script))
       .toContain('scripts/fetch-protoc.mjs');
-    // Python orchestration owns the SDK → final carrier link; it is not a legacy
-    // build-libbox shell invocation and cannot disappear behind the node scanner.
-    const androidSource = stripLineComments(readFileSync(join(REPO_ROOT, '.github/workflows/android.yml'), 'utf8'), 'yaml');
-    const appleSource = stripLineComments(readFileSync(join(REPO_ROOT, '.github/workflows/apple.yml'), 'utf8'), 'yaml');
-    for (const action of ['prepare', 'build', 'verify']) {
-      expect(androidSource).toContain(`python3 scripts/mobile-core/ci_android.py ${action}`);
+    for (const script of ['android-ci.mjs', 'producer.mjs', 'mobile-consumption.mjs']) {
+      expect(invoked).toContainEqual([`scripts/mobile-core/${script}`, 'android.yml']);
     }
-    for (const action of ['prepare', 'build', 'evidence']) {
-      expect(appleSource).toContain(`python3 -B scripts/mobile-core/ci_apple.py ${action}`);
+    for (const script of ['ci-apple.mjs', 'apple-cache.mjs']) {
+      expect(invoked).toContainEqual([`scripts/mobile-core/${script}`, 'apple.yml']);
     }
-    expect(classifyImpact(['scripts/mobile-core/ci_android.py']).android).toBe(true);
-    expect(appleRequired(['scripts/mobile-core/ci_apple.py'])).toBe(true);
 
     for (const [script, workflow] of invoked) {
       const { signal, label } = requiredLeg[workflow];

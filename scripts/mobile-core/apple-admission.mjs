@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { closeSync, constants, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync,
+import { closeSync, constants, fsyncSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync,
   realpathSync, renameSync, rmSync, statSync, writeFileSync, writeSync } from 'node:fs';
 import { loadavg } from 'node:os';
 import { performance } from 'node:perf_hooks';
@@ -8,7 +8,8 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { basename, isAbsolute, join, posix, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { characters, decode, pinned, readBoundedInput, ReceiptFloat, receiptLimit, receiptPolicy } from './source-admission.mjs';
+import { canonicalChunks, characters, decode, pinned, readBoundedInput, readMobileSource,
+  ReceiptFloat, receiptLimit, receiptPolicy } from './source-admission.mjs';
 
 const limits = receiptPolicy.receipt;
 const SDKS = new Map([['device-arm64', 'iphoneos'], ['sim-arm64', 'iphonesimulator']]);
@@ -27,74 +28,12 @@ function requireSetting(condition, message) {
   if (!condition) throw new AdmissionError(message);
 }
 
-function floatText(n) {
-  if (Object.is(n, -0)) return '-0.0';
-  if (n === 0) return '0.0';
-  const [coefficient, power = '0'] = Math.abs(n).toString().split('e');
-  const decimal = coefficient.indexOf('.');
-  const digits = coefficient.replace('.', '');
-  const leading = digits.search(/[1-9]/);
-  const exponent = Number(power) + (decimal < 0 ? coefficient.length : decimal) - leading - 1;
-  const significant = digits.slice(leading).replace(/0+$/, '');
-  const sign = n < 0 ? '-' : '';
-  if (exponent < -4 || exponent >= 16) {
-    return sign + significant[0] + (significant.length > 1 ? '.' + significant.slice(1) : '') +
-      'e' + (exponent < 0 ? '-' : '+') + String(Math.abs(exponent)).padStart(2, '0');
-  }
-  const point = exponent + 1;
-  if (point <= 0) return sign + '0.' + '0'.repeat(-point) + significant;
-  if (point >= significant.length) return sign + significant.padEnd(point, '0') + '.0';
-  return sign + significant.slice(0, point) + '.' + significant.slice(point);
-}
-
-function codepointOrder(left, right) {
-  for (let at = 0; at < Math.min(left.length, right.length);) {
-    const a = left.codePointAt(at), b = right.codePointAt(at);
-    if (a !== b) return a - b;
-    at += a > 0xffff ? 2 : 1;
-  }
-  return left.length - right.length;
-}
-
 function serialize(value, maximum, pretty, consume = () => {}) {
-  let bytes = 0, nodes = 0, stringChars = 0, buffer = '';
-  function push(token) {
-    bytes += Buffer.byteLength(token);
-    requireSetting(bytes <= maximum, 'receipt JSON byte budget');
-    buffer += token;
-    if (buffer.length >= 64 * 1024) { consume(buffer); buffer = ''; }
+  let bytes = 0;
+  for (const chunk of canonicalChunks(value, { maximum, pretty })) {
+    bytes += chunk.length;
+    consume(chunk);
   }
-  function encode(entry, depth, isKey = false) {
-    requireSetting(++nodes <= limits.nodes && depth <= limits.depth, 'receipt JSON node/depth budget');
-    if (entry instanceof ReceiptFloat) push(floatText(entry.value));
-    else if (typeof entry === 'string') {
-      const length = characters(entry);
-      stringChars += length;
-      requireSetting(length <= (isKey ? limits.keyChars : limits.stringChars) && stringChars <= maximum, 'receipt JSON string budget');
-      requireSetting(pretty || entry.isWellFormed(), 'invalid Unicode in receipt JSON');
-      const quoted = JSON.stringify(entry);
-      push(pretty ? quoted.replace(/[\u007f-\uffff]/g, char => '\\u' + char.charCodeAt(0).toString(16).padStart(4, '0')) : quoted);
-    } else if (Array.isArray(entry) || isObject(entry)) {
-      const array = Array.isArray(entry);
-      const keys = array ? entry.keys() : Object.keys(entry).sort(codepointOrder);
-      push(array ? '[' : '{');
-      let first = true;
-      for (const key of keys) {
-        if (!first) push(',');
-        if (pretty) push('\n' + ' '.repeat(2 * (depth + 1)));
-        if (!array) { encode(key, depth + 1, true); push(pretty ? ': ' : ':'); }
-        encode(entry[key], depth + 1);
-        first = false;
-      }
-      if (pretty && !first) push('\n' + ' '.repeat(2 * depth));
-      push(array ? ']' : '}');
-    } else if (typeof entry === 'bigint') push(entry.toString());
-    else if (entry === null || typeof entry === 'boolean' || Number.isSafeInteger(entry)) push(JSON.stringify(entry));
-    else throw new Error('unsupported receipt JSON value');
-  }
-  encode(value, 0);
-  if (pretty) push('\n');
-  if (buffer) consume(buffer);
   return bytes;
 }
 
@@ -364,7 +303,7 @@ function runXcodeSettings(args, { repo, env, slot }) {
   });
 }
 
-async function admitResolvedSettings(repo, output, env) {
+export async function admitResolvedSettings(repo, output, env) {
   const scope = env.POLARIS_APPLE_SCOPE ?? 'device-only';
   requireSetting(Object.hasOwn(receiptPolicy.appleScopes, scope), 'unknown Apple carrier scope');
   const slots = receiptPolicy.appleScopes[scope];
@@ -567,6 +506,12 @@ const TLS_FUNCTION = 'LibboxTLSFingerprintCapabilities';
 const TLS_FLAG_CONTENT = Buffer.from(`-Xlinker\n-u\n-Xlinker\n_${TLS_FUNCTION}\n`);
 const RECEIPT_LIMITS = receiptPolicy.receipt;
 const headerDecoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
+const TLS_EXPORTED = new RegExp(`(?<!${TUN_WORD})_${TLS_FUNCTION}${TUN_WORD_END}`, 'u');
+
+export function appleNativeTextDefinition(symbols, name, lowerCase = false) {
+  const kind = lowerCase ? '[Tt]' : 'T';
+  return new RegExp(`(?<!${TUN_WORD})${kind}${TUN_WS}+${RegExp.escape(name)}${TUN_WS}*(?=\\n|$)`, 'u').test(symbols);
+}
 
 // The pinned gomobile v0.1.13 generator maps (string, error) to an
 // NSString* return and an NSError** argument. Source-derived declarations
@@ -688,7 +633,7 @@ function tlsCapabilityPresent(headers, defined) {
   return defined;
 }
 
-function sdkFrameworkLibraries(libraries) {
+export function sdkFrameworkLibraries(libraries) {
   requireSetting(Array.isArray(libraries) && libraries.length === 2 && libraries.every(isObject)
     && new Set(libraries.map(row => row.LibraryIdentifier)).size === 2, 'framework device/simulator library inventory differs');
   const variants = new Set(libraries.map(row => row.SupportedPlatformVariant ?? null));
@@ -753,16 +698,40 @@ function selectedTLSInputs(env) {
   return { binaryPath, binary, headers };
 }
 
-// Native tool output is observed under the existing Python parent lease. Xcode
-// consumes only the prepared bytes and never observes or uses its stale fd.
-function tlsCompilerResponse(action, env) {
+function observedTLSOutput(path, maximum = RECEIPT_LIMITS.controlBytes) {
+  requireSetting(isAbsolute(path ?? ''), 'absolute original TLS observation required');
+  const { bytes } = pinned(path, maximum, false, { allowEmpty: true });
+  return headerDecoder.decode(bytes).replace(/\r\n?/g, '\n');
+}
+
+// Xcode consumes only the prepared bytes. The archive parent still uses its
+// inherited reservation and registered native runner to obtain nm/exports.
+function tlsCompilerResponse(action, env, files) {
+  if (action === 'verify-final-nm') {
+    requireSetting(files.length === 1, 'one final TLS symbol observation required');
+    requireSetting(appleNativeTextDefinition(observedTLSOutput(files[0]), '_' + TLS_FUNCTION),
+      'final PacketTunnel stripped the actual TLS capability function');
+    return;
+  }
+  if (action === 'verify-final') {
+    const observation = decode(Buffer.from(observedTLSOutput(files[0], TLS_RECEIPT_BYTES)), TLS_RECEIPT_BYTES);
+    const { capabilityPresent, nativeTunHeaderABIAvailable } = observation;
+    requireSetting(typeof capabilityPresent === 'boolean' && typeof nativeTunHeaderABIAvailable === 'boolean'
+      && files.length === (capabilityPresent ? 2 : 1), 'final TLS observation structure differs');
+    if (capabilityPresent) requireSetting(TLS_EXPORTED.test(observedTLSOutput(files[1])),
+      'final PacketTunnel TLS capability function is not dynamically discoverable');
+    const executable = pinned(join(env.TARGET_BUILD_DIR, env.EXECUTABLE_PATH), RECEIPT_LIMITS.artifactBytes).pin;
+    return { scope: 'actual-final-PacketTunnel-static-link', capabilityPresent, executable,
+      nativeTunHeaderABIAvailable, loadedQueryExecuted: false, devicePassed: false };
+  }
+  requireSetting(files.length === (action === 'prepare' ? 2 : 0), 'unexpected TLS observation files');
   if (action === 'select') return selectedTLSInputs(env);
   const derived = env.DERIVED_FILE_DIR;
   requireSetting(typeof derived === 'string' && derived.length > 0, 'TLS compiler response directory required');
   if (action === 'prepare') {
-    // Only the admitted parent sends this pinned snapshot and its nm decision.
-    const { input, defined } = JSON.parse(readBoundedInput(6 * HEADER_BYTES + TLS_RECEIPT_BYTES).toString('utf8'));
-    requireSetting(typeof defined === 'boolean', 'TLS native symbol observation required');
+    const maximum = 6 * HEADER_BYTES + TLS_RECEIPT_BYTES;
+    const input = decode(Buffer.from(observedTLSOutput(files[0], maximum)), maximum);
+    const defined = appleNativeTextDefinition(observedTLSOutput(files[1]), '_' + TLS_FUNCTION);
     const headers = Object.entries(input.headers);
     const texts = headers.map(([, header]) => header.text);
     const capabilityPresent = tlsCapabilityPresent(texts, defined);
@@ -822,12 +791,47 @@ function tlsCompilerResponse(action, env) {
   }
 }
 
+export async function observeTLS(action, env, log, runner, run = runner.run) {
+  // Existing runner validates and registers the inherited original descriptor
+  // and owns the native processes; Xcode hooks only read prepared bytes.
+  requireSetting((env.POLARIS_BUILD_RESERVATION_FD !== undefined || runner.hasReservation())
+    && env.POLARIS_FORMAL_APP_BUILD === '1', 'native TLS inspection must inherit admitted parent reservation');
+  const root = env.POLARIS_APP_WORK;
+  requireSetting(isAbsolute(root ?? ''), 'absolute TLS observation work required');
+  return runner.withReservation(root, readMobileSource(), async () => {
+    const command = [process.execPath, fileURLToPath(import.meta.url), '--tls-link'];
+    const observations = mkdtempSync(join(root, basename(log, '.log') + '-'));
+    const observed = join(observations, 'input.log');
+    const nm = join(observations, 'nm.log');
+    const exports = join(observations, 'exports.log');
+    const stdout = path => path + '.stdout.raw';
+    const node = (arguments_, output) => run([...command, ...arguments_], { env, log: output, timeoutSeconds: 30 });
+    const symbols = target => run(['xcrun', 'nm', '--no-llvm-bc', '-gU', target], { env, log: nm, capture: 'none' });
+    if (action === 'prepare') {
+      const selection = decode(Buffer.from(await node(['select'], observed)), 6 * (2 * 1024 ** 2) + 65536);
+      await symbols(selection.binaryPath);
+      return node(['prepare', stdout(observed), stdout(nm)], log);
+    }
+    requireSetting(action === 'verify', 'unknown native TLS observation action');
+    const observation = decode(Buffer.from(await node(['verify-parent'], observed)), 65536);
+    const arguments_ = ['verify-final', stdout(observed)];
+    if (observation.capabilityPresent) {
+      const executable = join(env.TARGET_BUILD_DIR, env.EXECUTABLE_PATH);
+      await symbols(executable);
+      await node(['verify-final-nm', stdout(nm)]);
+      await run(['xcrun', 'dyld_info', '-exports', executable], { env, log: exports, capture: 'none' });
+      arguments_.push(stdout(exports));
+    }
+    return node(arguments_, log);
+  });
+}
+
 const entry = process.argv[1];
 if (entry && basename(entry) === 'apple-admission.mjs' && realpathSync(entry) === fileURLToPath(import.meta.url)) {
   const [, , mode, action, ...extra] = process.argv;
   try {
     if (mode === '--tls-link') {
-      const result = tlsCompilerResponse(action, process.env);
+      const result = tlsCompilerResponse(action, process.env, extra);
       if (result !== undefined) console.log(JSON.stringify(result));
     } else if (mode === '--sdk-header-contract' || mode === '--sdk-framework-libraries') {
       const header = mode === '--sdk-header-contract';

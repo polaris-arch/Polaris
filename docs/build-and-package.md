@@ -18,10 +18,9 @@ README 只留「怎么装、怎么用」。
 | 工具 | 版本 | 用途 |
 |---|---|---|
 | Rust | stable（edition 2021） | 后端 + `crates/` 下的域 crate（另有 `source-probe` 是 dev-only，只进 `[dev-dependencies]`，不进任何 lib/bin 依赖图） |
-| Node.js | 24+（CI 钉 26） | 前端构建 + fetch 脚本 |
-| pnpm | 11.24.0（由 `ui/package.json` 钉扎） | 前端包管理（`ui/`）；`tauri build` 的 `beforeBuildCommand` 直接调用 `pnpm`，须在 PATH 上 |
+| Node.js | 24+（CI 钉 26） | 前端构建、下载脚本、移动组件构建与收据核验 |
+| pnpm | 12.21.0（由 `ui/package.json` 钉扎） | 前端包管理（`ui/`）。`tauri build` 的 `beforeBuildCommand` 直接调用 `pnpm`，须在 PATH 上 |
 | Go | 所选构建路径源码清单的 `goVersion` | 源码构建与二进制构建信息检查；桌面、移动端输入分开维护 |
-| Python | 3（完整移动主机测试需 3.11+，CI 使用 3.12） | 桌面固定源码归档核验及移动构建器；Windows 命令名为 `python`，其它平台为 `python3` |
 | [Tauri CLI 2](https://v2.tauri.app/) | `scripts/tauri-cli.version` 钉扎 | 全局 CLI 执行 `tauri build` 打包 |
 
 在仓库根安装全局 CLI。CLI 已从 `ui/` devDependency 退场，桌面和 Android CI 均安装同一固定版本。
@@ -193,11 +192,11 @@ portable 由 `package.yml` 在 Windows 腿从 `target/release/polaris.exe` + `re
 
 ### 移动端源码构建前置条件
 
-桌面 sidecar 下载不能替代移动端绑定组件。当前共同输入见 [source-contract.json](../scripts/mobile-core/source-contract.json) 和 [移动内核构建说明](../scripts/mobile-core/README.md)：固定 sing-box-polaris 源码、Go 1.27.2、gomobile/gobind v0.1.13，先生成并核验组件及原始收据，再由 App 消费。
+先用固定的 sing-box-polaris 源码、Go 和 gomobile/gobind 生成移动端绑定组件，再通过组件及原始收据的核验供 App 使用。输入版本和完整参数见 [source-contract.json](../scripts/mobile-core/source-contract.json) 和 [移动内核构建说明](../scripts/mobile-core/README.md)。
 
 - **Android 绑定组件**：API 24 AAR，Java 17（CI 固定 17.0.20+101）、稳定 NDK r30（完整来源版本 30.0.16248370）。AAR 含 ARM64、ARMv7、x86、x86_64 四种 ABI；这不扩大正式 APK 的两种 ARM ABI 范围。
 - **Android App**：Gradle 使用 JDK 21，SDK/Build Tools 当前为 36 / 36.0.0；Rust 使用 [android-rust-ndk.version](../scripts/android-rust-ndk.version) 固定的 27.3.13750724，不能与绑定组件 NDK 混用。App 最低 API 24。
-- **组件准备顺序**：共享入口为 `bash scripts/build-mobile-core.sh android`，须显式提供已有 source、Go、gomobile、gobind、SDK、NDK、JDK、work/cache 路径（完整参数见移动内核说明）。随后由 `scripts/mobile-core/consume.py materialize-android` 核验组件和收据再写入 App 输入；CI 的 `ci_android.py prepare/build` 编排此过程。仅把任意 AAR 复制为 `libbox.aar` 不满足当前来源核验。
+- 本地构建 Android 组件时，先运行 `bash scripts/build-mobile-core.sh android`，显式提供源码、Go、gomobile、gobind、SDK、NDK、JDK、工作目录和缓存路径。再运行 `node scripts/mobile-core/mobile-consumption.mjs materialize-android`，核验组件和收据后写入 App 输入。托管 CI 通过 `node scripts/mobile-core/android-ci.mjs` 检查源码与工具并确定缓存标识，再直接调用 Node 生产和消费入口。
 - **iOS / iPadOS**：源构建入口、固定 Xcode/SDK、ARM64 设备与模拟器目标及个人签名条件见 [iOS 源码构建](ios-source-build.md)。没有已发布 IPA 不影响源码构建文档的提供；编译/链接、签名、真机安装和运行验收是不同阶段。
 
 ### Android 当前源码签名发布构建

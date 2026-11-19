@@ -105,9 +105,11 @@ jobs:
           npm install --global "$(node -p "require('./ui/package.json').packageManager")"
           pnpm --dir ui install --frozen-lockfile --ignore-scripts
 
-      - uses: actions/setup-python@v6
-        with:
-          python-version: '3.12'
+      - name: Install the pinned Rust toolchain for native custody tests
+        run: |
+          set -euo pipefail
+          toolchain="$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$toolchain" --profile minimal --no-self-update
 
       - name: Install SquashFS fixture tools
         run: |
@@ -122,12 +124,6 @@ jobs:
         # cwd 时是 rc=0 静默判绿（scripts/gate-node-test.sh 顶部注释有实测）；本机全量门单
         # （vault SoT §12.3c）调用的是同一份脚本，两处判据共用一份实现，不各自漂移。
         run: bash scripts/gate-node-test.sh
-
-      - name: Test release script Python contracts
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 -B -m unittest discover -s scripts/mobile-core -p 'test_*.py'
 
       - name: Classify changed paths
         id: impact

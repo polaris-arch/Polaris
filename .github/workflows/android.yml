@@ -104,9 +104,7 @@ on:
 permissions:
   contents: read
 
-# Shared provider imports are source reads; do not write Python bytecode into the App checkout.
 env:
-  PYTHONDONTWRITEBYTECODE: '1'
   # 构建权重的两个开关放在 workflow 级而不是某个 job：两个 job 的前置步骤逐字相同，
   # 其中 `Select APK build weight` 步与 rust-cache 的键都读它们；放 job 级就得写两份、会漂。
   # 轻量构建只认调用方显式传入的 true；手动 dispatch 与 tag 发布调用都没有它 ⇒ '0'。
@@ -198,7 +196,7 @@ jobs:
   #     输入是 Java/Kotlin 字节码与 keep 规则，Rust 构型不在其输入里，成立；
   #   · `release 构建行为裁判` —— gradle 配置期事实（`--dry-run` 任务图与 `printPolarisReleaseFacts`），
   #     不调 cargo，成立；
-  #   · libbox 收据（`mobile-core/ci_android.py verify --apk`）—— 判 libbox 来源与随包一致性，成立；
+  #   · libbox 收据（`mobile-core/mobile-consumption.mjs android`）—— 判 libbox 来源与随包一致性，成立；
   #   · 体积 —— Android 侧**没有体积上限门**（`verify-apk.mjs` 刻意按节区与死字节比值判，理由在其
   #     判据 ⑥ 的注释）。末步打印的 APK 字节数在轻量构型下**偏大，不是发行体积**，该步已标注构型。
   # 风险门从此**不验**的一件事：Android target 上 fat LTO 链接本身能否成功、以及 fat LTO 产物的
@@ -403,7 +401,7 @@ jobs:
       - name: Prepare formal mobile source and isolated tools
         id: libbox_input
         shell: bash
-        run: python3 scripts/mobile-core/ci_android.py prepare
+        run: node scripts/mobile-core/android-ci.mjs
 
       - name: Restore formal component and fixed Go cache
         id: libbox
@@ -416,7 +414,17 @@ jobs:
 
       - name: Build or revalidate formal four-ABI component and App input
         shell: bash
-        run: python3 scripts/mobile-core/ci_android.py build
+        run: |
+          set -euo pipefail
+          node scripts/mobile-core/producer.mjs android \
+            --source "$POLARIS_ANDROID_SOURCE" --go "$POLARIS_ANDROID_GO" \
+            --gomobile "$POLARIS_ANDROID_GOMOBILE" --gobind "$POLARIS_ANDROID_GOBIND" \
+            --work "$POLARIS_ANDROID_WORK" --cache "$POLARIS_ANDROID_CACHE" \
+            --sdk "$POLARIS_ANDROID_SDK" --ndk "$POLARIS_ANDROID_NDK" --jdk "$POLARIS_ANDROID_JDK"
+          node scripts/mobile-core/mobile-consumption.mjs materialize-android \
+            --component "$POLARIS_ANDROID_COMPONENT" --receipt "$POLARIS_ANDROID_RECEIPT" \
+            --work "$POLARIS_ANDROID_CONSUME" --cache "$POLARIS_ANDROID_CACHE" \
+            --go "$POLARIS_ANDROID_GO" --javap "$POLARIS_ANDROID_JDK/bin/javap" --readelf "$POLARIS_ANDROID_READELF"
 
       - name: libbox.aar 必须在位
         id: libbox_verified
@@ -424,7 +432,10 @@ jobs:
         run: |
           set -euo pipefail
           test -s src-tauri/gen/android/app/libs/libbox.aar
-          python3 scripts/mobile-core/ci_android.py verify
+          node scripts/mobile-core/mobile-consumption.mjs verify-android \
+            --component "$POLARIS_ANDROID_COMPONENT" --receipt "$POLARIS_ANDROID_RECEIPT" \
+            --work "$POLARIS_ANDROID_VERIFY" --cache "$POLARIS_ANDROID_CACHE" \
+            --go "$POLARIS_ANDROID_GO" --javap "$POLARIS_ANDROID_JDK/bin/javap" --readelf "$POLARIS_ANDROID_READELF"
 
       # Save only the validated AAR/receipt pair before an unrelated APK failure can discard it.
       - name: Save verified libbox.aar
@@ -567,7 +578,12 @@ jobs:
       - name: R8 吃进了什么 / 保住了什么（产物级证据）
         run: |
           node scripts/assert-r8-evidence.mjs src-tauri/gen/android/app/build/outputs/mapping/arm64Release
-          python3 scripts/mobile-core/ci_android.py verify --apk src-tauri/gen/android/app/build/outputs/apk/arm64/release/app-arm64-release-unsigned.apk --abi arm64-v8a --r8 src-tauri/gen/android/app/build/outputs/mapping/arm64Release
+          apk=src-tauri/gen/android/app/build/outputs/apk/arm64/release/app-arm64-release-unsigned.apk
+          node scripts/mobile-core/mobile-consumption.mjs android \
+            --artifact "$apk" --abi arm64-v8a --r8 src-tauri/gen/android/app/build/outputs/mapping/arm64Release \
+            --component "$POLARIS_ANDROID_COMPONENT" --receipt "$POLARIS_ANDROID_RECEIPT" \
+            --scratch "$POLARIS_ANDROID_CARRIER" --output "$apk.source-consumption.json" \
+            --go "$POLARIS_ANDROID_GO" --javap "$POLARIS_ANDROID_JDK/bin/javap" --readelf "$POLARIS_ANDROID_READELF"
 
       - name: 记录未分发 APK 体积
         shell: bash
@@ -851,7 +867,7 @@ jobs:
       - name: Prepare formal mobile source and isolated tools
         id: libbox_input
         shell: bash
-        run: python3 scripts/mobile-core/ci_android.py prepare
+        run: node scripts/mobile-core/android-ci.mjs
 
       - name: Restore formal component and fixed Go cache
         id: libbox
@@ -864,7 +880,17 @@ jobs:
 
       - name: Build or revalidate formal four-ABI component and App input
         shell: bash
-        run: python3 scripts/mobile-core/ci_android.py build
+        run: |
+          set -euo pipefail
+          node scripts/mobile-core/producer.mjs android \
+            --source "$POLARIS_ANDROID_SOURCE" --go "$POLARIS_ANDROID_GO" \
+            --gomobile "$POLARIS_ANDROID_GOMOBILE" --gobind "$POLARIS_ANDROID_GOBIND" \
+            --work "$POLARIS_ANDROID_WORK" --cache "$POLARIS_ANDROID_CACHE" \
+            --sdk "$POLARIS_ANDROID_SDK" --ndk "$POLARIS_ANDROID_NDK" --jdk "$POLARIS_ANDROID_JDK"
+          node scripts/mobile-core/mobile-consumption.mjs materialize-android \
+            --component "$POLARIS_ANDROID_COMPONENT" --receipt "$POLARIS_ANDROID_RECEIPT" \
+            --work "$POLARIS_ANDROID_CONSUME" --cache "$POLARIS_ANDROID_CACHE" \
+            --go "$POLARIS_ANDROID_GO" --javap "$POLARIS_ANDROID_JDK/bin/javap" --readelf "$POLARIS_ANDROID_READELF"
 
       - name: libbox.aar 必须在位
         id: libbox_verified
@@ -872,7 +898,10 @@ jobs:
         run: |
           set -euo pipefail
           test -s src-tauri/gen/android/app/libs/libbox.aar
-          python3 scripts/mobile-core/ci_android.py verify
+          node scripts/mobile-core/mobile-consumption.mjs verify-android \
+            --component "$POLARIS_ANDROID_COMPONENT" --receipt "$POLARIS_ANDROID_RECEIPT" \
+            --work "$POLARIS_ANDROID_VERIFY" --cache "$POLARIS_ANDROID_CACHE" \
+            --go "$POLARIS_ANDROID_GO" --javap "$POLARIS_ANDROID_JDK/bin/javap" --readelf "$POLARIS_ANDROID_READELF"
 
       # Save only the validated AAR/receipt pair before an unrelated APK failure can discard it.
       - name: Save verified libbox.aar
@@ -1098,9 +1127,12 @@ jobs:
           for pair in arm64:arm64-v8a arm:armeabi-v7a universal:universal; do
             flavor="${pair%%:*}"
             abi="${pair#*:}"
-            python3 scripts/mobile-core/ci_android.py verify \
-              --apk "$RUNNER_TEMP/Polaris_${version}_${abi}-android.apk" --abi "$abi" \
-              --r8 "src-tauri/gen/android/app/build/outputs/mapping/${flavor}Release"
+            apk="$RUNNER_TEMP/Polaris_${version}_${abi}-android.apk"
+            node scripts/mobile-core/mobile-consumption.mjs android \
+              --artifact "$apk" --abi "$abi" --r8 "src-tauri/gen/android/app/build/outputs/mapping/${flavor}Release" \
+              --component "$POLARIS_ANDROID_COMPONENT" --receipt "$POLARIS_ANDROID_RECEIPT" \
+              --scratch "$POLARIS_ANDROID_CARRIER" --output "$apk.source-consumption.json" \
+              --go "$POLARIS_ANDROID_GO" --javap "$POLARIS_ANDROID_JDK/bin/javap" --readelf "$POLARIS_ANDROID_READELF"
           done
 
       - name: 上传成 release 资产

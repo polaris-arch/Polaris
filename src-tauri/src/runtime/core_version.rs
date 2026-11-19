@@ -36,7 +36,7 @@ fn read_selected_kernel_version() -> String {
 #[cfg(any(target_os = "android", target_os = "ios", test))]
 fn mobile_kernel_version(raw: &str) -> String {
     // The mobile builder injects this exact version into constant.Version via
-    // fork_input.py's ldflags. The old updater baseline is not the mobile build.
+    // The formal mobile producer passes the pinned version through ldflags.
     let Ok(contract) = serde_json::from_str::<serde_json::Value>(raw) else {
         return String::new();
     };

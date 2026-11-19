@@ -30,7 +30,6 @@ permissions:
   contents: read
 
 env:
-  PYTHONDONTWRITEBYTECODE: '1'
   POLARIS_APP_CANDIDATE: ${{ inputs.candidate || github.sha }}
   POLARIS_APPLE_SCOPE: ${{ inputs.include_simulator && 'device-and-simulator' || 'device-only' }}
 
@@ -46,14 +45,11 @@ jobs:
       - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.candidate || github.sha }}
-      - name: Reject a mismatched runner before installing tools or transporting inputs
-        run: python3 -B scripts/mobile-core/ci_apple.py admit
-      - uses: actions/setup-python@v6
-        with:
-          python-version: '3.12'
       - uses: actions/setup-node@v7
         with:
           node-version: '26'
+      - name: Verify the selected Xcode runner
+        run: node scripts/mobile-core/ci-apple.mjs admit
       - name: Select the validated mobile Go toolchain
         id: mobile-go
         run: |
@@ -76,7 +72,7 @@ jobs:
           [ -n "${CARGO_TERM_COLOR+set}" ] || echo 'CARGO_TERM_COLOR=always' >> "$GITHUB_ENV"
           rustc -Vv
       - name: Exact tool/source and declared arm64 carrier configuration admission
-        run: python3 -B scripts/mobile-core/ci_apple.py prepare
+        run: node scripts/mobile-core/ci-apple.mjs prepare
       - name: Execute pure Swift lifecycle, monitor and G4 receipt seams
         id: swift_lifecycle
         shell: bash
@@ -113,7 +109,7 @@ jobs:
         run: pnpm --dir ui install --frozen-lockfile
       - name: Frontend resources and admitted two-slice arm64 component
         id: shared_component
-        run: python3 -B scripts/mobile-core/ci_apple.py build
+        run: node scripts/mobile-core/ci-apple.mjs build
       - uses: actions/upload-artifact@v7
         id: component_manifest
         with:
@@ -125,7 +121,7 @@ jobs:
           retention-days: 7
       - name: Preserve producer originals on success or failure
         if: always()
-        run: python3 -B scripts/mobile-core/ci_apple.py evidence
+        run: node scripts/mobile-core/ci-apple.mjs evidence
       - uses: actions/upload-artifact@v7
         id: component_original
         if: always()
@@ -138,7 +134,7 @@ jobs:
       - name: Verify frozen component locally without extraction or identity rewriting
         id: local_component
         if: ${{ !cancelled() && steps.shared_component.conclusion == 'success' }}
-        run: python3 -B scripts/mobile-core/ci_apple.py import-local
+        run: node scripts/mobile-core/ci-apple.mjs import-local
       - name: Pinned protobuf compiler
         id: protoc
         if: ${{ !cancelled() && steps.local_component.conclusion == 'success' }}
@@ -146,7 +142,7 @@ jobs:
       - name: Admit bounded dependency cache transport and bind actual tools/configuration
         id: rust_cache
         if: ${{ !cancelled() && steps.local_component.conclusion == 'success' }}
-        run: python3 -B scripts/mobile-core/apple-cache.py prepare
+        run: node scripts/mobile-core/apple-cache.mjs prepare
       - name: Restore Cargo registry downloads separately from target dependencies
         id: rust_registry_restore
         uses: actions/cache/restore@v5
@@ -167,7 +163,7 @@ jobs:
       - name: Move restored device dependencies into the actual Cargo target directory
         id: rust_device_ready
         if: ${{ !cancelled() && steps.rust_device_restore.conclusion == 'success' }}
-        run: python3 -B scripts/mobile-core/apple-cache.py import --slot "device-arm64" --restored "${{ steps.rust_device_restore.outputs.cache-hit == 'true' && 'hit' || 'miss' }}"
+        run: node scripts/mobile-core/apple-cache.mjs import --slot "device-arm64" --restored "${{ steps.rust_device_restore.outputs.cache-hit == 'true' && 'hit' || 'miss' }}"
 
       - name: Require all shared carrier prerequisites
         id: shared_ready
@@ -181,10 +177,10 @@ jobs:
       - name: Real device-arm64 Rust and unsigned App plus PacketTunnel
         id: device_arm64
         if: ${{ !cancelled() && steps.shared_ready.conclusion == 'success' }}
-        run: python3 -B scripts/mobile-core/ci_apple.py carrier --slot "device-arm64"
+        run: node scripts/mobile-core/ci-apple.mjs carrier --slot "device-arm64"
       - name: Preserve device-arm64 originals before another target touches staging
         if: ${{ !cancelled() && steps.shared_ready.conclusion == 'success' }}
-        run: python3 -B scripts/mobile-core/ci_apple.py evidence --slot "device-arm64"
+        run: node scripts/mobile-core/ci-apple.mjs evidence --slot "device-arm64"
       - uses: actions/upload-artifact@v7
         id: original_device_arm64
         if: ${{ !cancelled() && steps.shared_ready.conclusion == 'success' }}
@@ -204,7 +200,7 @@ jobs:
       - name: Stage device dependencies without copying accepted App products
         id: rust_device_export
         if: ${{ !cancelled() && steps.device_arm64.conclusion == 'success' && steps.original_device_arm64.conclusion == 'success' && steps.summary_device_arm64.conclusion == 'success' && steps.rust_device_restore.outputs.cache-hit != 'true' }}
-        run: python3 -B scripts/mobile-core/apple-cache.py export --slot "device-arm64"
+        run: node scripts/mobile-core/apple-cache.mjs export --slot "device-arm64"
       - name: Save device-arm64 release dependencies before retirement
         id: rust_device_save
         uses: actions/cache/save@v5
@@ -215,11 +211,11 @@ jobs:
       - name: Return staged device dependencies even if cache upload failed
         id: rust_device_return
         if: ${{ !cancelled() && steps.rust_device_export.conclusion == 'success' }}
-        run: python3 -B scripts/mobile-core/apple-cache.py import --slot "device-arm64" --restored staged
+        run: node scripts/mobile-core/apple-cache.mjs import --slot "device-arm64" --restored staged
       - name: Check Cargo registry cache archive headroom
         id: rust_registry_ready
         if: ${{ !cancelled() && steps.device_arm64.conclusion == 'success' && steps.original_device_arm64.conclusion == 'success' && steps.summary_device_arm64.conclusion == 'success' && steps.rust_registry_restore.outputs.cache-hit != 'true' }}
-        run: python3 -B scripts/mobile-core/apple-cache.py registry-ready
+        run: node scripts/mobile-core/apple-cache.mjs registry-ready
       - name: Save registry downloads separately from target dependencies
         uses: actions/cache/save@v5
         if: ${{ !cancelled() && steps.rust_registry_ready.conclusion == 'success' }}
@@ -232,7 +228,7 @@ jobs:
       - name: Retire device-arm64 rebuildable intermediates after original upload
         id: retire_device_arm64
         if: ${{ !cancelled() && steps.original_device_arm64.conclusion == 'success' && (steps.rust_device_export.conclusion == 'skipped' || steps.rust_device_return.conclusion == 'success') }}
-        run: python3 -B scripts/mobile-core/ci_apple.py retire-slot --slot "device-arm64"
+        run: node scripts/mobile-core/ci-apple.mjs retire-slot --slot "device-arm64"
 
       - name: Restore sim-arm64 release dependencies after device retirement
         id: rust_sim_restore
@@ -244,15 +240,15 @@ jobs:
       - name: Move restored simulator dependencies into the actual Cargo target directory
         id: rust_sim_ready
         if: ${{ inputs.include_simulator && !cancelled() && steps.rust_sim_restore.conclusion == 'success' }}
-        run: python3 -B scripts/mobile-core/apple-cache.py import --slot "sim-arm64" --restored "${{ steps.rust_sim_restore.outputs.cache-hit == 'true' && 'hit' || 'miss' }}"
+        run: node scripts/mobile-core/apple-cache.mjs import --slot "sim-arm64" --restored "${{ steps.rust_sim_restore.outputs.cache-hit == 'true' && 'hit' || 'miss' }}"
 
       - name: Real sim-arm64 Rust and unsigned App plus PacketTunnel
         id: sim_arm64
         if: ${{ inputs.include_simulator && !cancelled() && steps.shared_ready.conclusion == 'success' && steps.rust_sim_ready.conclusion == 'success' }}
-        run: python3 -B scripts/mobile-core/ci_apple.py carrier --slot "sim-arm64"
+        run: node scripts/mobile-core/ci-apple.mjs carrier --slot "sim-arm64"
       - name: Preserve sim-arm64 originals before another target touches staging
         if: ${{ inputs.include_simulator && !cancelled() && steps.shared_ready.conclusion == 'success' && steps.rust_sim_ready.conclusion == 'success' }}
-        run: python3 -B scripts/mobile-core/ci_apple.py evidence --slot "sim-arm64"
+        run: node scripts/mobile-core/ci-apple.mjs evidence --slot "sim-arm64"
       - uses: actions/upload-artifact@v7
         id: original_sim_arm64
         if: ${{ inputs.include_simulator && !cancelled() && steps.shared_ready.conclusion == 'success' && steps.rust_sim_ready.conclusion == 'success' }}
@@ -272,7 +268,7 @@ jobs:
       - name: Stage simulator dependencies without copying accepted App products
         id: rust_sim_export
         if: ${{ inputs.include_simulator && !cancelled() && steps.sim_arm64.conclusion == 'success' && steps.original_sim_arm64.conclusion == 'success' && steps.summary_sim_arm64.conclusion == 'success' && steps.rust_sim_restore.outputs.cache-hit != 'true' }}
-        run: python3 -B scripts/mobile-core/apple-cache.py export --slot "sim-arm64"
+        run: node scripts/mobile-core/apple-cache.mjs export --slot "sim-arm64"
       - name: Save sim-arm64 release dependencies before retirement
         id: rust_sim_save
         uses: actions/cache/save@v5
@@ -283,11 +279,11 @@ jobs:
       - name: Return staged simulator dependencies even if cache upload failed
         id: rust_sim_return
         if: ${{ inputs.include_simulator && !cancelled() && steps.rust_sim_export.conclusion == 'success' }}
-        run: python3 -B scripts/mobile-core/apple-cache.py import --slot "sim-arm64" --restored staged
+        run: node scripts/mobile-core/apple-cache.mjs import --slot "sim-arm64" --restored staged
       - name: Retire sim-arm64 rebuildable intermediates after original upload
         id: retire_sim_arm64
         if: ${{ inputs.include_simulator && !cancelled() && steps.original_sim_arm64.conclusion == 'success' && (steps.rust_sim_export.conclusion == 'skipped' || steps.rust_sim_return.conclusion == 'success') }}
-        run: python3 -B scripts/mobile-core/ci_apple.py retire-slot --slot "sim-arm64"
+        run: node scripts/mobile-core/ci-apple.mjs retire-slot --slot "sim-arm64"
 
   unsigned-chain:
     needs: component

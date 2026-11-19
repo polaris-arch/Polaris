@@ -1,12 +1,14 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdirSync, mkdtempDisposableSync, readFileSync, readdirSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempDisposableSync, readFileSync, readdirSync, realpathSync, renameSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { delimiter, join } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { fixtureZip } from './lib/formal-package-fixtures.mjs';
+import { emitAndroidInputs, prepareAndroid } from './mobile-core/android-ci.mjs';
+import { openComponentZip, withComponentZip } from './mobile-core/component-admission.mjs';
 import { observeNdkInput, prepareSdkView } from './mobile-core/prepare-ndk-linux.mjs';
 
 import {
@@ -37,6 +39,98 @@ import {
 
 /** 夹具默认造缺省 ABI（arm64-v8a）的包；`ABI` 这个名字保留下来只是为了少改一堆现有用例。 */
 const ABI = DEFAULT_ABI;
+
+test('hosted Android cache outputs reject an invalid identity or multiline path before writing', () => {
+  using fixture = mkdtempDisposableSync(join(tmpdir(), 'polaris-android-hosted-outputs-'));
+  const output = join(fixture.path, 'github-output');
+  const environment = join(fixture.path, 'github-env');
+  const env = { GITHUB_OUTPUT: output, GITHUB_ENV: environment };
+  const paths = Object.fromEntries(['go', 'gomobile', 'gobind', 'ndk', 'jdk', 'sdk', 'source',
+    'work', 'cache', 'consume', 'verify', 'carrier'].map(name => [name, join(fixture.path, name)]));
+  for (const file of [output, environment]) writeFileSync(file, 'retained\n');
+  for (const bad of ['', 'A'.repeat(64), 'g'.repeat(64), 'a'.repeat(63), 'a'.repeat(65), 'a'.repeat(64) + '\n']) {
+    assert.throws(() => emitAndroidInputs(env, paths, bad, 'libbox.aar'), /cache fingerprint/);
+  }
+  assert.throws(() => emitAndroidInputs(env, { ...paths, work: '/work\nINJECT=1' }, 'a'.repeat(64),
+    'libbox.aar'), /line controls/);
+  assert.equal(readFileSync(output, 'utf8'), 'retained\n');
+  assert.equal(readFileSync(environment, 'utf8'), 'retained\n');
+  const fingerprint = 'a'.repeat(64);
+  emitAndroidInputs(env, paths, fingerprint, 'libbox.aar');
+  assert.equal(readFileSync(output, 'utf8'),
+    `retained\nfingerprint=${fingerprint}\nwork=${paths.work}\ncache=${paths.cache}\n`);
+  assert.ok(readFileSync(environment, 'utf8').includes('POLARIS_ANDROID_COMPONENT=' + join(paths.work, 'libbox.aar') + '\n'));
+});
+
+test('hosted Android preparation emits one bound handoff and halts on preparation faults', {
+  skip: process.platform !== 'linux',
+}, async () => {
+  const source = JSON.parse(readFileSync(new URL('./mobile-core/source-contract.json', import.meta.url)));
+  for (const failure of ['capacity', 'NDK', 'source', null]) {
+    using fixture = mkdtempDisposableSync(join(tmpdir(), 'polaris-android-hosted-prep-'));
+    const [sdk, ndk, jdk, output, environment] = ['sdk', 'ndk', 'jdk', 'github-output', 'github-env']
+      .map(name => join(fixture.path, name));
+    mkdirSync(join(sdk, 'platforms', source.android.bootclasspath.platform), { recursive: true });
+    mkdirSync(ndk);
+    mkdirSync(join(jdk, 'bin'), { recursive: true });
+    const go = join(fixture.path, 'go');
+    for (const file of [go, join(jdk, 'bin/java'), join(jdk, 'bin/javac'),
+      join(ndk, 'source.properties'), join(sdk, 'platforms', source.android.bootclasspath.platform, 'android.jar')]) {
+      writeFileSync(file, 'controlled ' + file);
+    }
+    for (const file of [output, environment]) writeFileSync(file, 'retained\n');
+    const env = { GITHUB_ACTIONS: 'true', ANDROID_SDK_ROOT: sdk, JAVA_HOME_17_X64: jdk,
+      GITHUB_OUTPUT: output, GITHUB_ENV: environment, ...(failure === 'capacity' ? { GOMAXPROCS: 'auto' } : {}) };
+    const steps = [], observations = [];
+    const preparation = prepareAndroid({
+      env, home: fixture.path, observeCapacity: () => ({ jobCap: 1 }), report: row => observations.push(row.phase),
+      run: async ([program, ...args], options) => {
+        if (program === 'git') return args.includes('status') ? '' : '1'.repeat(40);
+        if (program === 'node' && args.includes('--check-license-only')) return '';
+        if (program === 'which' && args[0] === 'go') return go;
+        if (program === go && args[0] === 'version') return 'go version go' + source.goVersion + ' linux/amd64';
+        if (program === go && args[0] === 'install') {
+          assert.deepEqual(args, ['install', 'github.com/sagernet/gomobile/cmd/gomobile@' + source.gomobileVersion,
+            'github.com/sagernet/gomobile/cmd/gobind@' + source.gobindVersion]);
+          assert.equal(options.env.GOMAXPROCS, '1');
+          assert.ok(options.env.GOMODCACHE.startsWith(fixture.path));
+          for (const tool of ['gomobile', 'gobind']) writeFileSync(join(options.env.GOBIN, tool), 'controlled ' + tool);
+          steps.push('install');
+          return '';
+        }
+        if (program === 'node' && args[0].endsWith('/prepare-ndk-linux.mjs')) {
+          steps.push('NDK');
+          if (failure === 'NDK') throw new Error('controlled NDK refusal');
+          return ndk;
+        }
+        if ([join(jdk, 'bin/java'), join(jdk, 'bin/javac')].includes(program)) {
+          assert.deepEqual(args, ['--version']);
+          return 'controlled JDK 17';
+        }
+        assert.fail('unexpected hosted operation: ' + program);
+      },
+      prepare: async (checkout, declaration) => {
+        steps.push('source');
+        assert.ok(checkout.startsWith(fixture.path));
+        assert.equal(declaration.sourceCommit, source.sourceCommit);
+        if (failure === 'source') throw new Error('controlled source refusal');
+      },
+    });
+    if (!failure) {
+      await preparation;
+      assert.deepEqual(observations, ['android-tool-prepare-capacity-sample', 'android-tool-prepare-capacity']);
+      assert.deepEqual(steps, ['install', 'NDK', 'source']);
+      assert.match(readFileSync(output, 'utf8'), /\nfingerprint=[0-9a-f]{64}\nwork=.+\ncache=.+\n$/);
+      assert.match(readFileSync(environment, 'utf8'), /\nPOLARIS_ANDROID_RECEIPT=.+\/component-receipt\.json\n/);
+      continue;
+    }
+    await assert.rejects(preparation, failure === 'capacity' ? /positive integer/ : new RegExp('controlled ' + failure + ' refusal'));
+    assert.equal(observations[0], 'android-tool-prepare-capacity-sample');
+    assert.deepEqual(steps, failure === 'capacity' ? [] : failure === 'NDK' ? ['install', 'NDK'] : ['install', 'NDK', 'source']);
+    assert.equal(readFileSync(output, 'utf8'), 'retained\n');
+    assert.equal(readFileSync(environment, 'utf8'), 'retained\n');
+  }
+});
 
 test('formal Android SDK preparation requires existing license and exact archive bytes', {
   skip: process.platform !== 'linux',
@@ -461,6 +555,23 @@ test('formal APK SDK payload matches selected AAR bytes and preserves the carrie
   badCrc.writeUInt32LE(0, central + 16);
   writeFileSync(apk, badCrc);
   assert.throws(() => verifySdkPayload(apk, 'universal', pins), /size or CRC differs/);
+});
+
+test('mobile carrier reads the App and extension from one original archive across an awaited plist read', async () => {
+  using fixture = mkdtempDisposableSync(join(tmpdir(), 'polaris-mobile-zip-'));
+  const path = join(fixture.path, 'app.ipa'), replacement = join(fixture.path, 'replacement.ipa');
+  const app = 'Payload/Polaris.app/Polaris', extension = 'Payload/Polaris.app/PlugIns/Tunnel.appex/Tunnel';
+  writeFileSync(path, fixtureZip([{ name: app, data: 'original host App' }, { name: extension, data: 'original extension' }]));
+  writeFileSync(replacement, fixtureZip([{ name: app, data: 'replacement host App' }, { name: extension, data: 'replacement extension' }]));
+  const archive = openComponentZip(path);
+  try {
+    assert.equal(archive.member(app).toString(), 'original host App');
+    await Promise.resolve().then(() => renameSync(replacement, path));
+    assert.equal(archive.member(extension).toString(), 'original extension');
+    assert.equal(withComponentZip(path, current => current.member(extension).toString()), 'replacement extension');
+  } finally {
+    archive.close();
+  }
 });
 
 test('native ZIP metadata accepts DEFLATE at an unaligned data offset and rejects STORE', () => {
@@ -1643,10 +1754,10 @@ test('AAR interface commands bind observations to the exact tool captures', () =
   const plan = JSON.parse(captures.stdout);
   assert.deepEqual(plan.javaInterfaces, Object.keys(AAR_JAVA_OBSERVATION));
   assert.deepEqual([...plan.hotJavaInterfaces].sort(), Object.keys(RETAINED_AAR_HOT_JAVA).sort());
-  const source = readFileSync(new URL('./mobile-core/artifacts.py', import.meta.url), 'utf8');
-  const owner = source.split('def inspect_aar(', 2)[1].split('def tree_inventory(', 1)[0];
-  for (const requirement of ['formal AAR must contain all four ABIs', 'verify_native_buildinfo(info, value, graph',
-    "'--aar-elf'", "'--dyn-syms', '--wide'", "'--aar-interfaces'", "'--aar-interface-classes'"]) {
+  const source = readFileSync(new URL('./mobile-core/component-admission.mjs', import.meta.url), 'utf8');
+  const owner = source.split('function inspectAar(', 2)[1].split('function parsePlist(', 1)[0];
+  for (const requirement of ['formal AAR must contain all four ABIs', 'verifyNativeBuildInfo({ raw, source, graph',
+    'aarElfFacts(bytes, abi, libbox)', "'--dyn-syms', '--wide'", 'verifyAarInterfaces(observations)', 'aarInterfaceClasses()']) {
     assert.ok(owner.includes(requirement), requirement);
   }
   const path = join(fixture.path, 'observations.json');

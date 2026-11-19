@@ -2,7 +2,7 @@
 
 项目保留 iOS 源码与编译入口，不在 GitHub Releases 发布 iOS 安装包。以下步骤说明当前源码的设备 ARM64 无签名编译/链接路径，不表示签名、安装、Network Extension 授权或实际 VPN 流量已验收。
 
-在 Mac 上准备 Rust stable 与 aarch64-apple-ios、Node.js 24+（CI 26）、pnpm 11.24.0、Python 3，以及 Xcode 27.1 build 27A9275；设备与模拟器 SDK 都须 27.1。Go 1.27.2（以 `source-contract.json` 的 `goVersion` 为准）、SagerNet gomobile/gobind v0.1.13 须用明确工具路径提供。本文使用正式 Python 构建入口，不使用历史 `tauri ios build` 流程；通用 Tauri CLI 版本见 `scripts/tauri-cli.version`（当前 2.12.1），不应据此假定 UI 依赖安装会提供本地 CLI。不要运行 `gomobile init` 来替换已固定 gobind。
+在 Mac 上准备仓库固定的 Rust 和 aarch64-apple-ios、Node.js 26、`ui/package.json` 固定的 pnpm，以及 Xcode 27.1 build 27A9275。设备与模拟器 SDK 都须 27.1。Go 版本以 `source-contract.json` 的 `goVersion` 为准。构建入口要求提供 Go 和固定版本的 SagerNet gomobile/gobind 的实际路径。通用 Tauri CLI 版本见 `scripts/tauri-cli.version`。保留固定版本的 gobind。
 
 当前内核来源为 [sing-box-polaris](https://github.com/polaris-arch/sing-box-polaris)，移动端固定输入由 source-contract 锁定。来源选择不表示 App 运行验收完成，也不提供已发布 IPA 下载；核心仓的原始组件不能替代 App 构建器生成并核验的组件收据。
 
@@ -17,7 +17,7 @@ rustup target add aarch64-apple-ios
 pnpm --dir ui install --frozen-lockfile
 node scripts/fetch-dashboard.mjs
 pnpm --dir ui build
-python3 -B scripts/mobile-core/build_apple_app.py \
+node scripts/mobile-core/build-apple-app.mjs \
   --source "$CORE_SOURCE" \
   --go "$GO_BIN" --gomobile "$GOMOBILE_BIN" --gobind "$GOBIND_BIN" \
   --developer "$DEVELOPER_DIR" \

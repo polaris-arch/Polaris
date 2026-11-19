@@ -146,6 +146,109 @@ export function receiptLimit(value) {
   return limits.controlBytes;
 }
 
+function floatText(n) {
+  if (Object.is(n, -0)) return '-0.0';
+  if (n === 0) return '0.0';
+  const [coefficient, power = '0'] = Math.abs(n).toString().split('e');
+  const decimal = coefficient.indexOf('.');
+  const digits = coefficient.replace('.', '');
+  const leading = digits.search(/[1-9]/);
+  const exponent = Number(power) + (decimal < 0 ? coefficient.length : decimal) - leading - 1;
+  const significant = digits.slice(leading).replace(/0+$/, '');
+  const sign = n < 0 ? '-' : '';
+  if (exponent < -4 || exponent >= 16) {
+    return sign + significant[0] + (significant.length > 1 ? '.' + significant.slice(1) : '') +
+      'e' + (exponent < 0 ? '-' : '+') + String(Math.abs(exponent)).padStart(2, '0');
+  }
+  const point = exponent + 1;
+  if (point <= 0) return sign + '0.' + '0'.repeat(-point) + significant;
+  if (point >= significant.length) return sign + significant.padEnd(point, '0') + '.0';
+  return sign + significant.slice(0, point) + '.' + significant.slice(point);
+}
+
+export function codepointOrder(left, right) {
+  for (let at = 0; at < Math.min(left.length, right.length);) {
+    const a = left.codePointAt(at), b = right.codePointAt(at);
+    if (a !== b) return a - b;
+    at += a > 0xffff ? 2 : 1;
+  }
+  return left.length - right.length;
+}
+
+export function* canonicalChunks(value, { maximum, pretty = false, ascii = pretty } = {}) {
+  let nodes = 0, stringChars = 0, bytes = 0, buffer = '';
+  const active = new Set();
+  function* encode(entry, depth, isKey = false) {
+    if (maximum !== undefined) {
+      demand(++nodes <= limits.nodes && depth <= limits.depth, 'receipt JSON node/depth budget');
+    }
+    if (entry instanceof ReceiptFloat) {
+      yield floatText(entry.value);
+    } else if (typeof entry === 'string') {
+      if (maximum !== undefined) {
+        const length = characters(entry);
+        stringChars += length;
+        demand(length <= (isKey ? limits.keyChars : limits.stringChars) && stringChars <= maximum,
+          'receipt JSON string budget');
+      }
+      demand(ascii || entry.isWellFormed(), 'invalid Unicode in receipt JSON');
+      const quoted = JSON.stringify(entry);
+      yield ascii ? quoted.replace(/[\u007f-\uffff]/g,
+        char => '\\u' + char.charCodeAt(0).toString(16).padStart(4, '0')) : quoted;
+    } else if (Array.isArray(entry) || object(entry)) {
+      demand(!active.has(entry), 'cyclic receipt JSON');
+      active.add(entry);
+      const array = Array.isArray(entry);
+      const keys = array ? entry.keys() : Object.keys(entry).sort(codepointOrder);
+      yield array ? '[' : '{';
+      let first = true;
+      for (const key of keys) {
+        if (!first) yield ',';
+        if (pretty) yield '\n' + ' '.repeat(2 * (depth + 1));
+        if (!array) {
+          yield* encode(key, depth + 1, true);
+          yield pretty ? ': ' : ':';
+        }
+        yield* encode(entry[key], depth + 1);
+        first = false;
+      }
+      if (pretty && !first) yield '\n' + ' '.repeat(2 * depth);
+      yield array ? ']' : '}';
+      active.delete(entry);
+    } else if (typeof entry === 'bigint') {
+      const magnitude = entry < 0n ? -entry : entry;
+      demand(maximum === undefined || magnitude < (1n << BigInt(limits.integerBits)),
+        'receipt JSON integer budget');
+      yield entry.toString();
+    } else if (entry === null || typeof entry === 'boolean' || Number.isSafeInteger(entry)) {
+      yield JSON.stringify(entry);
+    } else {
+      demand(typeof entry === 'number' && Number.isFinite(entry), 'unsupported receipt JSON value');
+      yield floatText(entry);
+    }
+  }
+  function* document() {
+    yield* encode(value, 0);
+    if (pretty) yield '\n';
+  }
+  for (const token of document()) {
+    if (maximum !== undefined) {
+      bytes += Buffer.byteLength(token);
+      demand(bytes <= maximum, 'receipt JSON byte budget');
+    }
+    buffer += token;
+    if (buffer.length >= 64 * 1024) {
+      yield Buffer.from(buffer);
+      buffer = '';
+    }
+  }
+  if (buffer) yield Buffer.from(buffer);
+}
+
+export function canonical(value, options) {
+  return Buffer.concat([...canonicalChunks(value, options)]);
+}
+
 function lexicalBudget(raw) {
   let quoted = false, escaped = false, depth = 0, tokens = 0, stringBytes = 0;
   for (const byte of raw) {
@@ -279,6 +382,12 @@ export function decode(raw, maximum, receiptLimit) {
   return decodeJSON(raw, maximum, receiptLimit);
 }
 
+export function decodeDocuments(raw, maximum) {
+  const rows = [];
+  decodeJSON(raw, maximum, undefined, value => rows.push(value));
+  return rows;
+}
+
 function moduleList(raw) {
   const paths = new Set(), rows = [];
   decodeJSON(raw, limits.controlBytes, undefined, (row, document) => {
@@ -292,7 +401,7 @@ function moduleList(raw) {
   return '[' + rows.join(',') + ']';
 }
 
-function readPinnedBytes(path, maximum, observation, { allowEmpty = false, executable } = {}) {
+function withPinnedDescriptor(path, maximum, observation, { allowEmpty = false, executable } = {}, inspect) {
   const before = lstatSync(path, { ...statOptions, throwIfNoEntry: false });
   if (observation) console.error(JSON.stringify({
     schema: 'polaris-receipt-size-observation-v1', phase: 'read', path,
@@ -305,16 +414,35 @@ function readPinnedBytes(path, maximum, observation, { allowEmpty = false, execu
   try {
     const identity = info => info.isFile() && ['dev', 'ino', 'mode', 'size', 'mtimeNs', 'ctimeNs'].every(key => info[key] === before[key]);
     demand(identity(fstatSync(fd, statOptions)), 'original file changed before bounded read');
-    const bytes = Buffer.allocUnsafe(Number(before.size));
-    let at = 0;
-    while (at < bytes.length) {
+    const value = inspect(fd, Number(before.size));
+    demand(identity(fstatSync(fd, statOptions)) && identity(lstatSync(path, statOptions)), 'original file changed during bounded read');
+    return value;
+  } finally { closeSync(fd); }
+}
+
+function readPinnedBytes(path, maximum, observation, options) {
+  return withPinnedDescriptor(path, maximum, observation, options, (fd, size) => {
+    const bytes = Buffer.allocUnsafe(size);
+    for (let at = 0; at < bytes.length;) {
       const length = readSync(fd, bytes, at, bytes.length - at, at);
       demand(length > 0, 'original file changed during bounded read');
       at += length;
     }
-    demand(identity(fstatSync(fd, statOptions)) && identity(lstatSync(path, statOptions)), 'original file changed during bounded read');
     return bytes;
-  } finally { closeSync(fd); }
+  });
+}
+
+export function pinnedDigest(path, maximum, options) {
+  return withPinnedDescriptor(path, maximum, false, options, (fd, size) => {
+    const hash = createHash('sha256'), block = Buffer.allocUnsafe(Math.min(size, 1024 ** 2));
+    for (let at = 0; at < size;) {
+      const length = readSync(fd, block, 0, Math.min(size - at, block.length), at);
+      demand(length > 0, 'original file changed during bounded read');
+      hash.update(block.subarray(0, length));
+      at += length;
+    }
+    return { bytes: size, sha256: hash.digest('hex') };
+  });
 }
 
 export function pinned(path, maximum, observation = false, options) {
@@ -329,7 +457,7 @@ function sourceDeclaration(value, key) {
   return value;
 }
 
-function validateSourceBytes(raw) {
+export function validateSourceBytes(raw) {
   const source = decode(raw, sourceContractBytes);
   validateMobileSource(sourceDeclaration(source));
   return source;
@@ -413,14 +541,17 @@ function vendorTree(entries) {
   return gitObject('tree', Buffer.concat(rows.map(({ row }) => row)));
 }
 
+export function gitEnvironment(environment = process.env) {
+  const env = Object.fromEntries(Object.entries(environment).filter(([name]) => !name.startsWith('GIT_')));
+  return Object.assign(env, { GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: devNull, GIT_NO_REPLACE_OBJECTS: '1', GIT_TERMINAL_PROMPT: '0' });
+}
+
 function sourceGit(args, operation, timeout = 30_000) {
-  const env = Object.fromEntries(Object.entries(process.env).filter(([name]) => !name.startsWith('GIT_')));
-  Object.assign(env, { GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: devNull, GIT_NO_REPLACE_OBJECTS: '1', GIT_TERMINAL_PROMPT: '0' });
   try {
     // Preparation inherits the producer's owned process group. Git never owns
     // a detached group or reads from the declaration/parent's standard input.
     return execFileSync('git', ['--no-replace-objects', ...args], {
-      env, timeout, maxBuffer: limits.controlBytes, stdio: ['ignore', 'pipe', 'pipe'],
+      env: gitEnvironment(), timeout, maxBuffer: limits.controlBytes, stdio: ['ignore', 'pipe', 'pipe'],
     });
   } catch {
     throw new Error('mobile source Git ' + operation + ' failed');
@@ -595,7 +726,7 @@ function mobileLinkerFlagsPrefix(source) {
     ' -X runtime.godebugDefault=multipathtcp=0,tlssha1=1 -checklinkname=0 -s -w -buildid=polaris-mobile-';
 }
 
-function bindingPlans(source) {
+export function bindingPlans(source) {
   const argument = input => ({ input });
   const platforms = Object.fromEntries(['android', 'apple'].map(platform => {
     const profile = source[platform];
@@ -833,6 +964,8 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
       console.log(`${source.goVersion} ${source.version}`);
     } else if ((args.length === 2 || args.length === 3 && args[2] === '--generator-outputs') && args[0] === '--verify-checkout') {
       console.log(JSON.stringify(sourceCheckout(args[1], readBoundedInput(sourceContractBytes), false, args.length === 3)));
+    } else if ((args.length === 3 || args.length === 4 && args[3] === '--generator-outputs') && args[0] === '--verify-checkout-file') {
+      console.log(JSON.stringify(sourceCheckout(args[1], pinned(args[2], sourceContractBytes).bytes, false, args.length === 4)));
     } else if (args.length === 3 && args[0] === '--prepare-checkout') {
       console.log(JSON.stringify(sourceCheckout(args[1], pinned(args[2], sourceContractBytes).bytes, true)));
     } else if (args.length === 2 && args[0] === '--module-list') {
@@ -845,7 +978,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
       console.log(JSON.stringify(nativeBuildInfoReport(evidence)));
     } else {
       // The producer sends its full declaration once and reuses these plans.
-      demand(args.length === 0, 'usage: source-admission.mjs [--versions | --verify-checkout ROOT [--generator-outputs] | --prepare-checkout ROOT DECLARATION | --module-list PATH | --native-buildinfo PATH BYTES SHA256]');
+      demand(args.length === 0, 'usage: source-admission.mjs [--versions | --verify-checkout ROOT [--generator-outputs] | --verify-checkout-file ROOT DECLARATION [--generator-outputs] | --prepare-checkout ROOT DECLARATION | --module-list PATH | --native-buildinfo PATH BYTES SHA256]');
       console.log(JSON.stringify(bindingPlans(validateSourceBytes(readBoundedInput(sourceContractBytes)))));
     }
   } catch (error) {

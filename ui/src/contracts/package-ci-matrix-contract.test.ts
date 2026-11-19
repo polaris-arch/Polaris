@@ -612,106 +612,35 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     expect(releaseCheck).toContain(
       'run: bash scripts/gate-android-release-behavior.sh',
     );
-    expect(releaseCheck).toContain(
-      'python3 scripts/mobile-core/ci_android.py verify --apk src-tauri/gen/android/app/build/outputs/apk/arm64/release/app-arm64-release-unsigned.apk --abi arm64-v8a --r8 src-tauri/gen/android/app/build/outputs/mapping/arm64Release',
-    );
+    const apkGate = executable(stepBlock(releaseCheck, 'R8 吃进了什么 / 保住了什么（产物级证据）'));
+    expect(apkGate).toContain('apk=src-tauri/gen/android/app/build/outputs/apk/arm64/release/app-arm64-release-unsigned.apk');
+    expect(apkGate).toContain('node scripts/mobile-core/mobile-consumption.mjs android');
+    expect(apkGate).toContain('--artifact "$apk" --abi arm64-v8a --r8 src-tauri/gen/android/app/build/outputs/mapping/arm64Release');
+    expect(apkGate).toContain('--component "$POLARIS_ANDROID_COMPONENT" --receipt "$POLARIS_ANDROID_RECEIPT"');
+    expect(apkGate).toContain('--scratch "$POLARIS_ANDROID_CARRIER" --output "$apk.source-consumption.json"');
     expect(releaseCheck).toContain(
       'node scripts/assert-r8-evidence.mjs src-tauri/gen/android/app/build/outputs/mapping/arm64Release',
     );
-    // Real workflow → formal input wrapper → final carrier → R8/APK checks.
-    const verifier = readFileSync(join(REPO_ROOT, 'scripts/mobile-core/ci_android.py'), 'utf8');
-    const verify = verifier.slice(verifier.indexOf('def verify('), verifier.indexOf('\ndef main('));
-    expect(verify).toContain("require(r8 is not None, 'actual APK R8 output required')");
-    expect(verify).toContain("ROOT / 'scripts/mobile-core/carriers.py', 'android'");
-    expect(verify).toContain("'--artifact', apk, '--abi', abi, '--r8', r8");
-    expect(verify).toContain("'--component', Path(paths['work']) / value['android']['outputName']");
-    expect(verify).toContain("'--receipt', Path(paths['work']) / 'component-receipt.json'");
-    expect(verify).toContain('subprocess.run([str(arg) for arg in args], check=True)');
-    expect(verify).not.toMatch(/^\s*(?:try:|except\b)/m);
-    const carrier = readFileSync(join(REPO_ROOT, 'scripts/mobile-core/carriers.py'), 'utf8');
-    const consumption = carrier.slice(carrier.indexOf('def android('), carrier.indexOf('\ndef apple('));
-    expect(consumption).toContain("verify_original(component, receipt_path, 'android', tools, scratch)");
-    expect(consumption).toContain("run(['node', ROOT / 'scripts/assert-r8-evidence.mjs', r8], cwd=ROOT)");
-    expect(consumption).toContain("run(['node', ROOT / 'scripts/verify-apk.mjs', apk, '--abi', target], cwd=ROOT)");
-    expect(consumption).toContain("require(current == material['App'], 'App candidate changed after SDK materialization')");
-    expect(consumption).not.toMatch(/^\s*(?:try:|except\b)/m);
-    const producer = readFileSync(join(REPO_ROOT, 'scripts/mobile-core/producer.py'), 'utf8');
-    const run = producer.slice(producer.indexOf('def run('), producer.indexOf('\ndef ', producer.indexOf('def run(') + 1));
-    expect(run).toContain('require(process.returncode == 0,');
-    // Parse the actual handler and binding; aliases/indentation do not decide
-    // whether cleanup preserves and rethrows the primary exception.
-    // Keep the serialized request in an owned regular file: the synchronous
-    // probe must not depend on pipe EOF delivery. AST checks and mutations stay identical.
-    const policyFixture = mkdtempSync(join(tmpdir(), 'polaris-apple-policy-'));
-    onTestFinished(() => rmSync(policyFixture, { recursive: true, force: true }));
-    const policyRequest = join(policyFixture, 'request.json');
-    const primaryPolicy = (mutation = '') => {
-      writeFileSync(policyRequest, JSON.stringify({ source: producer, mutation }));
-      const result = spawnSync('python3', ['-c', `
-import ast,json,sys
-with open(sys.argv[1],encoding='utf-8') as request_file:
- request=json.load(request_file)
-tree=ast.parse(request['source'])
-function=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='run')
-# Select the lifecycle try itself, not the first exception handler in run.
-# Nested function bodies (e.g. drain), spawn and final log projection are
-# separate failure domains and must not change the primary cleanup target.
-def local_nodes(node):
- yield node
- for child in ast.iter_child_nodes(node):
-  if not isinstance(child,(ast.FunctionDef,ast.AsyncFunctionDef,ast.ClassDef,ast.Lambda)):
-   yield from local_nodes(child)
-def lifecycle_tries():
- matches=[]
- for node in local_nodes(function):
-  if not isinstance(node,ast.Try): continue
-  calls=[s.value for s in node.body if isinstance(s,ast.Expr) and isinstance(s.value,ast.Call)]
-  registered=any(isinstance(c.func,ast.Name) and c.func.id=='register_group'
-                 and len(c.args)==1 and isinstance(c.args[0],ast.Attribute)
-                 and c.args[0].attr=='pid' and isinstance(c.args[0].value,ast.Name)
-                 and c.args[0].value.id=='process' and not c.keywords for c in calls)
-  drained=any(isinstance(c.func,ast.Name) and c.func.id=='drain' for c in calls)
-  if registered and drained: matches.append(node)
- return matches
-candidates=lifecycle_tries()
-if len(candidates)!=1:
- print(json.dumps({'valid':False}));sys.exit(0)
-if request['mutation']=='missing-lifecycle':
- candidates[0].body=[s for s in candidates[0].body
-                     if not (isinstance(s,ast.Expr) and isinstance(s.value,ast.Call)
-                             and isinstance(s.value.func,ast.Name) and s.value.func.id=='drain')]
-if request['mutation']=='duplicate-lifecycle':
- import copy
- function.body.append(copy.deepcopy(candidates[0]))
-candidates=lifecycle_tries()
-if len(candidates)!=1:
- print(json.dumps({'valid':False}));sys.exit(0)
-handlers=[h for h in candidates[0].handlers if isinstance(h.type,ast.Name)
-          and h.type.id=='BaseException' and h.name]
-if len(handlers)!=1:
- print(json.dumps({'valid':False}));sys.exit(0)
-handler=handlers[0]
-notes=[n for n in ast.walk(handler) if isinstance(n,ast.Call)
-       and isinstance(n.func,ast.Name) and n.func.id=='failure_note']
-if request['mutation']=='silence': handler.body[-1]=ast.Pass()
-if request['mutation']=='replace': handler.body[-1]=ast.Raise(exc=ast.Call(func=ast.Name(id='RuntimeError'),args=[],keywords=[]))
-if request['mutation']=='wrong-note' and notes: notes[0].args[0]=ast.Name(id='secondary')
-last=handler.body[-1]
-bare=isinstance(last,ast.Raise) and last.exc is None and last.cause is None
-replacement=any(isinstance(n,ast.Raise) and n.exc is not None for n in ast.walk(handler))
-bound=len(notes)==1 and isinstance(notes[0].args[0],ast.Name) and notes[0].args[0].id==handler.name
-print(json.dumps({'valid':bare and not replacement and bound,
-                 'bareReraise':bare,'replacementRaise':replacement,'noteBoundToPrimary':bound}))
-`, policyRequest], { encoding: 'utf8', timeout: 5_000 });
-      expect(result.status, result.stderr).toBe(0);
-      return JSON.parse(result.stdout);
-    };
-    expect(primaryPolicy()).toEqual({ valid: true, bareReraise: true,
-      replacementRaise: false, noteBoundToPrimary: true });
-    for (const mutation of ['silence', 'replace', 'wrong-note', 'missing-lifecycle', 'duplicate-lifecycle']) {
-      expect(primaryPolicy(mutation).valid, mutation).toBe(false);
+    for (const job of [releaseCheck, publish]) {
+      expect(executable(stepBlock(job, 'Prepare formal mobile source and isolated tools')))
+        .toContain('node scripts/mobile-core/android-ci.mjs');
+      const build = executable(stepBlock(job, 'Build or revalidate formal four-ABI component and App input'));
+      expect(build).toContain('set -euo pipefail');
+      expect(build).toContain('node scripts/mobile-core/producer.mjs android');
+      expect(build).toContain('node scripts/mobile-core/mobile-consumption.mjs materialize-android');
+      expect(build.indexOf('producer.mjs android')).toBeLessThan(build.indexOf('materialize-android'));
+      const recheck = executable(stepBlock(job, 'libbox.aar 必须在位'));
+      expect(recheck).toContain('node scripts/mobile-core/mobile-consumption.mjs verify-android');
+      expect(recheck).toContain('--component "$POLARIS_ANDROID_COMPONENT" --receipt "$POLARIS_ANDROID_RECEIPT"');
     }
-    expect(run).toContain('register_group(process.pid, finished=True)');
+    const carrier = readFileSync(join(REPO_ROOT, 'scripts/mobile-core/mobile-consumption.mjs'), 'utf8');
+    const androidCarrier = carrier.indexOf('async function inspectAndroidCarrier(');
+    expect(androidCarrier).toBeGreaterThan(-1);
+    const consumption = carrier.slice(androidCarrier);
+    expect(consumption).toMatch(/await verifyOriginal\(/);
+    expect(consumption).toContain('scripts/assert-r8-evidence.mjs');
+    expect(consumption).toContain('scripts/verify-apk.mjs');
+    expect(consumption).toContain('App candidate changed after SDK materialization');
     expect(releaseCheck).toContain(
       'run: node scripts/verify-apk.mjs src-tauri/gen/android/app/build/outputs/apk/arm64/release/app-arm64-release-unsigned.apk --abi arm64-v8a',
     );
@@ -753,9 +682,10 @@ print(json.dumps({'valid':bare and not replacement and bound,
     expect(publish).toContain(
       'node scripts/release-assets.mjs abis "$RUNNER_TEMP/$asset_name" "$abi"',
     );
-    expect(publish).toContain(
-      '--apk "$RUNNER_TEMP/Polaris_${version}_${abi}-android.apk" --abi "$abi"',
-    );
+    const signedGate = executable(stepBlock(publish, '开箱验（产物级判据）'));
+    expect(signedGate).toContain('apk="$RUNNER_TEMP/Polaris_${version}_${abi}-android.apk"');
+    expect(signedGate).toContain('node scripts/mobile-core/mobile-consumption.mjs android');
+    expect(signedGate).toContain('--artifact "$apk" --abi "$abi" --r8 "src-tauri/gen/android/app/build/outputs/mapping/${flavor}Release"');
     expect(publish).toContain("digests='${{ steps.asset.outputs.digests }}'");
     expect(publish).toContain('signed_apks: ${{ steps.asset.outputs.digests }}');
     expect(publish).toContain('for pair in arm64:arm64-v8a arm:armeabi-v7a universal:universal; do');

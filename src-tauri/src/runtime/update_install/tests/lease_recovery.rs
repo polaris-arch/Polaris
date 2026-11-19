@@ -6,6 +6,36 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+const LEASE_FIXTURE_OPERATION: &str = "POLARIS_TEST_UPDATE_LEASE_OPERATION";
+const LEASE_FIXTURE_TEST: &str = concat!(module_path!(), "::inherited_lease_fixture");
+
+#[test]
+#[allow(
+    deprecated,
+    reason = "retain the lock on Bash's inherited open description"
+)]
+fn inherited_lease_fixture() {
+    use nix::errno::Errno;
+    use nix::fcntl::{flock, FlockArg};
+
+    let Ok(operation) = std::env::var(LEASE_FIXTURE_OPERATION) else {
+        return;
+    };
+    let argument = match operation.as_str() {
+        "lease-acquire" => FlockArg::LockExclusiveNonblock,
+        "lease-release" => FlockArg::Unlock,
+        _ => panic!("unsupported lease fixture operation: {operation}"),
+    };
+    match flock(9, argument) {
+        Ok(()) => {}
+        Err(Errno::EWOULDBLOCK) if operation == "lease-acquire" => {
+            eprintln!("polaris-test-lease-busy");
+            std::process::exit(73);
+        }
+        Err(error) => panic!("inherited lease fixture failed: {error}"),
+    }
+}
+
 struct Fixture(PathBuf);
 impl Fixture {
     fn new() -> Self {
@@ -52,12 +82,16 @@ impl Fixture {
     }
     fn command(&self, tail: &str) -> Command {
         let source = self.0.join(format!("source-{}", uuid::Uuid::new_v4()));
-        // flock on the inherited open description persists in Bash after this
-        // short-lived fixture exits, as in the actual process_lease utility.
-        crate::test_support::write_executable_stand_in(
-            &source,
-            b"#!/usr/bin/env python3\nimport sys,fcntl,errno\nfd=int(sys.argv[-1])\ntry:\n    fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB if sys.argv[1]=='lease-acquire' else fcntl.LOCK_UN)\nexcept BlockingIOError as error:\n    if sys.argv[1]!='lease-acquire' or error.errno not in (errno.EAGAIN,errno.EWOULDBLOCK):\n        raise\n    sys.stderr.write('polaris-test-lease-busy\\n')\n    sys.exit(73)\n",
+        // Re-enter this test executable on the inherited fd. Its open
+        // description remains in Bash when the short-lived helper exits.
+        let executable = std::env::current_exe().unwrap();
+        let (_, exact_test) = LEASE_FIXTURE_TEST.split_once("::").unwrap();
+        let helper = format!(
+            "#!/bin/bash\n[ \"$#\" -eq 5 ] && [ \"$2\" = --lock ] && [ \"$4\" = --fd ] && [ \"$5\" = 9 ] || exit 1\n{LEASE_FIXTURE_OPERATION}=\"$1\" exec {} --exact {} --nocapture\n",
+            sh_quote(executable.to_str().unwrap()),
+            sh_quote(exact_test),
         );
+        crate::test_support::write_executable_stand_in(&source, helper);
         let helper = fs::read(&source).unwrap();
         let frozen =
             freeze_lease_helper_in(&self.0, &source, &polaris_updater::sha256_hex(&helper))

@@ -7,7 +7,147 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { buildInfo, container } from './apple-carrier.mjs';
 import { nativeTunCompilerResponse, sdkHeaderContracts } from './mobile-core/apple-admission.mjs';
+
+function appleMachHeader(filetype, commands) {
+  const header = Buffer.alloc(32);
+  for (const [offset, value] of [[0, 0xfeedfacf], [4, 0x100000c], [12, filetype], [16, commands.length],
+    [20, commands.reduce((bytes, command) => bytes + command.length, 0)]]) header.writeUInt32LE(value, offset);
+  return header;
+}
+
+function appleBuildInfoSection() {
+  const header = Buffer.alloc(32);
+  header.write('\xff Go buildinf:', 'latin1');
+  header[14] = 8;
+  header[15] = 2;
+  const version = Buffer.from('go1.27.4');
+  const frame = Buffer.concat([
+    Buffer.from('3077af0c9274080241e1c107e6d618e6', 'hex'),
+    Buffer.from('path\texample.org/fixture\u0085build\tGOOS=ios\n'),
+    Buffer.from('f932433186182072008242104116d8f2', 'hex'),
+  ]);
+  const inputs = [header, Buffer.from([version.length]), version, Buffer.from([frame.length]), frame];
+  const bytes = inputs.reduce((size, part) => size + part.length, 0);
+  return Buffer.concat(inputs, Math.ceil(bytes / 16) * 16);
+}
+
+function appleGoObject(platform) {
+  const text = Buffer.from('\xff Go build ID: "source-bound-test"\n \xff', 'latin1');
+  const info = appleBuildInfoSection();
+  const version = Buffer.alloc(24);
+  version.writeUInt32LE(0x32);
+  version.writeUInt32LE(version.length, 4);
+  version.writeUInt32LE(platform, 8);
+  version.writeUInt32LE(15 << 16, 12);
+  version.writeUInt32LE(27 << 16 | 2 << 8, 16);
+  const segment = Buffer.alloc(72 + 2 * 80);
+  const end = 32 + segment.length + version.length;
+  const address = 9007199254740993n;
+  segment.writeUInt32LE(0x19);
+  segment.writeUInt32LE(segment.length, 4);
+  for (const [offset, value] of [[24, address], [32, BigInt(text.length + info.length)],
+    [40, BigInt(end)], [48, BigInt(text.length + info.length)]]) segment.writeBigUInt64LE(value, offset);
+  segment.writeUInt32LE(2, 64);
+  for (const [index, name, parent, payload, start] of [[0, '__text', '__TEXT', text, 0],
+    [1, '__go_buildinfo', '__DATA', info, text.length]]) {
+    const row = 72 + index * 80;
+    segment.write(name, row);
+    segment.write(parent, row + 16);
+    segment.writeBigUInt64LE(address + BigInt(start), row + 32);
+    segment.writeBigUInt64LE(BigInt(payload.length), row + 40);
+    segment.writeUInt32LE(end + start, row + 48);
+  }
+  return Buffer.concat([appleMachHeader(1, [segment, version]), segment, version, text, info]);
+}
+
+function appleArchiveMember(name, payload) {
+  const rawName = Buffer.from(name + '\0');
+  const bytes = rawName.length + payload.length;
+  const fields = [['#1/' + rawName.length, 16], [0, 12], [0, 6], [0, 6], [644, 8], [bytes, 10]];
+  const header = Buffer.from(fields.map(([value, width]) => String(value).padEnd(width)).join('') + '\x60\n');
+  return Buffer.concat([header, rawName, payload, Buffer.from(bytes % 2 ? '\n' : '')]);
+}
+
+test('Apple raw archive observations preserve slice, compiler bytes and exact Go provenance', () => {
+  const observe = [];
+  const callback = result => observe.push(result);
+  const wrap = (archive, cpu = 0x100000c) => {
+    const header = Buffer.alloc(32);
+    for (const [offset, value] of [[0, 0xcafebabe], [4, 1], [8, cpu], [16, 32], [20, archive.length], [24, 3]]) {
+      header.writeUInt32BE(value, offset);
+    }
+    return Buffer.concat([header, archive]);
+  };
+  for (const platform of [2, 7]) {
+    const object = appleGoObject(platform);
+    const symbols = Buffer.alloc(20);
+    symbols.writeUInt32LE(8, 0);
+    symbols.writeUInt32LE(4, 12);
+    symbols.write('go\0', 16);
+    const symbolName = '__.SYMDEF SORTED';
+    const codeOffset = 8 + appleArchiveMember(symbolName, symbols).length;
+    symbols.writeUInt32LE(codeOffset, 8);
+    const ar = Buffer.concat([Buffer.from('!<arch>\n'), appleArchiveMember(symbolName, symbols),
+      appleArchiveMember('original.o', object)]);
+    const parsed = container(wrap(ar), callback);
+    assert.deepEqual([parsed.kind, parsed.slices[0].offset, parsed.slices[0].archive.kind], ['fat-ar', 32, 'bsd-ar']);
+    const [table, member] = parsed.slices[0].archive.members;
+    assert.equal(table.classification, 'symbol-table');
+    assert.equal(member.headerOffset, codeOffset);
+    assert.equal(member.sha256, createHash('sha256').update(object).digest('hex'));
+    assert.equal(member.machO.platformCommands[0].platform, platform);
+    const [text, info] = member.machO.sections;
+    assert.equal(text.address, 9007199254740993n);
+    assert.deepEqual(text.buildIDs.map(note => [note.value, note.sectionOffset, note.fileOffset]),
+      [['source-bound-test', 0, text.offset]]);
+    assert.deepEqual(info.buildInfo, observe.at(-1));
+    assert.equal(info.buildInfo.parserInput, 'observed-section: go1.27.4\n\tpath\texample.org/fixture\n\tbuild\tGOOS=ios\n');
+    assert.throws(() => container(wrap(ar, 0x1000007), callback), /fat header\/payload CPU differs/);
+    const dirtyPad = wrap(ar);
+    dirtyPad[31] = 1;
+    assert.throws(() => container(dirtyPad, callback), /fat padding/);
+    const badBinding = Buffer.from(ar);
+    badBinding.writeUInt32LE(codeOffset + 1, table.payloadOffset + 8);
+    assert.throws(() => container(badBinding, callback), /BSD symbol\/member binding/);
+    const badReloc = Buffer.from(object);
+    badReloc.writeUInt32LE(32, 32 + 72 + 56);
+    badReloc.writeUInt32LE(1, 32 + 72 + 60);
+    assert.throws(() => container(badReloc, callback), /section relocation in headers/);
+    const badIdentity = Buffer.from(object);
+    badIdentity[text.offset] = 0;
+    assert.throws(() => container(badIdentity, callback), /missing\/extra Go identity/);
+  }
+  const invalid = appleBuildInfoSection();
+  invalid[32] = 128;
+  invalid[33] = 0;
+  assert.throws(() => buildInfo(invalid), /noncanonical inline varint/);
+});
+
+test('Apple raw executable receipts pin opaque signature bytes only inside the original linkedit segment', () => {
+  const segment = Buffer.alloc(72);
+  const signature = Buffer.alloc(16);
+  const offset = 32 + segment.length + signature.length;
+  const payload = Buffer.from('opaque native signature');
+  segment.writeUInt32LE(0x19);
+  segment.writeUInt32LE(segment.length, 4);
+  segment.write('__LINKEDIT', 8);
+  for (const [at, value] of [[32, payload.length], [40, offset], [48, payload.length]]) {
+    segment.writeBigUInt64LE(BigInt(value), at);
+  }
+  signature.writeUInt32LE(0x1d);
+  signature.writeUInt32LE(signature.length, 4);
+  signature.writeUInt32LE(offset, 8);
+  signature.writeUInt32LE(payload.length, 12);
+  const executable = Buffer.concat([appleMachHeader(2, [segment, signature]), segment, signature, payload]);
+  const parsed = container(executable);
+  assert.deepEqual(parsed.loadCommands[1], { ordinal: 1, command: 0x1d, offset: 104, bytes: 16,
+    dataOffset: offset, dataBytes: payload.length, payloadSha256: createHash('sha256').update(payload).digest('hex'),
+    payloadKind: 'opaque-code-signature', trustValidated: false });
+  executable.writeBigUInt64LE(BigInt(payload.length - 1), 32 + 48);
+  assert.throws(() => container(executable), /code signature outside unique __LINKEDIT segment/);
+});
 // Source-derived gomobile v0.1.13 declarations, with the result spelling
 // independently observed in the preserved original Libbox.objc.h.
 const sdkCapability = '- (NSString* _Nonnull)runtimeCapabilities:(NSError* _Nullable* _Nullable)error;';
@@ -416,9 +556,9 @@ test('native bridge retains real NE callbacks and PacketTunnel consumes the comp
   assert.ok(phase.includes('$(DERIVED_FILE_DIR)/PolarisNativeTunCompiler.args'));
   assert.equal(pbx.split('OTHER_SWIFT_FLAGS = ("$(inherited)", "@$(DERIVED_FILE_DIR)/PolarisNativeTunCompiler.args",);').length - 1, 2);
 
-  const builder = readFileSync(new URL('./mobile-core/build_apple_app.py', import.meta.url), 'utf8');
-  const phases = ["'original-tls-prepare.log'", "timed_phase('app-extension-archive'",
-    "'original-tls-final-verify.log'", "timed_phase('final-carrier-inspection'"];
+  const builder = readFileSync(new URL('./mobile-core/build-apple-app.mjs', import.meta.url), 'utf8');
+  const phases = ["'original-tls-prepare.log'", "timed('app-extension-archive'",
+    "'original-tls-final-verify.log'", "timed('final-carrier-inspection'"];
   let previous = -1;
   for (const name of phases) {
     const position = builder.indexOf(name);
@@ -508,6 +648,11 @@ test('the Apple build CLI binds TLS and native TUN inputs to each selected devic
   const sdks = [['iphoneos', 'ios-arm64'], ['iphonesimulator', 'ios-arm64-simulator']];
   const mobileCore = fileURLToPath(new URL('./mobile-core/', import.meta.url));
   const source = JSON.parse(readFileSync(new URL('./mobile-core/source-contract.json', import.meta.url)));
+  const lockTool = join(tunDirectories(t).root, 'native-fd');
+  const compileLock = spawnSync('rustc', ['--edition=2024', '-o', lockTool, join(mobileCore, 'native-fd.rs')],
+    { encoding: 'utf8', timeout: 30_000 });
+  assert.ifError(compileLock.error);
+  assert.equal(compileLock.status, 0, compileLock.stderr);
   const receiptName = 'PolarisTLSFingerprintLinker.json';
   const linkerName = 'PolarisTLSFingerprintLinker.args';
   const sha256 = bytes => createHash('sha256').update(bytes).digest('hex');
@@ -521,7 +666,11 @@ test('the Apple build CLI binds TLS and native TUN inputs to each selected devic
         const { root, prepared, derived } = tunDirectories(t);
         const linkedScripts = join(root, 'mobile-core');
         symlinkSync(mobileCore, linkedScripts);
-        const script = join(linkedScripts, 'apple_tls_fingerprint.py');
+        const parent = 'import { pathToFileURL } from "node:url"; import { join } from "node:path"; '
+          + 'const [root, action, log] = process.argv.slice(1); '
+          + 'const { createNativeRunner } = await import(pathToFileURL(join(root, "native-runner.mjs"))); '
+          + 'const { observeTLS } = await import(pathToFileURL(join(root, "apple-admission.mjs"))); '
+          + 'process.stdout.write(await observeTLS(action, process.env, log, createNativeRunner()));';
         const hook = join(linkedScripts, 'apple-admission.mjs');
         const framework = join(root, 'Libbox.xcframework');
         const slices = {};
@@ -567,11 +716,15 @@ exit 97
         mkdirSync(budget, { mode: 0o700 });
         const slot = sha256(root) + '.reservation';
         const ledger = join(budget, slot);
-        // The native CLI checks and locks this inherited descriptor without allocating a build's disk reserve.
+        // Hold the original open-file description with the actual POSIX lock
+        // helper. An inherited descriptor for an unlocked ledger is insufficient.
         writeFileSync(ledger, JSON.stringify({ schema: 'polaris-mobile-filesystem-reservation-v1', slot, work: root,
           filesystem: statSync(root).dev, reserveBytes: source.budget.buildPeakReserveBytes, groups: [] }), { mode: 0o600 });
         const fd = openSync(ledger, 'r+');
         t.after(() => closeSync(fd));
+        const lock = spawnSync(lockTool, ['exclusive'], { encoding: 'utf8', stdio: ['ignore', 'ignore', 'pipe', fd] });
+        assert.ifError(lock.error);
+        assert.equal(lock.status, 0, lock.stderr);
         const env = { ...process.env, PATH: `${root}:${process.env.PATH}`, PLATFORM_NAME: platform, ARCHS: 'arm64',
           POLARIS_MOBILE_LINK_INPUT: link, POLARIS_MOBILE_LINK_INPUT_SHA256: sha256(readFileSync(link)),
           POLARIS_APP_WORK: root, POLARIS_BUILD_BUDGET_ROOT: budget, POLARIS_FORMAL_APP_BUILD: '1',
@@ -580,11 +733,13 @@ exit 97
           FIXTURE_NATIVE_TRACE: nativeTrace,
           FIXTURE_RESERVATION_PROBE: '',
           TARGET_BUILD_DIR: root, EXECUTABLE_PATH: 'extension' };
-        const invoke = (action, env, parent = false, reservation = parent ? '3' : '999999') => {
-          const result = spawnSync(parent ? 'python3' : process.execPath,
-            parent ? ['-B', script, action] : [hook, '--tls-link', action], { encoding: 'utf8', timeout: 30_000,
+        let invocation = 0;
+        const invoke = (action, env, native = false, reservation = native ? '3' : '999999') => {
+          const log = join(root, `fixture-native-${++invocation}.log`);
+          const result = spawnSync(process.execPath,
+            native ? ['--input-type=module', '-e', parent, linkedScripts, action, log] : [hook, '--tls-link', action], { encoding: 'utf8', timeout: 30_000,
             env: { ...env, POLARIS_BUILD_RESERVATION_FD: reservation ?? undefined },
-            stdio: ['ignore', 'pipe', 'pipe', parent && reservation === '3' ? fd : 'ignore'] });
+            stdio: ['ignore', 'pipe', 'pipe', native && reservation === '3' ? fd : 'ignore'] });
           assert.ifError(result.error);
           return result;
         };
@@ -667,7 +822,7 @@ exit 97
         const reservationProbe = platform === 'iphoneos' && present;
         const prepareEnv = { ...parentEnv };
         if (reservationProbe) {
-          for (const [reservation, reason] of [[null, /admitted parent reservation/], ['999999', /OSError: \[Errno 9\]/]]) {
+          for (const [reservation, reason] of [[null, /admitted parent reservation/], ['999999', /EBADF|bad file descriptor|reservation descriptor invalid/i]]) {
             const result = invoke('prepare', parentEnv, true, reservation);
             assert.equal(result.status, 1, result.stderr);
             assert.match(result.stderr, reason);
@@ -765,7 +920,7 @@ console.log('T ' + process.env.FIXTURE_SYMBOL);
           writeFileSync(finalExecutable, '');
           const empty = invoke('verify', { ...parentEnv, ...pins }, true);
           assert.equal(empty.status, 1, empty.stderr);
-          assert.match(empty.stderr, /bounded regular artifact required/);
+          assert.match(empty.stderr, /bounded regular original receipt or artifact required/);
           writeFileSync(finalExecutable, executable);
         }
 

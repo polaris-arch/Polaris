@@ -1,7 +1,15 @@
 import { closeSync, constants, fstatSync, openSync, readSync } from 'node:fs';
 import { crc32, inflateRawSync } from 'node:zlib';
 
-export function withIndexedZip(path, { maximum, subject }, inspect) {
+const utf8 = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
+const cp437 = 'ÇüéâäàåçêëèïîìÄÅÉæÆôöòûùÿÖÜ¢£¥₧ƒáíóúñÑªº¿⌐¬½¼¡«»░▒▓│┤╡╢╖╕╣║╗╝╜╛┐└┴┬├─┼╞╟╚╔╩╦╠═╬╧╨╤╥╙╘╒╓╫╪┘┌█▄▌▐▀αßΓπΣσµτΦΘΩδ∞φε∩≡±≥≤⌠⌡÷≈°∙·√ⁿ²■ ';
+
+export function zipName(bytes, flags) {
+  return flags & 0x800 ? utf8.decode(bytes) : Array.from(bytes, byte =>
+    byte < 128 ? String.fromCharCode(byte) : cp437[byte - 128]).join('');
+}
+
+export function openIndexedZip(path, { maximum, subject, decodeName }) {
   const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
     const file = fstatSync(fd);
@@ -11,9 +19,20 @@ export function withIndexedZip(path, { maximum, subject }, inspect) {
       if (readSync(fd, bytes, 0, length, offset) !== length) throw new Error(`truncated ${subject} ZIP bytes`);
       return bytes;
     };
-    return inspect(readZipEntries(file.size, read, { zip64: true, maxEntries: 65536 }), read);
-  } finally {
+    const entries = readZipEntries(file.size, read, { zip64: true, maxEntries: 65536, decodeName });
+    return { entries, read, close: () => closeSync(fd) };
+  } catch (error) {
     closeSync(fd);
+    throw error;
+  }
+}
+
+export function withIndexedZip(path, options, inspect) {
+  const { entries, read, close } = openIndexedZip(path, options);
+  try {
+    return inspect(entries, read);
+  } finally {
+    close();
   }
 }
 

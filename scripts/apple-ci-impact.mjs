@@ -14,7 +14,7 @@ export function appleRequired(paths, full = false) {
       || /^src-tauri\/(?:Cargo\.toml|build\.rs|tauri(?:\.ios)?\.conf\.json)$/.test(path)
       || ['.github/workflows/apple.yml', '.github/workflows/release-risk.yml',
         'scripts/apple-ci-impact.mjs', 'scripts/classify-ci-impact.mjs',
-        'scripts/apple-carrier.py', 'scripts/fetch-dashboard.mjs', 'scripts/fetch-protoc.mjs',
+        'scripts/apple-carrier.mjs', 'scripts/fetch-dashboard.mjs', 'scripts/fetch-protoc.mjs',
         'scripts/lib/extract-zip.mjs', 'scripts/lib/bounded-download.mjs', 'scripts/gate-node-test.sh'].includes(path);
   });
 }

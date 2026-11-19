@@ -17,10 +17,9 @@ Implementation lands in batches per system design §H (B0 scaffolding → B10 re
 | Tool | Version | Purpose |
 |---|---|---|
 | Rust | stable (edition 2021) | Backend + domain crates under `crates/` (plus `source-probe`, which is dev-only: it appears solely in `[dev-dependencies]` and never in a lib/bin dependency graph) |
-| Node.js | 24+ (CI pins 26) | Frontend build + fetch scripts |
-| pnpm | 11.24.0 (pinned by `ui/package.json`) | Frontend package management (`ui/`); the `beforeBuildCommand` of `tauri build` calls `pnpm` directly, so it must be on PATH |
+| Node.js | 24+ (CI pins 26) | Frontend builds, download scripts, mobile component builds and receipt verification |
+| pnpm | 12.21.0 (pinned by `ui/package.json`) | Frontend package management (`ui/`). The `beforeBuildCommand` of `tauri build` calls `pnpm` directly, so it must be on PATH |
 | Go | `goVersion` in the source manifest for the selected build path | Source builds and binary build-information inspection; desktop and mobile inputs are separate |
-| Python | 3 (full mobile host tests need 3.11+; CI uses 3.12) | Desktop pinned-source archive verification and mobile builders; the command is `python` on Windows and `python3` elsewhere |
 | [Tauri CLI 2](https://v2.tauri.app/) | Pinned by `scripts/tauri-cli.version` | `tauri build` packaging with the global CLI |
 
 Install the global CLI from the repository root. The CLI is no longer a `ui/` devDependency; desktop and Android CI install the same pinned version.
@@ -197,11 +196,11 @@ Old-name copies and extra files are rejected.
 
 ### Mobile source-build prerequisites
 
-Desktop sidecar downloads do not supply mobile bindings. The current common inputs are defined by [source-contract.json](../scripts/mobile-core/source-contract.json) and the [mobile core build guide](../scripts/mobile-core/README.md): pinned sing-box-polaris source, Go 1.27.2, and gomobile/gobind v0.1.13. Build and verify the component and its original receipt before App consumption.
+Build the mobile bindings with the pinned sing-box-polaris source, Go and gomobile/gobind. Verify the component and its original receipt before the App consumes them. See the [source contract](../scripts/mobile-core/source-contract.json) and the [mobile core build guide](../scripts/mobile-core/README.md) for input versions and full arguments.
 
 - **Android bindings**: API 24 AAR, Java 17 (CI pins 17.0.20+101), and stable NDK r30 (complete source revision 30.0.16248370). The AAR contains ARM64, ARMv7, x86 and x86_64; this does not widen the two-ARM-ABI signed APK scope.
 - **Android App**: Gradle uses JDK 21 and currently SDK/Build Tools 36 / 36.0.0. Rust uses 27.3.13750724 pinned by [android-rust-ndk.version](../scripts/android-rust-ndk.version), separately from the binding NDK. The App minimum is API 24.
-- **Component preparation order**: the shared entry is `bash scripts/build-mobile-core.sh android`, with explicit existing source, Go, gomobile, gobind, SDK, NDK, JDK and work/cache paths (full arguments in the mobile core guide). Then `scripts/mobile-core/consume.py materialize-android` verifies the component and receipt before materializing App inputs; CI orchestrates this through `ci_android.py prepare/build`. Copying an arbitrary AAR to `libbox.aar` does not satisfy source verification.
+- For local Android component builds, first run `bash scripts/build-mobile-core.sh android` with explicit source, Go, gomobile, gobind, SDK, NDK, JDK, work and cache paths. Then run `node scripts/mobile-core/mobile-consumption.mjs materialize-android` to verify the component and receipt and write the App inputs. Hosted CI runs `node scripts/mobile-core/android-ci.mjs` to check source and tools and calculate the cache key, then invokes the Node producer and consumer directly.
 - **iOS / iPadOS**: see [iOS source builds](ios-source-build.md) for the source entry, pinned Xcode/SDK, ARM64 device/simulator targets and personal signing requirements. Source-build documentation is available without a published IPA; compile/link, signing, device installation and runtime acceptance are distinct stages.
 
 ### Android signed-release builds from current source

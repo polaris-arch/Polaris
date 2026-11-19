@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
-import { appendFileSync, chmodSync, copyFileSync, existsSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, writeFileSync, mkdirSync, rmSync, symlinkSync, unlinkSync } from 'node:fs';
+import { appendFileSync, chmodSync, closeSync, copyFileSync, existsSync, mkdtempSync, openSync, readFileSync, readdirSync, realpathSync, renameSync, statfsSync, writeFileSync, mkdirSync, rmSync, symlinkSync, unlinkSync } from 'node:fs';
 import { devNull, tmpdir } from 'node:os';
 import { delimiter, dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -10,10 +10,476 @@ import { once } from 'node:events';
 import { setTimeout as delay } from 'node:timers/promises';
 import { boundedDownload, DOWNLOAD_TIMEOUT_MS } from './lib/bounded-download.mjs';
 import { verifyDashboardArchive, dashboardInventory, dashboardFresh } from './fetch-dashboard.mjs';
-import { inspectAppleArchitecture } from './mobile-core/apple-admission.mjs';
+import { inspectAppleArchitecture, writeReceipt } from './mobile-core/apple-admission.mjs';
+import { AppleBuildInfoBatch, canonical, collectNativeInputs, readReceipt, receiptChunks,
+  receiptDigest, receiptFieldBytes, treeInventory, verifyNativeBuildInfo, verifyNativeInputs } from './mobile-core/component-admission.mjs';
 import { checkMobileBuildInfo, parseMobileBuildInfo, reviewedSource, validateMobileSource } from './mobile-core/source-admission.mjs';
+import { createNativeRunner, groupAlive, nativeCapacity, nativeEnvironment } from './mobile-core/native-runner.mjs';
 const nativeId = 'polaris-mobile-' + 'a'.repeat(64);
 const requiredNative = ['github.com/metacubex/utls', 'github.com/sagernet/sing-tun'];
+
+test('mobile native capacity observes cgroup ancestors and Darwin reclaimable pages', () => {
+  const gib = 1024 ** 3;
+  const settings = new Map(Object.entries({
+    '/proc/self/status': 'Cpus_allowed_list:\t0-6,10\n',
+    '/proc/self/cgroup': '0::/runner/job\n',
+    '/proc/meminfo': 'MemAvailable: 16777216 kB\n',
+    '/sys/fs/cgroup/runner/job/cpu.max': 'max 100000\n',
+    '/sys/fs/cgroup/runner/cpu.max': '200000 100000\n',
+    '/sys/fs/cgroup/cpu.max': 'max 100000\n',
+    '/sys/fs/cgroup/runner/memory.max': String(7 * gib),
+    '/sys/fs/cgroup/runner/memory.current': String(2 * gib),
+  }));
+  const linux = () => nativeCapacity({ platform: 'linux', logicalCPUs: 16, load1: 0, read: path => settings.get(path) ?? '' });
+  const v2 = linux();
+  assert.equal(v2.affinityCPUs, 8);
+  assert.equal(v2.quotaCPUs, 2);
+  assert.equal(v2.jobCap, 2);
+  assert.equal(v2.availableMemoryBytes, 5 * gib);
+  assert.equal(v2.osMemoryObservationBytes, 16 * gib);
+  assert.deepEqual(v2.cgroupMemoryConstraints[0], { version: 2, path: '/sys/fs/cgroup/runner',
+    limitBytes: 7 * gib, usageBytes: 2 * gib, headroomBytes: 5 * gib });
+  settings.set('/proc/self/cgroup', '2:cpu,cpuacct:/job\n3:memory:/job\n');
+  settings.set('/sys/fs/cgroup/cpu,cpuacct/job/cpu.cfs_quota_us', '350000');
+  settings.set('/sys/fs/cgroup/cpu,cpuacct/job/cpu.cfs_period_us', '100000');
+  settings.set('/sys/fs/cgroup/memory/job/memory.limit_in_bytes', String(6 * gib));
+  settings.set('/sys/fs/cgroup/memory/job/memory.usage_in_bytes', String(gib));
+  settings.set('/sys/fs/cgroup/memory/memory.limit_in_bytes', '9223372036854771712');
+  settings.set('/sys/fs/cgroup/memory/memory.usage_in_bytes', '1');
+  const v1 = linux();
+  assert.equal(v1.cgroupVersion, 1);
+  assert.equal(v1.quotaCPUs, 3.5);
+  assert.equal(v1.jobCap, 2);
+  assert.equal(v1.memorySource, 'cgroup-v1-headroom');
+  assert.match(JSON.stringify(v1), /"limitBytes":9223372036854771712/);
+  settings.clear();
+  assert.deepEqual(linux().unknown, ['memory', 'cpu-quota', 'container-memory']);
+  assert.equal(linux().jobCap, 1);
+
+  const vm = 'Mach Virtual Memory Statistics: (page size of 16384 bytes)\n' +
+    'Pages free: 300000.\nPages inactive: 600000.\nPages speculative: 0.\nPages wired down: 9999.\n';
+  const darwin = nativeCapacity({ platform: 'darwin', logicalCPUs: 8, load1: 1, observeVM: () => vm });
+  assert.equal(darwin.jobCap, 6);
+  assert.equal(darwin.availableMemoryBytes, 900_000 * 16_384);
+  assert.equal(darwin.osMemoryObservationKind, 'reclaimable-page-subset-not-complete-available-memory');
+  assert.equal(nativeCapacity({ platform: 'darwin', observeVM: () => '' }).jobCap, 1);
+  const original = { CARGO_BUILD_JOBS: '2', GOMAXPROCS: '99', DO_NOT_EXPORT_SECRET: 'fixture' };
+  const applied = nativeEnvironment(original, darwin);
+  assert.deepEqual(applied.env, { ...original, GOMAXPROCS: '6' });
+  assert.deepEqual(applied.observation.appliedEnvironment, { CARGO_BUILD_JOBS: 2, GOMAXPROCS: 6 });
+  assert.equal(original.GOMAXPROCS, '99');
+  assert.doesNotMatch(JSON.stringify(applied.observation), /DO_NOT_EXPORT_SECRET/);
+  for (const invalid of ['0', '-1', 'auto', '١', '', true, 2]) {
+    assert.throws(() => nativeEnvironment({ GOMAXPROCS: invalid }, darwin), /positive integer/);
+  }
+});
+
+const nativeContract = { budget: { buildPeakReserveBytes: 1024, cacheMaxBytes: 1024 } };
+const nativeRunnerURL = new URL('./mobile-core/native-runner.mjs', import.meta.url).href;
+const unixNative = ['linux', 'darwin'].includes(process.platform);
+
+function nativeFixture(t) {
+  const folder = mkdtempSync(join(realpathSync(tmpdir()), 'polaris-native-scope-'));
+  t.after(() => rmSync(folder, { recursive: true, force: true }));
+  const env = { ...process.env, POLARIS_BUILD_BUDGET_ROOT: join(folder, 'budget') };
+  delete env.POLARIS_BUILD_RESERVATION_FD;
+  return { folder, env };
+}
+
+test('mobile producer retains held reservation identity and projects pressured original streams in order',
+  { skip: !unixNative }, async t => {
+    const { folder, env } = nativeFixture(t);
+    const runner = createNativeRunner({ env });
+    const work = join(folder, 'work'), cache = join(folder, 'cache'), log = join(work, 'original.log');
+    assert.equal(runner.hasReservation(), false);
+    let release, late;
+    await runner.withLease(work, cache, nativeContract, async () => {
+      assert.equal(runner.hasReservation(), true);
+      late = new Promise(resolve => { release = resolve; }).then(() => runner.run([process.execPath, '-v']));
+      const second = createNativeRunner({ env });
+      await assert.rejects(second.withReservation(work, nativeContract, () => assert.fail('double lease admitted')), /already owns/);
+      await assert.rejects(second.withReservation(join(folder, 'different-work'), nativeContract,
+        () => assert.fail('peak oversold'), { reserveBytes: Number.MAX_SAFE_INTEGER }), /exhaust free space/);
+      const nested = await runner.run([process.execPath, '--input-type=module', '-e', `
+        import { createNativeRunner } from ${JSON.stringify(nativeRunnerURL)};
+        const child = createNativeRunner();
+        await child.withReservation(${JSON.stringify(join(folder, 'nested'))}, ${JSON.stringify(nativeContract)}, async () => {
+          if (!process.env.POLARIS_BUILD_RESERVATION_FD) process.exit(9);
+          console.log('nested');
+        });
+      `]);
+      assert.equal(nested, 'nested\n');
+      const paths = readdirSync(env.POLARIS_BUILD_BUDGET_ROOT).filter(path => path.endsWith('.reservation'));
+      const row = paths.map(path => join(env.POLARIS_BUILD_BUDGET_ROOT, path))
+        .find(path => readFileSync(path, 'utf8').includes(JSON.stringify(work)));
+      chmodSync(row, 0o644);
+      try {
+        await assert.rejects(runner.withReservation(join(folder, 'nested'), nativeContract,
+          () => assert.fail('insecure inherited lease admitted')), /identity differs/);
+      } finally {
+        chmodSync(row, 0o600);
+      }
+      await runner.run([process.execPath, '-e', `
+        process.stderr.write('first stderr\\r\\n');
+        process.stdout.write(Buffer.alloc(3 * 1024 * 1024, 97));
+        process.stdout.write('💡\\r\\n');
+        process.stderr.write('last stderr');
+      `], { log, capture: 'none' });
+      await runner.run([process.execPath, '-e', "process.stdout.write('second stdout')"], { log, capture: 'none' });
+      const first = Buffer.concat([Buffer.alloc(3 * 1024 * 1024, 97), Buffer.from('💡\r\n')]);
+      const stderr = Buffer.from('first stderr\r\nlast stderr');
+      assert.deepEqual(readFileSync(log), Buffer.concat([first, stderr, Buffer.from('second stdout')]));
+      assert.deepEqual(readFileSync(log + '.stdout.raw'), Buffer.concat([first, Buffer.from('second stdout')]));
+      assert.deepEqual(readFileSync(log + '.stderr.raw'), stderr);
+      await assert.rejects(runner.run([process.execPath, '-e', "console.error('real failure'); process.exit(4)"]),
+        /actual tool failed.*real failure/);
+      const invalid = join(work, 'invalid.log');
+      await assert.rejects(runner.run([process.execPath, '-e', 'process.stdout.write(Buffer.from([0xff, 0xfe]))'],
+        { log: invalid, capture: 'none' }), /encoded data/);
+      assert.deepEqual(readFileSync(invalid), Buffer.from([0xff, 0xfe]));
+      assert.deepEqual(JSON.parse(readFileSync(row, 'utf8')).groups, []);
+      const progressPath = join(work, 'progress');
+      const progressFd = openSync(progressPath, 'w');
+      try {
+        const output = await runner.run([process.execPath, '-e', `
+          const fs = require('node:fs');
+          if (process.env.POLARIS_BUILD_RESERVATION_FD !== '4') process.exit(4);
+          fs.writeSync(3, 'original side channel\\n');
+          console.log('original stdout');
+        `], { progressFd: { fd: progressFd, childFd: 3 }, observationPhase: 'carrier-command' });
+        assert.equal(output, 'original stdout\n');
+      } finally {
+        closeSync(progressFd);
+      }
+      const progressRows = readFileSync(progressPath, 'utf8').trim().split('\n');
+      assert.ok(progressRows.includes('original side channel'));
+      const observations = progressRows.filter(row => row.startsWith('APPLE_TOOL_PROGRESS='))
+        .map(row => JSON.parse(row.slice('APPLE_TOOL_PROGRESS='.length)));
+      assert.deepEqual(observations.map(row => row.event), ['start', 'waiting', 'end']);
+      assert.equal(observations[2].stdoutBytes, 'original stdout\n'.length);
+    });
+    assert.equal(JSON.parse(readFileSync(join(work, 'budget-observation.json'), 'utf8')).cleanupPerformed, false);
+    assert.equal(runner.hasReservation(), false);
+    release();
+    await assert.rejects(late, /native reservation scope already closed/);
+  });
+
+test('mobile bounded collectors retain an exact capped prefix and wait for original group cleanup',
+  { skip: !unixNative }, async t => {
+    const { env } = nativeFixture(t), runner = createNativeRunner({ env });
+    const chunks = [];
+    const append = part => { chunks.push(part); };
+    const capped = await runner.runBounded([process.execPath, '-e',
+      "process.stdout.write(Buffer.from('abcdefghijkl')); setInterval(() => {}, 1000)"], {
+      stdoutLimit: 9, stderrLimit: 0, onStdout: append, onStdoutOverflow: append, chunkBytes: 4,
+    });
+    assert.deepEqual(capped, { complete: false, reason: 'stdout-budget', cleanupComplete: true,
+      stdoutBytesObserved: 10, stderrBytesObserved: 0 });
+    assert.equal(Buffer.concat(chunks).toString(), 'abcdefghij');
+    const stderr = await runner.runBounded([process.execPath, '-e', "process.stderr.write('a private error')"],
+      { stdoutLimit: 32, stderrLimit: 4 });
+    assert.deepEqual(stderr, { complete: false, reason: 'stderr-budget', cleanupComplete: true,
+      stdoutBytesObserved: 0, stderrBytesObserved: 5 });
+    const timed = await runner.runBounded([process.execPath, '-e', 'setInterval(() => {}, 1000)'],
+      { stdoutLimit: 32, stderrLimit: 32, timeoutSeconds: 0.15, cleanupSeconds: 1 });
+    assert.deepEqual(timed, { complete: false, reason: 'deadline', cleanupComplete: true,
+      stdoutBytesObserved: 0, stderrBytesObserved: 0 });
+  });
+
+test('mobile producer counts competing live slots against one actual filesystem peak',
+  { skip: !unixNative }, async t => {
+    const { folder, env } = nativeFixture(t);
+    const { bavail, frsize } = statfsSync(folder, { bigint: true });
+    const available = bavail * frsize - 1024n ** 3n;
+    const reserveBytes = Number(available * 3n / 5n);
+    assert.ok(Number.isSafeInteger(reserveBytes) && reserveBytes > 0, 'fixture filesystem has observed build headroom');
+    const first = createNativeRunner({ env }), second = createNativeRunner({ env });
+    const left = join(folder, 'left'), right = join(folder, 'right');
+    const peak = { reserveBytes };
+    await second.withReservation(right, nativeContract, () => {}, peak);
+    await first.withReservation(left, nativeContract, async () => {
+      await assert.rejects(second.withReservation(right, nativeContract, () => assert.fail('same peak sold twice'), peak),
+        /shared filesystem peak reservations exhaust free space/);
+    }, peak);
+    await second.withReservation(right, nativeContract, () => {}, peak);
+  });
+
+test('mobile producer SIGTERM waits for native child and descendants before clearing the journal',
+  { skip: !unixNative }, async t => {
+    const { folder, env } = nativeFixture(t);
+    const work = join(folder, 'work'), ready = join(folder, 'ready');
+    const descendant = `
+      const fs = require('node:fs');
+      process.once('SIGTERM', () => process.exit(0));
+      fs.writeFileSync(${JSON.stringify(ready)}, process.pid + '\\n');
+      setInterval(() => {}, 1000);
+    `;
+    const tool = `
+      const { spawn } = require('node:child_process');
+      process.on('SIGTERM', () => {});
+      const child = spawn(process.execPath, ['-e', ${JSON.stringify(descendant)}], { stdio: 'inherit' });
+      child.once('exit', () => process.exit(143));
+    `;
+    const fixture = `
+      import { createNativeRunner } from ${JSON.stringify(nativeRunnerURL)};
+      const runner = createNativeRunner();
+      try {
+        await runner.withReservation(${JSON.stringify(work)}, ${JSON.stringify(nativeContract)}, () =>
+          runner.run([process.execPath, '-e', ${JSON.stringify(tool)}]));
+      } catch (error) {
+        if (error.message !== 'native operation interrupted') throw error;
+        process.exitCode = 5;
+      }
+    `;
+    const child = spawn(process.execPath, ['--input-type=module', '-e', fixture], { env, stdio: 'pipe' });
+    let completed = false, pgid;
+    const done = once(child, 'close');
+    try {
+      for (let retries = 0; retries < 300 && !existsSync(ready); retries++) await delay(20);
+      assert.ok(existsSync(ready), 'nested native process started');
+      const budget = env.POLARIS_BUILD_BUDGET_ROOT;
+      const name = readdirSync(budget).find(path => path.endsWith('.reservation'));
+      const journal = join(budget, name);
+      [pgid] = JSON.parse(readFileSync(journal, 'utf8')).groups;
+      const member = Number(readFileSync(ready, 'utf8'));
+      assert.ok(groupAlive(pgid));
+      assert.doesNotThrow(() => process.kill(member, 0));
+      child.kill('SIGTERM');
+      assert.deepEqual(await done, [5, null]);
+      completed = true;
+      assert.equal(groupAlive(pgid), false);
+      assert.throws(() => process.kill(member, 0), { code: 'ESRCH' });
+      assert.deepEqual(JSON.parse(readFileSync(journal, 'utf8')).groups, []);
+      await createNativeRunner({ env }).withReservation(work, nativeContract, () => {});
+    } finally {
+      if (!completed) {
+        if (pgid && groupAlive(pgid)) process.kill(-pgid, 'SIGKILL');
+        child.kill('SIGKILL');
+        await done;
+      }
+    }
+  });
+
+test('mobile producer preserves the original cancellation and cleanup errors independently',
+  { skip: !unixNative }, async t => {
+    const { folder, env } = nativeFixture(t);
+    const work = join(folder, 'work'), ready = join(folder, 'ready'), log = join(folder, 'original.log');
+    const controller = new AbortController();
+    const runner = createNativeRunner({ env, signal: controller.signal });
+    const tool = `
+      process.once('SIGTERM', () => {
+        process.stderr.write(Buffer.from([0xff]), () => process.exit(0));
+      });
+      require('node:fs').writeFileSync(${JSON.stringify(ready)}, process.pid + '\\n');
+      setInterval(() => {}, 1000);
+    `;
+    const original = new Error('original caller cancellation');
+    await runner.withReservation(work, nativeContract, async () => {
+      const operation = runner.run([process.execPath, '-e', tool], { log, capture: 'none', timeoutSeconds: 12 });
+      const refused = assert.rejects(operation, error => {
+        assert.equal(error.message, 'native operation interrupted');
+        assert.equal(error.cause, original);
+        assert.equal(error.secondary.length, 1);
+        assert.match(error.secondary[0].message, /encoded data/);
+        return true;
+      });
+      let pid;
+      try {
+        for (let attempts = 0; attempts < 200 && !existsSync(ready); attempts++) await delay(15);
+        assert.ok(existsSync(ready), 'tool is ready to report secondary failure while draining');
+        pid = Number(readFileSync(ready, 'utf8'));
+        assert.ok(groupAlive(pid));
+      } finally {
+        controller.abort(original);
+        await refused;
+      }
+      assert.equal(groupAlive(pid), false);
+      assert.deepEqual(readFileSync(log), Buffer.from([0xff]));
+      assert.deepEqual(readFileSync(log + '.stderr.raw'), Buffer.from([0xff]));
+    });
+    const second = createNativeRunner({ env });
+    await second.withReservation(work, nativeContract, () => {});
+  });
+
+test('mobile component receipts preserve legacy canonical bytes and refuse unbound layouts', t => {
+  const root = mkdtempSync(join(tmpdir(), 'mobile-component-receipt-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const value = { schema: 'small-control', utf8: '中文', number: 1.25, nested: [null, true, { b: 2, a: 1 }] };
+  const frozen = '{"nested":[null,true,{"a":1,"b":2}],"number":1.25,"schema":"small-control","utf8":"中文"}';
+  assert.equal(canonical(value).toString(), frozen);
+  assert.equal(receiptDigest(value), createHash('sha256').update(frozen).digest('hex'));
+  assert.deepEqual(receiptFieldBytes(value), { schema: 15, utf8: 8, number: 4, nested: 25 });
+  const receipt = join(root, 'receipt.json');
+  writeReceipt(receipt, value);
+  assert.equal(readFileSync(receipt, 'utf8').includes('\\u4e2d\\u6587'), true);
+  assert.deepEqual(readFileSync(receipt), Buffer.concat([...receiptChunks(value, { pretty: true })]));
+  assert.equal(canonical(readReceipt(receipt)).toString(), frozen);
+  const original = readFileSync(receipt);
+  for (const bad of [{ raw: 'x'.repeat(1024 ** 2 + 1) }, { raw: Infinity }, { raw: 1n << 257n }]) {
+    assert.throws(() => writeReceipt(receipt, bad), /receipt JSON/);
+    assert.deepEqual(readFileSync(receipt), original);
+    assert.equal(existsSync(receipt + '.tmp'), false);
+  }
+  for (const raw of ['[]', '{"a":1,"a":2}', '{"a":NaN}', '['.repeat(65) + '0' + ']'.repeat(65), '']) {
+    writeFileSync(receipt, raw);
+    assert.throws(() => readReceipt(receipt));
+  }
+});
+
+test('mobile native provenance still binds original files and bounded relative framework links', { skip: process.platform === 'win32' }, async t => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'mobile-component-native-')));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const cache = join(root, 'cache'), scratch = join(root, 'scratch'), work = join(scratch, 'work');
+  mkdirSync(cache);
+  mkdirSync(work, { recursive: true });
+  const object = join(work, 'module.o'), log = join(scratch, 'original-bind.log');
+  writeFileSync(object, 'original object');
+  writeFileSync(log, 'WORK=' + work + '\n');
+  const facts = await collectNativeInputs({ scratch, log, platform: 'android', cache });
+  await verifyNativeInputs({ facts, scratch, log });
+  writeFileSync(object, 'modified object');
+  await assert.rejects(verifyNativeInputs({ facts, scratch, log }), /actual native input bytes changed/);
+  const framework = join(root, 'Libbox.framework');
+  mkdirSync(join(framework, 'Versions/A'), { recursive: true });
+  writeFileSync(join(framework, 'Versions/A/Libbox'), 'static original');
+  writeFileSync(join(framework, 'Versions/A/empty'), '');
+  symlinkSync('A', join(framework, 'Versions/Current'));
+  symlinkSync('Versions/Current/Libbox', join(framework, 'Libbox'));
+  const inventory = treeInventory(framework);
+  assert.equal(inventory.find(row => row.path === 'Libbox').target, 'Versions/Current/Libbox');
+  assert.equal(inventory.find(row => row.path === 'Versions/A/empty').bytes, 0);
+  symlinkSync(object, join(framework, 'escape'));
+  assert.throws(() => treeInventory(framework), /inside the same component/);
+});
+
+test('mobile producer reports the original nonzero tool exit while cleaning its remaining group',
+  { skip: !unixNative }, async t => {
+    const { folder, env } = nativeFixture(t);
+    const work = join(folder, 'work'), ready = join(folder, 'group'), terminated = join(folder, 'terminated');
+    const log = join(folder, 'native.log');
+    const original = 'original tool cache verification failed';
+    const descendant = `
+      const fs = require('node:fs');
+      process.on('SIGTERM', () => {
+        fs.writeFileSync(${JSON.stringify(terminated)}, 'done');
+        process.exit(0);
+      });
+      fs.writeFileSync(${JSON.stringify(ready)}, String(process.ppid));
+      setInterval(() => {}, 1000);
+    `;
+    const primary = `
+      const { spawn } = require('node:child_process');
+      const { existsSync } = require('node:fs');
+      spawn(process.execPath, ['-e', ${JSON.stringify(descendant)}], { stdio: 'ignore' }).unref();
+      const ready = setInterval(() => {
+        if (!existsSync(${JSON.stringify(ready)})) return;
+        clearInterval(ready);
+        process.stderr.write(${JSON.stringify(original + '\n')}, () => process.exit(7));
+      }, 20);
+    `;
+    const runner = createNativeRunner({ env });
+    await runner.withReservation(work, nativeContract, async () => {
+      await assert.rejects(runner.run([process.execPath, '-e', primary], {
+        log, capture: 'none', timeoutSeconds: 5,
+      }), error => {
+        assert.match(error.message, /actual tool failed/);
+        assert.ok(error.message.includes(original));
+        return true;
+      });
+      const group = Number(readFileSync(ready, 'utf8'));
+      assert.equal(groupAlive(group), false);
+      assert.equal(readFileSync(terminated, 'utf8'), 'done');
+      assert.equal(readFileSync(log, 'utf8'), original + '\n');
+      const budget = env.POLARIS_BUILD_BUDGET_ROOT;
+      const journal = readdirSync(budget).find(path => path.endsWith('.reservation'));
+      assert.deepEqual(JSON.parse(readFileSync(join(budget, journal), 'utf8')).groups, []);
+    });
+  });
+
+test('mobile producer joins a managed wrapper before reporting nested cleanup complete',
+  { skip: !unixNative }, async t => {
+    const { folder, env } = nativeFixture(t);
+    const work = join(folder, 'work'), ready = join(folder, 'ready');
+    const finished = join(folder, 'finished'), termMarker = join(folder, 'term');
+    const leaf = `
+      const fs = require('node:fs');
+      process.on('SIGTERM', () => fs.writeFileSync(${JSON.stringify(termMarker)}, 'received'));
+      fs.writeFileSync(${JSON.stringify(ready)}, String(process.pid));
+      setInterval(() => {}, 1000);
+    `;
+    const wrapper = `
+      import { createNativeRunner, groupAlive } from ${JSON.stringify(nativeRunnerURL)};
+      import { readFileSync, writeFileSync } from 'node:fs';
+      const runner = createNativeRunner();
+      await runner.withReservation(${JSON.stringify(work)}, ${JSON.stringify(nativeContract)}, async () => {
+        const result = await runner.runBounded([process.execPath, '-e', ${JSON.stringify(leaf)}],
+          { stdoutLimit: 32, stderrLimit: 32, cleanupSeconds: 0.6 });
+        const leaf = Number(readFileSync(${JSON.stringify(ready)}, 'utf8'));
+        writeFileSync(${JSON.stringify(finished)}, JSON.stringify({ ...result, leafGone: !groupAlive(leaf) }));
+      });
+      process.exitCode = 7;
+    `;
+    const controller = new AbortController(), runner = createNativeRunner({ env, signal: controller.signal });
+    await runner.withReservation(work, nativeContract, async () => {
+      const pending = runner.runBounded([process.execPath, '--input-type=module', '-e', wrapper], {
+        stdoutLimit: 32, stderrLimit: 1024, cleanupSeconds: 0.6, downstreamCleanupSeconds: 0.65,
+      });
+      let group;
+      try {
+        for (let attempt = 0; attempt < 300 && !existsSync(ready); attempt++) await delay(20);
+        assert.ok(existsSync(ready), 'TERM-resistant nested native leaf started');
+        group = Number(readFileSync(ready, 'utf8'));
+        assert.ok(groupAlive(group));
+        controller.abort(new Error('original caller cancellation'));
+        const result = await pending;
+        assert.equal(result.reason, 'interrupted');
+        assert.equal(result.cleanupComplete, true);
+        assert.equal(groupAlive(group), false, 'outer cleanup waits for the original detached leaf');
+        assert.equal(readFileSync(termMarker, 'utf8'), 'received');
+        assert.deepEqual(JSON.parse(readFileSync(finished, 'utf8')), {
+          complete: false, reason: 'interrupted', cleanupComplete: true, stdoutBytesObserved: 0,
+          stderrBytesObserved: 0, leafGone: true,
+        });
+      } finally {
+        controller.abort();
+        await pending;
+        if (group && groupAlive(group)) process.kill(-group, 'SIGKILL');
+      }
+    });
+  });
+
+test('mobile producer retains uncertain cleanup after forcing a managed wrapper to exit',
+  { skip: !unixNative }, async t => {
+    const { folder, env } = nativeFixture(t);
+    const ready = join(folder, 'wrapper'), work = join(folder, 'work');
+    const wrapper = `
+      process.on('SIGTERM', () => {});
+      require('node:fs').writeFileSync(${JSON.stringify(ready)}, String(process.pid));
+      setInterval(() => {}, 1000);
+    `;
+    const controller = new AbortController(), runner = createNativeRunner({ env, signal: controller.signal });
+    await runner.withReservation(work, nativeContract, async () => {
+      const pending = runner.runBounded([process.execPath, '-e', wrapper], {
+        stdoutLimit: 32, stderrLimit: 32, cleanupSeconds: 0.6, downstreamCleanupSeconds: 0.6,
+      });
+      try {
+        for (let attempt = 0; attempt < 300 && !existsSync(ready); attempt++) await delay(20);
+        assert.ok(existsSync(ready), 'managed wrapper ready before cancellation');
+        const group = Number(readFileSync(ready, 'utf8'));
+        controller.abort();
+        const { reason, cleanupComplete } = await pending;
+        assert.equal(reason, 'cleanup-incomplete');
+        assert.equal(cleanupComplete, false);
+        assert.equal(groupAlive(group), false, 'only this direct group is proven closed');
+        const budget = env.POLARIS_BUILD_BUDGET_ROOT;
+        const journal = readdirSync(budget).find(path => path.endsWith('.reservation'));
+        assert.deepEqual(JSON.parse(readFileSync(join(budget, journal), 'utf8')).groups, [group]);
+      } finally {
+        controller.abort();
+        await pending;
+      }
+    });
+  });
 
 test('mobile module list admits exact Go rows and rejects ambiguous or incomplete output', t => {
   const folder = mkdtempSync(join(tmpdir(), 'mobile-module-list-'));
@@ -108,7 +574,7 @@ test('reviewed source observes every vendor object and enforces the independent 
     assert.equal(observation.replacementFileCount, 355);
     assert.deepEqual(observation.vendors, Object.fromEntries(vendors.map(([name, pin]) =>
       [name, { path: pin.replacementPath, tree: pin.replacementTree, files: pin.replacementFileCount }])));
-    await t.test('both live hosted adapters admit the same annotated checkout and canonical receipt', () => {
+    await t.test('both hosted platform slots admit the same annotated checkout and canonical receipt', () => {
       // The origin retains the pinned object but advertises a different tag.
       // Remap only this fixture's fetch to local Git while recording exact argv.
       tag('--force', '-m', 'different advertised tag');
@@ -132,22 +598,23 @@ if (fetch >= 0) {
 const result = spawnSync(${JSON.stringify(actualGit)}, args, { stdio: 'inherit' });
 process.exit(result.status ?? 94);
 `, { mode: 0o700 });
-      const mobileDir = fileURLToPath(new URL('mobile-core/', import.meta.url));
-      const envWithTrap = { ...env, PATH: wrapperDir + delimiter + env.PATH, PYTHONPATH: mobileDir,
+      const forkInput = new URL('mobile-core/fork-input.mjs', import.meta.url).href;
+      const envWithTrap = { ...env, PATH: wrapperDir + delimiter + env.PATH,
         GIT_DIR: join(folder, 'wrong.git'), GIT_WORK_TREE: join(folder, 'wrong-worktree') };
-      const input = JSON.stringify(source);
-      function adapter(owner, slot, value = source) {
-        return spawnSync('python3', ['-B', '-c',
-          'import importlib,json,sys; from fork_input import canonical,verify_source; ' +
-          'value=json.load(sys.stdin); source=sys.argv[2]; owner=importlib.import_module(sys.argv[1]); ' +
-          'print(json.dumps([owner.prepare_source(source,value), verify_source(source,value), canonical(value).decode()]))',
-          owner, slot], { cwd: folder, env: envWithTrap, input: JSON.stringify(value), encoding: 'utf8', timeout: 30_000 });
+      function adapter(slot, value = source) {
+        return spawnSync(process.execPath, ['--input-type=module', '-e', `
+          import { readFileSync } from 'node:fs';
+          import { canonical, prepareSource, verifySource } from ${JSON.stringify(forkInput)};
+          const value = JSON.parse(readFileSync(0, 'utf8'));
+          const slot = process.argv[1];
+          console.log(JSON.stringify([await prepareSource(slot, value), await verifySource(slot, value), canonical(value).toString()]));
+        `, slot], { cwd: folder, env: envWithTrap, input: JSON.stringify(value), encoding: 'utf8', timeout: 30_000 });
       }
       const requested = ['fetch', '--depth=1', '--no-tags', source.sourceURL, source.sourceTagObject + ':' + ref];
       const android = join(folder, 'android-source'), apple = join(folder, 'apple-source');
       let canonical;
-      for (const [owner, slot] of [['ci_android', android], ['ci_apple', apple]]) {
-        const prepared = adapter(owner, slot);
+      for (const slot of [android, apple]) {
+        const prepared = adapter(slot);
         assert.equal(prepared.status, 0, prepared.stderr);
         const [receipt, verified, bytes] = JSON.parse(prepared.stdout);
         canonical = bytes;
@@ -162,7 +629,7 @@ process.exit(result.status ?? 94);
       }
       const fetches = () => readFileSync(fetchLog, 'utf8').trim().split('\n').map(line => JSON.parse(line));
       assert.deepEqual(fetches(), [requested, requested]);
-      assert.equal(adapter('ci_android', android).status, 0); // Warm source never refetches the moved tag.
+      assert.equal(adapter(android).status, 0); // Warm source never refetches the moved tag.
       assert.deepEqual(fetches(), [requested, requested]);
 
       const script = fileURLToPath(new URL('mobile-core/source-admission.mjs', import.meta.url));
@@ -198,22 +665,22 @@ process.exit(result.status ?? 94);
 
       const invalid = { ...source, declaredTagsSource: { ...source.declaredTagsSource, sha256: 'invalid' } };
       const untouched = join(folder, 'invalid-source');
-      refuse(adapter('ci_apple', untouched, invalid), /tags declaration differs/);
+      refuse(adapter(untouched, invalid), /tags declaration differs/);
       assert.equal(existsSync(untouched), false);
-      refuse(adapter('ci_apple', untouched, { ...source, extra: 'x'.repeat(65536) }), /mobile input contract is too large/);
+      refuse(adapter(untouched, { ...source, extra: 'x'.repeat(65536) }), /mobile input contract is too large/);
       assert.equal(existsSync(untouched), false);
       const redirectedSlot = join(folder, 'redirected-source');
       symlinkSync(join(folder, 'outside-source-slot'), redirectedSlot, 'dir');
-      refuse(adapter('ci_android', redirectedSlot), /source slot is redirected/);
+      refuse(adapter(redirectedSlot), /source slot is redirected/);
       assert.equal(existsSync(join(folder, 'outside-source-slot')), false);
       const absent = { ...source, sourceTagObject: 'b'.repeat(40) };
       const rejected = join(folder, 'missing-object-source');
-      refuse(adapter('ci_android', rejected, absent), /immutable tag fetch failed/);
+      refuse(adapter(rejected, absent), /immutable tag fetch failed/);
       assert.deepEqual(fetches(), [requested, requested, [...requested.slice(0, -1), absent.sourceTagObject + ':' + ref]]);
-      refuse(adapter('ci_apple', rejected, absent), /Git verification failed/);
+      refuse(adapter(rejected, absent), /Git verification failed/);
       assert.equal(fetches().length, 3); // An occupied rejected slot stays rejected; no branch fallback.
       assert(!readdirSync(folder).some(name => name.startsWith('.mobile-source-declaration-')));
-      assert.notEqual(canonical, input); // The adapter's exact canonical bytes, not input formatting, were hashed.
+      assert.notEqual(canonical, JSON.stringify(source));
     });
     const refuse = reason => assert.throws(observe, reason);
     const target = 'third_party/sing/package.txt';
@@ -288,7 +755,7 @@ function verifyMobileBuildFixture({ facts, ...input }) {
   return checkMobileBuildInfo({ ...input, raw: buildInfoText(facts) });
 }
 
-test('native mobile BuildInfo admits each exact platform and preserves original module projection', { skip: process.platform === 'win32' }, () => {
+test('native mobile BuildInfo admits each exact platform and preserves original module projection', { skip: process.platform === 'win32' }, async () => {
   const folder = mkdtempSync(join(tmpdir(), 'mobile-buildinfo-cli-'));
   try {
     const { input, vendors } = mobileBuildFixture(folder);
@@ -336,35 +803,24 @@ test('native mobile BuildInfo admits each exact platform and preserves original 
         assert.deepEqual(JSON.parse(relocated.stdout), expected);
       }
       if (target.target.arch === 'arm64') {
-        const python = execFileSync('python3', ['-B', '-c', `
-import json
-import sys
-sys.path.insert(0, sys.argv[1])
-from artifacts import AppleBuildInfoBatch, verify_native_buildinfo
-from producer import run
-
-evidence = json.load(sys.stdin)
-if 'raw' in evidence:
-    target = evidence['target']
-    observed = verify_native_buildinfo(evidence['raw'], evidence['source'], evidence['graph'],
-                                       os_name=target['osName'], arch=target['arch'], mode=target['mode'],
-                                       simulator=target['simulator'], expected_id=evidence['expectedId'],
-                                       actual_id=evidence['actualId'], run=run, scratch=sys.argv[2])
-else:
-    batch, infos = AppleBuildInfoBatch(), []
-    for row in evidence['appleObservations']:
-        info = {'parserInput': row['raw']}
-        batch.observe(info)
-        infos.append(info)
-        if 'target' in row:
-            batch.bind(info, arch=row['target']['arch'], simulator=row['target']['simulator'],
-                       expected_id=row['expectedId'], actual_id=row['actualId'])
-    batch.verify(run=run, scratch=sys.argv[2], source=evidence['source'], graph=evidence['graph'])
-    assert infos[0]['buildInfoFingerprint'] == sys.argv[3]
-    observed = [info['parsedBuildInfo'] for info in infos]
-print(json.dumps(observed))
-`, dirname(script), folder, appleTextFingerprint], { input: readFileSync(report), encoding: 'utf8' });
-        assert.deepEqual(JSON.parse(python), expected);
+        const evidence = JSON.parse(readFileSync(report));
+        let observed;
+        if (evidence.raw) {
+          observed = verifyNativeBuildInfo(evidence);
+        } else {
+          const batch = new AppleBuildInfoBatch(), infos = [];
+          for (const row of evidence.appleObservations) {
+            const info = { parserInput: row.raw };
+            batch.observe(info);
+            infos.push(info);
+            if (row.target) batch.bind(info, { arch: row.target.arch, simulator: row.target.simulator,
+              expectedId: row.expectedId, actualId: row.actualId });
+          }
+          await batch.verify({ source: evidence.source, graph: evidence.graph });
+          assert.equal(infos[0].buildInfoFingerprint, appleTextFingerprint);
+          observed = infos.map(info => info.parsedBuildInfo);
+        }
+        assert.deepEqual(observed, expected);
         assert.equal(readdirSync(folder).some(name => name.startsWith('native-buildinfo-')), false);
       }
       for (const name of vendors) {
@@ -579,7 +1035,7 @@ test('Android textual Go BuildInfo preserves original rows including settings an
   }
 });
 
-test('same-run Apple aggregate preserves original Python wire bytes for both declared scopes', { skip: process.platform !== 'linux' }, () => {
+test('same-run Apple aggregate preserves original receipt bytes for both declared scopes', { skip: process.platform !== 'linux' }, () => {
   const repo = fileURLToPath(new URL('../', import.meta.url));
   const handoff = 'scripts/mobile-core/apple-aggregate.mjs';
   const policy = JSON.parse(readFileSync(join(repo, 'scripts/mobile-core/receipt-policy.json')));
@@ -587,7 +1043,8 @@ test('same-run Apple aggregate preserves original Python wire bytes for both dec
   const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')));
   const options = { env, cwd: checkout, stdio: ['ignore', 'pipe', 'pipe'] };
   try {
-    const imports = execFileSync('git', ['ls-files', '-z', '--', 'scripts/desktop-core', 'scripts/lib'], { ...options, cwd: repo, encoding: 'utf8' });
+    const imports = execFileSync('git', ['ls-files', '-z', '--', 'scripts/desktop-core', 'scripts/lib', 'scripts/mobile-core'],
+      { ...options, cwd: repo, encoding: 'utf8' });
     for (const name of new Set([handoff, ...Object.values(policy.sourceFiles).flat(), ...imports.split('\0').filter(Boolean)])) {
       const path = join(checkout, name);
       mkdirSync(dirname(path), { recursive: true });
@@ -601,50 +1058,61 @@ test('same-run Apple aggregate preserves original Python wire bytes for both dec
     for (const scope of Object.keys(policy.appleScopes)) {
       env.POLARIS_APPLE_SCOPE = scope;
       const summaries = join(folder, scope), expected = join(folder, scope + '.expected'), output = join(folder, scope + '.actual');
-      execFileSync('python3', ['-B', '-c', `
-import sys
-from pathlib import Path
-sys.path.insert(0, 'scripts/mobile-core')
-from apple_handoff import context, scope_fields
-from artifacts import file_pin, receipt_digest
-from consume import app_identity
-from fork_input import load
-from producer import producer_code, write_json
+      execFileSync(process.execPath, ['--input-type=module', '-e', `
+import { copyFileSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { carrierSummary, context, scopeFields } from './scripts/mobile-core/apple-handoff.mjs';
+import { filePin, receiptDigest } from './scripts/mobile-core/component-admission.mjs';
+import { load } from './scripts/mobile-core/fork-input.mjs';
+import { appIdentity } from './scripts/mobile-core/mobile-consumption.mjs';
+import { createNativeRunner, producerCode, writeJson } from './scripts/mobile-core/producer.mjs';
+import { ReceiptFloat } from './scripts/mobile-core/source-admission.mjs';
 
-folder, output = map(Path, sys.argv[1:])
-def signed(path, facts):
-    facts['fingerprint'] = receipt_digest(facts)
-    write_json(path, facts)
-    return facts
-
-scope, run, app, producer = scope_fields(), context(), app_identity(), producer_code()
-flags = dict(devicePassed=False, signatureTrustValidated=False, publicationEligible=False)
-component = folder / 'component'; component.mkdir(parents=True)
-manifest = component / 'component-handoff.json'
-signed(manifest, dict(schema='polaris-apple-component-handoff-v2', **scope, context=run, App=producer,
-                      sourceContract=load(), producerJob='component', componentFingerprint='component'))
-transport = signed(component / 'component-transport.json', dict(schema='polaris-apple-handoff-transport-v1',
-                   context=run, manifest=file_pin(manifest)))
-carriers = {}
-for slot in scope['requiredSlots']:
-    sim = slot == 'sim-arm64'
-    stage = folder / slot; stage.mkdir()
-    rust_path, receipt_path = stage / 'summary-rust-receipt.json', stage / 'summary-app-carrier.json'
-    signed(rust_path, dict(schema='polaris-formal-apple-rust-v1', App=app, target='aarch64-apple-ios' + ('-sim' if sim else ''),
-                          linkInputSha256='link', devicePassed=False, tools={'pythonEqual':120.0 if sim else 120}, rustc='actual rustc'))
-    receipt = signed(receipt_path, dict(schema='polaris-mobile-apple-carrier-v1', App=app, producerCandidate=run['candidate'],
-                     componentFingerprint='component', selectedTarget='ios-arm64' + ('-simulator' if sim else ''), AppCarrierValidated=True,
-                     AppAccepted=False, devicePassed=False, signatureTrustValidated=False, rustInput=file_pin(rust_path), linkInputSha256='link',
-                     wire={'𐀀':[2**255,-2**255,1e-7,-0.0,5e-324], '\\ue000':'许可证\\x7f\\u2028'}))
-    carriers[slot] = signed(stage / ('carrier-' + slot + '.json'), dict(schema='polaris-apple-carrier-handoff-v2', **scope,
-                            context=run, slot=slot, componentTransport=transport, receiptPin=file_pin(receipt_path), receipt=receipt, **flags))
-required = scope['requiredSlots']
-signed(output, dict(schema='polaris-apple-unsigned-chain-v3', context=run, App=producer, componentTransport=transport, carriers=carriers,
-                   completeSlots=required, **flags, **scope, validatedSlots=required,
-                   notRequestedSlots=[slot for slot in ['device-arm64','sim-arm64'] if slot not in required]))
-if len(required) == 2:
-    transport_path = component / 'component-transport.json'
-    transport_path.write_bytes(transport_path.read_text().encode('utf-32'))
+const [folder, output] = process.argv.slice(1), root = folder + '.original', runner = createNativeRunner();
+function signed(path, facts) {
+  const value = { ...facts, fingerprint: receiptDigest(facts) };
+  writeJson(path, value);
+  return value;
+}
+const scope = scopeFields(), run = await context(runner), app = await appIdentity({runner});
+const producer = await producerCode(runner.run);
+const flags = {devicePassed:false, signatureTrustValidated:false, publicationEligible:false};
+const component = join(folder, 'component');
+mkdirSync(component, {recursive:true});
+mkdirSync(root);
+const manifest = join(component, 'component-handoff.json');
+signed(manifest, {schema:'polaris-apple-component-handoff-v2', ...scope, context:run, App:producer,
+  sourceContract:load(), producerJob:'component', componentFingerprint:'component'});
+const transportPath = join(component, 'component-transport.json');
+const transport = signed(transportPath, {schema:'polaris-apple-handoff-transport-v1', context:run, manifest:filePin(manifest)});
+copyFileSync(transportPath, join(root, 'component-transport.json'));
+const carriers = {}, required = scope.requiredSlots;
+for (const slot of required) {
+  const sim = slot === 'sim-arm64', stage = join(root, slot);
+  mkdirSync(stage);
+  const rustPath = join(stage, 'original-rust.json'), receiptPath = join(stage, 'app-carrier.json');
+  signed(rustPath, {schema:'polaris-formal-apple-rust-v1', App:app, target:'aarch64-apple-ios' + (sim ? '-sim' : ''),
+    linkInputSha256:'link', devicePassed:false, tools:{pythonEqual:sim ? new ReceiptFloat(120) : 120}, rustc:'actual rustc'});
+  const receipt = signed(receiptPath, {schema:'polaris-mobile-apple-carrier-v1', App:app, producerCandidate:run.candidate,
+    componentFingerprint:'component', selectedTarget:'ios-arm64' + (sim ? '-simulator' : ''), AppCarrierValidated:true,
+    AppAccepted:false, devicePassed:false, signatureTrustValidated:false,
+    rustInput:{receipt:rustPath,...filePin(rustPath)}, linkInputSha256:'link',
+    wire:{'𐀀':[2n**255n,-(2n**255n),new ReceiptFloat(1e-7),new ReceiptFloat(-0),new ReceiptFloat(5e-324)], '\\ue000':'许可证\\x7f\\u2028'}});
+  const row = {schema:'polaris-apple-carrier-handoff-v2', ...scope, context:run, slot, componentTransport:transport,
+    receiptPin:filePin(receiptPath), receipt, ...flags};
+  carriers[slot] = {...row, fingerprint:receiptDigest(row)};
+  await carrierSummary(root, slot, runner);
+  renameSync(join(root, 'summaries', slot), join(folder, slot));
+}
+signed(output, {schema:'polaris-apple-unsigned-chain-v3', context:run, App:producer, componentTransport:transport, carriers,
+  completeSlots:required, ...flags, ...scope, validatedSlots:required,
+  notRequestedSlots:['device-arm64','sim-arm64'].filter(slot=>!required.includes(slot))});
+if (required.length === 2) {
+  const characters = [...readFileSync(transportPath, 'utf8')], raw = Buffer.alloc(4 * (characters.length + 1));
+  raw.writeUInt32LE(0xfeff, 0);
+  for (let i = 0; i < characters.length; i++) raw.writeUInt32LE(characters[i].codePointAt(0), (i + 1) * 4);
+  writeFileSync(transportPath, raw);
+}
 `, summaries, expected], options);
       const args = [handoff, '--scope', scope, '--summaries', summaries, '--output', output];
       execFileSync(process.execPath, args, options);
@@ -871,14 +1339,14 @@ const settings = {
 const normalized = JSON.stringify([{ target: args[1], buildSettings: settings }], null, 2) + '\n';
 fs.appendFileSync(FIXTURE_TRACE, JSON.stringify({ args, cwd: process.cwd(), DEVELOPER_DIR, normalized }) + '\n');
 if (FIXTURE_MODE === 'interrupt') {
-  process.on('SIGTERM', () => process.exit(0));
+  process.on('SIGTERM', () => {});
   const child = require('node:child_process').spawn(process.execPath, ['-e', [
     "const fs = require('node:fs')",
     "process.on('SIGTERM', () => setTimeout(() => { fs.writeFileSync(process.env.FIXTURE_SIGNAL_DONE, 'terminated'); process.exit(0); }, 200))",
-    "fs.writeFileSync(process.env.FIXTURE_SIGNAL_READY, JSON.stringify({group: Number(process.env.FIXTURE_XCODE_PID), owner: Number(process.env.FIXTURE_OWNER_PID)}))",
+    "fs.writeFileSync(process.env.FIXTURE_SIGNAL_READY, String(process.env.FIXTURE_XCODE_PID))",
     "setInterval(() => {}, 1000)",
-  ].join(';')], { stdio: 'ignore', env: { ...process.env, FIXTURE_XCODE_PID: String(process.pid), FIXTURE_OWNER_PID: String(process.ppid) } });
-  child.unref();
+  ].join(';')], { stdio: 'ignore', env: { ...process.env, FIXTURE_XCODE_PID: String(process.pid) } });
+  child.once('exit', () => process.exit(0));
   setInterval(() => {}, 1000);
   return;
 }
@@ -959,45 +1427,34 @@ else process.stdout.write(normalized.replace(/\n/g, '\r\n'));
       if (mode === 'wrong-arch') assert.doesNotMatch(result.stderr, /withheld\/path/);
     }
 
-    await t.test('Python-only SIGTERM waits for the detached Xcode group', async () => {
+    await t.test('caller-only SIGTERM waits for the detached Xcode group', async () => {
       const location = join(output, 'interrupt');
       const signalReady = join(directory, 'xcode-child-ready'), signalDone = join(directory, 'xcode-child-done');
       mkdirSync(location);
-      const mobileCore = fileURLToPath(new URL('./mobile-core', import.meta.url));
-      const python = spawn('python3', ['-B', '-c', [
-        'import sys', 'from pathlib import Path', 'sys.path.insert(0, sys.argv[1])', 'import ci_apple',
-        'ci_apple.ROOT = Path(sys.argv[2])', 'ci_apple.run_build_settings(Path(sys.argv[3]), dict(ci_apple.os.environ))',
-      ].join('; '), mobileCore, repo, location], {
-        stdio: ['ignore', 'pipe', 'pipe'], env: {
+      const caller = spawn(process.execPath, [script, '--build-settings', location], {
+        cwd: directory, stdio: ['ignore', 'pipe', 'pipe'], env: {
           ...invokeEnv('device-only', 'interrupt'), FIXTURE_SIGNAL_READY: signalReady, FIXTURE_SIGNAL_DONE: signalDone,
         },
       });
-      python.stdout.resume();
+      caller.stdout.resume();
       const diagnostics = [];
-      python.stderr.on('data', bytes => diagnostics.push(bytes));
+      caller.stderr.on('data', bytes => diagnostics.push(bytes));
       const deadline = AbortSignal.timeout(15000);
-      const terminal = once(python, 'close', { signal: deadline });
+      const terminal = once(caller, 'close', { signal: deadline });
       terminal.catch(() => {});
-      let observed;
+      let group;
       try {
         while (!existsSync(signalReady) || !readFileSync(signalReady).length) await delay(10, undefined, { signal: deadline });
-        observed = JSON.parse(readFileSync(signalReady, 'utf8'));
-        // Signal only the Python PID. Neither isolated child initially receives it.
-        process.kill(python.pid, 'SIGTERM');
-        assert.deepEqual(await terminal, [143, null], Buffer.concat(diagnostics).toString('utf8'));
+        group = Number(readFileSync(signalReady, 'utf8'));
+        process.kill(caller.pid, 'SIGTERM');
+        assert.deepEqual(await terminal, [1, null], Buffer.concat(diagnostics).toString('utf8'));
         assert.match(Buffer.concat(diagnostics).toString('utf8'), /Apple build-settings observation interrupted/);
         assert.equal(readFileSync(signalDone, 'utf8'), 'terminated');
-        assert.throws(() => process.kill(-observed.group, 0), { code: 'ESRCH' });
+        assert.equal(groupAlive(group), false);
         assert.equal(existsSync(join(location, 'build-settings-admission.json')), false);
       } finally {
-        if (python.exitCode === null && python.signalCode === null) python.kill('SIGKILL');
-        if (observed) {
-          try { process.kill(-observed.group, 0); } catch (error) { if (error.code === 'ESRCH') observed = undefined; else throw error; }
-          if (observed) {
-            process.kill(-observed.group, 'SIGKILL');
-            try { process.kill(observed.owner, 'SIGTERM'); } catch (error) { if (error.code !== 'ESRCH') throw error; }
-          }
-        }
+        if (caller.exitCode === null && caller.signalCode === null) caller.kill('SIGKILL');
+        if (group && groupAlive(group)) process.kill(-group, 'SIGKILL');
       }
     });
   } finally {

@@ -65,7 +65,7 @@ and refuses retained slots without deleting them.
 The hosted entry retains source.properties and its pinned observation even if a
 later producer step fails. Rust keeps its separate NDK 27.3.13750724.
 
-`python3 -B scripts/mobile-core/fork_input.py android` (or `apple`) verifies
+`node scripts/mobile-core/fork-input.mjs android` (or `apple`) verifies
 the supplied source checkout and prints a bind plan. It takes `--source`,
 `--gomobile`, `--output`, and (for Android) `--bootclasspath`. It never executes a build,
 copies an SDK into an App, installs tools, creates a tag or publishes assets.
@@ -75,10 +75,12 @@ the scoped SDK view only under a fixed private work slot held by the caller's
 exclusive producer lease. The pure source suites exercise admission without running a native producer;
 those tests are distinct from actual component and App acceptance.
 
-The formal producer entry is now `bash scripts/build-mobile-core.sh android`
+The formal producer entry is `bash scripts/build-mobile-core.sh android`
 or `apple`, with required `--source`, `--go`, `--gomobile`, `--gobind`, `--work`
 and `--cache`. Android also requires `--sdk --ndk --jdk`; Apple requires
-`--developer`. It verifies the supplied exact source and uses one fixed `work/build-view`
+`--developer`. Use Node 26 and the repository-pinned Rust toolchain, which builds
+the Unix file-descriptor helper for the shared reservation. The entry verifies
+the supplied source and uses one fixed `work/build-view`
 shared-object Git clone at that exact commit. The generator writes/deletes its
 own `source/build/<arch>` paths there; the supplied checkout stays untouched.
 This build view shares the work/cache filesystem budget and inherited lease,
@@ -90,12 +92,12 @@ binary hashes/versions, regardless of an ambient Java21 PATH. The
 pinned generator's marker directory is created inside that GOPATH: `gomobile
 init` is never invoked because v0.1.13 would install gobind@latest.
 
-`artifacts.py` is the shared fresh/cache predicate: four exact Android ABIs,
+`component-admission.mjs` verifies fresh and cached components against four Android ABIs,
 API24 ident notes, 16KiB PT_LOAD, actual dynamic runtime/JNI exports, generated
 Java API, original Go BuildInfo/module/replacement/BuildID; Apple has exactly
 two arm64 platform slices, bounded ar/Mach-O parsing, safe framework
 internal links, generated Objective-C API and real deployment/platform facts.
-`-x -work` preserves actual compiler objects and logs. `native_inputs.py` records
+`-x -work` preserves actual compiler objects and logs. The same admission code records
 those byte identities plus original external static archives, and maps every
 non-Go Apple archive member to actual compiler/runtime origins with multiplicity.
 Cache hits reread original native inputs, original log and the complete output.
@@ -112,7 +114,7 @@ the CPU is the same.
 Rust download and compiled-dependency keys are independent. Download identity
 retains exact Cargo format/tool bytes and lock/manifests/source configuration.
 Compiled identity excludes the Android-only NDK installer and SDK view, including
-the historical implementation. It retains shared `ci_android.py` and
+the historical implementation. It retains the shared producer and
 `source-admission.mjs`, unknown producer files, the Apple workflow, tools, SDK,
 configuration and flags. The full provenance records all producer files. The
 cache excludes final App outputs.
@@ -151,14 +153,14 @@ attempt did not record its current binding, so its exact differing fields remain
 unknown. Cache admission addresses the confirmed availability-dependent graph
 mechanism; the next exact-SHA run must establish the actual reuse outcome.
 
-`transaction.py` stages output/receipt/log together and journals exact fixed
+`transaction.mjs` stages output/receipt/log together and journals exact fixed
 paths and byte/tree pins. Failure or interrupted commit restores the original
 pair and keeps rejected bytes and the original journal in bounded recovery
 slots. Identical Android input materialization is a verified cache hit. Occupied
 prior/rejected slots block replacement pending owner/reference review; nothing
 recursively deletes an unknown or unique input to make a build proceed.
 
-All local entries use `budget.py`'s atomic same-filesystem admission ledger and
+All local entries use the shared native runner's atomic same-filesystem admission ledger and
 child-inherited flock reservation, plus fixed work/cache locks. The common
 ledger defaults to `~/.cache/polaris-build-budget`; an external volume needs one
 explicit `POLARIS_BUILD_BUDGET_ROOT` shared by its concurrent callers. Each
@@ -173,30 +175,29 @@ build allocators must join the same physical-filesystem reservation protocol
 before concurrent local heavy validation; this entry cannot account for an
 unregistered external builder.
 
-Android's existing workflow uses `ci_android.py` to prepare pinned tools/source,
-restore exact work/cache keys, unconditionally build or revalidate, and
-materialize the verified input. Both unsigned and signed APK legs verify final
+Android's workflow uses `android-ci.mjs` to prepare pinned tools and source
+before restoring work and cache. Both legs call the shared producer and
+consumer to build or revalidate and materialize the input. The unsigned and signed APK legs verify final
 APK ABI/runtime bytes, R8 evidence and the same original AAR/receipt; signed
 publication still goes through existing certificate/tag/draft gates. The formal
 SDK has four ABIs; published App scope remains the existing two ARM ABIs. SDK,
 original receipts/logs and final source-consumption receipts are retained as
 Actions evidence, not new public SDK publication.
 
-Apple's explicit uniform Mac entry is `python3 -B
-scripts/mobile-core/build_apple_app.py` with the same source/tool/slot arguments.
+Apple's Mac entry is `node scripts/mobile-core/build-apple-app.mjs` with the same source/tool/slot arguments.
 It builds/revalidates the static SDK, freezes an App-specific link context, runs
 the pure measurement-state Swift controls, and compiles/archives App and
 PacketTunnel. `--simulator` selects the arm64 simulator link probe
 (`--simulator-arch arm64` only); omit it for the unsigned device compile/link
 probe, or supply an explicit `--signing-team` for that team's signing observation. Xcode's extension
 pre-link hook verifies the exact link-context SHA and original static input.
-`carriers.py` checks final Go carrier/module/BuildID, the actual original or
+`mobile-consumption.mjs` checks final Go carrier/module/BuildID, the actual original or
 byte-equal DerivedData static archive and generated headers, linker-map member
 origins, bundle/App Group/device-family/platform/minimum-OS facts, and absence of
 installed static SDK payloads. It does not assert signing permission/trust,
 installation, device lifecycle or App acceptance. No Apple CI is dispatched by
 these source entries.
-The source-owned `.github/workflows/apple.yml` now calls `ci_apple.py`
+The source-owned `.github/workflows/apple.yml` calls `ci-apple.mjs`
 prepare/build/evidence from the existing Release Risk graph. Selection reads
 actual changed paths through `apple-ci-impact.mjs`; the aggregate refuses a
 selected failed/cancelled/skipped Apple leg. The hosted `xcode-27` runner must
@@ -292,8 +293,8 @@ source bytes/modes; the final IPA predicate requires the same complete resource
 inventory, bytes and modes in the real App bundle, alongside App/PacketTunnel
 static-link/source checks. An empty assets folder cannot satisfy the predicate.
 
-The formal builder compiles through `apple_rust.py build` under its inherited
-reservation before Xcode starts; the Xcode Rust phase runs `apple_rust.py verify`
+The formal builder compiles through `apple-rust.mjs build` under its inherited
+reservation before Xcode starts. The Xcode Rust phase runs `apple-rust.mjs verify`
 with the admitted
 link context, explicit Cargo target, locked dependencies and iOS config. It
 uses `cargo rustc --lib --crate-type staticlib` only for this iOS archive stage;
@@ -405,8 +406,8 @@ These structural controls do not substitute for actual device-arm64 final
 carrier verification, or sim-arm64 final verification when explicitly requested. Historical Intel simulator observations
 are outside the current contract.
 
-Formal output controls live in `test_outputs.py` and run in Release Risk through
-unittest discovery. This source-only gate does not compile native
+Formal output controls run in Release Risk through the shared
+`scripts/gate-node-test.sh` entry. This source-only gate does not compile native
 output, sign/install Apps or publish mobile assets. Running it cannot establish
 component or App acceptance. Input-contract artifact pins/producer receipt stay
 null and AppAccepted/devicePassed/publicationEligible stay false; actual results

@@ -274,7 +274,7 @@ esac
     const apple = read('apple.yml');
     const component = jobSection(apple, 'component', 'apple.yml');
     expect(component).not.toMatch(/strategy:|matrix:/);
-    expect(component.match(/ci_apple.py build/g)).toHaveLength(1);
+    expect(component.match(/ci-apple\.mjs build/g)).toHaveLength(1);
     const blocks = component.split(/^ {6}- /m).slice(1);
     const simulator = blocks.filter((block) => block.includes('--slot "sim-arm64"') ||
       block.includes('path: target/apple-ci-cache/sim-arm64') ||
@@ -284,7 +284,7 @@ esac
       expect(block).not.toContain('continue-on-error');
     }
     const device = blocks.find((block) => block.includes('id: device_arm64\n'))!;
-    expect(device).toContain('ci_apple.py carrier --slot "device-arm64"');
+    expect(device).toContain('ci-apple.mjs carrier --slot "device-arm64"');
     expect(device).not.toContain('inputs.include_simulator');
     expect(device).not.toContain('cache-hit');
     expect(component).not.toContain('Swatinem/rust-cache');

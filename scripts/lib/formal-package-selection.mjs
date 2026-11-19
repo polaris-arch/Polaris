@@ -15,7 +15,7 @@ import { createInflateRaw, crc32 } from 'node:zlib';
 import { LOCAL_MARKER } from '../desktop-core/local-development.mjs';
 import { requireGraph as demand } from '../desktop-core/source-graph.mjs';
 import { appImageFilesystems } from '../postprocess-appimage.mjs';
-import { readZipEntries } from './zip-archive.mjs';
+import { readZipEntries, zipName } from './zip-archive.mjs';
 import { now, streamChild, withHolds } from './windows-package-custody.mjs';
 
 const require = createRequire(new URL('../../ui/package.json', import.meta.url));
@@ -29,7 +29,6 @@ const BLOCK = 64 * 1024;
 const FILE_TYPE = 0o170000n;
 const statOptions = { bigint: true };
 const utf8 = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
-const cp437 = 'ÇüéâäàåçêëèïîìÄÅÉæÆôöòûùÿÖÜ¢£¥₧ƒáíóúñÑªº¿⌐¬½¼¡«»░▒▓│┤╡╢╖╕╣║╗╝╜╛┐└┴┬├─┼╞╟╚╔╩╦╠═╬╧╨╤╥╙╘╒╓╫╪┘┌█▄▌▐▀αßΓπΣσµτΦΘΩδ∞φε∩≡±≥≤⌠⌡÷≈°∙·√ⁿ²■ ';
 
 export function rejectWindowsReparsePoints(path, label, timeout = 30_000) {
   if (process.platform !== 'win32') return;
@@ -142,11 +141,6 @@ async function textChild(tool, args, limit, remaining) {
   const blocks = [];
   await readChild(tool, args, limit, remaining, (block) => blocks.push(block));
   return utf8.decode(Buffer.concat(blocks));
-}
-
-function zipName(bytes, flags) {
-  return flags & 0x800 ? utf8.decode(bytes) : Array.from(bytes, byte =>
-    byte < 128 ? String.fromCharCode(byte) : cp437[byte - 128]).join('');
 }
 
 // Match Unicode default case folding, independent of the reader host locale.
