@@ -56,28 +56,19 @@ import {
   remainingEntriesAfterCommit,
   replay,
   revertEntry,
+  savedEditNotice,
   stageEntry,
+  type SavedEditChange,
   type StagedEntry,
 } from '@/lib/staged-config';
 
 /** 直接从 IPC 契约取，避免与 `pending-bar-logic.ts` 的同名联合各写一份（store 不该反向依赖组件层）。 */
 type ApplyReceipt = Awaited<ReturnType<typeof api.proxy.applyPendingChanges>>;
-type SavedEditChange = { label: string; logLevel?: string };
 export type SavedRuntimeApply = ApplyReceipt & {
   changes?: readonly SavedEditChange[];
   saveRevision?: number;
   configVersion?: string;
 };
-
-export function notifySavedEdit(changes: readonly SavedEditChange[]): void {
-  if (!changes.length) return;
-  const labels = changes.slice(0, 3).map(({ label, logLevel }) => logLevel
-    ? `${i18n.t('logs.currentLevel')} ${logLevel}` : label);
-  const summary = labels.join(' · ');
-  const remaining = changes.length - labels.length;
-  toast.success(i18n.t(remaining > 0 ? 'home.pendingSavedMoreChanges' : 'home.pendingSavedChanges',
-    { changes: summary, count: remaining }));
-}
 
 type ApplyDispatch = (precedingSave: ApplyReceipt | null) => boolean;
 
@@ -713,7 +704,8 @@ function completeSave(
   });
   if (manualSave) persist(remainingBaseline, remaining);
   else if (savedRuntimeApply === undefined && (!observedDuringSave || current.baseVersion === outcome.version)) {
-    notifySavedEdit(changes);
+    const notice = savedEditNotice(changes, i18n.t);
+    if (notice) toast.success(notice);
   }
 }
 

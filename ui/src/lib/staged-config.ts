@@ -52,6 +52,20 @@ import { DIRECT_SERVER_ID, isSentinelSelection } from '@/domain/direct-selection
  */
 export const STAGED_CONFIG_ENABLED = true;
 
+export type SavedEditChange = { label: string; logLevel?: string };
+
+export function savedEditNotice(
+  changes: readonly SavedEditChange[],
+  text: (key: string, values?: { changes: string; count: number }) => string,
+): string | undefined {
+  if (!changes.length) return undefined;
+  const labels = changes.slice(0, 3).map(({ label, logLevel }) => logLevel
+    ? `${text('logs.currentLevel')} ${logLevel}` : label);
+  const remaining = changes.length - labels.length;
+  return text(remaining > 0 ? 'home.pendingSavedMoreChanges' : 'home.pendingSavedChanges',
+    { changes: labels.join(' · '), count: remaining });
+}
+
 // ─────────────────────────────── 条目模型（Q2）───────────────────────────────
 
 /**

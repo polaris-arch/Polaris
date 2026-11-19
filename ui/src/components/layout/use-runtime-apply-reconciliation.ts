@@ -3,8 +3,9 @@ import { useTranslation } from 'react-i18next';
 import type { TFunction } from 'i18next';
 import { api } from '@/ipc';
 import { useAppStore } from '@/store/app-store';
-import { dispatchSavedApply, notifySavedEdit, useStagedConfigStore, type SavedRuntimeApply } from '@/store/staged-config-store';
+import { dispatchSavedApply, useStagedConfigStore, type SavedRuntimeApply } from '@/store/staged-config-store';
 import { toast } from '@/lib/error-handler';
+import { savedEditNotice } from '@/lib/staged-config';
 import type { PendingApplyResult } from '@/contracts/types';
 import type { ProxyErrorTranslate } from '@/domain/proxy-error-text';
 import {
@@ -84,7 +85,8 @@ function showSavedChanges(
     return;
   }
   // A durable graph receipt does not say which saved entries changed its behavior.
-  notifySavedEdit(changes);
+  const notice = savedEditNotice(changes, text);
+  if (notice) toast.success(notice);
 }
 
 /** Shared observers; a host id is never passed to the Core transaction status API. */
