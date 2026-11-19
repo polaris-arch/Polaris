@@ -342,7 +342,7 @@ body {
   --toast-surface: var(--err-weak);
 }
 
-.toast-status-icon {
+.m-toast .toast-status-icon {
   display: inline-block;
   vertical-align: -0.24em;
   margin-inline-end: 0.45em;

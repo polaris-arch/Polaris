@@ -840,7 +840,7 @@ h1[tabindex='-1']:focus-visible { outline: none; }
 #toast-stack .toast.ok{ --toast-accent:var(--ok); --toast-surface:var(--ok-weak); }
 #toast-stack .toast.warn{ --toast-accent:var(--warn); --toast-surface:var(--warn-weak); }
 #toast-stack .toast.err{ --toast-accent:var(--err); --toast-surface:var(--err-weak); }
-.toast-status-icon{ display:inline-block; vertical-align:-.24em; margin-inline-end:.45em; color:hsl(var(--toast-accent)); }
+#toast-stack .toast-status-icon{ display:inline-block; vertical-align:-.24em; margin-inline-end:.45em; color:hsl(var(--toast-accent)); }
 #toast-stack .toast-desc{ color:hsl(var(--fg-dim)); opacity:1; }
 
 /* ── toast 行内动作与关闭（`.toast-actions` / `.toast-close`）──────────────────────
