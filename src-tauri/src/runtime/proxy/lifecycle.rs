@@ -2172,12 +2172,6 @@ impl ProxyRuntime {
         }
     }
 
-    /// 调度一次去抖重启（接线 switch-engine [`DebouncedRestart`](polaris_switch_engine::debounced_restart::DebouncedRestart)：timer + 世代守卫 + gate 顺序门）。
-    pub(super) fn schedule_restart(self: &Arc<Self>) {
-        let scheduled_generation = self.gate.generation();
-        self.schedule_restart_for_generation(scheduled_generation);
-    }
-
     /// 已在 gate 锁内认领过的尾随重启沿用该世代，Stop 即使插在认领与 timer 注册之间，
     /// restart_guarded 也只会让旧请求退场，不能错误读取停止后的新世代。
     pub(super) fn schedule_restart_for_generation(self: &Arc<Self>, scheduled_generation: u64) {

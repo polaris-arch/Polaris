@@ -4902,6 +4902,9 @@ async fn apply_pending_busy_is_conflict_without_queuing_restart() {
 #[tokio::test]
 async fn timer_with_old_force_id_cannot_consume_a_new_apply_snapshot() {
     let (rt, _dir) = test_runtime();
+    rt.config
+        .save_full(&two_node_config(7890, "node-a"))
+        .unwrap();
     let generation = rt.gate.generation();
     let original = serde_json::json!({"selectedServerId": "node-a"});
     *rt.pending_force_restart.write().unwrap() = Some((
