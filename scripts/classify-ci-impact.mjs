@@ -115,6 +115,11 @@ export const PACKAGE_IMPACT_SCOPES = Object.freeze({
     platforms: ALL,
     why: '正式发布资产命名与最终摘要清单由构建、聚合及更新器对拍消费；改动须重验全部桌面包的名称、资产集合和校验和。',
   },
+  'scripts/windows-package-integrity.mjs': {
+    kernel: false,
+    platforms: ['windows'],
+    why: 'Windows 打包预览使用该入口冻结输入、生成安装包并核对载荷。',
+  },
   'crates/config-engine/': {
     kernel: true,
     platforms: NO_LEG,

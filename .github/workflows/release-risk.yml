@@ -189,7 +189,7 @@ jobs:
             node scripts/apple-ci-impact.mjs --full < /dev/null > "$apple_result"
           fi
 
-          if [ "$POLARIS_WINDOWS_PACKAGE_PREVIEW" = true ]; then
+          if [ "${POLARIS_WINDOWS_PACKAGE_PREVIEW:-false}" = true ]; then
             if [ "$DISPATCH_REF" = refs/heads/main ] || ! jq -e '.platforms | index("windows") != null' "$result" >/dev/null; then
               echo '::error::Windows packaging preview requires a work branch with a selected Windows package leg'
               exit 1
