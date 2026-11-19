@@ -557,12 +557,33 @@ fn select_in_place(
 /// 即退出自动选择；再次点某订阅的「自动选择」才恢复）。两件事在同一次写里完成。
 ///
 /// 返回（已落盘配置, 出口是否真变, selector 意图代次, 是否清掉了一个自动意图）。
+#[cfg(test)]
 pub(crate) fn server_switch_core<F>(
     config: &ConfigManager,
     server_id: &str,
     validate_candidate: impl FnOnce(&UserConfig) -> Result<(), String>,
     register_intent: F,
 ) -> Result<(Value, bool, u64, bool), ServerSwitchError>
+where
+    F: FnOnce() -> u64,
+{
+    server_switch_core_with_owner(
+        config,
+        server_id,
+        validate_candidate,
+        register_intent,
+        |_| (),
+    )
+    .map(|(cfg, changed, intent, cleared, ())| (cfg, changed, intent, cleared))
+}
+
+fn server_switch_core_with_owner<F, O>(
+    config: &ConfigManager,
+    server_id: &str,
+    validate_candidate: impl FnOnce(&UserConfig) -> Result<(), String>,
+    register_intent: F,
+    own: impl FnOnce(u64) -> O,
+) -> Result<(Value, bool, u64, bool, O), ServerSwitchError>
 where
     F: FnOnce() -> u64,
 {
@@ -580,12 +601,13 @@ where
                 }
                 intent_cleared = obj.remove(polaris_store::SELECTION_INTENT_KEY).is_some();
             }
-            ConfigDecision::Write(Ok((exit_changed, intent_generation, intent_cleared)))
+            let owner = own(intent_generation);
+            ConfigDecision::Write(Ok((exit_changed, intent_generation, intent_cleared, owner)))
         })
         .map_err(|e| ServerSwitchError::Other(format!("{e}")))?;
-    let (exit_changed, intent_generation, intent_cleared) = outcome?;
+    let (exit_changed, intent_generation, intent_cleared, owner) = outcome?;
     let cfg = saved.expect("server_switch 的 Write 腿必须返回已落盘配置");
-    Ok((cfg, exit_changed, intent_generation, intent_cleared))
+    Ok((cfg, exit_changed, intent_generation, intent_cleared, owner))
 }
 
 /// 保存选择与实际运行态分开回执；只有严格读回才报告 applied。
@@ -630,7 +652,7 @@ pub async fn server_switch(
     state: State<'_, AppRuntime>,
     server_id: String,
 ) -> Result<ApiResponse<ServerSwitchReceipt>, ()> {
-    match server_switch_core(
+    let saved = server_switch_core_with_owner(
         state.config(),
         &server_id,
         |candidate| {
@@ -639,8 +661,18 @@ pub async fn server_switch(
                 .validate_selected_server_candidate_blocking(candidate)
         },
         || state.proxy().register_selector_intent(),
-    ) {
-        Ok((_cfg, _exit_changed, intent_generation, intent_cleared)) => {
+        |intent| state.proxy().own_automatic_selection(&server_id, intent),
+    );
+    if saved.is_err() {
+        // A durable write may fail after publication. Report the real diff
+        // after the provisional owner has been released.
+        state.proxy().push_pending_changes();
+    }
+    match saved {
+        Ok((_cfg, _exit_changed, intent_generation, intent_cleared, mut automatic)) => {
+            if let Some(owner) = automatic.as_mut() {
+                owner.mark_committed();
+            }
             if intent_cleared {
                 log::info!("自动选择：用户手动选了出口，意图回到手动");
                 state.proxy().auto_select_disarmed();
@@ -650,13 +682,14 @@ pub async fn server_switch(
             emit_config_changed_signal(&app);
             let starting_generation = state.proxy().core_generation();
             // Box：热切 future 达数百 KiB，Windows 主线程（1MB 栈）按值构造命令 future 会栈溢出。
-            match Box::pin(
+            let result = Box::pin(
                 state
                     .proxy
                     .switch_selected_server_if_current(&server_id, intent_generation),
             )
-            .await
-            {
+            .await;
+            drop(automatic);
+            match result {
                 Ok(outcome) => {
                     let outcome = state.proxy().settle_selected_switch_receipt(
                         outcome,

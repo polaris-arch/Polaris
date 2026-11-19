@@ -35,12 +35,56 @@ struct WorkerState {
     pending: Option<SelectorReconcileRequest>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AutomaticSelection {
+    generation: u64,
+    intent: u64,
+    revision: u64,
+    server_id: String,
+}
+
+pub(crate) struct AutomaticSelectionGuard<'a> {
+    runtime: &'a ProxyRuntime,
+    owner: AutomaticSelection,
+    committed: bool,
+}
+
+impl AutomaticSelectionGuard<'_> {
+    pub(crate) fn mark_committed(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for AutomaticSelectionGuard<'_> {
+    fn drop(&mut self) {
+        let removed = self
+            .runtime
+            .selector_reconcile
+            .automatic_selection
+            .lock()
+            .is_ok_and(|mut active| {
+                if active.as_ref() == Some(&self.owner) {
+                    *active = None;
+                    true
+                } else {
+                    false
+                }
+            });
+        // An unsuccessful write drops its provisional owner under ConfigManager's
+        // writer lock. Only a published write may emit a new public diff here.
+        if removed && self.committed {
+            self.runtime.push_pending_changes();
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub(super) struct SelectorReconcileOwner {
     intent_generation: AtomicU64,
     /// Serializes intent publication with a selected-only timer's lifecycle claim. The claim
     /// closure may take only the pending-snapshot and lifecycle locks; it must never read D.
     intent_claim: Mutex<()>,
+    automatic_selection: Mutex<Option<AutomaticSelection>>,
     required: AtomicBool,
     worker: Mutex<WorkerState>,
     wake: Notify,
@@ -149,6 +193,50 @@ impl ProxyRuntime {
 
     pub(crate) fn selector_intent_is_current(&self, intent_generation: u64) -> bool {
         self.selector_reconcile.intent_generation() == intent_generation
+    }
+
+    /// The caller is inside the config writer's lock. Persistence increments
+    /// the revision once, and an unsuccessful write drops this guard in that lock.
+    pub(crate) fn own_automatic_selection(
+        &self,
+        server_id: &str,
+        intent: u64,
+    ) -> Option<AutomaticSelectionGuard<'_>> {
+        let (generation, busy) = (self.core_generation(), self.gate.is_busy());
+        if busy || !self.core_running() || !self.selector_intent_is_current(intent) {
+            return None;
+        }
+        let owner = AutomaticSelection {
+            generation,
+            intent,
+            revision: self.config.saved_revision().checked_add(1)?,
+            server_id: server_id.to_owned(),
+        };
+        *self.selector_reconcile.automatic_selection.lock().ok()? = Some(owner.clone());
+        Some(AutomaticSelectionGuard {
+            runtime: self,
+            owner,
+            committed: false,
+        })
+    }
+
+    pub(super) fn executing_automatic_selection(&self, server_id: &str, revision: u64) -> bool {
+        let generation = self.core_generation();
+        if self.gate.is_busy() || !self.core_running() {
+            return false;
+        }
+        self.selector_reconcile
+            .automatic_selection
+            .lock()
+            .is_ok_and(|active| {
+                active.as_ref().is_some_and(|owner| {
+                    owner.revision == revision
+                        && owner.server_id == server_id
+                        && self.selector_intent_is_current(owner.intent)
+                        && self.config.saved_revision() == revision
+                        && generation == owner.generation
+                })
+            })
     }
 }
 

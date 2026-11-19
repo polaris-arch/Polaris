@@ -227,6 +227,7 @@ impl ProxyRuntime {
             snap_fps,
             applied,
             executing_exact_edit,
+            selection_owned,
             recovery_pending,
             baseline_pending,
             deferred,
@@ -243,6 +244,12 @@ impl ProxyRuntime {
                 .flatten();
             let (executing, recovery) =
                 self.config_edit_pending_observation(saved.as_ref().map(|(_, revision)| *revision));
+            let selection_owned = saved.as_ref().is_some_and(|(config, revision)| {
+                config
+                    .get("selectedServerId")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| self.executing_automatic_selection(id, *revision))
+            });
             let fingerprints = self
                 .switch_snapshot
                 .read()
@@ -260,6 +267,7 @@ impl ProxyRuntime {
                 fingerprints,
                 applied,
                 executing,
+                selection_owned,
                 recovery,
                 baseline_pending,
                 deferred,
@@ -301,13 +309,28 @@ impl ProxyRuntime {
         // selectedServerId 债。直接比 D/R 真值，切回运行出口后自然清掉，不污染“保存未应用”
         // 的独立 restart_deferred 标记。
         let selected_pending = !executing_exact_edit
+            && !selection_owned
             && applied.as_ref().is_some_and(|runtime| {
                 runtime.get("selectedServerId") != current.get("selectedServerId")
             });
         let non_node_pending = !executing_exact_edit
             && applied
                 .as_ref()
-                .and_then(|runtime| non_node_runtime_debt(runtime, current, self.helper.platform()))
+                .and_then(|runtime| {
+                    if selection_owned
+                        && current.get(polaris_store::SELECTION_INTENT_KEY).is_none()
+                        && runtime.get(polaris_store::SELECTION_INTENT_KEY).is_some()
+                    {
+                        // The same explicit selection owns closing its Auto intent.
+                        let mut projected = runtime.clone();
+                        projected
+                            .as_object_mut()?
+                            .remove(polaris_store::SELECTION_INTENT_KEY);
+                        non_node_runtime_debt(&projected, current, self.helper.platform())
+                    } else {
+                        non_node_runtime_debt(runtime, current, self.helper.platform())
+                    }
+                })
                 .unwrap_or(deferred);
         let host_pending = self.host_effect_pending();
         let rule_content_pending = self.has_uncommitted_rule_content();

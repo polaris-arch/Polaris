@@ -125,7 +125,7 @@ fn server_switch_rejects_binding_preflight_before_persisting() {
 fn server_switch_core_uses_atomic_config_update() {
     let body = crate::commands::guard_scan::top_level_fn_body(
         &crate_code("commands/server.rs"),
-        "fn server_switch_core<F>(",
+        "fn server_switch_core_with_owner<F, O>(",
     );
     let body = body.as_str();
     assert!(body.contains(".update(|cfg|"), "切节点必须走原子 update");

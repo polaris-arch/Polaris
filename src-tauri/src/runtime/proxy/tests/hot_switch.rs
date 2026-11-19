@@ -1,4 +1,5 @@
 use super::*;
+use crate::runtime::config::Decision as ConfigDecision;
 use polaris_config_engine::builder::mesh_mode::DASHBOARD_SELECTOR;
 use polaris_config_engine::user_config::dns_constants::BLOCK_SERVER_ID;
 
@@ -1690,6 +1691,70 @@ async fn failed_selection_stays_deferred_until_explicit_stop_takes_over() {
     assert_eq!(
         rt.settle_selected_switch_receipt(outcome, generation, intent),
         Some(SwitchOutcome::NotRunning)
+    );
+}
+
+#[tokio::test]
+async fn automatic_selection_hides_only_its_in_flight_selection_and_reveals_deferred() {
+    let (rt, _dir, sink, _) = explicit_selection_fixture();
+    *sink.groups.lock().unwrap() = Some(vec![group(PROXY_SELECTOR_TAG, "Node A")]);
+    let mut owner = rt
+        .config
+        .update(|disk| {
+            disk["selectedServerId"] = "node-b".into();
+            let intent = rt.register_selector_intent();
+            ConfigDecision::Write((
+                intent,
+                rt.own_automatic_selection("node-b", intent).unwrap(),
+            ))
+        })
+        .unwrap()
+        .0;
+    owner.1.mark_committed();
+    assert!(!rt.pending_changes().pending_apply);
+    assert!(
+        rt.pending_changes_against(Some(&rt.config.current().unwrap()))
+            .pending_apply,
+        "admission must still see the real saved debt"
+    );
+    assert_eq!(
+        rt.switch_selected_server_if_current("node-b", owner.0)
+            .await
+            .unwrap(),
+        Some(SwitchOutcome::Deferred)
+    );
+    drop(owner);
+    assert!(rt.pending_changes().pending_apply);
+}
+
+#[test]
+fn automatic_selection_never_borrows_another_revision_or_hides_prior_debt() {
+    let (rt, _dir, _, running) = explicit_selection_fixture();
+    let mut prior = rt.config.current().unwrap();
+    prior["logLevel"] = "debug".into();
+    rt.config.save_full(&prior).unwrap();
+    let mut owner = rt
+        .config
+        .update(|disk| {
+            disk["selectedServerId"] = "node-b".into();
+            let intent = rt.register_selector_intent();
+            ConfigDecision::Write(rt.own_automatic_selection("node-b", intent).unwrap())
+        })
+        .unwrap()
+        .0;
+    owner.mark_committed();
+    let saved = rt.config.current().unwrap();
+    assert!(rt.executing_automatic_selection("node-b", rt.config.saved_revision()));
+    assert!(
+        rt.pending_changes().pending_apply,
+        "prior log change must remain"
+    );
+    rt.config.save_full(&running).unwrap();
+    rt.config.save_full(&saved).unwrap();
+    assert!(!rt.executing_automatic_selection("node-b", rt.config.saved_revision()));
+    assert!(
+        rt.pending_changes().pending_apply,
+        "equal bytes are a new revision"
     );
 }
 
