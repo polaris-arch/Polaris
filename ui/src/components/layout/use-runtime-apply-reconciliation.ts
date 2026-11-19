@@ -35,28 +35,61 @@ function ownsSaveRecovery(save: SavedRuntimeApply | null, owner: RuntimeCoreReco
     && save.selectionIntentGeneration === owner.selectionIntentGeneration;
 }
 
-function showSavedChanges(save: SavedRuntimeApply, result: PendingApplyResult, apply: ApplyState, text: TFunction): void {
-  const staged = useStagedConfigStore.getState();
-  const { pendingChanges, proxyStatus } = useAppStore.getState();
-  const intent = proxyStatus?.ownedStopContext?.selectionIntentGeneration;
+const LOG_LEVEL_NOTICE_WAIT_MS = 1000;
+
+async function confirmRuntimeLogLevel(level: string): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const reading = await Promise.race([
+      api.logs.runtimeLevel(),
+      new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), LOG_LEVEL_NOTICE_WAIT_MS); }),
+    ]);
+    return reading?.reason === null && reading.level?.toUpperCase() === level;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function showSavedChanges(
+  save: SavedRuntimeApply,
+  result: PendingApplyResult,
+  currentApply: () => ApplyState | undefined,
+  text: TFunction,
+): void {
   const changes = save.changes;
   if (!changes?.length || !result.ok || result.status !== 'hotApplied'
-      || result.coreState !== 'committed' || result.configurationDurable !== true
-      || staged.savedRuntimeApply || staged.saveStatus === 'saving'
-      || save.saveRevision !== staged.completedSaveRevision || save.configVersion !== staged.baseVersion
-      || (intent ?? -1) > (save.selectionIntentGeneration ?? -1)
-      || result.nativeRetirements?.length || pendingChanges.nativeRetirements?.length || apply.nativeRetirements?.length
-      || apply.host && apply.host.phase !== 'settled') return;
-  if (changes.length === 1 && changes[0].logLevel) {
-    toast.info(text('home.pendingSavedLogLevelApplied', { level: changes[0].logLevel }));
+      || (result.coreState !== 'committed' && result.coreState !== 'unchanged')
+      || result.configurationDurable !== true || result.nativeRetirements?.length) return;
+  const current = () => {
+    const apply = currentApply();
+    const staged = useStagedConfigStore.getState();
+    const { pendingChanges, proxyStatus } = useAppStore.getState();
+    const intent = proxyStatus?.ownedStopContext?.selectionIntentGeneration;
+    return apply && proxyStatus?.running && proxyStatus.mainGeneration === save.runtimeGeneration
+      && (apply.mainGeneration ?? 0) <= (save.runtimeGeneration ?? 0)
+      && !staged.savedRuntimeApply && staged.saveStatus !== 'saving'
+      && save.saveRevision === staged.completedSaveRevision && save.configVersion === staged.baseVersion
+      && (intent ?? -1) <= (save.selectionIntentGeneration ?? -1)
+      && !pendingChanges.nativeRetirements?.length && !apply.nativeRetirements?.length
+      && (!apply.host || apply.host.phase === 'settled');
+  };
+  if (!current()) return;
+  const level = changes.length === 1 ? changes[0].logLevel : undefined;
+  if (level) {
+    void confirmRuntimeLogLevel(level).then((confirmed) => {
+      if (current()) toast.info(text(confirmed ? 'home.pendingSavedLogLevelActive' : 'home.pendingSavedLogLevel', { level }));
+    });
     return;
   }
+  // A durable graph receipt does not say which saved entries changed its behavior.
   const labels = changes.slice(0, 3).map((change) => change.logLevel
     ? `${text('logs.currentLevel')} ${change.logLevel}` : change.label);
   const summary = labels.join(' · ');
   const remaining = changes.length - labels.length;
-  toast.info(remaining > 0 ? text('home.pendingSavedMoreChangesApplied', { changes: summary, count: remaining })
-    : text('home.pendingSavedChangesApplied', { changes: summary }));
+  toast.info(remaining > 0 ? text('home.pendingSavedMoreChanges', { changes: summary, count: remaining })
+    : text('home.pendingSavedChanges', { changes: summary }));
 }
 
 /** Shared observers; a host id is never passed to the Core transaction status API. */
@@ -83,6 +116,11 @@ export function useRuntimeApplyReconciliation(
     mounted.current = true;
     return () => { mounted.current = false; };
   }, []);
+
+  const showOwnedSavedChanges = (save: SavedRuntimeApply, result: PendingApplyResult) => {
+    const request = attemptRef.current;
+    showSavedChanges(save, result, () => mounted.current && attemptRef.current === request ? latest.current : undefined, text);
+  };
 
   // Rust's original-operation observer pushes delayed UNKNOWN even when there are no deleted nodes.
   // This also restores debt on a fresh desktop/mobile mount without manufacturing an Apply owner.
@@ -135,7 +173,7 @@ export function useRuntimeApplyReconciliation(
       }
       return next;
     });
-    showSavedChanges(savedRuntimeApply, savedRuntimeApply, apply, text);
+    showOwnedSavedChanges(savedRuntimeApply, savedRuntimeApply);
   }, [apply, attemptRef, savedRuntimeApply, setApply, status, text]);
   const core = apply.coreRecovery ?? (apply.reconciling && apply.transactionId
     && apply.mainGeneration !== undefined && attemptRef.current?.intentGeneration !== undefined
@@ -155,7 +193,7 @@ export function useRuntimeApplyReconciliation(
       // A retry and a poll can complete together. Consume the original Save notice once.
       savedRecovery.current = null;
       if (disposition === 'owned' && !attemptRef.current && mounted.current && sameCore(latest.current, owner)) {
-        showSavedChanges(save, result, latest.current, text);
+        showOwnedSavedChanges(save, result);
       }
     }
     setApply((state) => {

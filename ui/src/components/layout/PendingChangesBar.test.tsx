@@ -12,7 +12,7 @@ const h = vi.hoisted(() => ({
   effects: [] as Array<{ deps?: readonly unknown[]; cleanup?: () => void }>,
   pendingEffects: [] as Array<() => void>,
   applyNow: vi.fn(), freshApply: vi.fn(), hostRead: vi.fn(), coreRead: vi.fn(), nativeRead: vi.fn(),
-  retryPersistence: vi.fn(), pendingRead: vi.fn(), cancelImpact: vi.fn(),
+  retryPersistence: vi.fn(), pendingRead: vi.fn(), cancelImpact: vi.fn(), runtimeLevel: vi.fn(),
   savedRuntimeApply: null as SavedRuntimeApply | null,
   completedSaveRevision: undefined as number | undefined,
   baseVersion: undefined as string | undefined,
@@ -46,15 +46,16 @@ vi.mock('react', async original => ({
   },
 }));
 vi.mock('react-i18next', async () => {
-  const { default: { home } } = await import('@/i18n/locales/en-US.json');
+  const { default: { home, logs } } = await import('@/i18n/locales/en-US.json');
   const messages: Record<string, string> = {
-    'home.pendingSavedChangesApplied': home.pendingSavedChangesApplied,
-    'home.pendingSavedLogLevelApplied': home.pendingSavedLogLevelApplied,
-    'home.pendingSavedMoreChangesApplied': home.pendingSavedMoreChangesApplied,
+    'home.pendingSavedChanges': home.pendingSavedChanges,
+    'home.pendingSavedLogLevel': home.pendingSavedLogLevel,
+    'home.pendingSavedLogLevelActive': home.pendingSavedLogLevelActive,
+    'home.pendingSavedMoreChanges': home.pendingSavedMoreChanges,
+    'logs.currentLevel': logs.currentLevel,
   };
-  const t = (key: string, values?: Record<string, string | number>) => messages[key] && values
-    ? messages[key].replace(/{{(\w+)}}/g, (_, field: string) => String(values[field]))
-    : key;
+  const t = (key: string, values?: Record<string, string | number>) =>
+    messages[key]?.replace(/{{(\w+)}}/g, (_, field: string) => String(values?.[field])) ?? key;
   return { useTranslation: () => ({ t }) };
 });
 vi.mock('@/lib/confirm-twice', () => ({
@@ -76,7 +77,7 @@ vi.mock('@/ipc', () => ({ api: { proxy: {
   retryRuntimePersistence: h.retryPersistence, getPendingChanges: h.pendingRead,
   cancelRuntimeImpact: h.cancelImpact, getStatus: h.statusRead,
   revertSavedSettings: h.revertSaved,
-} } }));
+}, logs: { runtimeLevel: h.runtimeLevel } } }));
 vi.mock('@/store/app-store', () => ({
   normalizePendingChanges: (pending: unknown) => pending,
   useAppStore: Object.assign((select: (state: typeof h.app) => unknown) => select(h.app), { getState: () => h.app }),
@@ -176,15 +177,63 @@ beforeEach(() => {
 });
 afterEach(() => { unmount(); if (vi.isFakeTimers()) vi.clearAllTimers(); vi.useRealTimers(); vi.unstubAllGlobals(); });
 
-it.each([7, 6])('shows a single Save HOT toast only for the running generation (%s)', (generation) => {
+it.each([
+  [7, 'committed', 'debug', 'Current core log level is DEBUG.'],
+  [7, 'unchanged', 'warn', 'Log level saved as DEBUG.'],
+  [6, 'committed', 'debug', null],
+] as const)('requires the current Core log readback for Save generation %i, %s receipt, level %s', async (generation, coreState, level, notice) => {
+  h.runtimeLevel.mockResolvedValueOnce({ level, reason: null });
   h.app.pendingChanges = { added: [], modified: [], removed: [], restartDeferred: false };
   h.savedRuntimeApply = { ok: true, status: 'hotApplied', transactionId: 'save-hot',
-    runtimeGeneration: generation, selectionIntentGeneration: 3, coreState: 'committed', configurationDurable: true, changes: [{ label: 'Log level submitted', logLevel: 'DEBUG' }] };
+    runtimeGeneration: generation, selectionIntentGeneration: 3, coreState, configurationDurable: true, changes: [{ label: 'Log level submitted', logLevel: 'DEBUG' }] };
   expect(renderBar()).toBeNull();
   expect(renderBar()).toBeNull();
-  if (generation === 7) expect(toast.info).toHaveBeenCalledExactlyOnceWith('Log level changed to DEBUG.');
-  else expect(toast.info).not.toHaveBeenCalled();
+  await microtasks();
+  if (notice) {
+    expect(h.runtimeLevel).toHaveBeenCalledOnce();
+    expect(toast.info).toHaveBeenCalledExactlyOnceWith(notice);
+  } else {
+    expect(h.runtimeLevel).not.toHaveBeenCalled();
+    expect(toast.info).not.toHaveBeenCalled();
+  }
   expect(h.applyNow).not.toHaveBeenCalled();
+});
+
+it('names saved rule remarks and disabled rules in a batch without claiming they took effect', () => {
+  h.savedRuntimeApply = { ok: true, status: 'hotApplied', transactionId: 'mixed-save',
+    runtimeGeneration: 7, selectionIntentGeneration: 3, coreState: 'committed', configurationDurable: true,
+    changes: [{ label: 'Edit remarks on Example' }, { label: 'Edit disabled rule Old' },
+      { label: 'Log level submitted', logLevel: 'DEBUG' }] };
+  renderBar();
+  expect(toast.info).toHaveBeenCalledExactlyOnceWith('Edit remarks on Example · Edit disabled rule Old · Log level DEBUG saved.');
+  expect(h.runtimeLevel).not.toHaveBeenCalled();
+});
+
+it.each(['deadline', 'newer Save'] as const)('bounds the log notice and drops late readback after %s', async (completion) => {
+  vi.useFakeTimers();
+  h.completedSaveRevision = 1;
+  h.baseVersion = 'original-config';
+  const original: SavedRuntimeApply = { ok: true, status: 'hotApplied', transactionId: 'log-save',
+    runtimeGeneration: 7, selectionIntentGeneration: 3, coreState: 'committed', configurationDurable: true,
+    saveRevision: 1, configVersion: 'original-config', changes: [{ label: 'Log level submitted', logLevel: 'DEBUG' }] };
+  let finishRead!: (level: { level: string; reason: null }) => void;
+  h.runtimeLevel.mockImplementationOnce(() => new Promise(resolve => { finishRead = resolve; }));
+  h.savedRuntimeApply = original;
+  renderBar();
+  expect(h.runtimeLevel).toHaveBeenCalledOnce();
+  expect(toast.info).not.toHaveBeenCalled();
+  if (completion === 'newer Save') {
+    h.completedSaveRevision = 2;
+    h.baseVersion = 'latest-config';
+    h.savedRuntimeApply = { ...original, transactionId: 'newer-save', saveRevision: 2, configVersion: 'latest-config',
+      changes: [{ label: 'Add rule Latest' }] };
+    renderBar();
+  } else {
+    await vi.advanceTimersByTimeAsync(1000);
+  }
+  finishRead({ level: 'debug', reason: null });
+  await microtasks();
+  expect(toast.info).toHaveBeenCalledExactlyOnceWith(completion === 'deadline' ? 'Log level saved as DEBUG.' : 'Add rule Latest saved.');
 });
 
 it('retains an ahead-of-status Save and replaces an earlier explicit failure after readback', () => {
@@ -199,7 +248,7 @@ it('retains an ahead-of-status Save and replaces an earlier explicit failure aft
   renderBar();
   expect(renderBar()).toBeNull();
   expect(h.states[0]).toMatchObject({ phase: 'idle', reason: null, mainGeneration: 8 });
-  expect(toast.info).toHaveBeenCalledExactlyOnceWith('Delete rule Example took effect.');
+  expect(toast.info).toHaveBeenCalledExactlyOnceWith('Delete rule Example saved.');
 });
 
 it.each(['hotApplied', 'applied'] as const)('keeps a newer explicit %s while an older Save is queued', async (status) => {
@@ -237,7 +286,7 @@ it.each(['hotApplied', 'applied'] as const)('keeps a newer explicit %s while an 
     renderBar();
     expect(h.savedRuntimeApply).toBeNull();
     expect(h.states[0]).toMatchObject({ phase: 'idle', mainGeneration: 9 });
-    expect(toast.info).toHaveBeenCalledExactlyOnceWith('Clone node Copy · Edit app policy Mail · Direct · Edit rule Example and 1 more took effect.');
+    expect(toast.info).toHaveBeenCalledExactlyOnceWith('Clone node Copy · Edit app policy Mail · Direct · Edit rule Example and 1 more saved.');
   } else {
     expect(h.states[0]).toMatchObject({ phase: 'idle', transactionId: 'newer-explicit' });
     expect(h.savedRuntimeApply).toBeNull();
@@ -275,6 +324,7 @@ it.each(['hotDurabilityPending', 'unconfirmed', 'newer disk-only Save', 'externa
       status: initial === 'unconfirmed' ? initial : 'hotDurabilityPending',
       saveRevision: 1, configVersion: 'saved-config', changes: [{ label: 'Log level draft', logLevel: 'DEBUG' }] };
     const terminal: PendingApplyResult = { ...owner, ok: true, status: 'hotApplied', coreState: 'committed', configurationDurable: true };
+    h.runtimeLevel.mockResolvedValueOnce({ level: 'debug', reason: null });
     h.coreRead.mockResolvedValueOnce({ ...terminal, selectionIntentGeneration: 10 }).mockResolvedValue(terminal);
     renderBar();
     renderBar();
@@ -287,8 +337,12 @@ it.each(['hotDurabilityPending', 'unconfirmed', 'newer disk-only Save', 'externa
     await vi.advanceTimersByTimeAsync(4000);
     expect(h.coreRead.mock.calls).toEqual([['save-A'], ['save-A']]);
     if (initial === 'hotDurabilityPending' || initial === 'unconfirmed') {
-      expect(toast.info).toHaveBeenCalledExactlyOnceWith('Log level changed to DEBUG.');
-    } else expect(toast.info).not.toHaveBeenCalled();
+      expect(h.runtimeLevel).toHaveBeenCalledOnce();
+      expect(toast.info).toHaveBeenCalledExactlyOnceWith('Current core log level is DEBUG.');
+    } else {
+      expect(h.runtimeLevel).not.toHaveBeenCalled();
+      expect(toast.info).not.toHaveBeenCalled();
+    }
   },
 );
 
@@ -310,7 +364,7 @@ it('shows the original named Save once when persistence retry and polling both c
   expect(h.coreRead).toHaveBeenCalledExactlyOnceWith('save-retry');
   finishRetry(terminal);
   await microtasks();
-  expect(toast.info).toHaveBeenCalledExactlyOnceWith('Delete rule Example took effect.');
+  expect(toast.info).toHaveBeenCalledExactlyOnceWith('Delete rule Example saved.');
 });
 
 it('keeps explicit ownership over a previously queued Save with the same selector intent', async () => {

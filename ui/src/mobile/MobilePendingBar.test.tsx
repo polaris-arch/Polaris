@@ -32,6 +32,7 @@ const h = vi.hoisted(() => ({
   lifecycleReady: vi.fn(),
   offLifecycle: vi.fn(),
   statusRead: vi.fn(),
+  runtimeLevel: vi.fn(),
   app: {
     pendingChanges: { added: ['node-1'], modified: [], removed: [], restartDeferred: false } as PendingNodeChanges,
     proxyStatus: { running: true, mainGeneration: 7,
@@ -67,9 +68,10 @@ vi.mock('react', async (original) => ({
 vi.mock('react-i18next', async () => {
   const { default: { home } } = await import('@/i18n/locales/en-US.json');
   const messages: Record<string, string> = {
-    'home.pendingSavedChangesApplied': home.pendingSavedChangesApplied,
-    'home.pendingSavedLogLevelApplied': home.pendingSavedLogLevelApplied,
-    'home.pendingSavedMoreChangesApplied': home.pendingSavedMoreChangesApplied,
+    'home.pendingSavedChanges': home.pendingSavedChanges,
+    'home.pendingSavedLogLevel': home.pendingSavedLogLevel,
+    'home.pendingSavedLogLevelActive': home.pendingSavedLogLevelActive,
+    'home.pendingSavedMoreChanges': home.pendingSavedMoreChanges,
   };
   const t = (key: string, values?: Record<string, string | number>) => messages[key] && values
     ? messages[key].replace(/{{(\w+)}}/g, (_, field: string) => String(values[field]))
@@ -97,7 +99,7 @@ vi.mock('@/ipc', () => ({ api: { proxy: {
   cancelRuntimeImpact: h.cancelImpact,
   revertSavedSettings: h.revertSaved,
   getStatus: h.statusRead,
-} } }));
+}, logs: { runtimeLevel: h.runtimeLevel } } }));
 vi.mock('@/store/app-store', () => ({
   normalizePendingChanges: (pending: unknown) => pending,
   useAppStore: Object.assign((selector: (state: typeof h.app) => unknown) => selector(h.app), {
@@ -205,14 +207,17 @@ beforeEach(() => {
 });
 afterEach(() => { unmount(); if (vi.isFakeTimers()) vi.clearAllTimers(); vi.useRealTimers(); vi.restoreAllMocks(); });
 
-it('uses the shared Save HOT receipt and keeps durability recovery bound to its owner', () => {
+it('uses the shared readback for a Save HOT receipt and keeps durability recovery bound to its owner', async () => {
   h.realReconciliation = true;
+  h.runtimeLevel.mockResolvedValueOnce({ level: 'info', reason: null });
   h.app.pendingChanges = { added: [], modified: [], removed: [], restartDeferred: false };
   h.savedRuntimeApply = { ok: true, status: 'hotApplied', transactionId: 'save-hot', runtimeGeneration: 7,
     selectionIntentGeneration: 3, coreState: 'committed', configurationDurable: true, changes: [{ label: 'Log level submitted', logLevel: 'INFO' }] };
   expect(renderBar()).toBeNull();
   expect(renderBar()).toBeNull();
-  expect(toast.info).toHaveBeenCalledExactlyOnceWith('Log level changed to INFO.');
+  await microtasks();
+  expect(h.runtimeLevel).toHaveBeenCalledOnce();
+  expect(toast.info).toHaveBeenCalledExactlyOnceWith('Current core log level is INFO.');
 
   vi.useFakeTimers();
   h.savedRuntimeApply = { ok: true, status: 'hotDurabilityPending', transactionId: 'save-persist', runtimeGeneration: 7,
@@ -220,7 +225,7 @@ it('uses the shared Save HOT receipt and keeps durability recovery bound to its 
   renderBar();
   expect(markup(renderBar())).toContain('home.pendingRetryPersistenceBtn');
   expect(h.states[0]).toMatchObject({ coreRecovery: { transactionId: 'save-persist', runtimeGeneration: 7 } });
-  expect(toast.info).toHaveBeenCalledExactlyOnceWith('Log level changed to INFO.');
+  expect(toast.info).toHaveBeenCalledExactlyOnceWith('Current core log level is INFO.');
   expect(h.applyNow).not.toHaveBeenCalled();
 });
 
