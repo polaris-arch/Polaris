@@ -25,8 +25,8 @@ import sys
 sys.dont_write_bytecode = True
 os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
 
-from fork_input import git_environment, require_git_root, ROOT, canonical, load, require, sha, verify_source, tool_environment
-from plan import plan
+from fork_input import (ROOT, bind_command, canonical, declared_plan, git_environment, load,
+                        require, require_git_root, sha, tool_environment, verify_source)
 from artifacts import RECEIPT_POLICY, receipt_digest, file_pin, inspect_aar, inspect_framework, module_stream, tree_inventory, read_receipt, failure_note
 from budget import group_alive, register_group, reservation, native_capacity, native_environment
 
@@ -970,8 +970,7 @@ def execute(args):
             env, capacity = native_environment(env, observation)
             print(json.dumps({'phase': 'component-native-capacity', 'platform': args.platform,
                               'capacity': capacity, 'compilerCapacityApplied': True}), flush=True)
-            recipe = plan(args.platform, value, gomobile=tools['gomobile'], output=staged, bootclasspath=jar)
-            from fork_input import git_environment, require_git_root, bind_command
+            declared = declared_plan(args.platform, value)['facts']
             command = bind_command(args.platform, value, tools['gomobile'], staged, fp, jar)
             # One direct bind; no helper API21/macOS/tvOS/git-describe side effects.
             log = work / 'stage-original-bind.log'
@@ -995,7 +994,7 @@ def execute(args):
                 origins['generatorOutputInventory'] = tree_inventory(source / 'build')
             verify(origins, scratch, log, output=output)
             receipt = {'schema': 'polaris-mobile-component-v1', 'platform': args.platform, 'input': binding,
-                       'command': command, 'declaredPlan': recipe['facts'], 'sourceOverlay': 0, 'output': output,
+                       'command': command, 'declaredPlan': declared, 'sourceOverlay': 0, 'output': output,
                        'nativeInputs': origins,
                        'AppAccepted': False, 'devicePassed': False, 'publicationEligible': False,
                        'scope': 'actual component bytes/API/source/tool identity only; final App/carrier/device pending'}

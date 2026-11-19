@@ -295,6 +295,33 @@ export function readMobileSource() {
   return validateSourceBytes(pinned(path, sourceContractBytes).bytes);
 }
 
+function bindingPlans(source) {
+  const linkerFlagsPrefix = '-X github.com/sagernet/sing-box/constant.Version=' + source.version +
+    ' -X github.com/sagernet/sing-box/constant.DirectoryRetirementSourceIdentity=' + source.sourceCommit +
+    ' -X runtime.godebugDefault=multipathtcp=0,tlssha1=1 -checklinkname=0 -s -w -buildid=polaris-mobile-';
+  const argument = input => ({ input });
+  const platforms = Object.fromEntries(['android', 'apple'].map(platform => {
+    const profile = source[platform];
+    const android = platform === 'android';
+    const argv = [argument('gomobile'), 'bind', '-o', argument('output'), '-target', profile.targets.join(','),
+      '-libname=' + profile.libname, '-trimpath', '-buildvcs=false', '-work', '-x',
+      '-ldflags', argument('ldflags'), '-tags', profile.tags.join(','),
+      ...(android ? ['-androidapi', argument('minimumAPI'), '-bootclasspath', argument('bootclasspath'),
+        '-javapkg=' + profile.javaPackage] : ['-iosversion', profile.minimumOS]),
+      './experimental/libbox'];
+    const facts = { schema: 'polaris-mobile-bind-input-v1', platform, targets: profile.targets, tags: profile.tags,
+      gomobileVersion: source.gomobileVersion, gobindVersion: source.gobindVersion, artifactAcceptance: false };
+    const summary = { sourceOverlay: 0, actualToolIdentityRequiredBeforeExecution: true,
+      requiredOutputChecks: android ? ['four exact ABI native ELF', 'API24 Android ident', '16KiB PT_LOAD',
+        'complete JNI/Java API', 'actual Go BuildInfo/module/replacement', 'actual BuildID and source/tool input binding',
+        'final APK/R8/alignment'] : ['two exact arm64 iOS platform slices', 'static archives and generated Objective-C/Swift API',
+        'source/module/runtime inputs', 'actual SDK/compiler identities and BuildID', 'final App/PacketTunnel static-link provenance'],
+      producerReceipt: null, AppAccepted: false, devicePassed: false, publicationEligible: false };
+    return [platform, { schema: 'polaris-mobile-bind-plan-v1', argv, facts, summary }];
+  }));
+  return { linkerFlagsPrefix, platforms };
+}
+
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   try {
     const args = process.argv.slice(2);
@@ -302,7 +329,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
       const source = readMobileSource();
       console.log(`${source.goVersion} ${source.version}`);
     } else {
-      // Python producer methods send a complete declaration on stdin.
+      // The producer sends its full declaration once and reuses these plans.
       demand(args.length === 0, 'usage: source-admission.mjs [--versions]');
       const bytes = Buffer.allocUnsafe(sourceContractBytes + 1);
       let received = 0;
@@ -311,7 +338,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
         if (count === 0) break;
         received += count;
       }
-      validateSourceBytes(bytes.subarray(0, received));
+      console.log(JSON.stringify(bindingPlans(validateSourceBytes(bytes.subarray(0, received)))));
     }
   } catch (error) {
     console.error(error instanceof SyntaxError ? 'invalid mobile source declaration JSON' : error.message);

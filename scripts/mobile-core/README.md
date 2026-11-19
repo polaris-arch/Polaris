@@ -65,7 +65,9 @@ and refuses retained slots without deleting them.
 The hosted entry retains source.properties and its pinned observation even if a
 later producer step fails. Rust keeps its separate NDK 27.3.13750724.
 
-`plan.py` verifies the input and prints a bind plan. It never executes a build,
+`python3 -B scripts/mobile-core/fork_input.py android` (or `apple`) verifies
+the supplied source checkout and prints a bind plan. It takes `--source`,
+`--gomobile`, `--output`, and (for Android) `--bootclasspath`. It never executes a build,
 copies an SDK into an App, installs tools, creates a tag or publishes assets.
 Plan fingerprints bind source and target declarations; actual tool identities
 must be added by the producer before compiling. `prepare-ndk-linux.mjs` prepares

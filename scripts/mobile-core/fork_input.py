@@ -49,6 +49,7 @@ def admit_declaration(raw):
                             input=raw, capture_output=True, timeout=30)
     require(result.returncode == 0,
             result.stderr.decode(errors='replace').strip() or 'formal mobile source declaration rejected')
+    return json.loads(result.stdout)
 
 
 def validate(value):
@@ -136,33 +137,36 @@ def verify_source(source, value, *, generator_outputs=False):
                                                          vendor_modes=modes, vendor_trees=trees)}
 
 
-def linker_flags(value, input_fingerprint):
-    validate(value)
+def binding_flags(authority, input_fingerprint):
     require(isinstance(input_fingerprint, str) and re.fullmatch('[0-9a-f]{64}', input_fingerprint),
             'actual binding input fingerprint required')
-    # The producer verifies clean HEAD/tree before and after bind. Inject that
-    # exact pinned commit, never a tag description, dirty tree or future SHA.
-    # Version is explicit. Never use ReadTag/git describe or a reused CLI BuildID.
-    return ('-X github.com/sagernet/sing-box/constant.Version=' + value['version'] +
-            ' -X github.com/sagernet/sing-box/constant.DirectoryRetirementSourceIdentity=' + value['sourceCommit'] +
-            ' -X runtime.godebugDefault=multipathtcp=0,tlssha1=1 -checklinkname=0 -s -w' +
-            ' -buildid=polaris-mobile-' + input_fingerprint)
+    return authority['linkerFlagsPrefix'] + input_fingerprint
+
+
+def linker_flags(value, input_fingerprint):
+    return binding_flags(admit_declaration(canonical(value)), input_fingerprint)
+
+
+def declared_plan(platform, value):
+    require(platform in ('android', 'apple'), 'unknown formal mobile platform')
+    plan = admit_declaration(canonical(value))['platforms'][platform]
+    facts = plan['facts']
+    # Keep the original complete declaration, including its Python JSON values.
+    return {**plan, 'facts': {'schema': facts['schema'], 'source': value, **facts}}
 
 
 def bind_command(platform, value, gomobile, output, input_fingerprint, bootclasspath=None):
-    validate(value)
     require(platform in ('android', 'apple'), 'unknown formal mobile platform')
-    profile = value[platform]
-    args = [str(gomobile), 'bind', '-o', str(output), '-target', ','.join(profile['targets']),
-            '-libname=' + profile['libname'], '-trimpath', '-buildvcs=false', '-work', '-x',
-            '-ldflags', linker_flags(value, input_fingerprint), '-tags', ','.join(profile['tags'])]
+    authority = admit_declaration(canonical(value))
+    inputs = {'gomobile': str(gomobile), 'output': str(output),
+              'ldflags': binding_flags(authority, input_fingerprint)}
     if platform == 'android':
         require(bootclasspath is not None, 'explicit Android bootclasspath required')
-        args += ['-androidapi', str(profile['minimumAPI']), '-bootclasspath', str(bootclasspath),
-                 '-javapkg=' + profile['javaPackage']]
-    else:
-        args += ['-iosversion', profile['minimumOS']]
-    return args + ['./experimental/libbox']
+        # Keep the original CLI spelling of admitted integers and floats.
+        inputs['minimumAPI'] = str(value['android']['minimumAPI'])
+        inputs['bootclasspath'] = str(bootclasspath)
+    return [argument if isinstance(argument, str) else inputs[argument['input']]
+            for argument in authority['platforms'][platform]['argv']]
 
 
 def tool_environment(go, gomobile, gobind, cache, scratch, *, sdk=None, ndk=None,
@@ -198,3 +202,25 @@ def tool_environment(go, gomobile, gobind, cache, scratch, *, sdk=None, ndk=None
         env.pop('PKG_CONFIG_PATH', None)
         env['DEVELOPER_DIR'] = str(developer)
     return env
+
+
+def show_plan():
+    import argparse
+    parser = argparse.ArgumentParser(description='Verify formal source and print a read-only mobile bind plan.')
+    parser.add_argument('platform', choices=['android', 'apple'])
+    for name in ('source', 'gomobile', 'output'):
+        parser.add_argument('--' + name, required=True, type=Path)
+    parser.add_argument('--bootclasspath', type=Path)
+    args = parser.parse_args()
+    value = load()
+    observation = verify_source(args.source, value)
+    plan = declared_plan(args.platform, value)
+    facts = plan['facts']
+    fingerprint = sha(canonical(facts))
+    command = bind_command(args.platform, value, args.gomobile, args.output, fingerprint, args.bootclasspath)
+    print(json.dumps({'schema': plan['schema'], 'facts': facts, 'fingerprint': fingerprint,
+                      'command': command, **plan['summary'], 'sourceObservation': observation}, indent=2))
+
+
+if __name__ == '__main__':
+    show_plan()

@@ -30,7 +30,6 @@
       "scripts/mobile-core/fork_input.py",
       "scripts/mobile-core/source_policy.py",
       "scripts/mobile-core/source-admission.mjs",
-      "scripts/mobile-core/plan.py",
       "scripts/lib/polaris-version.json",
       "scripts/mobile-core/artifacts.py",
       "scripts/mobile-core/producer.py",

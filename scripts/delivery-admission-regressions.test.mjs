@@ -187,6 +187,45 @@ test('formal mobile declaration admits the fixed source and rejects platform, po
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test('the normal mobile declaration worker supplies exact Android and Apple bind plans', () => {
+  const module = new URL('./mobile-core/', import.meta.url);
+  const raw = readFileSync(new URL('source-contract.json', module));
+  const source = JSON.parse(raw);
+  const admitted = input => spawnSync(process.execPath, [fileURLToPath(new URL('source-admission.mjs', module))],
+    { input, encoding: 'utf8' });
+  const run = admitted(raw);
+  assert.equal(run.status, 0, run.stderr);
+  const { linkerFlagsPrefix, platforms } = JSON.parse(run.stdout);
+  const contract = raw.toString('utf8');
+  const fractional = contract.replace(/("minimumAPI"\s*:\s*)24\b/, (_, prefix) => prefix + '24.0');
+  assert.notEqual(fractional, contract);
+  const fractionalAPI = admitted(fractional);
+  assert.equal(fractionalAPI.status, 0, fractionalAPI.stderr);
+  assert.deepEqual(JSON.parse(fractionalAPI.stdout), { linkerFlagsPrefix, platforms });
+  const ldflags = linkerFlagsPrefix + '4'.repeat(64);
+  assert.equal(ldflags, '-X github.com/sagernet/sing-box/constant.Version=' + source.version +
+    ' -X github.com/sagernet/sing-box/constant.DirectoryRetirementSourceIdentity=' + source.sourceCommit +
+    ' -X runtime.godebugDefault=multipathtcp=0,tlssha1=1 -checklinkname=0 -s -w -buildid=polaris-mobile-' + '4'.repeat(64));
+  assert.deepEqual(Object.keys(platforms), ['android', 'apple']);
+  const paths = { gomobile: '/fixture/工具 bin/gomobile', output: '/fixture/output name',
+    minimumAPI: '24', bootclasspath: '/fixture/android sdk/android.jar', ldflags };
+  for (const [platform, { argv, facts, summary }] of Object.entries(platforms)) {
+    const profile = source[platform];
+    assert.deepEqual(argv.map(part => typeof part === 'string' ? part : paths[part.input]), [
+      paths.gomobile, 'bind', '-o', paths.output, '-target', profile.targets.join(','), '-libname=box',
+      '-trimpath', '-buildvcs=false', '-work', '-x', '-ldflags', ldflags, '-tags', profile.tags.join(','),
+      ...(platform === 'android' ? ['-androidapi', '24', '-bootclasspath', paths.bootclasspath, '-javapkg=io.nekohasekai'] :
+        ['-iosversion', '15.0']), './experimental/libbox',
+    ]);
+    assert.deepEqual(facts, { schema: 'polaris-mobile-bind-input-v1', platform, targets: profile.targets, tags: profile.tags,
+      gomobileVersion: source.gomobileVersion, gobindVersion: source.gobindVersion, artifactAcceptance: false });
+    assert.equal(summary.producerReceipt, null);
+    assert.equal(summary.AppAccepted, false);
+    assert.equal(summary.devicePassed, false);
+    assert.equal(summary.publicationEligible, false);
+  }
+});
+
 test('Apple architecture admission rechecks the explicit extension and retains sanitized observations', () => {
   const app = 'polaris_iOS';
   const extension = 'polaris_PacketTunnel';
