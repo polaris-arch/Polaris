@@ -302,53 +302,102 @@ pub fn generate_sing_box_config_with_report_and_runtime_bindings(
     let mut outcome = generate_base_config(config, resolved_ips, deps, runtime_bind_interfaces)?;
     if deps.platform == "android" && deps.has_management_api {
         if let Some((normal_id, mesh_id)) = super::mesh_mode::mode_candidates(config) {
-            let mut normal = config.clone();
-            normal.selected_server_id = Some(normal_id);
-            let mut mesh = config.clone();
-            mesh.selected_server_id = Some(mesh_id);
-            // Both projections come from the exact same builder and runtime facts. Only
-            // differences proven expressible by clash_mode/selector are admitted.
-            if let (Ok(normal), Ok(mesh)) = (
-                generate_base_config(&normal, resolved_ips, deps, runtime_bind_interfaces),
-                generate_base_config(&mesh, resolved_ips, deps, runtime_bind_interfaces),
-            ) {
-                super::mesh_mode::try_compile(
-                    &mut outcome.config,
-                    &normal.config,
-                    &mesh.config,
-                    super::mesh_mode::selected_mode(config),
-                );
-            }
+            compile_android_mesh_modes(
+                config,
+                resolved_ips,
+                deps,
+                runtime_bind_interfaces,
+                (normal_id, mesh_id),
+                &mut outcome.config,
+            );
         }
     }
     Ok(outcome)
 }
 
-/// Keep the running Android layout when its start did not provision dual mesh
-/// mode. A routine graph edit must not also introduce a Clash API service and
-/// replace the Dashboard's HTTP client. A normal start can compile both modes
-/// from the latest config.
+fn compile_android_mesh_modes(
+    config: &UserConfig,
+    resolved_ips: &BTreeMap<String, String>,
+    deps: &GenerateConfigDeps,
+    runtime_bind_interfaces: &BTreeMap<String, String>,
+    (normal_id, mesh_id): (String, String),
+    actual: &mut SingBoxConfig,
+) -> bool {
+    let mut normal = config.clone();
+    normal.selected_server_id = Some(normal_id);
+    let mut mesh = config.clone();
+    mesh.selected_server_id = Some(mesh_id);
+    // Both projections use the same builder and runtime facts. The compiler
+    // admits only differences it can express through clash_mode and selectors.
+    let (Ok(normal), Ok(mesh)) = (
+        generate_base_config(&normal, resolved_ips, deps, runtime_bind_interfaces),
+        generate_base_config(&mesh, resolved_ips, deps, runtime_bind_interfaces),
+    ) else {
+        return false;
+    };
+    super::mesh_mode::try_compile(
+        actual,
+        &normal.config,
+        &mesh.config,
+        super::mesh_mode::selected_mode(config),
+    )
+}
+
+/// Rebuild the graph using the running Android layout and its original mesh
+/// profile. A newly added endpoint does not become the active mesh policy.
 pub fn generate_running_candidate(
     config: &UserConfig,
     deps: &GenerateConfigDeps,
     runtime_bind_interfaces: &BTreeMap<String, String>,
     running: &SingBoxConfig,
+    running_mesh_id: Option<&str>,
 ) -> Result<GenerateOutcome, String> {
     let resolved_ips = BTreeMap::new();
-    if deps.platform == "android"
-        && running
+    if deps.platform != "android" {
+        return generate_sing_box_config_with_report_and_runtime_bindings(
+            config,
+            &resolved_ips,
+            deps,
+            runtime_bind_interfaces,
+        );
+    }
+    let mut outcome = generate_base_config(config, &resolved_ips, deps, runtime_bind_interfaces)?;
+    let Some((mesh_id, clash_api)) = running_mesh_id.zip(
+        running
             .experimental
             .as_ref()
-            .is_none_or(|experimental| experimental.clash_api.is_none())
+            .and_then(|value| value.clash_api.as_ref()),
+    ) else {
+        return Ok(outcome);
+    };
+    if !deps.has_management_api
+        || config.servers.iter().any(|server| {
+            server.protocol == Protocol::Tailscale
+                && server.id != mesh_id
+                && config.effective_selected_server_id() == Some(server.id.as_str())
+        })
     {
-        return generate_base_config(config, &resolved_ips, deps, runtime_bind_interfaces);
+        return Ok(outcome);
     }
-    generate_sing_box_config_with_report_and_runtime_bindings(
+    let Some(candidates) = super::mesh_mode::mode_candidates_for_anchor(config, mesh_id) else {
+        return Ok(outcome);
+    };
+    if !compile_android_mesh_modes(
         config,
         &resolved_ips,
         deps,
         runtime_bind_interfaces,
-    )
+        candidates,
+        &mut outcome.config,
+    ) {
+        return Ok(outcome);
+    }
+    if let Some(experimental) = outcome.config.experimental.as_mut() {
+        // The selected mode may have changed live; the cold boot default
+        // remains fixed for this generation.
+        experimental.clash_api = Some(clash_api.clone());
+    }
+    Ok(outcome)
 }
 
 fn generate_base_config(

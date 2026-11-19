@@ -92,7 +92,7 @@ fn android_single_no_exit_ts_precompiles_both_policies_with_dashboard() {
     let ordinary_base = generate_base_config(&config, &BTreeMap::new(), &deps, &BTreeMap::new())
         .unwrap()
         .config;
-    let candidate = generate_running_candidate(&config, &deps, &BTreeMap::new(), &running)
+    let candidate = generate_running_candidate(&config, &deps, &BTreeMap::new(), &running, None)
         .unwrap()
         .config;
     assert_eq!(candidate, ordinary_base);
@@ -103,9 +103,10 @@ fn android_single_no_exit_ts_precompiles_both_policies_with_dashboard() {
             .iter()
             .any(|endpoint| endpoint.type_field == "tailscale")
     }));
-    let existing_dual = generate_running_candidate(&config, &deps, &BTreeMap::new(), &ordinary)
-        .unwrap()
-        .config;
+    let existing_dual =
+        generate_running_candidate(&config, &deps, &BTreeMap::new(), &ordinary, Some("ts"))
+            .unwrap()
+            .config;
     assert_eq!(existing_dual, ordinary);
     assert_eq!(
         ordinary
@@ -169,6 +170,81 @@ fn android_single_no_exit_ts_precompiles_both_policies_with_dashboard() {
     if let Ok(path) = std::env::var("POLARIS_MESH_MODE_TEST_OUTPUT") {
         std::fs::write(path, serde_json::to_vec_pretty(&ordinary).unwrap()).unwrap();
     }
+}
+
+#[test]
+fn android_warm_tailscale_add_preserves_admitted_dual_mode_and_dashboard() {
+    let mut config = base_config();
+    config.singbox_dashboard = Some(true);
+    config.servers.push(ServerConfig {
+        id: "original".into(),
+        name: "Original tailnet".into(),
+        protocol: Protocol::Tailscale,
+        on_demand: Some(true),
+        tailscale_settings: Some(Box::default()),
+        ..Default::default()
+    });
+    let mut deps = deps_default();
+    deps.platform = "android".into();
+    deps.has_management_api = true;
+    let bindings = BTreeMap::new();
+    let running = generate_sing_box_config(&config, &BTreeMap::new(), &deps).unwrap();
+    let (_, anchor) = super::super::mesh_mode::mode_candidates(&config).unwrap();
+    config.servers.push(ServerConfig {
+        id: "fresh".into(),
+        name: "Fresh tailnet".into(),
+        protocol: Protocol::Tailscale,
+        tailscale_settings: Some(Box::default()),
+        ..Default::default()
+    });
+    let cold = generate_sing_box_config(&config, &BTreeMap::new(), &deps).unwrap();
+    let running_wire = serde_json::to_value(&running).unwrap();
+    let cold_wire = serde_json::to_value(&cold).unwrap();
+    assert_ne!(
+        cold_wire["experimental"]["clash_api"],
+        running_wire["experimental"]["clash_api"]
+    );
+    assert_ne!(cold_wire["services"], running_wire["services"]);
+
+    for active in ["s1", "original"] {
+        config.selected_server_id = Some(active.into());
+        let candidate =
+            generate_running_candidate(&config, &deps, &bindings, &running, Some(&anchor))
+                .unwrap()
+                .config;
+        let wire = serde_json::to_value(&candidate).unwrap();
+        assert_eq!(
+            wire["experimental"]["clash_api"],
+            running_wire["experimental"]["clash_api"]
+        );
+        assert_eq!(wire["services"], running_wire["services"]);
+        assert_eq!(candidate.endpoints.as_ref().unwrap().len(), 2);
+        assert!(candidate
+            .outbounds
+            .iter()
+            .any(|outbound| outbound.tag == super::super::mesh_mode::DASHBOARD_SELECTOR));
+        let base = generate_base_config(&config, &BTreeMap::new(), &deps, &bindings)
+            .unwrap()
+            .config;
+        assert!(compiled_projection_matches_base(
+            &candidate,
+            &base,
+            super::super::mesh_mode::selected_mode(&config)
+        ));
+    }
+
+    config.singbox_dashboard = Some(false);
+    let disabled = generate_running_candidate(&config, &deps, &bindings, &running, Some(&anchor))
+        .unwrap()
+        .config;
+    assert!(disabled.services.unwrap()[0].dashboard.is_none());
+
+    config.singbox_dashboard = Some(true);
+    config.selected_server_id = Some("fresh".into());
+    let unadmitted = generate_running_candidate(&config, &deps, &bindings, &running, Some(&anchor))
+        .unwrap()
+        .config;
+    assert!(unadmitted.experimental.unwrap().clash_api.is_none());
 }
 
 #[test]

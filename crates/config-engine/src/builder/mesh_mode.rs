@@ -24,15 +24,27 @@ fn is_no_exit_ts(server: &ServerConfig) -> bool {
 /// One TS without an exit node and at least one real public exit. Multiple Tailscale endpoints
 /// are deliberately excluded: selection can change the MagicDNS endpoint binding.
 pub fn mode_candidates(config: &UserConfig) -> Option<(String, String)> {
-    if config.selection_intent.is_some() {
-        return None;
-    }
-    let ts: Vec<_> = config
+    let mut tailscale = config
         .servers
         .iter()
-        .filter(|s| s.protocol == Protocol::Tailscale)
-        .collect();
-    if ts.len() != 1 || !is_no_exit_ts(ts[0]) {
+        .filter(|s| s.protocol == Protocol::Tailscale);
+    let mesh = tailscale.next()?;
+    if tailscale.next().is_some() {
+        return None;
+    }
+    mode_candidates_for_anchor(config, &mesh.id)
+}
+
+pub(super) fn mode_candidates_for_anchor(
+    config: &UserConfig,
+    mesh_id: &str,
+) -> Option<(String, String)> {
+    if config.selection_intent.is_some()
+        || !config
+            .servers
+            .iter()
+            .any(|s| s.id == mesh_id && is_no_exit_ts(s))
+    {
         return None;
     }
     let normal = config
@@ -51,7 +63,7 @@ pub fn mode_candidates(config: &UserConfig) -> Option<(String, String)> {
                         || mesh_node_carries_full_tunnel(s))
             })
         })?;
-    Some((normal.id.clone(), ts[0].id.clone()))
+    Some((normal.id.clone(), mesh_id.to_owned()))
 }
 
 pub fn selected_mode(config: &UserConfig) -> &'static str {

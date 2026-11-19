@@ -298,6 +298,7 @@ pub(super) struct RuntimeConfigBaseline {
     protected_physical_root: Option<Arc<ProtectedPhysicalRoot>>,
     deps: GenerateConfigDeps,
     generated: SingBoxConfig,
+    android_mesh_id: Option<String>,
     /// 起核前（TUN 建立前）经物理网卡探得 Bootstrap DoH 端点被 RST/拒绝/超时。只报不通，未知按 false。
     pub(super) doh_blocked: bool,
 }
@@ -1342,6 +1343,17 @@ impl ProxyRuntime {
         pairing: RuntimePairing,
     ) {
         let accepted_host_deps = deps.clone();
+        let android_mesh_id = if deps.platform == "android"
+            && generated
+                .experimental
+                .as_ref()
+                .is_some_and(|value| value.clash_api.is_some())
+        {
+            polaris_config_engine::builder::mesh_mode::mode_candidates(&physical_route_config)
+                .map(|(_, mesh_id)| mesh_id)
+        } else {
+            None
+        };
         if let Ok(mut baseline) = self.runtime_config_baseline.write() {
             if let Some(owner) = baseline
                 .as_ref()
@@ -1365,6 +1377,7 @@ impl ProxyRuntime {
                 protected_physical_root: None,
                 deps,
                 generated,
+                android_mesh_id,
                 doh_blocked: false,
             });
         }
@@ -2471,6 +2484,7 @@ impl ProxyRuntime {
             &deps,
             &bindings,
             &baseline.generated,
+            baseline.android_mesh_id.as_deref(),
         ) {
             Ok(value)
                 if value.invalid_nodes.iter().all(|node| node.reason == polaris_config_engine::builder::outbounds::INVALID_REASON_VISION_TRANSPORT)
@@ -2567,6 +2581,7 @@ impl ProxyRuntime {
             &baseline.deps,
             &previous_bindings,
             &baseline.generated,
+            baseline.android_mesh_id.as_deref(),
         )
         .ok()
         .and_then(|value| serde_json::to_value(value.config).ok())
@@ -3451,6 +3466,7 @@ impl ProxyRuntime {
                 protected_physical_root,
                 deps: pending.deps.clone(),
                 generated: pending.generated.clone(),
+                android_mesh_id: previous.android_mesh_id.clone(),
                 doh_blocked: previous.doh_blocked,
             });
             if let Ok(mut status) = self.status.write() {
