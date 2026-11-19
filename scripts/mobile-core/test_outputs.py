@@ -293,7 +293,7 @@ class FormalOutputs(unittest.TestCase):
         self.assertIn('hot_jni_contract(exported)', body)
         self.assertIn('inspect_hot_java(classes, tools, run)', body)
         for required in ['formal AAR must contain all four ABIs', 'check_buildinfo(facts, value, graph',
-                         "'Java_go_Seq_'", '16KiB PT_LOAD required', 'ELF Android API differs',
+                         "'Java_go_Seq_'", "'--aar-elf'",
                          'newTransientCommandServer(', 'newStrictCommandServer(', 'newManagedStrictCommandServer(',
                          'interfaceUpdateListenerIdentity(', 'checkConfigWithResult(', 'exportTailscaleStoreRetirement();',
                          'exportTailscaleDirectoryCapability();', 'exportTailscaleDirectoryRetirement();',

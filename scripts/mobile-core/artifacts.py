@@ -14,8 +14,7 @@ from contextlib import contextmanager
 
 from fork_input import ROOT, canonical, decode, require, sha, validate
 
-ABI = {'arm64-v8a': (2, 183, 'arm64'), 'armeabi-v7a': (1, 40, 'arm'),
-       'x86': (1, 3, '386'), 'x86_64': (2, 62, 'amd64')}
+ABI = {'arm64-v8a': 'arm64', 'armeabi-v7a': 'arm', 'x86': '386', 'x86_64': 'amd64'}
 APPLE = {'ios-arm64': (0x100000c, 2, 'arm64', None),
          'ios-arm64-simulator': (0x100000c, 7, 'arm64', 'simulator')}
 RECEIPT_POLICY = decode(Path(__file__).with_name('receipt-policy.json').read_bytes())
@@ -376,55 +375,6 @@ def check_buildinfo(facts, value, graph, *, os_name, arch, mode, expected_id, ac
                 require(observed.get('sum') == expected['Sum'], 'native module h1 differs: ' + name)
 
 
-def elf_loads(raw):
-    require(len(raw) >= 52 and raw[:6] in (b'\x7fELF\x01\x01', b'\x7fELF\x02\x01'), 'expected little-endian ELF')
-    wide = raw[4] == 2
-    fmt = '<HHIQQQIHHHHHH' if wide else '<HHIIIIIHHHHHH'
-    header = struct.unpack_from(fmt, raw, 16)
-    offset, size, count = header[4], header[8], header[9]
-    entry = '<IIQQQQQQ' if wide else '<IIIIIIII'
-    require(count > 0 and size == struct.calcsize(entry) and offset + size * count <= len(raw), 'ELF program header bounds')
-    result = []
-    for index in range(count):
-        segment = struct.unpack_from(entry, raw, offset + index * size)
-        if segment[0] == 1:
-            off, addr, length, align = (segment[2], segment[3], segment[5], segment[7]) if wide else (segment[1], segment[2], segment[4], segment[7])
-            require(off + length <= len(raw) and align > 0, 'ELF PT_LOAD bounds')
-            result.append({'offset': off, 'virtualAddress': addr, 'alignment': align, 'bytes': length})
-    require(result, 'ELF has no load segments')
-    return result
-
-
-def android_api(raw):
-    wide = raw[4] == 2
-    header = struct.unpack_from('<HHIQQQIHHHHHH' if wide else '<HHIIIIIHHHHHH', raw, 16)
-    offset, size, count = header[4], header[8], header[9]
-    result = []
-    for index in range(count):
-        row = struct.unpack_from('<IIQQQQQQ' if wide else '<IIIIIIII', raw, offset + index * size)
-        if row[0] != 4:
-            continue
-        start, length = (row[2], row[5]) if wide else (row[1], row[4])
-        end = start + length
-        require(end <= len(raw), 'Android note bounds')
-        while start < end:
-            if not raw[start:end].strip(b'\0'):
-                break
-            require(start + 12 <= end, 'Android note header bounds')
-            names, desc, kind = struct.unpack_from('<3I', raw, start)
-            owner = start + 12
-            payload = owner + (names + 3) // 4 * 4
-            stop = payload + (desc + 3) // 4 * 4
-            require(stop <= end, 'Android note payload bounds')
-            if raw[owner:owner + names].rstrip(b'\0') == b'Android' and kind == 1:
-                require(desc >= 4, 'Android ident descriptor missing')
-                result.append(struct.unpack_from('<I', raw, payload)[0])
-            start = stop
-    require(len(result) == 1, 'one actual Android ident API note required')
-    return result[0]
-
-
-
 # Observed generated Java forms for the Go CommandServer HOT owner API and
 # RuntimePersistenceHandler (sagernet/gomobile v0.1.13). Check the declaration
 # and descriptor together: a same-named static/foreign/overloaded method cannot
@@ -510,32 +460,31 @@ def inspect_aar(aar, value, graph, tools, run, scratch, expected_id):
         require(re.search(r'minSdkVersion\s*=\s*[\"\']24[\"\']', manifest), 'AAR minimumAPI must be24')
         for name in libs:
             abi = name.split('/')[1]
+            libbox = name.endswith('/libbox.so')
             raw = archive.read(name)
-            klass, machine, arch = ABI[abi]
-            require(len(raw) >= 64 and raw[4] == klass and struct.unpack_from('<H', raw, 18)[0] == machine and
-                    struct.unpack_from('<H', raw, 16)[0] == 3, 'ELF shared-library ABI differs')
-            loads = elf_loads(raw)
-            require(all(r['alignment'] >= 16384 and (r['virtualAddress'] - r['offset']) % 16384 == 0 for r in loads), '16KiB PT_LOAD required')
+            size, digest = len(raw), sha(raw)
             path = scratch / name.replace('/', '_')
             path.write_bytes(raw)
+            del raw
+            elf = json.loads(run(['node', ROOT / 'scripts/verify-apk.mjs', '--aar-elf', path,
+                                  abi, size, digest, 'libbox' if libbox else 'dependency']))
             dynamic = run([tools['readelf'], '-d', str(path)])
             needed = re.findall(r'Shared library: \[([^]]+)\]', dynamic)
             require(all(n in {'liblog.so', 'libdl.so', 'libm.so', 'libandroid.so', 'libc.so'} or
                         'jni/' + abi + '/' + n in names for n in needed), 'unpackaged Android runtime dependency')
-            row = {'bytes': len(raw), 'sha256': sha(raw), 'ptLoad': loads, 'needed': needed}
-            if name.endswith('/libbox.so'):
+            row = {'bytes': size, 'sha256': digest, 'ptLoad': elf['ptLoad'], 'needed': needed}
+            if libbox:
                 info = run([tools['go'], 'version', '-m', str(path)])
                 actual_id = run([tools['go'], 'tool', 'buildid', str(path)]).strip()
                 facts = helper.parse_build_info(info)
-                check_buildinfo(facts, value, graph, os_name='android', arch=arch, mode='c-shared',
+                check_buildinfo(facts, value, graph, os_name='android', arch=ABI[abi], mode='c-shared',
                                 expected_id=expected_id, actual_id=actual_id)
-                require(android_api(raw) == 24, 'ELF Android API differs')
                 symbols = run([tools['readelf'], '--dyn-syms', '--wide', str(path)])
                 exported = {m[1] for m in re.finditer(r'GLOBAL\s+DEFAULT\s+(?!UND\b)\S+\s+(\S+)', symbols)}
                 require('JNI_OnLoad' in exported and any(n.startswith('Java_go_Seq_') for n in exported),
                         'actual generated JNI loader/sequence exports missing')
                 hot_jni_contract(exported)
-                row.update(goBuildInfo=info, parsedBuildInfo=facts, buildID=actual_id, androidAPI=24,
+                row.update(goBuildInfo=info, parsedBuildInfo=facts, buildID=actual_id, androidAPI=elf['androidAPI'],
                            jniExports=sorted(n for n in exported if n.startswith(('Java_', 'JNI_'))))
             native[name] = row
         classes = scratch / 'classes.jar'

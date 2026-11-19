@@ -518,6 +518,10 @@ def android_build_code(identity, policy=ANDROID_BUILD_CODE_POLICY):
     # A retained receipt can predate the separate source admission module.
     # Its original inventory still takes part in comparison and causes a miss.
     missing.discard('scripts/mobile-core/source-admission.mjs')
+    # Retained receipts can predate the Node AAR ELF verifier and its imports.
+    aar_verifier = {'scripts/verify-apk.mjs', 'scripts/lib/zip-archive.mjs', 'scripts/release-assets.mjs'}
+    if aar_verifier <= missing:
+        missing -= aar_verifier
     # Retained receipts can describe the previous installer or Apple inspector.
     if 'scripts/mobile-core/prepare-ndk-linux.py' in files:
         missing.discard('scripts/mobile-core/prepare-ndk-linux.mjs')

@@ -567,6 +567,88 @@ export function elfPageAlignment(buf) {
   return loads ? { ok: true } : { ok: false, why: 'ELF has no LOAD segments' };
 }
 
+function aarElfFacts(raw, abi, requireAndroidNote) {
+  const need = (ok, why) => { if (!ok) throw new Error(why); };
+  const ident = elfIdent(raw), expected = abiSpec(abi);
+  need(raw.length >= 64 && raw[5] === 1 && ident.ok && ident.elfClass === expected.elfClass
+    && ident.machine === expected.machine && raw.readUInt16LE(16) === 3, 'ELF shared-library ABI differs');
+  const wide = ident.elfClass === 2;
+  const word = (at) => wide ? raw.readBigUInt64LE(at) : BigInt(raw.readUInt32LE(at));
+  const programOffset = word(wide ? 32 : 28);
+  const rowSize = raw.readUInt16LE(wide ? 54 : 42), count = raw.readUInt16LE(wide ? 56 : 44);
+  need(count > 0 && rowSize === (wide ? 56 : 32)
+    && programOffset <= raw.length - rowSize * count, 'ELF program header bounds');
+  const ptLoad = [];
+  let androidAPI;
+  const androidOwner = Buffer.from('Android');
+  for (let i = 0; i < count; i++) {
+    const start = Number(programOffset) + rowSize * i;
+    const type = raw.readUInt32LE(start);
+    if (type !== 1 && !(requireAndroidNote && type === 4)) continue;
+    const fileOffset = word(start + (wide ? 8 : 4)), fileBytes = word(start + (wide ? 32 : 16));
+    need(fileOffset + fileBytes <= raw.length, type === 1 ? 'ELF PT_LOAD bounds' : 'Android note bounds');
+    const offset = Number(fileOffset), bytes = Number(fileBytes);
+    if (type === 1) {
+      const virtualAddress = word(start + (wide ? 16 : 8)), alignment = word(start + (wide ? 48 : 28));
+      need(alignment >= 16384n && virtualAddress % 16384n === fileOffset % 16384n, '16KiB PT_LOAD required');
+      ptLoad.push({ offset, virtualAddress, alignment, bytes });
+      continue;
+    }
+    const end = offset + bytes;
+    let last = end - 1;
+    while (last >= offset && raw[last] === 0) last--;
+    for (let at = offset; at <= last;) {
+      need(end - at >= 12, 'Android note header bounds');
+      const names = raw.readUInt32LE(at), desc = raw.readUInt32LE(at + 4), kind = raw.readUInt32LE(at + 8);
+      const owner = at + 12, payload = owner + Math.ceil(names / 4) * 4;
+      const stop = payload + Math.ceil(desc / 4) * 4;
+      need(stop <= end, 'Android note payload bounds');
+      if (kind === 1) {
+        let nameEnd = owner + names;
+        while (nameEnd > owner && raw[nameEnd - 1] === 0) nameEnd--;
+        if (raw.subarray(owner, nameEnd).equals(androidOwner)) {
+          need(desc >= 4, 'Android ident descriptor missing');
+          need(androidAPI === undefined, 'one actual Android ident API note required');
+          androidAPI = raw.readUInt32LE(payload);
+        }
+      }
+      at = stop;
+    }
+  }
+  need(ptLoad.length > 0, 'ELF has no load segments');
+  if (!requireAndroidNote) return { ptLoad };
+  need(androidAPI !== undefined, 'one actual Android ident API note required');
+  need(androidAPI === 24, 'ELF Android API differs');
+  return { ptLoad, androidAPI };
+}
+
+// The AAR owner supplies the identity of the member it already extracted.
+// Prove the exact buffered bytes before using them as native receipt evidence.
+function verifyAarElf(path, abi, expectedBytes, expectedSha, library) {
+  const { receipt } = JSON.parse(readFileSync(join(ROOT, 'scripts/mobile-core/receipt-policy.json'), 'utf8'));
+  if (!Number.isSafeInteger(expectedBytes) || expectedBytes < 64 || expectedBytes > 2 * receipt.artifactBytes
+    || !/^[a-f0-9]{64}$/.test(expectedSha) || !['libbox', 'dependency'].includes(library)) {
+    throw new Error('bounded original AAR ELF member pin required');
+  }
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  try {
+    const before = fstatSync(fd);
+    if (!before.isFile() || before.size !== expectedBytes) throw new Error('AAR ELF member size differs');
+    const raw = Buffer.allocUnsafe(expectedBytes);
+    for (let at = 0; at < raw.length;) {
+      const bytes = readSync(fd, raw, at, raw.length - at, at);
+      if (bytes === 0) throw new Error('truncated AAR ELF member');
+      at += bytes;
+    }
+    if (fstatSync(fd).size !== before.size || createHash('sha256').update(raw).digest('hex') !== expectedSha) {
+      throw new Error('AAR ELF member pin differs');
+    }
+    return aarElfFacts(raw, abi, library === 'libbox');
+  } finally {
+    closeSync(fd);
+  }
+}
+
 export function elfSectionNames(buf) {
   if (buf.length < 64) return { ok: false, why: `只有 ${buf.length} 字节，连 ELF 头都放不下` };
   // 魔数 / EI_CLASS / EI_DATA 三项与判据 ② 读的是**同一份**取值口：分两份写必然漂，
@@ -1129,6 +1211,13 @@ export function verifySdkPayload(apk, flavor, nativePins) {
 }
 
 function main() {
+  if (process.argv[2] === '--aar-elf') {
+    const [, , , path, abi, bytes, sha, library] = process.argv;
+    if (process.argv.length !== 8) throw new Error('usage: verify-apk.mjs --aar-elf <path> <abi> <bytes> <sha256> <libbox|dependency>');
+    const facts = verifyAarElf(path, abi, Number(bytes), sha, library);
+    console.log(JSON.stringify(facts, (_, value) => typeof value === 'bigint' ? JSON.rawJSON(value.toString()) : value));
+    return;
+  }
   if (process.argv[2] === '--sdk-payload') {
     const [, , , apk, flavor, pins] = process.argv;
     if (process.argv.length !== 6) throw new Error('usage: verify-apk.mjs --sdk-payload <apk> <flavor> <native pins JSON>');

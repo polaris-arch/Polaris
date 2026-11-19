@@ -249,16 +249,21 @@ function fakeElf({
   buf[4] = is64 ? 2 : 1; // EI_CLASS
   buf[5] = 1; // EI_DATA = 小端
   buf[6] = 1; // EI_VERSION
+  buf.writeUInt16LE(3, 16); // ET_DYN
   buf.writeUInt16LE(machine, 18); // e_machine（e_ident 16 + e_type 2）
   payload.copy(buf, payloadOffset);
   if (is64) {
     buf.writeBigUInt64LE(BigInt(EHDR), 32);
-    buf.writeUInt16LE(PHENT, 54);
-    buf.writeUInt16LE(2, 56);
-    for (let i = 0; i < 2; i++) {
-      buf.writeUInt32LE(1, EHDR + i * PHENT);
-      buf.writeBigUInt64LE(16384n, EHDR + i * PHENT + 48);
-    }
+  } else {
+    buf.writeUInt32LE(EHDR, 28);
+  }
+  buf.writeUInt16LE(PHENT, is64 ? 54 : 42);
+  buf.writeUInt16LE(2, is64 ? 56 : 44);
+  for (let i = 0; i < 2; i++) {
+    const row = EHDR + i * PHENT;
+    buf.writeUInt32LE(1, row);
+    if (is64) buf.writeBigUInt64LE(16384n, row + 48);
+    else buf.writeUInt32LE(16384, row + 28);
   }
   strtab.copy(buf, strtabOff);
 
@@ -1177,6 +1182,113 @@ test('16 KB alignment checks every LOAD, including dependency libraries', () => 
   const result = run(input => input._members.set(`lib/${ABI}/libextra.so`, so));
   assert.ok(result.some(message => message.includes('libextra.so') && message.includes('16 KB')));
   assert.equal(elfPageAlignment(so.subarray(0, 70)).ok, false);
+});
+
+function androidNote(api = 24) {
+  const note = Buffer.alloc(24);
+  note.writeUInt32LE(8, 0);
+  note.writeUInt32LE(4, 4);
+  note.writeUInt32LE(1, 8);
+  note.write('Android', 12);
+  note.writeUInt32LE(api, 20);
+  return note;
+}
+
+function aarElf(abi, notes) {
+  const { elfClass, machine } = ABIS[abi];
+  const wide = elfClass === 2;
+  const raw = fakeElf({ cls: wide ? 64 : 32, machine, payload: notes });
+  const secondRow = wide ? 120 : 84;
+  const payload = wide ? 176 : 116;
+  if (notes) {
+    raw.writeUInt32LE(4, secondRow);
+    if (wide) {
+      raw.writeBigUInt64LE(BigInt(payload), secondRow + 8);
+      raw.writeBigUInt64LE(BigInt(notes.length), secondRow + 32);
+    } else {
+      raw.writeUInt32LE(payload, secondRow + 4);
+      raw.writeUInt32LE(notes.length, secondRow + 16);
+    }
+  }
+  return raw;
+}
+
+test('AAR ELF CLI preserves all ABI receipt rows and rejects malformed member bytes', () => {
+  using fixture = mkdtempDisposableSync(join(tmpdir(), 'polaris-aar-elf-'));
+  const script = fileURLToPath(new URL('./verify-apk.mjs', import.meta.url));
+  const path = join(fixture.path, 'member.so');
+  const inspect = (raw, abi, library = 'libbox', { size = raw.length, sha, file = path } = {}) => {
+    writeFileSync(path, raw);
+    const pin = sha ?? createHash('sha256').update(raw).digest('hex');
+    const child = spawnSync(process.execPath, [script, '--aar-elf', file, abi, size, pin, library],
+      { encoding: 'utf8', timeout: 5000 });
+    assert.ifError(child.error);
+    return child;
+  };
+  const rejected = (raw, abi, why, library, pin) => {
+    const child = inspect(raw, abi, library, pin);
+    assert.equal(child.status, 1, child.stdout);
+    assert.match(child.stderr, why);
+  };
+  const load = { offset: 0, virtualAddress: 0, alignment: 16384, bytes: 0 };
+  for (const abi of Object.keys(ABIS)) {
+    const raw = aarElf(abi, Buffer.concat([androidNote(), Buffer.alloc(5)]));
+    const child = inspect(raw, abi);
+    assert.equal(child.status, 0, child.stderr);
+    assert.deepEqual(JSON.parse(child.stdout), { ptLoad: [load], androidAPI: 24 });
+    const dependency = inspect(aarElf(abi), abi, 'dependency');
+    assert.equal(dependency.status, 0, dependency.stderr);
+    assert.deepEqual(JSON.parse(dependency.stdout), { ptLoad: [load, load] });
+  }
+
+  const abi = DEFAULT_ABI;
+  rejected(aarElf(abi, androidNote(23)), abi, /Android API differs/);
+  rejected(aarElf(abi), abi, /one actual Android ident API note required/);
+  rejected(aarElf(abi, Buffer.concat([androidNote(), androidNote()])), abi, /one actual Android ident API note required/);
+  const foreign = androidNote();
+  foreign.write('AndroidX', 12);
+  rejected(aarElf(abi, foreign), abi, /one actual Android ident API note required/);
+  rejected(aarElf(abi, androidNote().subarray(0, 23)), abi, /Android note payload bounds/);
+  rejected(aarElf(abi, Buffer.concat([androidNote(), Buffer.from([1])])), abi, /Android note header bounds/);
+  rejected(aarElf('x86', androidNote()), abi, /ELF shared-library ABI differs/);
+  rejected(aarElf('x86_64', androidNote()), abi, /ELF shared-library ABI differs/);
+
+  const raw = aarElf(abi, androidNote());
+  rejected(raw, abi, /bounded original AAR ELF member pin required/, 'libbox', { size: 2 ** 31 + 1 });
+  rejected(raw, abi, /AAR ELF member size differs/, 'libbox', { size: raw.length + 1 });
+  rejected(raw, abi, /AAR ELF member pin differs/, 'libbox', { sha: '0'.repeat(64) });
+  if (process.platform !== 'win32') {
+    const link = join(fixture.path, 'link.so');
+    symlinkSync(path, link);
+    rejected(raw, abi, /ELOOP/, 'libbox', { file: link });
+  }
+  raw.writeUInt16LE(2, 16);
+  rejected(raw, abi, /ELF shared-library ABI differs/);
+  raw.writeUInt16LE(3, 16);
+  raw[5] = 2;
+  rejected(raw, abi, /ELF shared-library ABI differs/);
+  raw[5] = 1;
+  raw.writeUInt16LE(55, 54);
+  rejected(raw, abi, /ELF program header bounds/);
+  raw.writeUInt16LE(56, 54);
+  raw.writeBigUInt64LE(BigInt(raw.length + 1), 120 + 32);
+  rejected(raw, abi, /Android note bounds/);
+  raw.writeBigUInt64LE(24n, 120 + 32);
+  raw.writeBigUInt64LE(2n ** 63n, 64 + 16);
+  const checked = inspect(raw, abi);
+  assert.equal(checked.status, 0, checked.stderr);
+  assert.match(checked.stdout, /"virtualAddress":9223372036854775808[,}]/);
+  raw.writeBigUInt64LE(1n, 64 + 16);
+  rejected(raw, abi, /16KiB PT_LOAD required/);
+  raw.writeUInt32LE(0, 64);
+  rejected(raw, abi, /ELF has no load segments/);
+
+  const dependency = aarElf('armeabi-v7a');
+  dependency.writeUInt32LE(4096, 84 + 28);
+  rejected(dependency, 'armeabi-v7a', /16KiB PT_LOAD required/, 'dependency');
+  dependency.writeUInt32LE(16384, 84 + 28);
+  dependency.writeUInt32LE(dependency.length + 1, 84 + 16);
+  rejected(dependency, 'armeabi-v7a', /ELF PT_LOAD bounds/, 'dependency');
 });
 
 
