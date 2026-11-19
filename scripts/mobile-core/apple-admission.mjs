@@ -568,6 +568,111 @@ const TLS_FLAG_CONTENT = Buffer.from(`-Xlinker\n-u\n-Xlinker\n_${TLS_FUNCTION}\n
 const RECEIPT_LIMITS = receiptPolicy.receipt;
 const headerDecoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
 
+// The pinned gomobile v0.1.13 generator maps (string, error) to an
+// NSString* return and an NSError** argument. Source-derived declarations
+// are checked here; fresh framework and Swift compilation remain separate.
+const HOT_HANDLER = {
+  runtimePersistenceMode: '- (NSString* _Nonnull)runtimePersistenceMode;',
+  persistRuntimeConfiguration: '- (BOOL)persistRuntimeConfiguration:(NSString* _Nullable)incarnation revision:(int64_t)revision effectiveDigest:(NSString* _Nullable)effectiveDigest configContent:(NSString* _Nullable)configContent error:(NSError* _Nullable* _Nullable)error;',
+};
+const HOT_CONTRACTS = [
+  ['interface', 'LibboxCommandServer', 'goSeqRefInterface', {
+    runtimeCapabilities: '- (NSString* _Nonnull)runtimeCapabilities:(NSError* _Nullable* _Nullable)error;',
+    startOrReloadServiceWithRetryableRuntimePersistence: '- (BOOL)startOrReloadServiceWithRetryableRuntimePersistence:(NSString* _Nullable)configContent options:(LibboxOverrideOptions* _Nullable)options handler:(id<LibboxRuntimePersistenceHandler> _Nullable)handler error:(NSError* _Nullable* _Nullable)error;',
+  }],
+  ['protocol', 'LibboxRuntimePersistenceHandler', 'NSObject', HOT_HANDLER],
+  ['interface', 'LibboxRuntimePersistenceHandler', 'goSeqRefInterface, LibboxRuntimePersistenceHandler', HOT_HANDLER],
+  ['interface', 'LibboxOverrideOptions', 'goSeqRefInterface', { init: '- (nonnull instancetype)init;' }],
+];
+const VALIDATION_RECEIVER = 'LibboxConfigValidationResult';
+const VALIDATION_GETTERS = ['getCleanup', 'getCleanupError', 'getConfigDigest', 'getContractVersion', 'getRequestID',
+  'getTailscaleStoreMembership', 'getTailscaleStoreRetirement', 'getValidation', 'getValidationError'];
+const SDK_SYMBOLS = ['NewManagedStrictCommandServer', 'exportTailscaleDirectoryCapability', 'activateTailscaleDirectoryDomain',
+  'exportTailscaleDirectoryRetirement', 'NewTransientCommandServer', 'NewStrictCommandServer', 'InterfaceUpdateListenerIdentity',
+  'CheckConfigWithResult', 'ConfigValidationContractVersion', 'exportTailscaleStoreRetirement', 'getTailscaleStoreRetirement',
+  'getTailscaleStoreMembership', 'wakeNow', 'recordScreenState'];
+const SDK_INTERFACE_BASE = TUN_WS + '*:' + TUN_WS + '*NSObject' + TUN_WS + '*';
+const SDK_INTERFACE_BODY = TUN_WS + '*\\{' + TUN_WS + '*\\}';
+const SDK_END = '@end' + TUN_WORD_END;
+const sdkTokens = value => (value.match(new RegExp('[A-Za-z_]' + TUN_WORD + '*|[^' + TUN_SPACE + ']', 'gu')) ?? []).join(' ');
+const sdkReturn = new RegExp('^NSString' + TUN_WS + '*\\*' + TUN_WS + '*_Nonnull$', 'u');
+
+function sdkMethods(body, allowProperties, label) {
+  // Same-line duplicate getters and setters enter the same method table.
+  const statements = body.split(';');
+  requireSetting(!trimTunSpace(statements.pop()), 'unterminated Objective-C ' + label);
+  const methods = new Map(), properties = [];
+  const methodPattern = new RegExp('^([-+])' + TUN_WS + '*\\(([^()]*)\\)' + TUN_WS
+    + '*([A-Za-z_]' + TUN_WORD + '*)' + TUN_WS + '*(.*)$', 'su');
+  for (const piece of statements) {
+    const statement = trimTunSpace(piece);
+    if (!statement) continue;
+    if (allowProperties && statement.startsWith('@property')) {
+      properties.push(statement);
+      continue;
+    }
+    const method = methodPattern.exec(statement);
+    requireSetting(method, 'unexpected Objective-C ' + label);
+    const [, sign, returnType, name, args] = method;
+    const named = methods.get(name) ?? [];
+    named.push({ sign, returnType: trimTunSpace(returnType), args: trimTunSpace(args), statement });
+    methods.set(name, named);
+  }
+  return { methods, properties };
+}
+
+function validationGetterContract(code) {
+  const prefix = '@interface' + TUN_WS + '+' + VALIDATION_RECEIVER + TUN_WORD_END;
+  requireSetting([...code.matchAll(new RegExp(prefix, 'gu'))].length === 1,
+    'one generated Objective-C validation result receiver required');
+  const receivers = [...code.matchAll(new RegExp(prefix + SDK_INTERFACE_BASE + '<' + TUN_WS + '*goSeqRefInterface'
+    + TUN_WS + '*>' + SDK_INTERFACE_BODY + '(.*?)' + SDK_END, 'gsu'))];
+  requireSetting(receivers.length === 1, 'generated Objective-C validation result receiver differs');
+  const { methods, properties } = sdkMethods(receivers[0][1], true, 'result declaration');
+  const getters = {};
+  for (const selector of VALIDATION_GETTERS) {
+    const named = methods.get(selector) ?? [];
+    requireSetting(named.length === 1 && named[0].sign === '-' && !named[0].args && sdkReturn.test(named[0].returnType),
+      'generated Objective-C immutable getter differs: ' + selector);
+    requireSetting(!methods.has('set' + selector.slice(3)), 'generated Objective-C validation result setter: ' + selector);
+    const field = selector[3].toLowerCase() + selector.slice(4);
+    const alias = new RegExp('(?<!' + TUN_WORD + ')' + field + TUN_WORD_END, 'u');
+    requireSetting(!properties.some(item => alias.test(item)), 'generated Objective-C validation result property alias: ' + field);
+    getters[selector] = '- (NSString* _Nonnull)' + selector + ';';
+  }
+  return { receiver: VALIDATION_RECEIVER, getters };
+}
+
+export function sdkHeaderContracts(header) {
+  for (const symbol of SDK_SYMBOLS) {
+    requireSetting(header.includes(symbol), 'generated Objective-C API missing: ' + symbol);
+  }
+  // The original SDK checks remove comments in two passes, with no separator.
+  const code = header.replace(/\/\*.*?\*\//gs, '').replace(/\/\/[^\n]*/g, '');
+  const validationResultGetterContract = validationGetterContract(code);
+  const hotObjectiveCContract = {};
+  for (const [kind, owner, protocols, declarations] of HOT_CONTRACTS) {
+    const prefix = '@' + kind + TUN_WS + '+' + owner + TUN_WORD_END;
+    // A forward protocol declaration does not define a callable receiver.
+    requireSetting([...code.matchAll(new RegExp(prefix + '(?!' + TUN_WS + '*;)', 'gu'))].length === 1,
+      'one generated Objective-C HOT receiver required: ' + kind + ' ' + owner);
+    const isInterface = kind === 'interface';
+    const base = isInterface ? SDK_INTERFACE_BASE : TUN_WS + '*';
+    const body = isInterface ? SDK_INTERFACE_BODY : '';
+    const receivers = [...code.matchAll(new RegExp(prefix + base + '<([^<>]+)>' + body + '(.*?)' + SDK_END, 'gsu'))];
+    requireSetting(receivers.length === 1 && sdkTokens(receivers[0][1]) === sdkTokens(protocols),
+      'generated Objective-C HOT receiver/conformance differs: ' + kind + ' ' + owner);
+    const { methods } = sdkMethods(receivers[0][2], isInterface, 'HOT declaration: ' + owner);
+    for (const [name, declaration] of Object.entries(declarations)) {
+      const named = methods.get(name) ?? [];
+      requireSetting(named.length === 1 && sdkTokens(named[0].statement + ';') === sdkTokens(declaration),
+        'generated Objective-C HOT method differs: ' + kind + ' ' + owner + '.' + name);
+    }
+    hotObjectiveCContract['@' + kind + ' ' + owner] = { ...declarations };
+  }
+  return { validationResultGetterContract, hotObjectiveCContract };
+}
+
 function tlsCapabilityPresent(headers, defined) {
   const nullableRegions = new RegExp(`(?<!${TUN_WORD})NS_ASSUME_NONNULL_(?:BEGIN|END)${TUN_WORD_END}`, 'gu');
   const functionMarker = new RegExp(`(?<!${TUN_WORD})${TLS_FUNCTION}${TUN_WORD_END}${TUN_WS}*\\(`, 'u');
@@ -706,6 +811,11 @@ if (entry && basename(entry) === 'apple-admission.mjs' && realpathSync(entry) ==
     if (mode === '--tls-link') {
       const result = tlsCompilerResponse(action, process.env);
       if (result !== undefined) console.log(JSON.stringify(result));
+    } else if (mode === '--sdk-header-contract') {
+      requireSetting(isAbsolute(action ?? '') && extra.length === 2, 'pinned Apple SDK header observation required');
+      const { bytes, pin } = pinned(action, limits.artifactBytes);
+      requireSetting(matchesPin({ bytes: Number(extra[0]), sha256: extra[1] }, pin), 'Apple SDK header observation pin differs');
+      console.log(JSON.stringify(sdkHeaderContracts(headerDecoder.decode(bytes))));
     } else {
       requireSetting(mode === '--build-settings' && isAbsolute(action ?? '') && extra.length === 0,
         'Apple build-settings requires one absolute output directory');

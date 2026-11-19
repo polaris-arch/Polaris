@@ -11,7 +11,7 @@ from unittest.mock import Mock, patch
 import zipfile
 
 from fork_input import ROOT, canonical, load, sha
-from artifacts import component_output_identity, framework_entry_targets, module, module_stream, objc_hot_contract, objc_validation_getter_contract, tree_inventory, zip_entries
+from artifacts import component_output_identity, framework_entry_targets, module, module_stream, tree_inventory, zip_entries
 from budget import capacity_limit, native_capacity, native_environment, reservation
 from ci_android import emit_outputs, prepare_source, prepare
 from producer import PRODUCER_FILES, compiler_fact, equivalent_binding, executable_driver_identity
@@ -329,137 +329,6 @@ class FormalOutputs(unittest.TestCase):
             with patch('artifacts.decode') as decode, self.assertRaisesRegex(RuntimeError, 'depth'):
                 artifacts.read_receipt(path)
             decode.assert_not_called()
-
-    def hot_objc_header(self):
-        # Source-derived expectations from fresh libbox Go signatures plus
-        # sagernet/gomobile v0.1.13 genobjc.go/types.go, not a fresh generated
-        # framework observation or evidence that Swift compilation succeeded.
-        return '''@class LibboxCommandServer;
-@protocol LibboxRuntimePersistenceHandler;
-@class LibboxRuntimePersistenceHandler;
-@protocol LibboxRuntimePersistenceHandler <NSObject>
-- (BOOL)persistRuntimeConfiguration:(NSString* _Nullable)incarnation revision:(int64_t)revision effectiveDigest:(NSString* _Nullable)effectiveDigest configContent:(NSString* _Nullable)configContent error:(NSError* _Nullable* _Nullable)error;
-- (NSString* _Nonnull)runtimePersistenceMode;
-@end
-@interface LibboxCommandServer : NSObject <goSeqRefInterface> {
-}
-@property(strong, readonly) _Nonnull id _ref;
-- (NSString* _Nonnull)runtimeCapabilities:(NSError* _Nullable* _Nullable)error;
-- (BOOL)startOrReloadServiceWithRetryableRuntimePersistence:(NSString* _Nullable)configContent options:(LibboxOverrideOptions* _Nullable)options handler:(id<LibboxRuntimePersistenceHandler> _Nullable)handler error:(NSError* _Nullable* _Nullable)error;
-@end
-@interface LibboxOverrideOptions : NSObject <goSeqRefInterface> {
-}
-@property(strong, readonly) _Nonnull id _ref;
-- (nonnull instancetype)initWithRef:(_Nonnull id)ref;
-- (nonnull instancetype)init;
-@end
-@class LibboxRuntimePersistenceHandler;
-@interface LibboxRuntimePersistenceHandler : NSObject <goSeqRefInterface, LibboxRuntimePersistenceHandler> {
-}
-@property(strong, readonly) _Nonnull id _ref;
-- (nonnull instancetype)initWithRef:(_Nonnull id)ref;
-- (BOOL)persistRuntimeConfiguration:(NSString* _Nullable)incarnation revision:(int64_t)revision effectiveDigest:(NSString* _Nullable)effectiveDigest configContent:(NSString* _Nullable)configContent error:(NSError* _Nullable* _Nullable)error;
-- (NSString* _Nonnull)runtimePersistenceMode;
-@end
-'''
-
-    def test_objc_hot_contract_requires_exact_owners_and_pinned_generator_types(self):
-        header = self.hot_objc_header()
-        facts = objc_hot_contract(header)
-        self.assertEqual(set(facts), {'@interface LibboxCommandServer',
-                         '@protocol LibboxRuntimePersistenceHandler',
-                         '@interface LibboxRuntimePersistenceHandler', '@interface LibboxOverrideOptions'})
-        self.assertEqual(objc_hot_contract(header.replace('\n', ' ')), facts)
-        self.assertEqual(objc_hot_contract(header.replace('*', ' * ').replace(':', ' : ')), facts)
-        capability = '- (NSString* _Nonnull)runtimeCapabilities:(NSError* _Nullable* _Nullable)error;'
-        retry = next(line for line in header.splitlines() if ')startOrReloadServiceWithRetryable' in line)
-        persist = next(line for line in header.splitlines() if ')persistRuntimeConfiguration:' in line)
-        mode = '- (NSString* _Nonnull)runtimePersistenceMode;'
-        cases = [
-            header.replace('LibboxCommandServer :', 'LibboxOtherReceiver :'),
-            header.replace(capability, '') + '@interface Other : NSObject\n' + capability + '\n@end',
-            header.replace(capability, '// ' + capability),
-            header.replace(capability, '/* ' + capability + ' */'),
-            header.replace(capability, capability + ' ' + capability),
-            header.replace(capability, capability.replace('- ', '+ ')),
-            header.replace(capability, capability.replace('NSString* _Nonnull', 'BOOL')),
-            header.replace(capability, capability.replace('_Nonnull', '_Nullable')),
-            header.replace(capability, '- (BOOL)runtimeCapabilities:(NSString* _Nonnull* _Nullable)ret0_ error:(NSError* _Nullable* _Nullable)error;'),
-            header.replace(retry, retry.replace('BOOL', 'void')),
-            header.replace(retry, retry.replace('options:', 'overrideOptions:')),
-            header.replace(retry, retry.replace('options:(LibboxOverrideOptions* _Nullable)options handler:(id<LibboxRuntimePersistenceHandler> _Nullable)handler',
-                                                'handler:(id<LibboxRuntimePersistenceHandler> _Nullable)handler options:(LibboxOverrideOptions* _Nullable)options')),
-            header.replace(retry, retry.replace('id<LibboxRuntimePersistenceHandler> _Nullable', 'LibboxRuntimePersistenceHandler* _Nullable')),
-            header.replace(persist, persist.replace('revision:(int64_t)', 'revision:(int32_t)'), 1),
-            header.replace(persist, persist.replace('effectiveDigest:', 'effectiveDigestWrong:'), 1),
-            header.replace(persist, persist.replace('BOOL', 'void'), 1),
-            header.replace(mode, mode.replace('_Nonnull', '_Nullable'), 1),
-            header.replace('@protocol LibboxRuntimePersistenceHandler <NSObject>', '@protocol LibboxRuntimePersistenceHandler <Other>'),
-            header.replace('<goSeqRefInterface, LibboxRuntimePersistenceHandler>', '<goSeqRefInterface>'),
-            header.replace('<goSeqRefInterface, LibboxRuntimePersistenceHandler>', '<LibboxRuntimePersistenceHandler>'),
-            header.replace('<goSeqRefInterface, LibboxRuntimePersistenceHandler>', '<goSeqRefInterface, Other>'),
-            header.replace('- (nonnull instancetype)init;', '- (nullable instancetype)init;'),
-            header.replace('@protocol LibboxRuntimePersistenceHandler <NSObject>', '@protocol LibboxRuntimePersistenceHandler <NSObject>\n@optional'),
-            header + header,
-        ]
-        # Each pointer/nullability position and both callback owners matter.
-        for declaration in (capability, retry, persist):
-            for wrong_error in ('NSError* _Nullable', 'NSError* _Nonnull* _Nullable',
-                                'NSError* _Nullable* _Nonnull', 'NSString* _Nullable* _Nullable'):
-                cases.append(header.replace(declaration, declaration.replace('NSError* _Nullable* _Nullable', wrong_error), 1))
-        for original in ('NSString* _Nullable', 'LibboxOverrideOptions* _Nullable',
-                         'id<LibboxRuntimePersistenceHandler> _Nullable'):
-            cases.append(header.replace(retry, retry.replace(original, original.replace('_Nullable', '_Nonnull')), 1))
-        proxy = header.index('@interface LibboxRuntimePersistenceHandler :')
-        for declaration in (persist, mode):
-            cases.append(header[:proxy] + header[proxy:].replace(declaration, '', 1))
-            cases.append(header[:proxy] + header[proxy:].replace(declaration, declaration.replace('- ', '+ '), 1))
-        protocol_start = header.index('@protocol LibboxRuntimePersistenceHandler <')
-        protocol_end = header.index('@end', protocol_start) + len('@end')
-        cases.append(header[:protocol_start] + header[protocol_end:])
-        for wrong in cases:
-            with self.subTest(header=wrong[:180]), self.assertRaises(RuntimeError):
-                objc_hot_contract(wrong)
-
-    def validation_result_objc_header(self):
-        # Declaration spelling/receiver/return type from the preserved original
-        # ac6 Libbox.objc.h (129711B, e743b050...), not the former bare-name stub.
-        selectors = ['getCleanup', 'getCleanupError', 'getConfigDigest', 'getContractVersion', 'getRequestID',
-                     'getTailscaleStoreMembership', 'getTailscaleStoreRetirement', 'getValidation', 'getValidationError']
-        return ('@interface LibboxConfigValidationResult : NSObject <goSeqRefInterface> {\n}\n'
-                '@property(strong, readonly) _Nonnull id _ref;\n' +
-                '\n'.join('- (NSString* _Nonnull)' + name + ';' for name in selectors) + '\n@end\n')
-
-    def test_objc_validation_getters_require_exact_result_receiver_types_and_readonly_selectors(self):
-        header = self.validation_result_objc_header()
-        facts = objc_validation_getter_contract(header)
-        self.assertEqual(facts['receiver'], 'LibboxConfigValidationResult')
-        self.assertEqual(len(facts['getters']), 9)
-        self.assertEqual(objc_validation_getter_contract(header.replace('\n', ' ')), facts,
-                         'valid declaration formatting cannot depend on newlines')
-        getter = '- (NSString* _Nonnull)getTailscaleStoreRetirement;'
-        membership = '- (NSString* _Nonnull)getTailscaleStoreMembership;'
-        for wrong in [
-            header.replace(getter, ''), header.replace(membership, ''),
-            header.replace(getter, '// ' + getter), header.replace(getter, '/* ' + getter + ' */'),
-            header.replace(getter, getter.replace('getTailscaleStoreRetirement', 'tailscaleStoreRetirement')),
-            header.replace(getter, getter.replace('NSString* _Nonnull', 'int64_t')),
-            header.replace(getter, getter.replace('_Nonnull', '_Nullable')),
-            header.replace(getter, getter.replace(';', ': (NSString*)argument;')),
-            header.replace(getter, getter.replace('- ', '+ ')),
-            header.replace(getter, getter + '\n' + getter),
-            header.replace(getter, getter + ' ' + getter),
-            header.replace(getter, getter + ' - (void)setTailscaleStoreRetirement:(NSString*)value;'),
-            header.replace('LibboxConfigValidationResult', 'LibboxOtherReceiver'),
-            header.replace('goSeqRefInterface', 'OtherProtocol'), header + header,
-            header.replace('@end', '- (void)setTailscaleStoreRetirement:(NSString*)value;\n@end'),
-            header.replace('@end', '@property(strong) NSString* tailscaleStoreMembership;\n@end'),
-        ]:
-            with self.subTest(header=wrong[:150]), self.assertRaises(RuntimeError):
-                objc_validation_getter_contract(wrong)
-        wrong_receiver = header.replace(getter, '') + ('@interface LibboxOtherReceiver : NSObject\n' + getter + '\n@end\n')
-        with self.assertRaises(RuntimeError):
-            objc_validation_getter_contract(wrong_receiver)
 
     def facts(self, apple=False, simulator=False):
         tags = self.value['apple' if apple else 'android']['tags'][:]

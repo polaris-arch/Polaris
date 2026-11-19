@@ -410,105 +410,6 @@ def framework_entry_targets(entry):
     return ({'ios-arm64-simulator'} if entry.get('SupportedPlatformVariant') == 'simulator' else {'ios-arm64'})
 
 
-def objc_hot_contract(header):
-    # Expected declarations are derived from libbox's Go API and pinned
-    # sagernet/gomobile v0.1.13 (9f03b8f25789099c5c8abef4a02085da783ba923),
-    # bind/genobjc.go:funcSummary/asSignature/objcType/objcParamType and
-    # bind/types.go:isNullableType. They are not an observed fresh framework.
-    # In particular, (string, error) returns NSString* _Nonnull plus NSError**,
-    # not BOOL plus an NSString output argument. Actual framework inspection
-    # and Swift compilation remain required for each newly built source.
-    handler = {
-        'runtimePersistenceMode': '- (NSString* _Nonnull)runtimePersistenceMode;',
-        'persistRuntimeConfiguration': '- (BOOL)persistRuntimeConfiguration:(NSString* _Nullable)incarnation revision:(int64_t)revision effectiveDigest:(NSString* _Nullable)effectiveDigest configContent:(NSString* _Nullable)configContent error:(NSError* _Nullable* _Nullable)error;',
-    }
-    expected = {
-        ('interface', 'LibboxCommandServer', 'goSeqRefInterface'): {
-            'runtimeCapabilities': '- (NSString* _Nonnull)runtimeCapabilities:(NSError* _Nullable* _Nullable)error;',
-            'startOrReloadServiceWithRetryableRuntimePersistence': '- (BOOL)startOrReloadServiceWithRetryableRuntimePersistence:(NSString* _Nullable)configContent options:(LibboxOverrideOptions* _Nullable)options handler:(id<LibboxRuntimePersistenceHandler> _Nullable)handler error:(NSError* _Nullable* _Nullable)error;',
-        },
-        ('protocol', 'LibboxRuntimePersistenceHandler', 'NSObject'): handler,
-        ('interface', 'LibboxRuntimePersistenceHandler', 'goSeqRefInterface, LibboxRuntimePersistenceHandler'): handler,
-        ('interface', 'LibboxOverrideOptions', 'goSeqRefInterface'): {
-            'init': '- (nonnull instancetype)init;',
-        },
-    }
-    code = re.sub(r'/\*.*?\*/', '', header, flags=re.S)
-    code = re.sub(r'//[^\n]*', '', code)
-    tokens = lambda text: re.findall(r'[A-Za-z_]\w*|[^\s]', text)
-    observed = {}
-    for (kind, owner, protocols), declarations in expected.items():
-        prefix = '@' + kind + r'\s+' + owner + r'\b'
-        # Forward protocol declarations do not define a callable receiver.
-        require(len(re.findall(prefix + r'(?!\s*;)', code)) == 1,
-                'one generated Objective-C HOT receiver required: ' + kind + ' ' + owner)
-        base = r'\s*:\s*NSObject\s*' if kind == 'interface' else r'\s*'
-        body = r'\s*\{\s*\}' if kind == 'interface' else ''
-        receivers = re.findall(prefix + base + r'<([^<>]+)>' + body + r'(.*?)@end\b', code, re.S)
-        require(len(receivers) == 1 and tokens(receivers[0][0]) == tokens(protocols),
-                'generated Objective-C HOT receiver/conformance differs: ' + kind + ' ' + owner)
-        statements = receivers[0][1].split(';')
-        require(not statements[-1].strip(), 'unterminated Objective-C HOT declaration: ' + owner)
-        methods = {}
-        for statement in statements[:-1]:
-            statement = statement.strip()
-            if not statement:
-                continue
-            if statement.startswith('@property') and kind == 'interface':
-                continue
-            method = re.fullmatch(r'([-+])\s*\(([^()]*)\)\s*([A-Za-z_]\w*)\s*(.*)', statement, re.S)
-            require(method is not None, 'unexpected Objective-C HOT declaration: ' + owner)
-            methods.setdefault(method[3], []).append(tokens(statement + ';'))
-        for name, declaration in declarations.items():
-            require(methods.get(name) == [tokens(declaration)],
-                    'generated Objective-C HOT method differs: ' + kind + ' ' + owner + '.' + name)
-        observed['@' + kind + ' ' + owner] = declarations
-    return observed
-
-
-def objc_validation_getter_contract(header):
-    # Actual pinned gobind headers use getTailscaleStore* selectors on this
-    # result receiver, not lowercase tailscaleStore* aliases. Comments or
-    # selectors on another class cannot supply the immutable result contract.
-    code = re.sub(r'/\*.*?\*/', '', header, flags=re.S)
-    code = re.sub(r'//[^\n]*', '', code)
-    require(len(re.findall(r'@interface\s+LibboxConfigValidationResult\b', code)) == 1,
-            'one generated Objective-C validation result receiver required')
-    receivers = re.findall(r'@interface\s+LibboxConfigValidationResult\s*:\s*NSObject\s*'
-                           r'<\s*goSeqRefInterface\s*>\s*\{\s*\}(.*?)@end\b', code, re.S)
-    require(len(receivers) == 1, 'generated Objective-C validation result receiver differs')
-    receiver, declarations = receivers[0], {}
-    # Method declarations end at semicolons, not newlines. In particular a
-    # same-line duplicate getter or setter must enter the same method table.
-    statements = receiver.split(';')
-    require(not statements[-1].strip(), 'unterminated Objective-C result declaration')
-    methods, properties = {}, []
-    for statement in statements[:-1]:
-        statement = statement.strip()
-        if not statement:
-            continue
-        if statement.startswith('@property'):
-            properties.append(statement)
-            continue
-        method = re.fullmatch(r'([-+])\s*\(([^()]*)\)\s*([A-Za-z_]\w*)\s*(.*)', statement, re.S)
-        require(method is not None, 'unexpected Objective-C result declaration')
-        sign, return_type, name, arguments = method.groups()
-        methods.setdefault(name, []).append((sign, return_type.strip(), arguments.strip()))
-    for selector in ['getCleanup', 'getCleanupError', 'getConfigDigest', 'getContractVersion', 'getRequestID',
-                     'getTailscaleStoreMembership', 'getTailscaleStoreRetirement', 'getValidation', 'getValidationError']:
-        named = methods.get(selector, [])
-        require(len(named) == 1 and named[0][0] == '-' and not named[0][2] and
-                re.fullmatch(r'NSString\s*\*\s*_Nonnull', named[0][1]) is not None,
-                'generated Objective-C immutable getter differs: ' + selector)
-        require('set' + selector[3:] not in methods,
-                'generated Objective-C validation result setter: ' + selector)
-        field = selector[3:4].lower() + selector[4:]
-        require(not any(re.search(r'\b' + field + r'\b', item) for item in properties),
-                'generated Objective-C validation result property alias: ' + field)
-        declarations[selector] = '- (NSString* _Nonnull)' + selector + ';'
-    return {'receiver': 'LibboxConfigValidationResult', 'getters': declarations}
-
-
 def inspect_framework(framework, value, graph, expected_id, *, run, scratch):
     reads = {}
     with inspection_stage('framework-inspection', reads):
@@ -572,15 +473,14 @@ def _inspect_framework(framework, value, graph, expected_id, reads, run, scratch
             pinned[resolved] = header_pin
             # Match read_text's universal newline behavior in the stable output.
             headers[header_path.name] = header_raw.decode().replace('\r\n', '\n').replace('\r', '\n')
-        header = '\n'.join(headers.values())
-        for symbol in ['NewManagedStrictCommandServer', 'exportTailscaleDirectoryCapability',
-                       'activateTailscaleDirectoryDomain', 'exportTailscaleDirectoryRetirement',
-                       'NewTransientCommandServer', 'NewStrictCommandServer', 'InterfaceUpdateListenerIdentity',
-                       'CheckConfigWithResult', 'ConfigValidationContractVersion', 'exportTailscaleStoreRetirement',
-                       'getTailscaleStoreRetirement', 'getTailscaleStoreMembership', 'wakeNow', 'recordScreenState']:
-            require(symbol in header, 'generated Objective-C API missing: ' + symbol)
-        validation_getters = objc_validation_getter_contract(header)
-        hot_contract = objc_hot_contract(header)
+        # Keep the exact text observed from the pinned framework files, in
+        # their original order and normalized as in the receipt.
+        header = '\n'.join(headers.values()).encode()
+        with tempfile.TemporaryDirectory(prefix='apple-sdk-headers-', dir=scratch) as folder:
+            report = Path(folder) / 'header.h'
+            report.write_bytes(header)
+            contracts = json.loads(run(['node', ROOT / 'scripts/mobile-core/apple-admission.mjs',
+                                        '--sdk-header-contract', report.resolve(), len(header), sha(header)]))
         for slice_row in slices:
             members = [m for m in slice_row['archive']['members'] if m['classification'] == 'code']
             require(members, 'static archive has no code')
@@ -609,8 +509,8 @@ def _inspect_framework(framework, value, graph, expected_id, reads, run, scratch
                                     simulator=spec[3] == 'simulator', run=run, scratch=scratch)
             observed[target] = {'libraryIdentifier': identifier, 'binary': binary_pin,
                 'headerSha256': {name: sha(text.encode()) for name, text in headers.items()},
-                'validationResultGetterContract': validation_getters,
-                'hotObjectiveCContract': hot_contract,
+                'validationResultGetterContract': contracts['validationResultGetterContract'],
+                'hotObjectiveCContract': contracts['hotObjectiveCContract'],
                 'goBuildInfo': infos[0], 'buildID': ids[0],
                 'linkerOptions': [{'memberOrdinal': m['ordinal'], 'memberName': m['name'],
                                   'memberSha256': m['sha256'], 'command': command}

@@ -7,7 +7,158 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { nativeTunCompilerResponse } from './mobile-core/apple-admission.mjs';
+import { nativeTunCompilerResponse, sdkHeaderContracts } from './mobile-core/apple-admission.mjs';
+// Source-derived gomobile v0.1.13 declarations, with the result spelling
+// independently observed in the preserved original Libbox.objc.h.
+const sdkCapability = '- (NSString* _Nonnull)runtimeCapabilities:(NSError* _Nullable* _Nullable)error;';
+const sdkRetry = '- (BOOL)startOrReloadServiceWithRetryableRuntimePersistence:(NSString* _Nullable)configContent options:(LibboxOverrideOptions* _Nullable)options handler:(id<LibboxRuntimePersistenceHandler> _Nullable)handler error:(NSError* _Nullable* _Nullable)error;';
+const sdkPersist = '- (BOOL)persistRuntimeConfiguration:(NSString* _Nullable)incarnation revision:(int64_t)revision effectiveDigest:(NSString* _Nullable)effectiveDigest configContent:(NSString* _Nullable)configContent error:(NSError* _Nullable* _Nullable)error;';
+const sdkMode = '- (NSString* _Nonnull)runtimePersistenceMode;';
+const sdkInit = '- (nonnull instancetype)init;';
+const sdkGetters = ['getCleanup', 'getCleanupError', 'getConfigDigest', 'getContractVersion', 'getRequestID',
+  'getTailscaleStoreMembership', 'getTailscaleStoreRetirement', 'getValidation', 'getValidationError'];
+const sdkGetter = name => '- (NSString* _Nonnull)' + name + ';';
+const sdkProductSymbols = ['NewManagedStrictCommandServer', 'exportTailscaleDirectoryCapability', 'activateTailscaleDirectoryDomain',
+  'exportTailscaleDirectoryRetirement', 'NewTransientCommandServer', 'NewStrictCommandServer', 'InterfaceUpdateListenerIdentity',
+  'CheckConfigWithResult', 'ConfigValidationContractVersion', 'exportTailscaleStoreRetirement', 'wakeNow', 'recordScreenState'];
+const sdkDeclarations = sdkProductSymbols.map(name => 'void Libbox' + name + '(void);').join('\n');
+const sdkResult = ['@interface LibboxConfigValidationResult : NSObject <goSeqRefInterface> {\n}',
+  '@property(strong, readonly) _Nonnull id _ref;', ...sdkGetters.map(sdkGetter), '@end'].join('\n');
+const sdkHot = [
+  '@class LibboxCommandServer;', '@protocol LibboxRuntimePersistenceHandler;', '@class LibboxRuntimePersistenceHandler;',
+  '@protocol LibboxRuntimePersistenceHandler <NSObject>', sdkPersist, sdkMode, '@end',
+  '@interface LibboxCommandServer : NSObject <goSeqRefInterface> {\n}',
+  '@property(strong, readonly) _Nonnull id _ref;', sdkCapability, sdkRetry, '@end',
+  '@interface LibboxOverrideOptions : NSObject <goSeqRefInterface> {\n}',
+  '@property(strong, readonly) _Nonnull id _ref;', '- (nonnull instancetype)initWithRef:(_Nonnull id)ref;', sdkInit, '@end',
+  '@class LibboxRuntimePersistenceHandler;',
+  '@interface LibboxRuntimePersistenceHandler : NSObject <goSeqRefInterface, LibboxRuntimePersistenceHandler> {\n}',
+  '@property(strong, readonly) _Nonnull id _ref;', '- (nonnull instancetype)initWithRef:(_Nonnull id)ref;', sdkPersist, sdkMode, '@end',
+].join('\n');
+const sdkHeader = [sdkDeclarations, sdkHot, sdkResult].join('\n');
+
+test('Apple SDK HOT declarations require exact receivers, conformance and generator types', () => {
+  const inspect = header => sdkHeaderContracts([sdkDeclarations, header, sdkResult].join('\n')).hotObjectiveCContract;
+  const facts = inspect(sdkHot);
+  const handler = { runtimePersistenceMode: sdkMode, persistRuntimeConfiguration: sdkPersist };
+  assert.deepEqual(facts, {
+    '@interface LibboxCommandServer': {
+      runtimeCapabilities: sdkCapability, startOrReloadServiceWithRetryableRuntimePersistence: sdkRetry,
+    },
+    '@protocol LibboxRuntimePersistenceHandler': handler,
+    '@interface LibboxRuntimePersistenceHandler': handler,
+    '@interface LibboxOverrideOptions': { init: sdkInit },
+  });
+  assert.deepEqual(inspect(sdkHot.replaceAll('\n', ' ')), facts);
+  assert.deepEqual(inspect(sdkHot.replaceAll('*', ' * ').replaceAll(':', ' : ')), facts);
+  assert.deepEqual(inspect(sdkHot.replaceAll(' ', '\u0085')), facts);
+  const types = '<goSeqRefInterface, LibboxRuntimePersistenceHandler>';
+  const protocol = '@protocol LibboxRuntimePersistenceHandler <NSObject>';
+  const cases = [
+    sdkHot.replace('LibboxCommandServer :', 'LibboxOtherReceiver :'),
+    sdkHot.replace(sdkCapability, '') + '\n@interface Other : NSObject\n' + sdkCapability + '\n@end',
+    sdkHot.replace(sdkCapability, '// ' + sdkCapability),
+    sdkHot.replace(sdkCapability, '/* ' + sdkCapability + ' */'),
+    sdkHot.replace(sdkCapability, sdkCapability + ' ' + sdkCapability),
+    sdkHot.replace(sdkCapability, sdkCapability.replace('- ', '+ ')),
+    sdkHot.replace(sdkCapability, sdkCapability.replace('NSString* _Nonnull', 'BOOL')),
+    sdkHot.replace(sdkCapability, sdkCapability.replace('_Nonnull', '_Nullable')),
+    sdkHot.replace(sdkCapability, '- (BOOL)runtimeCapabilities:(NSString* _Nonnull* _Nullable)ret0_ error:(NSError* _Nullable* _Nullable)error;'),
+    sdkHot.replace(sdkRetry, sdkRetry.replace('BOOL', 'void')),
+    sdkHot.replace(sdkRetry, sdkRetry.replace('options:', 'overrideOptions:')),
+    sdkHot.replace(sdkRetry, sdkRetry.replace('options:(LibboxOverrideOptions* _Nullable)options handler:(id<LibboxRuntimePersistenceHandler> _Nullable)handler',
+      'handler:(id<LibboxRuntimePersistenceHandler> _Nullable)handler options:(LibboxOverrideOptions* _Nullable)options')),
+    sdkHot.replace(sdkRetry, sdkRetry.replace('id<LibboxRuntimePersistenceHandler> _Nullable', 'LibboxRuntimePersistenceHandler* _Nullable')),
+    sdkHot.replace(sdkPersist, sdkPersist.replace('revision:(int64_t)', 'revision:(int32_t)')),
+    sdkHot.replace(sdkPersist, sdkPersist.replace('effectiveDigest:', 'effectiveDigestWrong:')),
+    sdkHot.replace(sdkPersist, sdkPersist.replace('BOOL', 'void')),
+    sdkHot.replace(sdkMode, sdkMode.replace('_Nonnull', '_Nullable')),
+    sdkHot.replace(protocol, protocol.replace('NSObject', 'Other')),
+    sdkHot.replace(types, '<goSeqRefInterface>'),
+    sdkHot.replace(types, '<LibboxRuntimePersistenceHandler>'),
+    sdkHot.replace(types, '<goSeqRefInterface, Other>'),
+    sdkHot.replace(sdkInit, sdkInit.replace('nonnull', 'nullable')),
+    sdkHot.replace(protocol, protocol + '\n@optional'),
+    sdkHot.replace('LibboxCommandServer :', 'LibboxCommandServeré :'),
+    sdkHot.replace('LibboxCommandServer :', 'LibboxCommandServer\ufeff:'),
+    sdkHot + sdkHot,
+  ];
+  for (const declaration of [sdkCapability, sdkRetry, sdkPersist]) {
+    for (const type of ['NSError* _Nullable', 'NSError* _Nonnull* _Nullable', 'NSError* _Nullable* _Nonnull', 'NSString* _Nullable* _Nullable']) {
+      cases.push(sdkHot.replace(declaration, declaration.replace('NSError* _Nullable* _Nullable', type)));
+    }
+  }
+  for (const type of ['NSString* _Nullable', 'LibboxOverrideOptions* _Nullable', 'id<LibboxRuntimePersistenceHandler> _Nullable']) {
+    cases.push(sdkHot.replace(sdkRetry, sdkRetry.replace(type, type.replace('_Nullable', '_Nonnull'))));
+  }
+  const proxy = sdkHot.indexOf('@interface LibboxRuntimePersistenceHandler :');
+  for (const declaration of [sdkPersist, sdkMode]) {
+    const preceding = sdkHot.slice(0, proxy), remaining = sdkHot.slice(proxy);
+    cases.push(preceding + remaining.replace(declaration, ''), preceding + remaining.replace(declaration, declaration.replace('- ', '+ ')));
+  }
+  const protocolStart = sdkHot.indexOf(protocol);
+  const protocolEnd = sdkHot.indexOf('@end', protocolStart) + '@end'.length;
+  cases.push(sdkHot.slice(0, protocolStart) + sdkHot.slice(protocolEnd));
+  for (const changed of cases) assert.throws(() => inspect(changed), /generated Objective-C HOT|unexpected Objective-C HOT/);
+});
+
+test('Apple SDK validation result requires exact immutable getters on its own receiver', () => {
+  const inspect = header => sdkHeaderContracts([sdkDeclarations, sdkHot, header].join('\n')).validationResultGetterContract;
+  const facts = inspect(sdkResult);
+  assert.deepEqual(facts, { receiver: 'LibboxConfigValidationResult',
+    getters: Object.fromEntries(sdkGetters.map(name => [name, sdkGetter(name)])) });
+  assert.deepEqual(inspect(sdkResult.replaceAll('\n', ' ')), facts);
+  const getter = sdkGetter('getTailscaleStoreRetirement');
+  const membership = sdkGetter('getTailscaleStoreMembership');
+  for (const changed of [
+    sdkResult.replace(getter, ''), sdkResult.replace(membership, ''),
+    sdkResult.replace(getter, '// ' + getter), sdkResult.replace(getter, '/* ' + getter + ' */'),
+    sdkResult.replace(getter, getter.replace('getTailscaleStoreRetirement', 'tailscaleStoreRetirement')),
+    sdkResult.replace(getter, getter.replace('NSString* _Nonnull', 'int64_t')),
+    sdkResult.replace(getter, getter.replace('_Nonnull', '_Nullable')),
+    sdkResult.replace(getter, getter.replace(';', ': (NSString*)argument;')),
+    sdkResult.replace(getter, getter.replace('- ', '+ ')),
+    sdkResult.replace(getter, getter + '\n' + getter),
+    sdkResult.replace(getter, getter + ' ' + getter),
+    sdkResult.replace(getter, getter + ' - (void)setTailscaleStoreRetirement:(NSString*)value;'),
+    sdkResult.replace('LibboxConfigValidationResult', 'LibboxOtherReceiver'),
+    sdkResult.replace('goSeqRefInterface', 'OtherProtocol'), sdkResult + sdkResult,
+    sdkResult.replace('@end', '- (void)setTailscaleStoreRetirement:(NSString*)value;\n@end'),
+    sdkResult.replace('@end', '@property(strong) NSString* tailscaleStoreMembership;\n@end'),
+    sdkResult.replace(getter, '') + '\n@interface LibboxOtherReceiver : NSObject\n' + getter + '\n@end',
+  ]) assert.throws(() => inspect(changed), /generated Objective-C/);
+});
+
+test('Apple SDK header command admits exact original observations and fails closed on mutations', () => {
+  const root = mkdtempSync(join(tmpdir(), 'apple-sdk-bindings-'));
+  try {
+    const script = fileURLToPath(new URL('./mobile-core/apple-admission.mjs', import.meta.url));
+    const header = join(root, 'header.h');
+    const verify = (text, original = text) => {
+      const bytes = Buffer.from(original);
+      writeFileSync(header, text);
+      return spawnSync(process.execPath, [script, '--sdk-header-contract', header, bytes.length,
+        createHash('sha256').update(bytes).digest('hex')], { encoding: 'utf8' });
+    };
+    const admitted = verify(sdkHeader);
+    assert.equal(admitted.status, 0, admitted.stderr);
+    assert.deepEqual(JSON.parse(admitted.stdout), sdkHeaderContracts(sdkHeader));
+    const changed = sdkHeader.replace('recordScreenState', 'recordScreenStatf');
+    const tampered = verify(changed, sdkHeader);
+    assert.equal(tampered.status, 1);
+    assert.match(tampered.stderr, /header observation pin differs/);
+    const missing = verify(changed);
+    assert.equal(missing.status, 1);
+    assert.match(missing.stderr, /generated Objective-C API missing: recordScreenState/);
+    const denied = verify(sdkHeader.replace(sdkCapability, sdkCapability + sdkCapability));
+    assert.equal(denied.status, 1);
+    assert.match(denied.stderr, /HOT method differs: interface LibboxCommandServer.runtimeCapabilities/);
+    assert.equal(denied.stdout, '');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 
 const read = name => readFileSync(new URL(`../src-tauri/gen/apple/PacketTunnel/${name}.swift`, import.meta.url), 'utf8');
 const platform = read('TunnelPlatform');
