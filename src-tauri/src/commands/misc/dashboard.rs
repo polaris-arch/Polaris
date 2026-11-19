@@ -179,7 +179,6 @@ async fn reconcile_dashboard_window(
             .title("sing-box Dashboard")
             .inner_size(1100.0, 760.0)
             .min_inner_size(800.0, 600.0)
-            .focused(opening)
             // preload 等价：document-start 于面板同源预写 localStorage（读前已写）。
             .initialization_script(&script)
             // 同一条 preload 通道再挂一次系统右键菜单禁用（面板是第三方产物，改不了它的 JS）。
@@ -196,6 +195,10 @@ async fn reconcile_dashboard_window(
                     true // tauri:/about:/data: 等内部 scheme 放行
                 }
             });
+    #[cfg(desktop)]
+    {
+        builder = builder.focused(opening);
+    }
     // WebView2 启动参数（图形逃生门 `--disable-gpu`）：四个建窗点同值，唯一真值在 graphics_compat。
     // 面板加载的是外部 URL，但与主窗共用默认 data directory ⇒ 参数必须一致，否则关硬件加速后面板建不出来。
     if let Some(args) = crate::graphics_compat::webview_additional_browser_args() {
