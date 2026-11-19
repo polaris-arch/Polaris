@@ -177,24 +177,25 @@ async fn in_api_lifetime<T>(
     }
 }
 
-/// 把一次 unary 调用收在 [`UNARY_DEADLINE`] 之内，从发起起算。
+/// 把一次 unary 调用收在指定预算内，从发起起算。
 ///
 /// 到期一律报 `DeadlineExceeded`。tonic 自己那只按 `grpc-timeout` 走的本地时钟到期时报的是
 /// `Cancelled`，两只时钟取同一个期限、谁先被看见不确定，所以「已到期限的 `Cancelled`」也归到这里
 /// —— 调用方看到的到期只有一种说法。
 async fn within_unary_deadline<T>(
+    deadline: Duration,
     call: impl std::future::Future<Output = Result<T, tonic::Status>>,
 ) -> Result<T, ClientError> {
     let expired = || {
         ClientError::Status(tonic::Status::deadline_exceeded(format!(
-            "no answer from the management API within {UNARY_DEADLINE:?}"
+            "no answer from the management API within {deadline:?}"
         )))
     };
     let started = tokio::time::Instant::now();
-    match tokio::time::timeout(UNARY_DEADLINE, call).await {
+    match tokio::time::timeout(deadline, call).await {
         Err(_) => Err(expired()),
         Ok(Err(status))
-            if status.code() == tonic::Code::Cancelled && started.elapsed() >= UNARY_DEADLINE =>
+            if status.code() == tonic::Code::Cancelled && started.elapsed() >= deadline =>
         {
             Err(expired())
         }
@@ -276,7 +277,19 @@ impl SingBoxApiClient {
         &self,
         call: impl std::future::Future<Output = Result<T, tonic::Status>>,
     ) -> Result<T, ClientError> {
-        in_api_lifetime(&self._retained_lifetime, within_unary_deadline(call)).await
+        self.unary_with_deadline(UNARY_DEADLINE, call).await
+    }
+
+    async fn unary_with_deadline<T>(
+        &self,
+        deadline: Duration,
+        call: impl std::future::Future<Output = Result<T, tonic::Status>>,
+    ) -> Result<T, ClientError> {
+        in_api_lifetime(
+            &self._retained_lifetime,
+            within_unary_deadline(deadline, call),
+        )
+        .await
     }
 
     /// 注入 Bearer metadata 的请求包装。secret 空则原样返回（免认证）。

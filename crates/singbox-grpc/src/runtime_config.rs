@@ -2,10 +2,15 @@
 //! Callers must inspect capabilities, plan errors and returned operation state.
 use crate::{daemon, ClientError, SingBoxApiClient, UNARY_DEADLINE};
 use daemon::runtime_config_service_client::RuntimeConfigServiceClient;
+use std::time::Duration;
 use tonic::{transport::Channel, Request};
 
 /// Bounded request and response envelopes, including effective configuration text.
 pub const RUNTIME_CONFIG_MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+
+// Plan validates the full candidate and may fetch remote rule sources, even
+// for a small edit. This budget applies only to preparation.
+const RUNTIME_CONFIG_PLAN_DEADLINE: Duration = Duration::from_secs(12);
 
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimeConfigError {
@@ -57,8 +62,13 @@ impl SingBoxApiClient {
         request: daemon::PlanRuntimeConfigRequest,
     ) -> Result<daemon::RuntimeConfigPlan, RuntimeConfigError> {
         let mut client = self.runtime_config_client();
+        let mut request = self.with_auth(Request::new(request));
+        request.set_timeout(RUNTIME_CONFIG_PLAN_DEADLINE);
         Ok(self
-            .unary(client.plan_runtime_config(self.runtime_config_request(request)))
+            .unary_with_deadline(
+                RUNTIME_CONFIG_PLAN_DEADLINE,
+                client.plan_runtime_config(request),
+            )
             .await
             .map_err(classify)?
             .into_inner())

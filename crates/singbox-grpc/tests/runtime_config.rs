@@ -11,11 +11,13 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
 };
+use std::time::Duration;
 use tonic::{Code, Request, Response, Status};
 
 #[derive(Clone, Default)]
 struct Mock {
     code: Option<Code>,
+    plan_delay: Duration,
     stall_apply: bool,
     stall_retry: bool,
     no_op: bool,
@@ -176,6 +178,9 @@ impl RuntimeConfigService for Mock {
     ) -> Result<Response<daemon::RuntimeConfigPlan>, Status> {
         self.check(&request)?;
         assert_eq!(request.into_inner(), plan_request());
+        if !self.plan_delay.is_zero() {
+            tokio::time::sleep(self.plan_delay).await;
+        }
         Ok(Response::new(daemon::RuntimeConfigPlan {
             plan_id: "plan".into(),
             transaction_id: "transaction".into(),
@@ -430,6 +435,17 @@ async fn other_statuses_are_not_unsupported() {
     assert!(matches!(client.get_runtime_capabilities().await,
         Err(RuntimeConfigError::Call(ClientError::Status(status))) if status.code() == Code::Unauthenticated));
 }
+#[tokio::test]
+async fn runtime_plan_can_finish_after_the_regular_unary_deadline() {
+    let mock = Mock {
+        plan_delay: UNARY_DEADLINE + Duration::from_millis(100),
+        ..Default::default()
+    };
+    let (client, _server) = start(mock, "secret").await;
+    let result = client.plan_runtime_config(plan_request()).await.unwrap();
+    assert!(result.applicable);
+}
+
 #[tokio::test]
 async fn apply_timeout_is_bounded_and_never_retried() {
     let mock = Mock {
