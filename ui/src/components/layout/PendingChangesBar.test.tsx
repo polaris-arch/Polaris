@@ -4,6 +4,7 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import type { SavedRuntimeApply } from '@/store/staged-config-store';
 import type { NativeRetirementDebt, PendingApplyResult, PendingNodeChanges } from '@/contracts/types';
 import type { ApplyState } from './pending-bar-logic';
+import { RestartApplyDialog } from '@/components/dialogs/RestartApplyDialog';
 
 // Render the actual desktop handlers and shared observers in the existing node suite.
 const h = vi.hoisted(() => ({
@@ -12,7 +13,7 @@ const h = vi.hoisted(() => ({
   effects: [] as Array<{ deps?: readonly unknown[]; cleanup?: () => void }>,
   pendingEffects: [] as Array<() => void>,
   applyNow: vi.fn(), freshApply: vi.fn(), hostRead: vi.fn(), coreRead: vi.fn(), nativeRead: vi.fn(),
-  retryPersistence: vi.fn(), pendingRead: vi.fn(), cancelImpact: vi.fn(), runtimeLevel: vi.fn(),
+  retryPersistence: vi.fn(), pendingRead: vi.fn(), cancelImpact: vi.fn(), cancelRestart: vi.fn(), runtimeLevel: vi.fn(),
   savedRuntimeApply: null as SavedRuntimeApply | null,
   completedSaveRevision: undefined as number | undefined,
   baseVersion: undefined as string | undefined,
@@ -75,7 +76,7 @@ vi.mock('@/ipc', () => ({ api: { proxy: {
   runtimeHostEffectStatus: h.hostRead, runtimeApplyStatus: h.coreRead,
   runtimeNativeRetirementStatus: h.nativeRead,
   retryRuntimePersistence: h.retryPersistence, getPendingChanges: h.pendingRead,
-  cancelRuntimeImpact: h.cancelImpact, getStatus: h.statusRead,
+  cancelRuntimeImpact: h.cancelImpact, cancelRuntimeRestart: h.cancelRestart, getStatus: h.statusRead,
   revertSavedSettings: h.revertSaved,
 }, logs: { runtimeLevel: h.runtimeLevel } } }));
 vi.mock('@/store/app-store', () => ({
@@ -171,6 +172,7 @@ beforeEach(() => {
   h.lifecycleReady.mockResolvedValue(h.offLifecycle);
   h.statusRead.mockImplementation(async () => h.app.proxyStatus);
   h.cancelImpact.mockResolvedValue({ ok: true, status: 'cancelled' });
+  h.cancelRestart.mockResolvedValue({ ok: true, status: 'cancelled' });
   h.coreRead.mockRejectedValue(new Error('Core status unavailable'));
   h.nativeRead.mockRejectedValue(new Error('Native-only status unavailable'));
   h.hostRead.mockRejectedValue(new Error('Host status unavailable'));
@@ -419,6 +421,20 @@ it('keeps the confirmation armed only for the saved settings the user saw', asyn
   await microtasks();
   expect(h.revertSaved).toHaveBeenCalledOnce();
   expect(h.revertSaved).toHaveBeenCalledWith('later');
+});
+
+it('keeping the current connection releases only the restart choice and retains saved undo', async () => {
+  h.app.pendingChanges = { ...h.app.pendingChanges, savedSettingsRevertToken: 'revert-token' };
+  h.applyNow.mockResolvedValueOnce({ saved: true, status: 'restartRequired', restartConfirmation: 'restart-token' });
+  click('home.pendingApplyBtn');
+  const findPrompt = () => elements(renderBar()).find(element => element.type === RestartApplyDialog);
+  await vi.waitFor(() => expect(findPrompt()).toBeDefined());
+  const prompt = findPrompt() as ReactElement<Parameters<typeof RestartApplyDialog>[0]>;
+  prompt.props.onDismiss();
+  expect(findPrompt()).toBeUndefined();
+  expect(button('home.pendingRevertSavedSettings')).toBeDefined();
+  expect(h.cancelRestart).toHaveBeenCalledExactlyOnceWith('restart-token');
+  expect(h.applyNow).toHaveBeenCalledTimes(1);
 });
 
 describe('pre-confirmed apply request', () => {

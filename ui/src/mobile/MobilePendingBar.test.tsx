@@ -26,6 +26,7 @@ const h = vi.hoisted(() => ({
   pendingRead: vi.fn(),
   freshApply: vi.fn(),
   cancelImpact: vi.fn(),
+  cancelRestart: vi.fn(),
   confirmTwice: vi.fn(),
   revertSaved: vi.fn(),
   realReconciliation: false,
@@ -97,6 +98,7 @@ vi.mock('@/ipc', () => ({ api: { proxy: {
   getPendingChanges: h.pendingRead,
   applyPendingChanges: h.freshApply,
   cancelRuntimeImpact: h.cancelImpact,
+  cancelRuntimeRestart: h.cancelRestart,
   revertSavedSettings: h.revertSaved,
   getStatus: h.statusRead,
 }, logs: { runtimeLevel: h.runtimeLevel } } }));
@@ -203,6 +205,7 @@ beforeEach(() => {
   h.coreRead.mockRejectedValue(new Error('no Core status reply'));
   h.nativeRead.mockRejectedValue(new Error('no native-only status reply'));
   h.cancelImpact.mockResolvedValue({ ok: true, status: 'cancelled' });
+  h.cancelRestart.mockResolvedValue({ ok: true, status: 'cancelled' });
   vi.spyOn(console, 'error').mockImplementation(() => undefined);
 });
 afterEach(() => { unmount(); if (vi.isFakeTimers()) vi.clearAllTimers(); vi.useRealTimers(); vi.restoreAllMocks(); });
@@ -285,7 +288,8 @@ describe('mobile pending restart and write feedback', () => {
     expect(h.retryPersistence).not.toHaveBeenCalled();
   });
 
-  it.each(['close/cancel', 'back'])('%s dismisses the restart decision without another write', async (route) => {
+  it.each(['close/cancel', 'back'])('%s releases the exact restart choice and keeps saved undo available', async (route) => {
+    h.app.pendingChanges = { ...h.app.pendingChanges, savedSettingsRevertToken: 'revert-token' };
     const sheet = await openRestartSheet();
     if (route === 'back') {
       markup(sheet); // FormSheet registers its real back-stack layer.
@@ -296,6 +300,8 @@ describe('mobile pending restart and write feedback', () => {
     }
     expect(h.states[1]).toBeNull();
     expect(elements(renderBar()).some((element) => element.type === FormSheet)).toBe(false);
+    expect(markup(renderBar())).toContain('home.pendingRevertSavedSettings');
+    expect(h.cancelRestart).toHaveBeenCalledExactlyOnceWith('restart-token');
     expect(h.applyNow).toHaveBeenCalledTimes(1);
     expect(h.retryPersistence).not.toHaveBeenCalled();
   });

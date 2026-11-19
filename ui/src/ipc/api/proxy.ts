@@ -129,6 +129,10 @@ export const proxyApi = {
     return invoke(IPC_CHANNELS.PROXY_APPLY_PENDING_CHANGES, { cancelImpactConfirmation });
   },
 
+  async cancelRuntimeRestart(cancelRestartConfirmation: string): Promise<PendingApplyResult> {
+    return invoke(IPC_CHANNELS.PROXY_APPLY_PENDING_CHANGES, { cancelRestartConfirmation });
+  },
+
   /**
    * 代理已启动。**payload 恒为空对象**——后端 `commands/proxy.rs:41,76` emit `json!({})`。
    *

@@ -2071,6 +2071,48 @@ fn pending_changes_contract_has_exactly_six_typed_fields() {
 }
 
 #[tokio::test]
+async fn keep_connection_releases_only_the_matching_restart_choice() {
+    let (rt, _dir, sink, running) = explicit_selection_fixture();
+    rt.config.save_full(&running).unwrap();
+    let running = rt.config.current().unwrap();
+    mark_running_with_snapshot(&rt, &running);
+    let mut desired = running.clone();
+    desired["mixedPort"] = 22468.into();
+    rt.config.save_full(&desired).unwrap();
+    let desired = rt.config.current().unwrap();
+    let undo = rt.pending_changes().saved_settings_revert_token.unwrap();
+    let previous = rt.restart_choice_for_test().restart_confirmation.unwrap();
+    let current = rt.restart_choice_for_test().restart_confirmation.unwrap();
+
+    assert_eq!(
+        rt.cancel_runtime_restart_choice(&previous).status,
+        "conflict"
+    );
+    assert_eq!(
+        rt.apply_pending_transaction(Some(previous)).await.status,
+        "conflict",
+    );
+    assert_eq!(
+        rt.cancel_runtime_restart_choice(&current).status,
+        "cancelled"
+    );
+    assert_eq!(
+        rt.apply_pending_transaction(Some(current)).await.status,
+        "conflict",
+    );
+    assert_eq!(rt.config.current().unwrap(), desired);
+    assert_eq!(rt.current_config_snapshot(), Some(running.clone()));
+    assert!(rt.pending_force_restart.read().unwrap().is_none());
+    assert_eq!(
+        rt.pending_changes().saved_settings_revert_token,
+        Some(undo.clone())
+    );
+    assert!(rt.revert_saved_proxy_settings(&undo, |_| {}).await);
+    assert_eq!(rt.config.current().unwrap(), running);
+    assert!(sink.calls().is_empty());
+}
+
+#[tokio::test]
 async fn revert_saved_proxy_settings_requires_the_current_receipt_and_preserves_other_edits() {
     let (rt, _dir, sink, mut running) = explicit_selection_fixture();
     running["controlPort"] = 9090.into();

@@ -4122,8 +4122,8 @@ impl ProxyRuntime {
                 .runtime_config_apply
                 .lock()
                 .ok()
-                .and_then(|mut state| state.restart.take());
-            let Some(choice) = choice.filter(|choice| choice.token == token) else {
+                .and_then(|mut state| state.restart.take_if(|choice| choice.token == token));
+            let Some(choice) = choice else {
                 return self.runtime_native_result(RuntimeApplyResult::status("conflict"));
             };
             let baseline = self
@@ -4148,6 +4148,20 @@ impl ProxyRuntime {
             Err(_) => return RuntimeApplyResult::status("rejected"),
         };
         Box::pin(self.apply_runtime_candidate(candidate, None)).await
+    }
+
+    pub(crate) fn cancel_runtime_restart_choice(&self, token: &str) -> RuntimeApplyResult {
+        let Ok(mut state) = self.runtime_config_apply.lock() else {
+            return RuntimeApplyResult::status("unconfirmed");
+        };
+        if state
+            .restart
+            .take_if(|choice| choice.token == token)
+            .is_none()
+        {
+            return RuntimeApplyResult::status("conflict");
+        }
+        RuntimeApplyResult::status("cancelled")
     }
 
     // The local D/R/generation/intent checks occur AFTER the protocol await too.
