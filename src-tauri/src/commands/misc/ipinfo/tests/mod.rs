@@ -204,17 +204,26 @@ async fn post_connect_proxy_request_and_retries_do_not_wait_for_direct() {
                 tokio::time::sleep(Duration::from_secs(direct_delay)).await;
                 Ok(json!({ "ip": "192.0.2.1" }))
             },
-            || {
-                let first = starts.is_empty();
-                starts.push(started.elapsed().as_secs());
-                async move {
-                    if first {
-                        tokio::time::sleep(Duration::from_secs(first_delay)).await;
-                        if !first_success {
-                            return Err("tunnel still warming".to_string());
-                        }
-                    }
-                    Ok(json!({ "ip": "192.0.2.2" }))
+            {
+                let starts = &mut starts;
+                move |attempts, _| {
+                    with_ipinfo_retry(
+                        move || {
+                            let first = starts.is_empty();
+                            starts.push(started.elapsed().as_secs());
+                            async move {
+                                if first {
+                                    tokio::time::sleep(Duration::from_secs(first_delay)).await;
+                                    if !first_success {
+                                        return Err("tunnel still warming".to_string());
+                                    }
+                                }
+                                Ok(json!({ "ip": "192.0.2.2" }))
+                            }
+                        },
+                        attempts,
+                        IPINFO_PROXY_POST_CONNECT_RETRY_MS,
+                    )
                 }
             },
             prior,
@@ -240,6 +249,32 @@ async fn post_connect_proxy_request_and_retries_do_not_wait_for_direct() {
         );
         assert_eq!(started.elapsed(), Duration::from_secs(expected_end));
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn post_connect_route_wait_uses_the_existing_proxy_budget() {
+    let started = Instant::now();
+    let (direct, proxy) = probe_post_connect_ipinfo(
+        async {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            assert_eq!(started.elapsed(), Duration::from_secs(2));
+            Ok(json!({ "ip": "192.0.2.1" }))
+        },
+        |_, _| async {
+            tokio::time::sleep(Duration::from_secs(9)).await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            Ok(json!({ "ip": "192.0.2.2" }))
+        },
+        FirstProxyAttempt::NotAttempted,
+        |_| panic!("proxy result exceeded its original budget"),
+    )
+    .await;
+    assert!(direct.is_ok());
+    assert!(proxy.is_null());
+    assert_eq!(
+        started.elapsed(),
+        Duration::from_millis(IPINFO_PROBE_BUDGET_MS)
+    );
 }
 
 #[tokio::test]

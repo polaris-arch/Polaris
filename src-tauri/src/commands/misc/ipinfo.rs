@@ -739,7 +739,7 @@ async fn probe_post_connect_ipinfo<D, P, PFut>(
 ) -> (Result<Value, String>, Value)
 where
     D: std::future::Future<Output = Result<Value, String>>,
-    P: FnMut() -> PFut,
+    P: FnOnce(u32, Instant) -> PFut,
     PFut: std::future::Future<Output = Result<Value, String>>,
 {
     let attempts = match first {
@@ -749,14 +749,21 @@ where
         // This ticket finishes direct-only unless Core confirmed the drain.
         FirstProxyAttempt::Unconfirmed => return (direct.await, Value::Null),
     };
-    let proxy = with_ipinfo_retry(proxy, attempts, IPINFO_PROXY_POST_CONNECT_RETRY_MS);
+    // Route admission and all requests consume the same proxy leg budget.
+    let cutoff = Instant::now() + Duration::from_millis(IPINFO_PROBE_BUDGET_MS);
+    let proxy = async {
+        tokio::time::timeout_at(cutoff, proxy(attempts, cutoff))
+            .await
+            .ok()
+            .and_then(Result::ok)
+    };
     // Keep the same proxy future running even when the direct leg finishes first.
     tokio::pin!(direct, proxy);
     let (direct, proxy) = tokio::select! {
         biased;
         direct = &mut direct => (direct, proxy.await),
         proxy = &mut proxy => {
-            if let Ok(value) = &proxy {
+            if let Some(value) = &proxy {
                 on_early_proxy(value);
             }
             (direct.await, proxy)
@@ -783,68 +790,89 @@ where
 /// 猜宽了只是 IP 类节点失败时多等一个 4s 间隔（仍在 10s 预算内截断，最坏多两次尝试）；
 /// 猜窄了则账号制节点在隧道热身期被 2×1s 耗尽 ⇒ 回落到本轮要根治的那个症状（空 IP + 空旗 + 空延迟）。
 /// **非对称风险下取宽**。真要区分，前置是给 [`schedule_ipinfo_refresh`] 传节点类型，不是改这里。
-async fn build_ipinfo_snapshot(
-    direct_http: &HttpRuntime,
-    status: &ProxyStatus,
-    local_proxy: Option<&LocalHttpProxy>,
-    doh_blocked: Option<&'static str>,
+async fn build_ipinfo_snapshot<'a>(
+    inputs: &IpinfoProbeInputs,
+    local_proxy: impl Fn() -> Option<&'a LocalHttpProxy>,
+    prepare_proxy: impl std::future::Future<Output = Option<&'a LocalHttpProxy>>,
     probe_kind: &ProxyProbe<'_>,
-    _probe: (u64, u64),
+    probe: (u64, u64),
     publish_early: impl FnOnce(&Value),
 ) -> Value {
     let direct = with_ipinfo_retry(
-        || fetch_ipip_ipinfo(direct_http),
+        || fetch_ipip_ipinfo(inputs.http.as_ref()),
         IPINFO_DIRECT_ATTEMPTS,
         IPINFO_DIRECT_RETRY_MS,
     );
-    // 代理出口经 `probe-proxy-in` 钉到运行核的 selector，移动端沿用本次起核凭据。
+    let proxy_request = |attempts, retry_delay_ms, cutoff: Option<Instant>| async move {
+        let lp = prepare_proxy
+            .await
+            .ok_or_else(|| "ipinfo: 代理探针入口未就绪".to_string())?;
+        let client = HttpRuntime::via_local_proxy(lp.port, lp.auth.as_ref())
+            .map_err(|err| err.to_string())?;
+        with_ipinfo_retry(
+            || async {
+                if cutoff.is_some_and(|cutoff| Instant::now() >= cutoff)
+                    || !ipinfo_probe_is_current(probe.0, probe.1)
+                {
+                    return Err("ipinfo: 探测预算耗尽或已被更新操作取代".to_string());
+                }
+                ipinfo_stage!(
+                    "stage=proxy_request_begin epoch={} seq={}",
+                    probe.0,
+                    probe.1
+                );
+                #[cfg(debug_assertions)]
+                let at = std::time::Instant::now();
+                let result = fetch_trace_ipinfo(&client).await;
+                ipinfo_stage!(
+                    "stage=proxy_request_end epoch={} seq={} elapsed_ms={} success={}",
+                    probe.0,
+                    probe.1,
+                    at.elapsed().as_millis(),
+                    result.is_ok()
+                );
+                result
+            },
+            attempts,
+            retry_delay_ms,
+        )
+        .await
+    };
     let (direct, proxy) = if let ProxyProbe::Verified { trace, .. } = probe_kind {
         publish_early(trace);
         (direct.await, trace.clone())
-    } else if let Some(lp) = local_proxy.filter(|_| status.running) {
-        match HttpRuntime::via_local_proxy(lp.port, lp.auth.as_ref()) {
-            Ok(p) => {
-                let proxy = || async {
-                    ipinfo_stage!(
-                        "stage=proxy_request_begin epoch={} seq={}",
-                        _probe.0,
-                        _probe.1
-                    );
-                    #[cfg(debug_assertions)]
-                    let at = std::time::Instant::now();
-                    let result = fetch_trace_ipinfo(&p).await;
-                    ipinfo_stage!(
-                        "stage=proxy_request_end epoch={} seq={} elapsed_ms={} success={}",
-                        _probe.0,
-                        _probe.1,
-                        at.elapsed().as_millis(),
-                        result.is_ok()
-                    );
-                    result
-                };
-                if let ProxyProbe::PostConnect(first) = probe_kind {
-                    probe_post_connect_ipinfo(direct, proxy, *first, publish_early).await
-                } else {
-                    let direct = direct.await;
-                    let proxy =
-                        with_ipinfo_retry(proxy, IPINFO_PROXY_ATTEMPTS, IPINFO_PROXY_RETRY_MS)
-                            .await
-                            .unwrap_or(Value::Null);
-                    (direct, proxy)
-                }
-            }
-            Err(_) => (direct.await, Value::Null),
-        }
-    } else {
+    } else if !inputs.status.running {
         (direct.await, Value::Null)
+    } else if let ProxyProbe::PostConnect(first) = probe_kind {
+        probe_post_connect_ipinfo(
+            direct,
+            |attempts, cutoff| {
+                proxy_request(attempts, IPINFO_PROXY_POST_CONNECT_RETRY_MS, Some(cutoff))
+            },
+            *first,
+            publish_early,
+        )
+        .await
+    } else {
+        let direct = direct.await;
+        let proxy = proxy_request(IPINFO_PROXY_ATTEMPTS, IPINFO_PROXY_RETRY_MS, None)
+            .await
+            .unwrap_or(Value::Null);
+        (direct, proxy)
     };
-    let tested_proxy = local_proxy.filter(|_| {
+    let tested_proxy = local_proxy().filter(|_| {
         !matches!(
             probe_kind,
             ProxyProbe::PostConnect(FirstProxyAttempt::Unconfirmed)
         )
     });
-    ipinfo_snapshot(status, tested_proxy, doh_blocked, Some(direct), proxy)
+    ipinfo_snapshot(
+        &inputs.status,
+        tested_proxy,
+        inputs.doh_blocked,
+        Some(direct),
+        proxy,
+    )
 }
 
 fn ipinfo_snapshot(
@@ -1006,19 +1034,30 @@ fn ipinfo_config_has_real_exit(config: &Value) -> bool {
 /// 的也会是个恒真的判据（`spawn_warm_rtt_probe` 的复查随之形同虚设）。由 `ipinfo_epoch_guard` 钉住。
 async fn probe_publish_ipinfo(
     app: &AppHandle,
-    inputs: IpinfoProbeInputs,
+    mut inputs: IpinfoProbeInputs,
     epoch: u64,
     seq: u64,
     probe_kind: ProxyProbe<'_>,
 ) -> (Value, bool, Option<u64>) {
-    let IpinfoProbeInputs {
-        http,
-        status,
-        http_route,
-        doh_blocked,
-        config,
-    } = inputs;
-    let local_proxy = http_route.as_ref().map(|route| &route.proxy);
+    let route = OnceLock::new();
+    if let Some(initial) = inputs.http_route.take() {
+        let _ = route.set((initial, None));
+    }
+    let local_proxy = || route.get().map(|(route, _)| &route.proxy);
+    let prepare_proxy = async {
+        let runtime = app.try_state::<AppRuntime>()?;
+        if route.get().is_none() && matches!(&probe_kind, ProxyProbe::PostConnect(_)) {
+            let current = runtime
+                .proxy()
+                .wait_for_exit_ip_http_route(inputs.status.main_generation)
+                .await?;
+            let _ = route.set((current, runtime.proxy().current_config_snapshot()));
+        }
+        let (route, _) = route.get()?;
+        runtime
+            .proxy()
+            .with_exit_ip_http_route(route, || &route.proxy)
+    };
     let publish = |mut snap: Value, warm_rtt| {
         if let ProxyProbe::Verified { observed_at, .. } = &probe_kind {
             snap["updatedAt"] = json!(observed_at);
@@ -1029,7 +1068,7 @@ async fn probe_publish_ipinfo(
             ProxyProbe::Verified { runtime, route, .. } => {
                 runtime.with_pinned_exit_ip_route(route, commit).flatten()
             }
-            _ if !snap["proxy"].is_null() => http_route.as_ref().and_then(|route| {
+            _ if !snap["proxy"].is_null() => route.get().and_then(|(route, _)| {
                 app.try_state::<AppRuntime>()?
                     .proxy()
                     .with_exit_ip_http_route(route, commit)
@@ -1057,10 +1096,13 @@ async fn probe_publish_ipinfo(
         if warm_rtt {
             crate::commands::speedtest::spawn_warm_rtt_probe(
                 app,
-                &config,
+                route
+                    .get()
+                    .and_then(|(_, config)| config.as_ref())
+                    .unwrap_or(&inputs.config),
                 proxy_probed,
-                status.running,
-                local_proxy.cloned(),
+                inputs.status.running,
+                local_proxy().cloned(),
                 epoch,
                 seq,
             );
@@ -1070,15 +1112,20 @@ async fn probe_publish_ipinfo(
 
     let mut early_revision = None;
     let snap = build_ipinfo_snapshot(
-        http.as_ref(),
-        &status,
+        &inputs,
         local_proxy,
-        doh_blocked,
+        prepare_proxy,
         &probe_kind,
         (epoch, seq),
         |proxy| {
             // 让代理结果立即可见，直连仍在检测，完整缓存保持不变。
-            let mut early = ipinfo_snapshot(&status, local_proxy, doh_blocked, None, proxy.clone());
+            let mut early = ipinfo_snapshot(
+                &inputs.status,
+                local_proxy(),
+                inputs.doh_blocked,
+                None,
+                proxy.clone(),
+            );
             early["loading"] = json!(true);
             let (early, committed) = publish(early, true);
             if committed {

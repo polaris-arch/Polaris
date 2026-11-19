@@ -573,6 +573,29 @@ impl ProxyRuntime {
         .ok()?
     }
 
+    /// The caller owns the HTTP probe budget and cancels superseded tickets.
+    pub(crate) async fn wait_for_exit_ip_http_route(
+        &self,
+        generation: u64,
+    ) -> Option<ExitIpHttpRoute> {
+        let intent = self.selector_reconcile.intent_generation();
+        let generation_changed = self.gen_changed.notified();
+        tokio::pin!(generation_changed);
+        generation_changed.as_mut().enable();
+        if !self.selector_operation_is_current(generation, intent) {
+            return None;
+        }
+        let _switch = tokio::select! {
+            biased;
+            _ = generation_changed => return None,
+            guard = self.switch_serial.lock() => guard,
+        };
+        self.with_runtime_candidate_claim(false, generation, intent, || {
+            self.snapshot_exit_ip_http_route(generation, intent)
+        })
+        .ok()?
+    }
+
     pub(crate) fn with_exit_ip_http_route<T>(
         &self,
         route: &ExitIpHttpRoute,

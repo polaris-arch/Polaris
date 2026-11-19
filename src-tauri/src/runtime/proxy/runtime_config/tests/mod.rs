@@ -114,7 +114,11 @@ async fn exit_ip_routes_reject_active_switch_and_stale_graphs() {
     assert!(runtime.pinned_exit_ip_route().is_none());
     assert_eq!(runtime.with_pinned_exit_ip_route(&pinned, || ()), None);
     assert_eq!(runtime.with_exit_ip_http_route(&route, || ()), None);
+    let wait = runtime.wait_for_exit_ip_http_route(generation);
+    tokio::pin!(wait);
+    assert!(futures::poll!(&mut wait).is_pending());
     drop(switch);
+    assert_eq!(wait.await.unwrap().proxy.port, 31002);
     assert_eq!(runtime.with_pinned_exit_ip_route(&pinned, || ()), Some(()));
 
     runtime.runtime_config_apply.lock().unwrap().pending = Some(pending.clone());
@@ -135,8 +139,27 @@ async fn exit_ip_routes_reject_active_switch_and_stale_graphs() {
     assert_eq!(runtime.with_pinned_exit_ip_route(&pinned, || ()), None);
     let route = runtime.exit_ip_http_route(generation).unwrap();
     assert_eq!(runtime.with_exit_ip_http_route(&route, || ()), Some(()));
+    let switch = runtime.switch_serial.try_lock().unwrap();
+    let wait = runtime.wait_for_exit_ip_http_route(generation);
+    tokio::pin!(wait);
+    assert!(futures::poll!(&mut wait).is_pending());
+    runtime.register_selector_intent();
+    drop(switch);
+    assert!(wait.await.is_none());
+
+    let route = runtime.exit_ip_http_route(generation).unwrap();
     runtime.set_login_fallback(true, Some("pending-login".into()));
     assert_eq!(runtime.with_exit_ip_http_route(&route, || ()), None);
+    let switch = runtime.switch_serial.try_lock().unwrap();
+    let wait = runtime.wait_for_exit_ip_http_route(generation);
+    tokio::pin!(wait);
+    assert!(futures::poll!(&mut wait).is_pending());
+    runtime.bump_generation();
+    assert!(matches!(
+        futures::poll!(&mut wait),
+        std::task::Poll::Ready(None)
+    ));
+    drop(switch);
     server.abort();
 }
 
