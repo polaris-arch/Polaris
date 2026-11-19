@@ -416,7 +416,9 @@ class BoxService(
             },
             withHosts = { server, config, nativeReload ->
                 TransientSpeedtestHost.withMainStart(attempt, { isReloadCurrent(attempt, server) }) {
-                    TransientLoginHost.withMainConfig(attempt, config, { isReloadCurrent(attempt, server) }) {
+                    TransientLoginHost.withMainReload(attempt, config,
+                        allowed = { isReloadCurrent(attempt, server) },
+                        joinsOriginal = { AndroidRuntimeTailscaleBridge.joinsOriginalOnReload(attempt, server, it) }) {
                         SystemStart.requireLegacyAllowed(service)
                         nativeReload()
                     }
@@ -431,6 +433,7 @@ class BoxService(
                     server.startOrReloadServiceWithRetryableRuntimePersistence(config, OverrideOptions(), persistence)
                 }
                 try {
+                    AndroidRuntimeTailscaleBridge.requireReloadRetirement(attempt)
                     admitRuntimeProtocol(attempt, server) { isReloadCurrent(attempt, server) }
                 } catch (failure: Throwable) {
                     // The replacement returned but cannot be published as a paired live core.

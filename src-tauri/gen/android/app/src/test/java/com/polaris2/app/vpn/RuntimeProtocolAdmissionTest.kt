@@ -131,7 +131,11 @@ class RuntimeProtocolAdmissionTest {
         assertTrue(start.contains("check(attempt.runtimeAdmission != null)"))
         assertTrue(start.contains("if (current) stopService(attempt)"))
         val reload = box.substringAfter("nativeReload = { server, config ->").substringBefore("setError =")
-        assertTrue(reload.indexOf("startOrReloadServiceWithRetryableRuntimePersistence(") < reload.indexOf("admitRuntimeProtocol(attempt, server)"))
+        val nativeReload = reload.indexOf("startOrReloadServiceWithRetryableRuntimePersistence(")
+        val retirement = reload.indexOf("AndroidRuntimeTailscaleBridge.requireReloadRetirement(attempt)")
+        val reloadAdmission = reload.indexOf("admitRuntimeProtocol(attempt, server)")
+        assertTrue(nativeReload >= 0 && nativeReload < retirement && retirement < reloadAdmission)
+        assertTrue(box.contains("joinsOriginal = { AndroidRuntimeTailscaleBridge.joinsOriginalOnReload(attempt, server, it) }"))
         assertTrue(reload.contains("stopService(attempt)"))
         val gate = box.substringAfter("private fun admitRuntimeProtocol(").substringBefore("/** New native incarnation")
         for (guard in listOf("Thread.holdsLock(attempt.operationLock)", "mainAttempt === attempt",

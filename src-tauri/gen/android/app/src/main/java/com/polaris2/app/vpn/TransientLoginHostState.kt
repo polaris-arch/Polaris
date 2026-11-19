@@ -144,12 +144,29 @@ internal class TransientLoginHostState(
     fun releaseRuntimeDirectories(owner: MainKernelAttempt<*>, scope: RuntimeTailscaleWriterScope): Boolean =
         runtimeClaims.remove(owner to scope) != null
 
+    fun hasRuntimeDirectoryClaims(owner: MainKernelAttempt<*>): Boolean = runtimeClaims.keys.any { it.first === owner }
+
     /** Claims precede core startup and survive failures until its actual close succeeds. */
-    fun <T> withMainConfig(owner: MainKernelAttempt<*>, config: String, allowed: () -> Boolean = { true }, action: () -> T): T = synchronized(owner.operationLock) {
+    fun <T> withMainConfig(owner: MainKernelAttempt<*>, config: String, allowed: () -> Boolean = { true }, action: () -> T): T =
+        withMainDirectories(owner, config, allowed, null, action)
+
+    /** Only the strict Go Reload path can join the original writer before constructing the replacement. */
+    fun <T> withMainReload(
+        owner: MainKernelAttempt<*>, config: String, allowed: () -> Boolean,
+        joinsOriginal: (RuntimeTailscaleWriterScope) -> Boolean, action: () -> T,
+    ): T = withMainDirectories(owner, config, allowed, joinsOriginal, action)
+
+    private fun <T> withMainDirectories(
+        owner: MainKernelAttempt<*>, config: String, allowed: () -> Boolean,
+        joinsOriginal: ((RuntimeTailscaleWriterScope) -> Boolean)?, action: () -> T,
+    ): T = synchronized(owner.operationLock) {
         val directories = parseDirectories(config)
         val revision = ownershipLock.withLock {
             check(allowed()) { "Android 主核生命周期已变化" }
-            check(runtimeClaims.values.none { !directories.resolved || overlaps(it, directories.paths) }) {
+            check(runtimeClaims.none { (key, claim) ->
+                !directories.resolved || overlaps(claim, directories.paths) &&
+                    (key.first !== owner || joinsOriginal?.invoke(key.second) != true)
+            }) {
                 "Android Tailscale 端点已被运行时主核持有"
             }
             val next = (mainClaimRevisions[owner] ?: 0L) + 1L

@@ -624,6 +624,38 @@ class TransientLoginHostStateTest {
         f.host.withMainConfig(main, "same-cold-directory-reload") {}
     }
 
+    @Test fun strictReloadCanReserveOnlyTheExactOriginalWriterUntilItsJoinedRelease() {
+        val f = Fixture()
+        val original = MainKernelAttempt<Any>()
+        val foreign = MainKernelAttempt<Any>()
+        val scope = runtimeScope(f.directory, 1)
+        val paths = setOf(f.directory.canonicalPath)
+        assertTrue(f.host.claimRuntimeDirectories(original, scope, paths) { true })
+        assertTrue(runCatching {
+            f.host.withMainReload(foreign, "config", { true }, { error("foreign scope seen") }) { error("foreign reload entered") }
+        }.exceptionOrNull()?.message?.contains("端点") == true)
+        assertTrue(runCatching {
+            f.host.withMainReload(original, "config", { true }, { it == scope.copy(generation = 9) }) { error("unverified reload entered") }
+        }.exceptionOrNull()?.message?.contains("端点") == true)
+        val failure = IllegalStateException("native close unknown")
+        assertEquals(failure, runCatching {
+            f.host.withMainReload(original, "config", { true }, { it == scope }) { throw failure }
+        }.exceptionOrNull())
+        assertTrue(f.host.hasRuntimeDirectoryClaims(original))
+        assertFalse(f.host.releaseRuntimeDirectories(foreign, scope))
+        assertFalse(f.host.validateRuntimeDirectories(original, paths) { true })
+
+        f.host.withMainReload(original, "config", { true }, { it == scope }) {
+            assertTrue(f.host.releaseRuntimeDirectories(original, scope))
+            assertFalse(f.host.hasRuntimeDirectoryClaims(original))
+            val login = start(f, "login-after-release")
+            f.queue.runNext()
+            assertTrue(login.value.get() is TransientLoginHost.GeneralFailure)
+        }
+        // The replacement now holds the same path as a normal cold claim.
+        assertFalse(f.host.validateRuntimeDirectories(original, paths) { true })
+    }
+
     @Test fun runtimeCallbacksDoNotWaitForTransientNativeStartup() {
         val f = Fixture()
         val main = MainKernelAttempt<Any>()

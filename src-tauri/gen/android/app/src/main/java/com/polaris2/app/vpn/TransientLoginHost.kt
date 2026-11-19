@@ -32,6 +32,10 @@ internal object TransientLoginHost {
 
     fun <T> withMainConfig(owner: MainKernelAttempt<*>, config: String, allowed: () -> Boolean = { true }, action: () -> T): T =
         state.withMainConfig(owner, config, allowed, action)
+    fun <T> withMainReload(
+        owner: MainKernelAttempt<*>, config: String, allowed: () -> Boolean,
+        joinsOriginal: (RuntimeTailscaleWriterScope) -> Boolean, action: () -> T,
+    ): T = state.withMainReload(owner, config, allowed, joinsOriginal, action)
     fun closeMain(owner: Any, action: () -> Unit) = state.closeMain(owner, action)
     fun start(id: String, config: String, done: (StartFailure?) -> Unit) = state.start(id, config, done)
     fun close(id: String, done: (String?) -> Unit) = state.close(id, done)
@@ -47,6 +51,7 @@ internal object TransientLoginHost {
     ): Boolean = state.claimRuntimeDirectories(owner, scope, directories, retainScope, allowed)
     fun releaseRuntimeDirectories(owner: MainKernelAttempt<*>, scope: RuntimeTailscaleWriterScope): Boolean =
         state.releaseRuntimeDirectories(owner, scope)
+    fun hasRuntimeDirectoryClaims(owner: MainKernelAttempt<*>): Boolean = state.hasRuntimeDirectoryClaims(owner)
     fun observeRuntimeScope(
         owner: MainKernelAttempt<*>, incarnation: String, digest: String, allowed: (RuntimeTailscaleWriterScope) -> Boolean,
     ): RuntimeTailscaleWriterScope? = state.observeRuntimeScope(owner, incarnation, digest, allowed)

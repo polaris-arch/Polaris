@@ -316,6 +316,10 @@ internal class AndroidNativeAdmission(
         runtimeMainEntryLocked(ticket, birthNonce)?.runtimeWriters?.values?.any { it.outcome != RuntimeWriterOutcome.NoAcquisition } == true
     }
 
+    internal fun hasHeldRuntimeWriter(ticket: Ticket, birthNonce: String): Boolean = synchronized(lock) {
+        runtimeMainEntryLocked(ticket, birthNonce)?.runtimeWriters?.values?.any { it.outcome == RuntimeWriterOutcome.Held } == true
+    }
+
     private fun runtimeMainEntryLocked(ticket: Ticket, birthNonce: String): Entry? =
         entries[ticket.id]?.takeIf { it.ticket === ticket && ticket.kind == Kind.Main && it.store?.birthNonce == birthNonce }
 

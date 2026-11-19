@@ -99,6 +99,25 @@ internal object AndroidRuntimeTailscaleBridge {
             .put("nativeTicketId", ticket.id).put("runId", attempt.runId).put("birthNonce", attempt.birthNonce)
     }
 
+    fun joinsOriginalOnReload(
+        attempt: MainKernelAttempt<CommandServer>, server: CommandServer, scope: RuntimeTailscaleWriterScope,
+    ): Boolean {
+        val ticket = attempt.nativeTicket ?: return false
+        val ledger = AndroidNativeAdmissionGate.ledger
+        return attempt.runtimeTailscaleRegistered(server) && isCurrent(attempt, ticket, ledger) &&
+            attempt.runtimeAdmission?.identity?.incarnation == scope.incarnation &&
+            ledger.runtimeWriterHistory(ticket, attempt.birthNonce, scope)?.outcome == AndroidNativeAdmission.RuntimeWriterOutcome.Held
+    }
+
+    /** Strict native Reload has returned; its old claims must already be settled before republishing. */
+    fun requireReloadRetirement(attempt: MainKernelAttempt<CommandServer>) {
+        val ticket = checkNotNull(attempt.nativeTicket)
+        check(!TransientLoginHost.hasRuntimeDirectoryClaims(attempt) &&
+            !AndroidNativeAdmissionGate.ledger.hasHeldRuntimeWriter(ticket, attempt.birthNonce)) {
+            "Android runtime Tailscale reload retirement is unknown"
+        }
+    }
+
     fun observe(attempt: MainKernelAttempt<*>, digest: String): JSONObject {
         val ledger = AndroidNativeAdmissionGate.ledger
         val ticket = checkNotNull(attempt.nativeTicket)
