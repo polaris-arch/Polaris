@@ -1,6 +1,6 @@
 use std::collections::HashSet;
-use std::io::Read;
-use std::path::Path;
+use std::io::{self, Read};
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use serde_json::{json, Value};
@@ -10,7 +10,7 @@ use crate::commands::config::{broadcast_config_changed, emit_config_changed_sign
 use crate::commands::rules::new_uuid;
 use crate::events::{broadcast, channel::EVENT_RULE_RESOURCE_PROGRESS};
 use crate::response::ApiResponse;
-use crate::runtime::config::{Decision, DeferredConfigDeletion};
+use crate::runtime::config::{ConfigManager, Decision, DeferredConfigDeletion};
 use crate::runtime::http::{app_user_agent, SystemDnsLookup};
 use crate::runtime::proxy::runtime_config::{HotConfigEditOutcome, StagedSaveOwner};
 use crate::runtime::subscription_scheduler::now_ms;
@@ -28,6 +28,7 @@ use polaris_config_engine::user_config::{
 };
 use polaris_net_stack::safe_redirect::{safe_redirect_fetch, HttpClient, SafeRedirectFetchOptions};
 use polaris_net_stack::ssrf::DnsLookup;
+use polaris_store::StoreError;
 
 const ERR_RESOURCE_BAD_ITEM: &str = "RULE_RESOURCE_BAD_ITEM";
 /// 下载失败（网络/SSRF/非 2xx/内容 sanity 不过）。前端据此提示可重试。
@@ -1699,20 +1700,67 @@ async fn update_builtin_resource<H: HttpClient, L: DnsLookup>(
     }
 }
 
-// Caller holds the config writer fence through both publication and metadata save.
+enum BuiltinFileChange {
+    Unchanged,
+    Created,
+    Replaced(PathBuf),
+    RestoreUnavailable(io::Error),
+}
+
+impl BuiltinFileChange {
+    fn capture(staged: &Path, live: &Path) -> io::Result<Self> {
+        let info = match std::fs::symlink_metadata(live) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self::Created),
+            result => result?,
+        };
+        if !info.is_file() {
+            return Err(io::Error::other("生效副本不是常规文件"));
+        }
+        let backup = staged.with_extension("previous");
+        // The stage is private and on the live volume. Preserve the old inode
+        // when supported, with a bounded copy for volumes without hard links.
+        std::fs::hard_link(live, &backup).or_else(|_| {
+            let size = info.len();
+            if size > RULE_RESOURCE_MAX_BYTES as u64 {
+                return Err(io::Error::other("旧版生效副本超出备份大小限制"));
+            }
+            let input = std::fs::File::open(live)?;
+            let mut output = std::fs::File::create_new(&backup)?;
+            if io::copy(&mut input.take(size + 1), &mut output)? != size {
+                return Err(io::Error::other("备份期间旧版生效副本已变化"));
+            }
+            Ok(())
+        })?;
+        Ok(Self::Replaced(backup))
+    }
+
+    fn restore(&self, live: &Path) -> Result<(), String> {
+        match self {
+            Self::Unchanged => Ok(()),
+            Self::Created => std::fs::remove_file(live),
+            Self::Replaced(backup) => std::fs::rename(backup, live),
+            Self::RestoreUnavailable(error) => return Err(error.to_string()),
+        }
+        .map_err(|error| error.to_string())
+    }
+}
+
+// Caller holds the config writer fence through publication and metadata save.
 fn publish_builtin_file(
     operation: &BuiltinUpdateOperation,
     staged: &Path,
     live: &Path,
-) -> Result<bool, String> {
+) -> Result<BuiltinFileChange, String> {
     if !operation.is_current() {
         return Err("内置资源更新已被重置取消".to_owned());
     }
     if same_resource_bytes(staged, live) {
-        return Ok(false);
+        return Ok(BuiltinFileChange::Unchanged);
     }
+    let previous = BuiltinFileChange::capture(staged, live)
+        .unwrap_or_else(BuiltinFileChange::RestoreUnavailable);
     std::fs::rename(staged, live).map_err(|error| format!("替换生效副本失败: {error}"))?;
-    Ok(true)
+    Ok(previous)
 }
 
 /// 记「该内置 tag 已网络更新过」：`config.builtinGeoMeta[tag].updatedAt = <ISO>`。
@@ -1730,31 +1778,70 @@ fn persist_builtin_geo_updated(
     paths: (&Path, &Path),
     operation: &BuiltinUpdateOperation,
 ) -> Result<(), String> {
-    let (staged, live) = paths;
-    let saved = save_resource_change(state, |cfg| {
-        let Some(obj) = cfg.as_object_mut() else {
-            return Err("配置不是对象".to_owned());
-        };
-        // The writer also fences deferred cleanup. No live path is touched until
-        // admission, and no reset/cleanup can interleave publication and metadata.
-        let apply = publish_builtin_file(operation, staged, live)?;
-        let meta = obj
-            .entry("builtinGeoMeta")
-            .or_insert_with(|| json!({}))
-            .as_object_mut()
-            .map(|m| {
-                m.insert(tag.to_string(), json!({ "updatedAt": updated_at }));
-            });
-        if meta.is_none() {
-            obj.insert(
-                "builtinGeoMeta".to_string(),
-                json!({ tag: { "updatedAt": updated_at } }),
-            );
-        }
-        Ok(apply)
-    })?;
+    let owner = StagedSaveOwner::capture(state.proxy(), 0);
+    let saved = save_resource_change(state.config(), tag, updated_at, paths, operation, owner)
+        .map_err(|error| {
+            if matches!(error, StoreError::CommitUncertain(_)) {
+                state.proxy().push_pending_changes();
+                emit_config_changed_signal(app);
+            }
+            format!("保存规则资源配置失败: {error}")
+        })?;
     broadcast.record(app, saved);
     Ok(())
+}
+
+fn save_resource_change(
+    manager: &ConfigManager,
+    tag: &str,
+    updated_at: &str,
+    paths: (&Path, &Path),
+    operation: &BuiltinUpdateOperation,
+    owner: StagedSaveOwner,
+) -> Result<ResourceSave, StoreError> {
+    let (staged, live) = paths;
+    let (result, candidate, revision) = manager.update_with_cleanup_revision_on_save_error(
+        false,
+        |cfg| {
+            let previous = cfg.clone();
+            let Some(obj) = cfg.as_object_mut() else {
+                return Decision::Skip(Err(StoreError::validation("配置不是对象")));
+            };
+            let change = match publish_builtin_file(operation, staged, live) {
+                Ok(change) => change,
+                Err(error) => return Decision::Skip(Err(StoreError::Io(error))),
+            };
+            let meta = obj.entry("builtinGeoMeta").or_insert_with(|| json!({}));
+            if !meta.is_object() {
+                *meta = json!({});
+            }
+            meta[tag] = json!({ "updatedAt": updated_at });
+            Decision::Write(Ok((previous, change)))
+        },
+        |result, error| {
+            // The managed config rename already happened on CommitUncertain.
+            // Keep its resource and withhold Apply until saved state is read back.
+            if matches!(error, StoreError::CommitUncertain(_)) {
+                return error;
+            }
+            let Ok((_, change)) = result else {
+                return error;
+            };
+            match change.restore(live) {
+                Ok(()) => error,
+                Err(restore_error) => StoreError::Io(format!(
+                    "配置未保存，无法恢复更新前的生效副本，规则资源可重试。保存错误为 {error}，恢复错误为 {restore_error}"
+                )),
+            }
+        },
+    )?;
+    let (previous, change) = result?;
+    Ok(ResourceSave {
+        previous,
+        candidate: candidate.ok_or_else(|| StoreError::validation("规则资源更新事务未写入"))?,
+        owner: StagedSaveOwner { revision, ..owner },
+        apply: !matches!(change, BuiltinFileChange::Unchanged),
+    })
 }
 
 /// ISO8601 当前时间（上游 `new Date().toISOString()`）。落进 `config.ruleResources[].downloadedAt`
@@ -2522,30 +2609,6 @@ async fn commit_registered_batch(
     }
     emit_config_changed_signal(app);
     Ok(())
-}
-
-fn save_resource_change(
-    state: &AppRuntime,
-    edit: impl FnOnce(&mut Value) -> Result<bool, String>,
-) -> Result<ResourceSave, String> {
-    let owner = StagedSaveOwner::capture(state.proxy(), 0);
-    let (result, saved, revision) = state
-        .config()
-        .update_with_cleanup_revision(false, |config| {
-            let previous = config.clone();
-            match edit(config) {
-                Ok(apply) => Decision::Write(Ok((previous, apply))),
-                Err(error) => Decision::Skip(Err(error)),
-            }
-        })
-        .map_err(|error| format!("保存规则资源配置失败: {error}"))?;
-    let (previous, apply) = result?;
-    Ok(ResourceSave {
-        previous,
-        candidate: saved.ok_or_else(|| "规则资源更新事务未写入".to_owned())?,
-        owner: StagedSaveOwner { revision, ..owner },
-        apply,
-    })
 }
 
 /// A batch can authorize only its own uninterrupted series of commits.

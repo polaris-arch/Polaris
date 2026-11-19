@@ -140,26 +140,64 @@ async fn builtin_http_or_invalid_content_failure_preserves_live() {
 
 #[tokio::test]
 async fn builtin_metadata_failure_is_retryable_error_and_never_done() {
-    let (plan, dir) = fixture();
-    let sink = RecordingSink::default();
-    let outcome = update_builtin_resource(
-        &sink,
-        &TestHttp::new(200, EMPTY_SRS_V1),
-        &PublicLookup,
-        &plan,
-        &dir,
-        async |_, staged, operation| {
-            publish_builtin_file(operation, staged, &dir.join(&plan.file_name))?;
-            Err("保存更新标记失败，可重试".into())
-        },
-    )
-    .await;
-    let result = outcome.into_value(&plan);
-    assert_eq!(result["ok"], false);
-    assert_eq!(result["errorCode"], ERR_RESOURCE_WRITE_FAILED);
-    assert_eq!(sink.statuses(), ["downloading", "error"]);
-    assert_eq!(std::fs::read_dir(dir.join(".update")).unwrap().count(), 0);
-    std::fs::remove_dir_all(dir.path()).unwrap();
+    for previous in [Some(EMPTY_SRS_V2), None, Some(EMPTY_SRS_V1)] {
+        let (plan, dir) = fixture();
+        let live = dir.join(&plan.file_name);
+        if let Some(bytes) = previous {
+            std::fs::write(&live, bytes).unwrap();
+        } else {
+            std::fs::remove_file(&live).unwrap();
+        }
+        let manager = ConfigManager::new(dir.join("config"));
+        manager.load_full().unwrap();
+        let before = std::fs::read(manager.path()).unwrap();
+        let revision = manager.saved_revision();
+        let owner = StagedSaveOwner {
+            generation: 0,
+            intent: 0,
+            revision,
+        };
+        manager.fail_next_config_persist_for_test();
+        let sink = RecordingSink::default();
+        let outcome = update_builtin_resource(
+            &sink,
+            &TestHttp::new(200, EMPTY_SRS_V1),
+            &PublicLookup,
+            &plan,
+            &dir,
+            async |resource, staged, operation| {
+                save_resource_change(
+                    &manager,
+                    "geosite-cn",
+                    &resource.downloaded_at,
+                    (staged, &live),
+                    operation,
+                    owner,
+                )
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+            },
+        )
+        .await;
+        let result = outcome.into_value(&plan);
+        assert_eq!(result["ok"], false);
+        assert_eq!(result["errorCode"], ERR_RESOURCE_WRITE_FAILED);
+        assert!(result["error"]
+            .as_str()
+            .unwrap()
+            .contains("injected config persistence failure"));
+        assert_eq!(sink.statuses(), ["downloading", "error"]);
+        assert_eq!(std::fs::read(manager.path()).unwrap(), before);
+        assert_eq!(manager.saved_revision(), revision);
+        match previous {
+            Some(bytes) => assert_eq!(std::fs::read(&live).unwrap(), bytes),
+            None => assert_eq!(
+                std::fs::read(&live).unwrap_err().kind(),
+                io::ErrorKind::NotFound
+            ),
+        }
+        assert_eq!(std::fs::read_dir(dir.join(".update")).unwrap().count(), 0);
+    }
 }
 
 #[tokio::test]
@@ -302,9 +340,11 @@ fn reset_and_publish_share_writer_fence_and_capture_precedes_queue() {
             < update.find(".lock().await").unwrap()
     );
     assert!(!update.contains("std::fs::rename"));
-    let persist = top_level_fn_body(&src, "fn persist_builtin_geo_updated(");
+    let persist = top_level_fn_body(&src, "fn save_resource_change(");
     assert!(
-        persist.find("save_resource_change(state, |cfg|").unwrap()
+        persist
+            .find("update_with_cleanup_revision_on_save_error(")
+            .unwrap()
             < persist.find("publish_builtin_file(").unwrap()
     );
     assert!(

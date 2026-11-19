@@ -1917,6 +1917,16 @@ impl ConfigManager {
         defer_cleanup: bool,
         f: impl FnOnce(&mut Value) -> Decision<R>,
     ) -> Result<(R, Option<Value>, u64), StoreError> {
+        self.update_with_cleanup_revision_on_save_error(defer_cleanup, f, |_, error| error)
+    }
+
+    /// Handle a failed save before another writer or deferred deletion can run.
+    pub(crate) fn update_with_cleanup_revision_on_save_error<R>(
+        &self,
+        defer_cleanup: bool,
+        f: impl FnOnce(&mut Value) -> Decision<R>,
+        on_save_error: impl FnOnce(&R, StoreError) -> StoreError,
+    ) -> Result<(R, Option<Value>, u64), StoreError> {
         deny_inside_projection("update_with_cleanup");
         let _guard = self
             .write_lock
@@ -1929,10 +1939,11 @@ impl ConfigManager {
             Decision::Skip(r) => Ok((r, None, self.saved_revision())),
             Decision::Write(r) => {
                 let saved = if let Some(current) = current.as_ref() {
-                    self.save_full_deferred_cleanup_under_write_lock(current, &cfg)?
+                    self.save_full_deferred_cleanup_under_write_lock(current, &cfg)
                 } else {
-                    self.save_full_under_write_lock(&cfg)?
-                };
+                    self.save_full_under_write_lock(&cfg)
+                }
+                .map_err(|error| on_save_error(&r, error))?;
                 Ok((r, Some(saved), self.saved_revision()))
             }
         }
