@@ -3650,6 +3650,13 @@ const CFG_REGISTRY: &[CfgSite] = &[
         "New directory intents use platform-specific retained directory custody on iOS and Windows; historical unbound intents are not upgraded. Android keeps its prior path. This records source dispatch only, not device or protocol acceptance.",
     ),
     (
+        "src-tauri/src/runtime/config.rs",
+        "target_os = \"android\"",
+        1,
+        IosSide::DiffersRight,
+        "Debounced restarts on Android use native start admission. The other targets retain the saved-config legacy-start lease under the writer lock.",
+    ),
+    (
         "src-tauri/src/runtime/mesh.rs",
         "all(target_os = \"ios\", unix)",
         1,
@@ -4702,7 +4709,7 @@ const IOS_SIDE_CENSUS: &[(&str, usize)] = &[
     // in pending_changes (1 Right); its object no longer exists.
     // Mobile native custody, rule asset directories and SAF add 110 measured sites.
     // The old iOS-only config-file guard is now a runtime Platform match covering both mobile targets.
-    ("DiffersRight", 445),
+    ("DiffersRight", 446),
     ("DiffersUndecided", 26),
     // Saved temporary-core concurrency adds three group members; no old debt is repaid.
     ("DiffersWrongToday", 140),
