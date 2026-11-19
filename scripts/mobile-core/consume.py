@@ -43,7 +43,7 @@ def verify_original(component, receipt_path, platform, tools, scratch):
             require(name in tools, 'actual verifier tool missing: ' + name)
         observed = inspect_aar(component, value, binding['moduleGraph'], tools, run, scratch, expected_id)
     else:
-        observed = inspect_framework(component, value, binding['moduleGraph'], expected_id)
+        observed = inspect_framework(component, value, binding['moduleGraph'], expected_id, run=run, scratch=scratch)
     current_identity, producer_identity = component_output_identity(observed), component_output_identity(receipt['output'])
     missing = object()
     changed = sorted(key for key in set(current_identity) | set(producer_identity)

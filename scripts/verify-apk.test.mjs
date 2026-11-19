@@ -1645,7 +1645,7 @@ test('AAR interface commands bind observations to the exact tool captures', () =
   assert.deepEqual([...plan.hotJavaInterfaces].sort(), Object.keys(RETAINED_AAR_HOT_JAVA).sort());
   const source = readFileSync(new URL('./mobile-core/artifacts.py', import.meta.url), 'utf8');
   const owner = source.split('def inspect_aar(', 2)[1].split('def tree_inventory(', 1)[0];
-  for (const requirement of ['formal AAR must contain all four ABIs', 'check_buildinfo(facts, value, graph',
+  for (const requirement of ['formal AAR must contain all four ABIs', 'verify_native_buildinfo(info, value, graph',
     "'--aar-elf'", "'--dyn-syms', '--wide'", "'--aar-interfaces'", "'--aar-interface-classes'"]) {
     assert.ok(owner.includes(requirement), requirement);
   }

@@ -551,7 +551,7 @@ def verify_receipt(component, receipt, value, binding, tools, run_tool, scratch)
     if binding['platform'] == 'android':
         observed = inspect_aar(component, value, binding['moduleGraph'], tools, run_tool, scratch, expected)
     else:
-        observed = inspect_framework(component, value, binding['moduleGraph'], expected)
+        observed = inspect_framework(component, value, binding['moduleGraph'], expected, run=run_tool, scratch=scratch)
     from artifacts import component_output_identity
     require(component_output_identity(observed) == component_output_identity(receipt['output']),
             'cached component native/content predicate differs')
@@ -990,7 +990,7 @@ def execute(args):
                         'effective Go/native inputs changed during bind')
             expected = 'polaris-mobile-' + fp
             output = (inspect_aar(staged, value, graph, tools, run_tool, scratch, expected) if args.platform == 'android'
-                      else inspect_framework(staged, value, graph, expected))
+                      else inspect_framework(staged, value, graph, expected, run=run_tool, scratch=scratch))
             from native_inputs import collect, verify
             origins = collect(scratch, log, args.platform, output, cache)
             if (source / 'build').exists():

@@ -14,7 +14,7 @@ sys.dont_write_bytecode = True
 os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
 
 from fork_input import ROOT, canonical, load, require, sha
-from artifacts import APPLE, receipt_digest, file_pin, module, zip_entries, check_buildinfo, read_receipt, inspection_stage
+from artifacts import APPLE, receipt_digest, file_pin, module, zip_entries, verify_native_buildinfo, read_receipt, inspection_stage
 from producer import lease, run, write_json
 from consume import app_identity, apple_resources, verify_original
 
@@ -193,9 +193,10 @@ def apple(ipa, link_path, link_sha, linkmap, receipt_path, scratch, derived, sim
                     infos = [s['buildInfo'] for s in parsed['sections'] if 'buildInfo' in s]
                     ids = [n['value'] for s in parsed['sections'] for n in s.get('buildIDs', [])]
                     require(len(infos) == len(ids) == 1, 'final extension must retain original Go source carrier')
-                    check_buildinfo(infos[0]['parsedBuildInfo'], value, receipt['input']['moduleGraph'],
-                                    os_name='ios', arch=simulator_arch or 'arm64', mode='c-archive', simulator=bool(simulator_arch),
-                                    expected_id='polaris-mobile-' + receipt_digest(receipt['input']), actual_id=ids[0])
+                    verify_native_buildinfo(infos[0]['parsedBuildInfo'], value, receipt['input']['moduleGraph'],
+                                            os_name='ios', arch=simulator_arch or 'arm64', mode='c-archive',
+                                            simulator=bool(simulator_arch), run=run, scratch=scratch,
+                                            expected_id='polaris-mobile-' + receipt_digest(receipt['input']), actual_id=ids[0])
                     rows[name].update(goBuildInfo=infos[0], buildID=ids[0])
             require(not any(n.startswith(app_root) and (n.endswith('.a') or 'Libbox.framework/' in n) for n in archive.namelist()),
                     'build-only static SDK must not be copied into the installed App')

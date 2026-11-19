@@ -11,7 +11,7 @@ from unittest.mock import Mock, patch
 import zipfile
 
 from fork_input import ROOT, canonical, load, sha
-from artifacts import check_buildinfo, component_output_identity, framework_entry_targets, inspect_framework, module, module_stream, objc_hot_contract, objc_validation_getter_contract, tree_inventory, zip_entries
+from artifacts import component_output_identity, framework_entry_targets, module, module_stream, objc_hot_contract, objc_validation_getter_contract, tree_inventory, zip_entries
 from budget import capacity_limit, native_capacity, native_environment, reservation
 from ci_android import emit_outputs, prepare_source, prepare
 from producer import PRODUCER_FILES, compiler_fact, equivalent_binding, executable_driver_identity
@@ -26,12 +26,6 @@ class FormalOutputs(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.source = Path(temporary.name).resolve()
-        self.graph = [{'Path': 'example.org/module', 'Version': 'v1.2.3', 'Sum': 'h1:fixed'},
-                      {'Path': self.value['goModule'], 'Main': True, 'Dir': str(self.source)}]
-        for name, pin in self.value['sourcePolicy']['vendors'].items():
-            directory = self.source / pin['replacementPath'][2:]; directory.mkdir(parents=True)
-            self.graph.append({'Path': name, 'Version': pin['version'],
-                               'Replace': {'Path': pin['replacementPath'], 'Dir': str(directory)}})
 
     def test_native_capacity_caps_current_runner_by_load_affinity_quota_and_memory(self):
         facts = {'logicalCPUs': 16, 'affinityCPUs': 8, 'quotaCPUs': 4.5, 'load1': 1.1,
@@ -481,130 +475,6 @@ class FormalOutputs(unittest.TestCase):
                 'replacement': pin['replacementPath'], 'replacementVersion': '(devel)', 'replacementSum': ''}
         return facts
 
-    def check(self, facts, **kwargs):
-        check_buildinfo(facts, self.value, self.graph,
-                        os_name=kwargs.pop('os_name', 'android'), arch='arm64', mode=kwargs.pop('mode', 'c-shared'),
-                        expected_id='polaris-mobile-' + 'a' * 64, actual_id=kwargs.pop('actual_id', 'polaris-mobile-' + 'a' * 64),
-                        **kwargs)
-
-    def check_vendor_buildinfo(self, facts, graph, *, apple=False, simulator=False):
-        check_buildinfo(facts, self.value, graph, os_name='ios' if apple else 'android', arch='arm64',
-                        mode='c-archive' if apple else 'c-shared', simulator=simulator,
-                        expected_id='polaris-mobile-' + 'a' * 64, actual_id='polaris-mobile-' + 'a' * 64)
-
-    def test_vendor_native_consistency_allows_only_unrequired_link_pruning(self):
-        required = {'github.com/metacubex/utls', 'github.com/sagernet/sing-tun'}
-        for apple, simulator in [(False, False), (True, False), (True, True)]:
-            facts, graph = self.facts(apple, simulator), self.graph
-            frozen = deepcopy(facts)
-            self.check_vendor_buildinfo(facts, graph, apple=apple, simulator=simulator)
-            self.assertEqual(facts, frozen)
-            for name in self.value['sourcePolicy']['vendors']:
-                changed = deepcopy(facts); del changed['modules'][name]
-                with self.subTest(apple=apple, simulator=simulator, name=name):
-                    if name in required:
-                        with self.assertRaisesRegex(RuntimeError, 'required local source module'):
-                            self.check_vendor_buildinfo(changed, graph, apple=apple, simulator=simulator)
-                    else:
-                        self.check_vendor_buildinfo(changed, graph, apple=apple, simulator=simulator)
-            pruned = deepcopy(facts)
-            for name in set(self.value['sourcePolicy']['vendors']) - required: del pruned['modules'][name]
-            self.check_vendor_buildinfo(pruned, graph, apple=apple, simulator=simulator)
-
-    def test_buildinfo_rejects_every_linked_vendor_identity_mutation(self):
-        facts, graph = self.facts(), self.graph
-        for name in self.value['sourcePolicy']['vendors']:
-            for field, bad in [('version', 'v9.9.9'), ('replacement', './third_party/stock'),
-                               ('replacementVersion', 'v1.0.0'), ('replacementSum', 'h1:invented'),
-                               ('sum', 'h1:invented'), ('kind', 'mod')]:
-                changed = deepcopy(facts); changed['modules'][name][field] = bad
-                with self.subTest(name=name, field=field), self.assertRaises(RuntimeError):
-                    self.check_vendor_buildinfo(changed, graph)
-        changed = deepcopy(facts)
-        changed['modules']['example.invalid/unreviewed'] = {'kind': 'dep', 'version': 'v1.0.0', 'sum': 'h1:invented'}
-        with self.assertRaisesRegex(RuntimeError, 'not in actual source graph'):
-            self.check_vendor_buildinfo(changed, graph)
-        # Source-owned absolute aliases remain admissible for non-Meta vendors.
-        changed = deepcopy(facts)
-        name = 'github.com/sagernet/sing'
-        changed['modules'][name]['replacement'] = str(self.source / 'third_party/sing')
-        self.check_vendor_buildinfo(changed, graph)
-
-    def test_complete_graph_is_checked_even_for_native_pruned_modules(self):
-        source, facts, graph = self.source, self.facts(), self.graph
-        name = 'github.com/sagernet/fswatch'
-        del facts['modules'][name]
-        index = next(i for i, row in enumerate(graph) if row['Path'] == name)
-        for case in ('missing', 'duplicate', 'version', 'sum', 'path', 'directory', 'replacement-sum', 'stock', 'extra', 'main'):
-            changed = deepcopy(graph); row = changed[index]
-            if case == 'missing': changed.pop(index)
-            elif case == 'duplicate': changed.append(deepcopy(row))
-            elif case == 'version': row['Version'] = 'v9.9.9'
-            elif case == 'sum': row['Sum'] = 'h1:invented'
-            elif case == 'path': row['Replace']['Path'] = '../outside'
-            elif case == 'directory': row['Replace']['Dir'] = str(source / 'third_party/sing')
-            elif case == 'replacement-sum': row['Replace']['Sum'] = 'h1:invented'
-            elif case == 'stock': row.pop('Replace')
-            elif case == 'extra': changed.append({'Path': 'example.invalid/extra', 'Replace': {'Path': './extra', 'Dir': str(source / 'extra')}})
-            else: row['Main'] = True
-            with self.subTest(case=case), self.assertRaises(RuntimeError): self.check_vendor_buildinfo(facts, changed)
-        outside = source / 'outside'; outside.mkdir()
-        escaped = source / 'third_party/fswatch'; escaped.rmdir(); escaped.symlink_to(source.parent, target_is_directory=True)
-        with self.assertRaisesRegex(RuntimeError, 'local graph path differs'):
-            self.check_vendor_buildinfo(facts, graph)
-
-    def test_trimpath_does_not_invent_absent_ldflags(self):
-        self.check(self.facts())
-
-    def test_reported_ldflags_bind_exact_directory_source_identity(self):
-        from fork_input import linker_flags
-        expected = linker_flags(self.value, 'a' * 64)
-        facts = self.facts()
-        facts['settings']['-ldflags'] = expected
-        self.check(facts)
-        injection = ' -X github.com/sagernet/sing-box/constant.DirectoryRetirementSourceIdentity=' + self.value['sourceCommit']
-        for bad in [expected.replace(injection, ''),
-                    expected.replace(injection, injection[:-40] + '0' * 40)]:
-            facts['settings']['-ldflags'] = bad
-            with self.assertRaisesRegex(RuntimeError, 'ldflags differ'):
-                self.check(facts)
-
-    def test_actual_buildid_cannot_reuse_cli_or_other_input(self):
-        for bad in ['', 'CLI-BuildID', 'polaris-mobile-' + 'b' * 64]:
-            with self.subTest(id=bad), self.assertRaises(RuntimeError):
-                self.check(self.facts(), actual_id=bad)
-
-    def test_all_native_settings_and_required_feature_tags_are_checked(self):
-        for field, bad in [('GOOS', 'linux'), ('GOARCH', 'amd64'), ('CGO_ENABLED', '0'),
-                           ('-buildmode', 'exe'), ('-trimpath', 'false'), ('-tags', 'android')]:
-            value = self.facts()
-            value['settings'][field] = bad
-            with self.subTest(field=field), self.assertRaises(RuntimeError):
-                self.check(value)
-
-    def test_simulator_tag_cannot_appear_in_device_or_android(self):
-        self.check(self.facts(True), os_name='ios', mode='c-archive')
-        self.check(self.facts(True, True), os_name='ios', mode='c-archive', simulator=True)
-        for apple, sim, kwargs in [(True, True, {'os_name': 'ios', 'mode': 'c-archive'}),
-                                   (True, False, {'os_name': 'ios', 'mode': 'c-archive', 'simulator': True}),
-                                   (False, False, {})]:
-            facts = self.facts(apple, sim)
-            if not apple:
-                facts['settings']['-tags'] += ',android'
-            with self.subTest(apple=apple, simulator=sim), self.assertRaises(RuntimeError):
-                self.check(facts, **kwargs)
-
-    def test_module_version_h1_and_replacements_cannot_drift(self):
-        for key, bad in [('version', 'v9.9.9'), ('sum', 'h1:other'), ('replacement', '/unowned/source')]:
-            facts = self.facts()
-            facts['modules']['example.org/module'][key] = bad
-            with self.subTest(field=key), self.assertRaises(RuntimeError):
-                self.check(facts)
-        facts = self.facts()
-        facts['modules']['undeclared/module'] = {'kind': 'dep', 'version': 'v1.0.0'}
-        with self.assertRaises(RuntimeError):
-            self.check(facts)
-
     def test_module_stream_requires_unique_actual_rows(self):
         self.assertEqual(module_stream('{"Path":"a"}\n {"Path":"b"}'), [{'Path': 'a'}, {'Path': 'b'}])
         for bad in ['', '{"Path":"a"}{"Path":"a"}', '[]', '{"Version":"v1"}']:
@@ -1004,65 +874,6 @@ class FormalOutputs(unittest.TestCase):
                 verify_original('/component.aar', '/receipt.json', 'android', tools, Path('/consumer/work'))
             with self.assertRaisesRegex(RuntimeError, 'cached component native/content'):
                 verify_receipt('/component.aar', receipt, self.value, binding, tools, None, Path('/consumer/work'))
-
-    def test_source_owned_local_replacement_accepts_only_coherent_declared_literal_or_directory(self):
-        source, graph = self.source, self.graph
-        directory = source / 'third_party/sing-tun'
-        name = 'github.com/sagernet/sing-tun'
-        version = self.value['sourcePolicy']['vendors'][name]['version']
-        index = next(i for i, row in enumerate(graph) if row['Path'] == name)
-        facts = self.facts()
-        def check(observed, declared=graph):
-            check_buildinfo(observed, self.value, declared, os_name='android', arch='arm64', mode='c-shared',
-                            expected_id='polaris-mobile-' + 'a' * 64, actual_id='polaris-mobile-' + 'a' * 64)
-        for alias in ('./third_party/sing-tun', str(directory)):
-            for replacement_version in ('', '(devel)'):
-                facts['modules'][name] = {'kind': 'dep', 'version': version, 'replacement': alias,
-                                         'replacementVersion': replacement_version}
-                frozen = deepcopy(facts)
-                check(facts)
-                self.assertEqual(facts, frozen, 'native BuildInfo must remain its original observed values')
-        for wrong in ('third_party/sing-tun', '../third_party/sing-tun', './third_party/sing-tun/',
-                      './third_party/../third_party/sing-tun', str(source.parent / 'elsewhere/sing-tun')):
-            facts['modules'][name]['replacement'] = wrong
-            with self.subTest(path=wrong), self.assertRaisesRegex(RuntimeError, 'observed=.*declaredPath=.*declaredDir='):
-                check(facts)
-        facts['modules'][name]['replacement'] = './third_party/sing-tun'
-        for change in [('version', 'v9.0.0'), ('replacementVersion', 'v0.1.0'),
-                       ('replacementVersion', 'devel'), ('replacementSum', 'h1:undeclared')]:
-            wrong = deepcopy(facts); wrong['modules'][name][change[0]] = change[1]
-            with self.subTest(change=change), self.assertRaises(RuntimeError):
-                check(wrong)
-        wrong = deepcopy(graph); wrong[index]['Replace']['Dir'] = str(source / 'outside')
-        with self.assertRaisesRegex(RuntimeError, 'local graph path differs'):
-            check(facts, wrong)
-        for path in ('./../outside', './third_party/../sing-tun', '/absolute', './third_party//sing-tun'):
-            wrong = deepcopy(graph); wrong[index]['Replace']['Path'] = path
-            with self.subTest(declared=path), self.assertRaises(RuntimeError):
-                check(facts, wrong)
-        with self.assertRaisesRegex(RuntimeError, 'actual graph replacements differ'):
-            check(facts, graph[:index] + graph[index + 1:])
-        directory.rmdir(); directory.symlink_to(source.parent, target_is_directory=True)
-        with self.assertRaisesRegex(RuntimeError, 'local graph path differs'):
-            check(facts)
-
-    def test_remote_versioned_replacement_retains_exact_path_version_and_h1(self):
-        facts = self.facts()
-        name = 'example.org/module'
-        graph = deepcopy(self.graph)
-        graph[0]['Replace'] = {'Path': 'example.org/replaced', 'Version': 'v1.4.5', 'Sum': 'h1:replaced'}
-        facts['modules'][name].update(replacement='example.org/replaced', replacementVersion='v1.4.5',
-                                      replacementSum='h1:replaced')
-        def check(observed):
-            check_buildinfo(observed, self.value, graph, os_name='android', arch='arm64', mode='c-shared',
-                            expected_id='polaris-mobile-' + 'a' * 64, actual_id='polaris-mobile-' + 'a' * 64)
-        check(facts)
-        for key, bad in [('replacement', './example.org/replaced'), ('replacementVersion', 'v9.0.0'),
-                         ('replacementSum', 'h1:other'), ('replacementVersion', '(devel)'), ('version', 'v9.0.0')]:
-            wrong = deepcopy(facts); wrong['modules'][name][key] = bad
-            with self.subTest(field=key), self.assertRaises(RuntimeError):
-                check(wrong)
-
 
 if __name__ == '__main__':
     unittest.main()

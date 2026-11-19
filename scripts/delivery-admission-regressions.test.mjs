@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
-import { appendFileSync, copyFileSync, existsSync, mkdtempSync, readFileSync, realpathSync, writeFileSync, mkdirSync, rmSync, symlinkSync } from 'node:fs';
+import { appendFileSync, copyFileSync, existsSync, mkdtempSync, readFileSync, readdirSync, realpathSync, writeFileSync, mkdirSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { delimiter, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -11,7 +11,277 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { boundedDownload, DOWNLOAD_TIMEOUT_MS } from './lib/bounded-download.mjs';
 import { verifyDashboardArchive, dashboardInventory, dashboardFresh } from './fetch-dashboard.mjs';
 import { inspectAppleArchitecture } from './mobile-core/apple-admission.mjs';
-import { validateMobileSource } from './mobile-core/source-admission.mjs';
+import { checkMobileBuildInfo, parseMobileBuildInfo, validateMobileSource } from './mobile-core/source-admission.mjs';
+const nativeId = 'polaris-mobile-' + 'a'.repeat(64);
+const requiredNative = ['github.com/metacubex/utls', 'github.com/sagernet/sing-tun'];
+function mobileBuildFixture(folder) {
+  const root = realpathSync(folder);
+  const source = JSON.parse(readFileSync(new URL('mobile-core/source-contract.json', import.meta.url)));
+  const vendors = Object.entries(source.sourcePolicy.vendors);
+  const graph = [
+    { Path: 'example.org/module', Version: 'v1.2.3', Sum: 'h1:fixed' },
+    { Path: source.goModule, Main: true, Dir: root },
+  ];
+  const modules = {
+    gobind: { kind: 'mod', version: '(devel)' },
+    'example.org/module': { kind: 'dep', version: 'v1.2.3', sum: 'h1:fixed' },
+    [source.goModule]: { kind: 'dep', version: 'v0.0.0-00010101000000-000000000000', replacement: root },
+  };
+  for (const [name, pin] of vendors) {
+    const directory = join(root, pin.replacementPath);
+    mkdirSync(directory, { recursive: true });
+    graph.push({ Path: name, Version: pin.version, Replace: { Path: pin.replacementPath, Dir: directory } });
+    modules[name] = { kind: 'dep', version: pin.version, replacement: pin.replacementPath, replacementVersion: '(devel)' };
+  }
+  const input = (osName = 'android', arch = 'arm64', simulator = false) => {
+    const android = osName === 'android', mode = android ? 'c-shared' : 'c-archive';
+    const tags = [...source[android ? 'android' : 'apple'].tags, ...(android ? [] : ['ios']), ...(simulator ? ['iossimulator'] : [])];
+    const facts = { goVersion: source.goVersion, path: 'gobind', modules: structuredClone(modules), settings: {
+      GOOS: osName, GOARCH: arch, CGO_ENABLED: '1', '-buildmode': mode, '-trimpath': 'true', '-tags': tags.join(','),
+    } };
+    return { source, graph: structuredClone(graph), target: { osName, arch, mode, simulator },
+      expectedId: nativeId, actualId: nativeId, facts };
+  };
+  return { input, vendors: vendors.map(([name]) => name) };
+}
+
+function buildInfoText(facts) {
+  const lines = ['libbox.so: go' + facts.goVersion, '\tpath\t' + facts.path];
+  for (const [name, row] of Object.entries(facts.modules)) {
+    lines.push(['', row.kind, name, row.version, row.sum ?? ''].join('\t'));
+    if (Object.hasOwn(row, 'replacement')) {
+      lines.push(['', '=>', row.replacement, row.replacementVersion ?? '', row.replacementSum ?? ''].join('\t'));
+    }
+  }
+  for (const [key, value] of Object.entries(facts.settings)) lines.push('\tbuild\t' + key + '=' + JSON.stringify(value));
+  return lines.join('\n') + '\n';
+}
+
+function verifyMobileBuildFixture({ facts, ...input }) {
+  return checkMobileBuildInfo(input.target.osName === 'android'
+    ? { ...input, raw: buildInfoText(facts) }
+    : { ...input, facts });
+}
+
+test('native mobile BuildInfo admits each exact platform and preserves original module projection', { skip: process.platform === 'win32' }, () => {
+  const folder = mkdtempSync(join(tmpdir(), 'mobile-buildinfo-cli-'));
+  try {
+    const { input, vendors } = mobileBuildFixture(folder);
+    const script = fileURLToPath(new URL('mobile-core/source-admission.mjs', import.meta.url));
+    const report = join(folder, 'report.json');
+    const verify = (target, tamper) => {
+      const { facts, ...rest } = target;
+      const evidence = target.target.osName === 'android' ? { ...rest, raw: buildInfoText(facts) } : target;
+      const bytes = Buffer.from(JSON.stringify(evidence));
+      writeFileSync(report, bytes);
+      const digest = createHash('sha256').update(bytes).digest('hex');
+      tamper?.(bytes);
+      return spawnSync(process.execPath, [script, '--native-buildinfo', report, bytes.length, digest], { encoding: 'utf8' });
+    };
+    for (const target of [
+      ...['arm64', 'arm', '386', 'amd64'].map(arch => input('android', arch)),
+      input('ios'), input('ios', 'arm64', true),
+    ]) {
+      const frozen = structuredClone(target);
+      const result = verify(target);
+      assert.equal(result.status, 0, result.stderr);
+      assert.deepEqual(target, frozen);
+      if (target.target.osName === 'android') assert.deepEqual(JSON.parse(result.stdout), frozen.facts);
+      else assert.equal(result.stdout, '');
+      if (target.target.arch === 'arm64') {
+        const python = execFileSync('python3', ['-B', '-c', `
+import json
+import sys
+sys.path.insert(0, sys.argv[1])
+from artifacts import verify_native_buildinfo
+from producer import run
+
+evidence = json.load(sys.stdin)
+target = evidence['target']
+observed = verify_native_buildinfo(evidence.get('raw', evidence.get('facts')), evidence['source'], evidence['graph'],
+                                   os_name=target['osName'], arch=target['arch'], mode=target['mode'],
+                                   simulator=target['simulator'], expected_id=evidence['expectedId'],
+                                   actual_id=evidence['actualId'], run=run, scratch=sys.argv[2])
+print(json.dumps(observed))
+`, dirname(script), folder], { input: readFileSync(report), encoding: 'utf8' });
+        assert.deepEqual(JSON.parse(python), target.target.osName === 'android' ? frozen.facts : null);
+        assert.equal(readdirSync(folder).some(name => name.startsWith('native-buildinfo-')), false);
+      }
+      for (const name of vendors) {
+        const changed = structuredClone(target);
+        delete changed.facts.modules[name];
+        if (requiredNative.includes(name)) assert.throws(() => verifyMobileBuildFixture(changed), /required local source module/);
+        else verifyMobileBuildFixture(changed);
+      }
+      for (const name of vendors.filter(name => !requiredNative.includes(name))) delete target.facts.modules[name];
+      verifyMobileBuildFixture(target);
+    }
+    const mutated = verify(input(), bytes => writeFileSync(report, Buffer.from(bytes.toString().replace('gobind', 'gobinx'))));
+    assert.equal(mutated.status, 1);
+    assert.match(mutated.stderr, /native BuildInfo evidence pin differs/);
+    const linked = verify(input(), () => {
+      const original = join(folder, 'original.json');
+      copyFileSync(report, original);
+      rmSync(report);
+      symlinkSync(original, report);
+    });
+    assert.equal(linked.status, 1);
+    assert.match(linked.stderr, /bounded regular original/);
+  } finally {
+    rmSync(folder, { recursive: true, force: true });
+  }
+});
+
+test('mobile BuildInfo rejects wrong settings, platform tags, BuildID, and exact linker flags', { skip: process.platform === 'win32' }, () => {
+  const folder = mkdtempSync(join(tmpdir(), 'mobile-buildinfo-settings-'));
+  try {
+    const { input } = mobileBuildFixture(folder);
+    for (const [field, bad] of Object.entries({ GOOS: 'linux', GOARCH: 'amd64', CGO_ENABLED: '0',
+      '-buildmode': 'exe', '-trimpath': 'false', '-tags': 'android' })) {
+      const changed = input();
+      changed.facts.settings[field] = bad;
+      assert.throws(() => verifyMobileBuildFixture(changed), /setting differs|feature tags differ/);
+    }
+    const wrongVersion = input();
+    wrongVersion.facts.goVersion = '1.27.5';
+    assert.throws(() => verifyMobileBuildFixture(wrongVersion), /Go version differs/);
+    for (const changed of [input(), input('ios'), input('ios', 'arm64', true)]) {
+      changed.facts.settings['-tags'] = changed.target.simulator
+        ? changed.facts.settings['-tags'].replace(',iossimulator', '')
+        : changed.facts.settings['-tags'] + ',iossimulator';
+      assert.throws(() => verifyMobileBuildFixture(changed), /feature tags differ/);
+    }
+    for (const actualId of ['', 'CLI-BuildID', 'polaris-mobile-' + 'b'.repeat(64)]) {
+      assert.throws(() => verifyMobileBuildFixture({ ...input(), actualId }), /BuildID input differs/);
+    }
+    const observed = input();
+    const retirementFlag = ' -X github.com/sagernet/sing-box/constant.DirectoryRetirementSourceIdentity=' + observed.source.sourceCommit;
+    const flags = '-X github.com/sagernet/sing-box/constant.Version=' + observed.source.version + retirementFlag
+      + ' -X runtime.godebugDefault=multipathtcp=0,tlssha1=1 -checklinkname=0 -s -w -buildid=' + nativeId;
+    verifyMobileBuildFixture(observed);
+    observed.facts.settings['-ldflags'] = flags;
+    verifyMobileBuildFixture(observed);
+    for (const bad of [flags.replace(retirementFlag, ''), flags.replace(observed.source.sourceCommit, '0'.repeat(40))]) {
+      observed.facts.settings['-ldflags'] = bad;
+      assert.throws(() => verifyMobileBuildFixture(observed), /ldflags differ/);
+    }
+  } finally {
+    rmSync(folder, { recursive: true, force: true });
+  }
+});
+
+test('native local modules and the complete pruned source graph retain exact ownership', { skip: process.platform === 'win32' }, () => {
+  const folder = mkdtempSync(join(tmpdir(), 'mobile-buildinfo-graph-'));
+  try {
+    const { input, vendors } = mobileBuildFixture(folder);
+    for (const name of vendors) {
+      for (const [field, value] of Object.entries({ version: 'v9.9.9', replacement: './third_party/stock',
+        replacementVersion: 'v1.0.0', replacementSum: 'h1:invented', sum: 'h1:invented', kind: 'mod' })) {
+        const changed = input();
+        changed.facts.modules[name][field] = value;
+        assert.throws(() => verifyMobileBuildFixture(changed), undefined, name + ' ' + field);
+      }
+    }
+    const local = input();
+    const name = 'github.com/sagernet/sing-tun';
+    const declared = local.graph.find(row => row.Path === name).Replace;
+    for (const alias of [declared.Path, declared.Dir]) {
+      for (const version of ['', '(devel)']) {
+        Object.assign(local.facts.modules[name], { replacement: alias, replacementVersion: version });
+        verifyMobileBuildFixture(local);
+      }
+    }
+    for (const alias of ['third_party/sing-tun', '../third_party/sing-tun', './third_party/sing-tun/',
+      './third_party/../third_party/sing-tun', join(folder, 'outside/sing-tun')]) {
+      local.facts.modules[name].replacement = alias;
+      assert.throws(() => verifyMobileBuildFixture(local), /observed=.*declaredPath=.*declaredDir=/);
+    }
+    local.facts.modules[name].replacement = declared.Path;
+    local.facts.modules[name].replacementVersion = 'devel';
+    assert.throws(() => verifyMobileBuildFixture(local), /replacement version differs/);
+
+    const pruned = 'github.com/sagernet/fswatch';
+    const graphMutations = [
+      (rows, index) => rows.splice(index, 1), (rows, index) => rows.push(structuredClone(rows[index])),
+      (rows, index) => { rows[index].Version = 'v9.9.9'; }, (rows, index) => { rows[index].Sum = 'h1:invented'; },
+      ...['../outside', './../outside', './third_party/../fswatch', '/absolute', './third_party//fswatch']
+        .map(path => (rows, index) => { rows[index].Replace.Path = path; }),
+      (rows, index) => { rows[index].Replace.Dir = join(folder, 'third_party/sing'); },
+      (rows, index) => { rows[index].Replace.Sum = 'h1:invented'; }, (rows, index) => { delete rows[index].Replace; },
+      (rows, index) => { rows[index].Main = true; },
+      rows => rows.push({ Path: 'example.invalid/extra', Replace: { Path: './extra', Dir: join(folder, 'extra') } }),
+    ];
+    for (const mutate of graphMutations) {
+      const changed = input();
+      delete changed.facts.modules[pruned];
+      mutate(changed.graph, changed.graph.findIndex(row => row.Path === pruned));
+      assert.throws(() => verifyMobileBuildFixture(changed));
+    }
+    for (const escaped of [name, pruned]) {
+      const changed = input();
+      delete changed.facts.modules[pruned];
+      const directory = changed.graph.find(row => row.Path === escaped).Replace.Dir;
+      rmSync(directory, { recursive: true });
+      symlinkSync(dirname(folder), directory, 'dir');
+      assert.throws(() => verifyMobileBuildFixture(changed), /local graph path differs/);
+      rmSync(directory);
+      mkdirSync(directory);
+    }
+  } finally {
+    rmSync(folder, { recursive: true, force: true });
+  }
+});
+
+test('native BuildInfo keeps ordinary and remote replacement identity and exact generated source alias', { skip: process.platform === 'win32' }, () => {
+  const folder = mkdtempSync(join(tmpdir(), 'mobile-buildinfo-modules-'));
+  try {
+    const { input } = mobileBuildFixture(folder);
+    const name = 'example.org/module';
+    for (const [field, value] of Object.entries({ version: 'v9.9.9', sum: 'h1:other', replacement: '/unowned/source' })) {
+      const changed = input();
+      changed.facts.modules[name][field] = value;
+      assert.throws(() => verifyMobileBuildFixture(changed));
+    }
+    const unreviewed = input();
+    unreviewed.facts.modules['example.invalid/unreviewed'] = { kind: 'dep', version: 'v1.0.0' };
+    assert.throws(() => verifyMobileBuildFixture(unreviewed), /not in actual source graph/);
+    const wrongCore = input();
+    wrongCore.facts.modules[wrongCore.source.goModule].replacement += '/elsewhere';
+    assert.throws(() => verifyMobileBuildFixture(wrongCore), /exact verified source module/);
+    const replacement = input();
+    replacement.graph[0].Replace = { Path: 'example.org/replaced', Version: 'v1.4.5', Sum: 'h1:replaced' };
+    const original = { replacement: 'example.org/replaced', replacementVersion: 'v1.4.5', replacementSum: 'h1:replaced' };
+    Object.assign(replacement.facts.modules[name], original);
+    verifyMobileBuildFixture(replacement);
+    for (const [field, value] of [['replacement', './example.org/replaced'], ['replacementVersion', 'v9.0.0'],
+      ['replacementSum', 'h1:other'], ['replacementVersion', '(devel)'], ['version', 'v9.0.0']]) {
+      const changed = structuredClone(replacement);
+      changed.facts.modules[name][field] = value;
+      assert.throws(() => verifyMobileBuildFixture(changed));
+    }
+  } finally {
+    rmSync(folder, { recursive: true, force: true });
+  }
+});
+
+test('Android textual Go BuildInfo preserves original rows including settings and rejects malformed records', () => {
+  const header = 'lib path/libbox.so: go1.27.4';
+  const rows = ['\tpath\tgobind', '\tmod\tgobind\t(devel)\t',
+    '\tdep\tmodule\tv1.2.3\th1:original', '\t=>\t./third_party/module\t(devel)\t', '\t',
+    '\tbuild\tGOOS=android', '\tbuild\t-ldflags="flag \\"value\\"=path"', '\tbuild\tkey=left=right'];
+  assert.deepEqual(parseMobileBuildInfo([header, ...rows].join('\r\n') + '\u0085 '), {
+    goVersion: '1.27.4', path: 'gobind',
+    modules: { gobind: { kind: 'mod', version: '(devel)' },
+      module: { kind: 'dep', version: 'v1.2.3', sum: 'h1:original', replacement: './third_party/module', replacementVersion: '(devel)' } },
+    settings: { GOOS: 'android', '-ldflags': 'flag "value"=path', key: 'left=right' },
+  });
+  for (const wrong of ['', 'libbox.so: devel', header + '\ufeff',
+    ...['\tunknown\tvalue', '\t=>\t./unbound', '\tdep\tmissing-version', '\tbuild\t-x',
+      '\tbuild\t=x', '\tbuild\tkey="missing close', '\tbuild\tkey=duplicate', '\tpath\tsecond',
+      '\tdep\tmodule\tv1.2.3', 'first\tdep\tmodule\tv1.2.3'].map(row => [header, ...rows, row].join('\n'))]) {
+    assert.throws(() => parseMobileBuildInfo(wrong));
+  }
+});
 
 test('same-run Apple aggregate preserves original Python wire bytes for both declared scopes', { skip: process.platform !== 'linux' }, () => {
   const repo = fileURLToPath(new URL('../', import.meta.url));

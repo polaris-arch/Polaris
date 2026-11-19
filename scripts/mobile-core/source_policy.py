@@ -132,29 +132,6 @@ def verify_vendor_sources(source, vendors, git):
     return verify_vendor_files(vendors, files, modes, trees), files, modes, trees
 
 
-def verify_vendor_graph(graph, source, vendors):
-    require(isinstance(graph, list) and all(isinstance(row, dict) and isinstance(row.get('Path'), str) for row in graph),
-            'actual source graph module rows differ')
-    require(len(graph) == len({row['Path'] for row in graph}), 'duplicate module graph row')
-    require(all(not row.get('Replace') or isinstance(row['Replace'], dict) for row in graph), 'invalid graph replacement')
-    local = {r['Path']: r for r in graph if r.get('Replace') and not r['Replace'].get('Version')}
-    require(set(local) == set(vendors), 'actual graph replacements differ')
-    root = Path(source)
-    require(root.is_absolute() and '..' not in root.parts, 'absolute source graph root required')
-    physical_root = root.resolve(strict=True)
-    for name, row in local.items():
-        replacement, pin = row['Replace'], vendors[name]
-        expected = root / pin['replacementPath'][2:]
-        directory = replacement.get('Dir')
-        require(replacement.get('Path') == pin['replacementPath'] and isinstance(directory, str) and
-                directory == str(expected) and expected.is_dir() and
-                expected.resolve(strict=True).is_relative_to(physical_root), 'local graph path differs')
-        require(not row.get('Main') and row.get('Sum', '') == '' and replacement.get('Sum', '') == '' and
-                replacement.get('Version', '') == '', 'local replacement must not invent h1/version')
-        require(row.get('Version') == pin['version'], 'actual vendor graph version differs: ' + name)
-    return graph
-
-
 def decode_binding(raw):
     def pairs(rows):
         result = {}

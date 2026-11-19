@@ -1,7 +1,7 @@
 // Mobile declaration and receipt decoding. The producer independently observes
 // Git, source bytes and tool execution.
 import { createHash } from 'node:crypto';
-import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync, readSync } from 'node:fs';
+import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync, readSync, realpathSync, statSync } from 'node:fs';
 import { posix, resolve, win32 } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -302,10 +302,13 @@ export function readMobileSource() {
   return validateSourceBytes(pinned(path, sourceContractBytes).bytes);
 }
 
-function bindingPlans(source) {
-  const linkerFlagsPrefix = '-X github.com/sagernet/sing-box/constant.Version=' + source.version +
+function mobileLinkerFlagsPrefix(source) {
+  return '-X github.com/sagernet/sing-box/constant.Version=' + source.version +
     ' -X github.com/sagernet/sing-box/constant.DirectoryRetirementSourceIdentity=' + source.sourceCommit +
     ' -X runtime.godebugDefault=multipathtcp=0,tlssha1=1 -checklinkname=0 -s -w -buildid=polaris-mobile-';
+}
+
+function bindingPlans(source) {
   const argument = input => ({ input });
   const platforms = Object.fromEntries(['android', 'apple'].map(platform => {
     const profile = source[platform];
@@ -326,7 +329,163 @@ function bindingPlans(source) {
       producerReceipt: null, AppAccepted: false, devicePassed: false, publicationEligible: false };
     return [platform, { schema: 'polaris-mobile-bind-plan-v1', argv, facts, summary }];
   }));
-  return { linkerFlagsPrefix, platforms };
+  return { linkerFlagsPrefix: mobileLinkerFlagsPrefix(source), platforms };
+}
+
+// The textual Android observation and the parsed Apple Mach-O section
+// share contract validation. The latter's original framing/fingerprint stays
+// with the native section observer.
+export function parseMobileBuildInfo(raw) {
+  const lines = raw.replace(/[\u0009-\u000d\u001c-\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+$/u, '')
+    .split(/\r\n|[\n\r\u000b\u000c\u001c-\u001e\u0085\u2028\u2029]/u);
+  const version = /: go(\p{Nd}+\.\p{Nd}+\.\p{Nd}+)$/u.exec(lines.shift());
+  demand(version, 'Missing Go BuildInfo');
+  const modules = new Map(), settings = new Map();
+  let path = null, previous;
+  for (const line of lines) {
+    if (line === '\t') {
+      previous = undefined;
+      continue;
+    }
+    const [prefix, kind, value, first, second] = line.split('\t');
+    demand(prefix === '' && value !== undefined, 'Malformed Go BuildInfo row');
+    if (kind === 'mod' || kind === 'dep') {
+      demand(first !== undefined && !modules.has(value), 'Duplicate/malformed module row');
+      previous = { kind, version: first };
+      if (second) previous.sum = second;
+      modules.set(value, previous);
+      continue;
+    }
+    if (kind === '=>') {
+      demand(previous && !Object.hasOwn(previous, 'replacement') && value, 'Unbound/duplicate replacement');
+      previous.replacement = value;
+      if (first) previous.replacementVersion = first;
+      if (second) previous.replacementSum = second;
+    } else if (kind === 'build') {
+      const at = value.indexOf('='), key = value.slice(0, at);
+      demand(at > 0 && !settings.has(key), 'Malformed/duplicate build setting');
+      const setting = value.slice(at + 1);
+      settings.set(key, setting.startsWith('"') ? JSON.parse(setting) : setting);
+    } else if (kind === 'path') {
+      demand(path === null, 'Duplicate BuildInfo path');
+      path = value;
+    } else {
+      throw new Error('Unsupported Go BuildInfo row');
+    }
+    previous = undefined;
+  }
+  return { goVersion: version[1], modules: Object.fromEntries(modules), settings: Object.fromEntries(settings), path };
+}
+
+const field = (value, key) => Object.hasOwn(value, key) ? value[key] : '';
+const present = (value) => value != null && typeof value === 'object' ? Object.keys(value).length !== 0 : Boolean(value);
+function declareNativeGraph(graph, module, vendors) {
+  demand(Array.isArray(graph) && graph.every(row => object(row) && typeof row.Path === 'string'),
+    'actual source graph module rows differ');
+  const declared = new Map(graph.map(row => [row.Path, row]));
+  demand(declared.size === graph.length, 'duplicate actual source graph module');
+  demand(graph.every(row => !present(row.Replace) || object(row.Replace)), 'invalid graph replacement');
+  const local = graph.filter(row => present(row.Replace) && !present(row.Replace.Version));
+  demand(local.length === Object.keys(vendors).length && local.every(row => Object.hasOwn(vendors, row.Path)),
+    'actual graph replacements differ');
+  const source = declared.get(module);
+  demand(source?.Main === true && typeof source.Dir === 'string', 'actual main source graph root differs');
+  demand(posix.isAbsolute(source.Dir) && !source.Dir.split('/').includes('..'), 'absolute source graph root required');
+  demand(!source.Dir.includes('\0'), 'absolute source graph root required');
+  const root = realpathSync(source.Dir);
+  const doubleSlash = /^\/\/[^/]/.test(source.Dir) || source.Dir === '//';
+  for (const row of local) {
+    const pin = vendors[row.Path], replacement = row.Replace;
+    const expected = (doubleSlash ? '/' : '') + posix.join(source.Dir, pin.replacementPath.slice(2));
+    demand(replacement.Path === pin.replacementPath && replacement.Dir === expected
+      && statSync(expected, { throwIfNoEntry: false })?.isDirectory(), 'local graph path differs');
+    const relative = posix.relative(root, realpathSync(expected));
+    demand(relative !== '..' && !relative.startsWith('../') && !posix.isAbsolute(relative), 'local graph path differs');
+    demand(!present(row.Main) && field(row, 'Sum') === '' && field(replacement, 'Sum') === ''
+      && field(replacement, 'Version') === '', 'local replacement must not invent h1/version');
+    demand(row.Version === pin.version, 'actual vendor graph version differs: ' + row.Path);
+  }
+  return declared;
+}
+
+export function checkMobileBuildInfo({ source: declaration, graph, target, expectedId, actualId, raw, facts }) {
+  const source = validateMobileSource(sourceDeclaration(declaration));
+  const { osName, arch, mode, simulator } = target;
+  const android = osName === 'android';
+  demand(android
+    ? mode === 'c-shared' && ['arm64', 'arm', '386', 'amd64'].includes(arch) && simulator === false
+    : osName === 'ios' && mode === 'c-archive' && arch === 'arm64' && typeof simulator === 'boolean',
+  'actual mobile BuildInfo target differs');
+  demand(android ? typeof raw === 'string' && facts === undefined : object(facts) && raw === undefined,
+    'native BuildInfo observation kind differs');
+  const observed = android ? parseMobileBuildInfo(raw) : facts;
+  demand(observed.goVersion === source.goVersion, 'native Go version differs');
+  const { settings, modules } = observed;
+  demand(object(settings) && object(modules), 'actual native BuildInfo shape differs');
+  for (const [key, expected] of Object.entries({
+    GOOS: osName, GOARCH: arch, CGO_ENABLED: '1', '-buildmode': mode, '-trimpath': 'true',
+  })) {
+    demand(settings[key] === expected, 'actual native setting differs: ' + key);
+  }
+  const tags = new Set([...source[android ? 'android' : 'apple'].tags,
+    ...(android ? [] : ['ios']), ...(simulator ? ['iossimulator'] : [])]);
+  const actualTags = typeof settings['-tags'] === 'string' ? new Set(settings['-tags'].split(',')) : new Set();
+  demand(tags.size === actualTags.size && [...tags].every(tag => actualTags.has(tag)), 'native feature tags differ');
+  demand(typeof expectedId === 'string' && actualId === expectedId, 'actual source/tool/target BuildID input differs');
+  // With trimpath Go can omit this setting. The tool/target binding and
+  // actual BuildID are still required separately.
+  if (Object.hasOwn(settings, '-ldflags')) {
+    const fingerprint = expectedId.replace(/^polaris-mobile-/, '');
+    demand(hex(fingerprint, 64) && settings['-ldflags'] === mobileLinkerFlagsPrefix(source) + fingerprint,
+      'reported native ldflags differ');
+  }
+  const { metacubex, vendors } = source.sourcePolicy;
+  const declared = declareNativeGraph(graph, source.goModule, vendors);
+  // Go may prune unlinked vendors, while the complete source graph is required.
+  for (const name of [metacubex.module, 'github.com/sagernet/sing-tun']) {
+    demand(Object.hasOwn(modules, name), 'required local source module absent from native carrier: ' + name);
+  }
+  demand(declared.get(metacubex.module).Version === metacubex.version, 'actual Meta source graph version differs');
+  const actualMeta = modules[metacubex.module];
+  demand(actualMeta && actualMeta.version === metacubex.version && field(actualMeta, 'sum') === ''
+    && actualMeta.replacement === metacubex.replacementPath && actualMeta.replacementVersion === '(devel)'
+    && field(actualMeta, 'replacementSum') === '', 'actual Meta local replacement identity differs; baseline h1 is not a local sum');
+  demand(Object.hasOwn(modules, source.goModule), 'original core source module absent from native carrier');
+  for (const [name, linked] of Object.entries(modules)) {
+    demand(object(linked), 'actual native module row differs');
+    // Generated binding main packages are separate from source dependencies.
+    if ((name === 'command-line-arguments' || name === 'gobind') && linked.kind === 'mod') continue;
+    const expected = declared.get(name);
+    demand(expected, 'native module not in actual source graph: ' + name);
+    if (Object.hasOwn(vendors, name)) {
+      demand(linked.kind === 'dep' && field(linked, 'sum') === '', 'native local module must not invent h1 or main role: ' + name);
+    }
+    if (present(expected.Main)) {
+      if (linked.kind === 'dep') {
+        demand(linked.replacement === expected.Dir && linked.version === 'v0.0.0-00010101000000-000000000000',
+          'generated binding must point at the exact verified source module');
+        continue;
+      }
+      demand(linked.version === '(devel)' || linked.version === '', 'main module version differs');
+    } else {
+      demand(linked.version === expected.Version, 'native module version differs: ' + name);
+    }
+    const replacement = expected.Replace;
+    if (present(replacement)) {
+      const diagnostic = 'native replacement differs: ' + name + '; observed=' + JSON.stringify(linked)
+        + '; declaredPath=' + JSON.stringify(replacement.Path) + '; declaredDir=' + JSON.stringify(replacement.Dir);
+      const versioned = present(replacement.Version);
+      demand(linked.replacement === replacement.Path || (!versioned && linked.replacement === replacement.Dir), diagnostic);
+      // Go can emit (devel) for a versionless replacement in a linked binary.
+      demand((versioned ? [replacement.Version] : ['', '(devel)']).includes(field(linked, 'replacementVersion')),
+        'replacement version differs; ' + diagnostic);
+      demand(field(linked, 'replacementSum') === field(replacement, 'Sum'), 'replacement h1 differs; ' + diagnostic);
+    } else {
+      demand(!Object.hasOwn(linked, 'replacement'), 'undeclared native module replacement');
+      if (present(expected.Sum)) demand(linked.sum === expected.Sum, 'native module h1 differs: ' + name);
+    }
+  }
+  return observed;
 }
 
 export function readBoundedInput(maximum) {
@@ -347,9 +506,16 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
     if (args.length === 1 && args[0] === '--versions') {
       const source = readMobileSource();
       console.log(`${source.goVersion} ${source.version}`);
+    } else if (args.length === 4 && args[0] === '--native-buildinfo') {
+      const [, path, size, digest] = args;
+      const { bytes, pin } = pinned(path, limits.controlBytes);
+      demand(pin.bytes === Number(size) && pin.sha256 === digest, 'native BuildInfo evidence pin differs');
+      const evidence = decode(bytes, limits.controlBytes, () => limits.controlBytes);
+      const observed = checkMobileBuildInfo(evidence);
+      if (Object.hasOwn(evidence, 'raw')) console.log(JSON.stringify(observed));
     } else {
       // The producer sends its full declaration once and reuses these plans.
-      demand(args.length === 0, 'usage: source-admission.mjs [--versions]');
+      demand(args.length === 0, 'usage: source-admission.mjs [--versions | --native-buildinfo PATH BYTES SHA256]');
       console.log(JSON.stringify(bindingPlans(validateSourceBytes(readBoundedInput(sourceContractBytes)))));
     }
   } catch (error) {

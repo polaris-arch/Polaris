@@ -293,92 +293,23 @@ def local_replacement_aliases(replacement, source_dir, observed, name):
     return {literal, directory}, diagnostic
 
 
-def check_buildinfo(facts, value, graph, *, os_name, arch, mode, expected_id, actual_id, simulator=False):
-    require(facts['goVersion'] == value['goVersion'], 'native Go version differs')
-    settings = facts['settings']
-    for key, expected in {'GOOS': os_name, 'GOARCH': arch, 'CGO_ENABLED': '1', '-buildmode': mode,
-                          '-trimpath': 'true'}.items():
-        require(settings.get(key) == expected, 'actual native setting differs: ' + key)
-    profile = value['android' if os_name == 'android' else 'apple']
-    platform_tags = set() if os_name == 'android' else {'ios'}
-    if simulator:
-        platform_tags.add('iossimulator')
-    require(set(settings.get('-tags', '').split(',')) == set(profile['tags']) | platform_tags, 'native feature tags differ')
-    require(actual_id == expected_id, 'actual source/tool/target BuildID input differs')
-    # Go1.25.5 intentionally omits -ldflags with trimpath. Command and BuildID
-    # are bound separately; do not invent that absent BuildInfo setting.
-    if '-ldflags' in settings:
-        from fork_input import linker_flags
-        require(settings['-ldflags'] == linker_flags(value, expected_id.removeprefix('polaris-mobile-')),
-                'reported native ldflags differ')
-    require(isinstance(graph, list) and all(isinstance(row, dict) and isinstance(row.get('Path'), str) for row in graph),
-            'actual source graph module rows differ')
-    declared = {row['Path']: row for row in graph}
-    require(len(declared) == len(graph), 'duplicate actual source graph module')
-    from source_policy import verify_vendor_graph
-    policy = validate(value)['sourcePolicy']
-    meta = policy['metacubex']
-    required_native = {meta['module'], 'github.com/sagernet/sing-tun'}
-    reviewed_vendors = policy['vendors']
-    source_row = declared.get(value['goModule'], {})
-    require(source_row.get('Main') is True and isinstance(source_row.get('Dir'), str),
-            'actual main source graph root differs')
-    verify_vendor_graph(graph, source_row['Dir'], reviewed_vendors)
-    # The resolved source graph contains all reviewed replacements. Go can
-    # prune unlinked vendors from native BuildInfo; these two remain required.
-    for name in required_native:
-        require(name in facts['modules'], 'required local source module absent from native carrier: ' + name)
-    require(declared[meta['module']].get('Version') == meta['version'], 'actual Meta source graph version differs')
-    actual = facts['modules'].get(meta['module'])
-    require(actual is not None and actual.get('version') == meta['version'] and
-            actual.get('sum', '') == '' and actual.get('replacement') == meta['replacementPath'] and
-            actual.get('replacementVersion') == '(devel)' and actual.get('replacementSum', '') == '',
-            'actual Meta local replacement identity differs; baseline h1 is not a local sum')
-    require(value['goModule'] in facts['modules'], 'original core source module absent from native carrier')
-    for name, observed in facts['modules'].items():
-        # The generated gobind main package is not a source module dependency.
-        if name in ('command-line-arguments', 'gobind') and observed['kind'] == 'mod':
-            continue
-        require(name in declared, 'native module not in actual source graph: ' + name)
-        expected = declared[name]
-        if name in reviewed_vendors:
-            require(observed.get('kind') == 'dep' and observed.get('sum', '') == '',
-                    'native local module must not invent h1 or main role: ' + name)
-        if expected.get('Main'):
-            if observed['kind'] == 'dep':
-                require(observed.get('replacement') == expected['Dir'] and
-                        observed['version'] == 'v0.0.0-00010101000000-000000000000',
-                        'generated binding must point at the exact verified source module')
-                continue
-            require(observed['version'] in ('(devel)', ''), 'main module version differs')
-        else:
-            require(observed['version'] == expected.get('Version'), 'native module version differs: ' + name)
-        replacement = expected.get('Replace')
-        if replacement:
-            diagnostic = ('native replacement differs: ' + name + '; observed=' + repr(observed) +
-                          '; declaredPath=' + repr(replacement.get('Path')) + '; declaredDir=' + repr(replacement.get('Dir')))
-            if replacement.get('Version'):
-                require(observed.get('replacement') == replacement['Path'], diagnostic)
-            else:
-                aliases, _ = local_replacement_aliases(replacement, declared[value['goModule']].get('Dir'),
-                                                    observed.get('replacement'), name)
-                require(observed.get('replacement') in aliases, diagnostic)
-            # Go1.25.5 debugModFromModinfo represents a versionless local
-            # replacement as (devel), while go list leaves Version absent.
-            # Keep that native encoding intact; versioned remote replacements
-            # still require their exact source graph version and h1.
-            expected_versions = {replacement['Version']} if replacement.get('Version') else {'', '(devel)'}
-            require(observed.get('replacementVersion', '') in expected_versions, 'replacement version differs; ' + diagnostic)
-            require(observed.get('replacementSum', '') == replacement.get('Sum', ''), 'replacement h1 differs; ' + diagnostic)
-        else:
-            require('replacement' not in observed, 'undeclared native module replacement')
-            if expected.get('Sum'):
-                require(observed.get('sum') == expected['Sum'], 'native module h1 differs: ' + name)
+def verify_native_buildinfo(observation, value, graph, *, os_name, arch, mode, expected_id, actual_id,
+                            run, scratch, simulator=False):
+    field = 'raw' if os_name == 'android' else 'facts'
+    evidence = {field: observation, 'source': value, 'graph': graph, 'expectedId': expected_id, 'actualId': actual_id,
+                'target': {'osName': os_name, 'arch': arch, 'mode': mode, 'simulator': simulator}}
+    raw = b''.join(_receipt_chunks(evidence, MAX_RECEIPT))
+    verifier = Path(__file__).with_name('source-admission.mjs').resolve()
+    with tempfile.TemporaryDirectory(prefix='native-buildinfo-', dir=scratch) as folder:
+        report = Path(folder) / 'observations.json'
+        report.write_bytes(raw)
+        observed = run(['node', verifier, '--native-buildinfo', report, len(raw), sha(raw)])
+    if os_name == 'android':
+        return json.loads(observed)
 
 
 def inspect_aar(aar, value, graph, tools, run, scratch, expected_id):
     validate(value)
-    helper = module('formal_mobile_buildinfo', 'scripts/mobile-core/android-source.py')
     verifier = ROOT / 'scripts/verify-apk.mjs'
     native, scratch = {}, Path(scratch)
     jni = {}
@@ -410,9 +341,8 @@ def inspect_aar(aar, value, graph, tools, run, scratch, expected_id):
             if libbox:
                 info = run([tools['go'], 'version', '-m', str(path)])
                 actual_id = run([tools['go'], 'tool', 'buildid', str(path)]).strip()
-                facts = helper.parse_build_info(info)
-                check_buildinfo(facts, value, graph, os_name='android', arch=ABI[abi], mode='c-shared',
-                                expected_id=expected_id, actual_id=actual_id)
+                facts = verify_native_buildinfo(info, value, graph, os_name='android', arch=ABI[abi], mode='c-shared',
+                                                expected_id=expected_id, actual_id=actual_id, run=run, scratch=scratch)
                 jni[abi] = run([tools['readelf'], '--dyn-syms', '--wide', str(path)])
                 row.update(goBuildInfo=info, parsedBuildInfo=facts, buildID=actual_id, androidAPI=elf['androidAPI'])
             native[name] = row
@@ -579,13 +509,13 @@ def objc_validation_getter_contract(header):
     return {'receiver': 'LibboxConfigValidationResult', 'getters': declarations}
 
 
-def inspect_framework(framework, value, graph, expected_id):
+def inspect_framework(framework, value, graph, expected_id, *, run, scratch):
     reads = {}
     with inspection_stage('framework-inspection', reads):
-        return _inspect_framework(framework, value, graph, expected_id, reads)
+        return _inspect_framework(framework, value, graph, expected_id, reads, run, scratch)
 
 
-def _inspect_framework(framework, value, graph, expected_id, reads):
+def _inspect_framework(framework, value, graph, expected_id, reads, run, scratch):
     validate(value)
     framework = Path(framework)
     helper = module('formal_apple_buildinfo', 'scripts/mobile-core/android-source.py')
@@ -674,8 +604,9 @@ def _inspect_framework(framework, value, graph, expected_id, reads):
                         infos.append(section['buildInfo'])
                     ids.extend(n['value'] for n in section.get('buildIDs', []))
             require(len(infos) == len(ids) == 1, 'one original Go carrier per Apple slice required')
-            check_buildinfo(infos[0]['parsedBuildInfo'], value, graph, os_name='ios', arch=spec[2], mode='c-archive',
-                            expected_id=expected_id, actual_id=ids[0], simulator=spec[3] == 'simulator')
+            verify_native_buildinfo(infos[0]['parsedBuildInfo'], value, graph, os_name='ios', arch=spec[2],
+                                    mode='c-archive', expected_id=expected_id, actual_id=ids[0],
+                                    simulator=spec[3] == 'simulator', run=run, scratch=scratch)
             observed[target] = {'libraryIdentifier': identifier, 'binary': binary_pin,
                 'headerSha256': {name: sha(text.encode()) for name, text in headers.items()},
                 'validationResultGetterContract': validation_getters,
