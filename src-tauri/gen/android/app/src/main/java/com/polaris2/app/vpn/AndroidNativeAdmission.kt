@@ -807,6 +807,8 @@ internal class AndroidTailscaleStoreCustody internal constructor(
 
     @Synchronized fun wire(): JSONObject = wireValue(runs, currentDigest, payload, currentStartRunNonces, unknown, terminal)
 
+    @Synchronized fun hasConfirmedCurrentStart(): Boolean = !unknown && !terminal && currentStartRunNonces != null
+
     private fun wireValue(originalRuns: List<Run>, digest: String, raw: String, group: List<String>?,
                           historyUnknown: Boolean, closed: Boolean): JSONObject = JSONObject()
         .put("contractVersion", "polaris-android-ts-store-custody-v1")

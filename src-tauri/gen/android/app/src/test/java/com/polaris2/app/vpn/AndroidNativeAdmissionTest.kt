@@ -189,6 +189,7 @@ class AndroidNativeAdmissionTest {
         val active = custody.wire()
         assertFalse(active.getBoolean("historyUnknown"))
         assertFalse(active.has("currentStartRunNonces"))
+        assertFalse(custody.hasConfirmedCurrentStart())
         assertEquals(ScopedNativeFixture.digest("reload"), active.getString("actualConfigDigest"))
         assertEquals(2, active.getJSONArray("originalObservedRuns").length())
         custody.closed {
@@ -205,6 +206,7 @@ class AndroidNativeAdmissionTest {
         val ticket = ledger.reserveOwner(AndroidNativeAdmission.Kind.Main, "main")
         val custody = ledger.bindTailscaleStore(ticket, "birth")
         assertTrue(ledger.enterBirth(ticket))
+        assertFalse(custody.hasConfirmedCurrentStart())
         val rawConfig = "original input"
         val parent = ScopedNativeFixture.run("a", rawConfig, emptyList())
         val child = ScopedNativeFixture.run("b", "frozen construction with resolved inputs", listOf("first"))
@@ -215,6 +217,7 @@ class AndroidNativeAdmissionTest {
         }
         val active = custody.wire()
         assertFalse(active.getBoolean("historyUnknown"))
+        assertTrue(custody.hasConfirmedCurrentStart())
         assertEquals(ScopedNativeFixture.digest(rawConfig), active.getString("actualConfigDigest"))
         assertEquals(listOf("b".repeat(64), "a".repeat(64)), active.getJSONArray("currentStartRunNonces").let {
             listOf(it.getString(0), it.getString(1))
@@ -226,6 +229,7 @@ class AndroidNativeAdmissionTest {
         assertFalse(custody.matches(withoutGroup))
         custody.closed { ScopedNativeFixture.export(ScopedNativeFixture.retired(child), ScopedNativeFixture.retired(parent)) }
         assertTrue(custody.matches(active))
+        assertFalse(custody.hasConfirmedCurrentStart())
         assertEquals(true, custody.closedRelation(ScopedNativeFixture.file("first")))
         assertEquals(false, custody.closedRelation(ScopedNativeFixture.file("unrelated")))
     }
@@ -335,6 +339,7 @@ class AndroidNativeAdmissionTest {
             val active = custody.wire()
             assertTrue(scenario, active.getBoolean("historyUnknown"))
             assertFalse(scenario, active.has("currentStartRunNonces"))
+            assertFalse(scenario, custody.hasConfirmedCurrentStart())
             assertEquals(scenario, 0, active.getJSONArray("originalObservedRuns").length())
         }
     }

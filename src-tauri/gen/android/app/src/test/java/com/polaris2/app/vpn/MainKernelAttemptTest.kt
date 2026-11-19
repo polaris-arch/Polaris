@@ -22,12 +22,12 @@ class MainKernelAttemptTest {
         skippedPackages = emptyList(),
     )
 
-    @Test fun runtimeTailscaleCapabilityRequiresSuccessfulOriginalRegistration() {
+    @Test fun runtimeTailscaleCapabilityRequiresSuccessfulOriginalRegistrationAndTypedStartup() {
         val ledger = AndroidNativeAdmission("process").also { it.bootstrap(RequiredMarkerProof.Absent) }
         val ticket = ledger.reserveOwner(AndroidNativeAdmission.Kind.Main, "original")
         val attempt = MainKernelAttempt<Any>(runId = ticket.logicalId, nativeTicket = ticket)
         val server = Any()
-        attempt.bindTailscaleStore(ledger)
+        val custody = attempt.bindTailscaleStore(ledger)
         assertTrue(ledger.enterBirth(ticket))
         attempt.publish(server)
         attempt.runtimeAdmission = RuntimeProtocolAdmission("m", RuntimeProtocolAdmission.Identity("incarnation", "1", "d"), "0", emptyList())
@@ -42,7 +42,20 @@ class MainKernelAttemptTest {
             assertTrue(runCatching { AndroidRuntimeTailscaleBridge.checkAdmission(attempt, ledger) }.isFailure)
             synchronized(attempt.operationLock) { assertTrue(attempt.registerRuntimeTailscale(server) { true }) }
             assertTrue(runCatching { AndroidRuntimeTailscaleBridge.checkAdmission(attempt, ledger) }.isFailure)
+            var native = ScopedNativeFixture.export()
+            val legacy = ScopedNativeFixture.run("a", "legacy start", emptyList())
+            synchronized(attempt.operationLock) {
+                custody.invoke("legacy start", { native }) { native = ScopedNativeFixture.export(legacy) }
+            }
             attempt.acknowledgeStart()
+            assertTrue(runCatching { AndroidRuntimeTailscaleBridge.checkAdmission(attempt, ledger) }.isFailure)
+            val current = ScopedNativeFixture.run("b", "typed reload", emptyList())
+            synchronized(attempt.operationLock) {
+                custody.invoke("typed reload", { native }, startupReceipt = { it }) {
+                    native = ScopedNativeFixture.export(ScopedNativeFixture.retired(legacy), current)
+                    ScopedNativeFixture.cohort(current)
+                }
+            }
             val receipt = AndroidRuntimeTailscaleBridge.checkAdmission(attempt, ledger)
             assertEquals("polaris-android-runtime-ts-admission-v1", receipt.getString("contractVersion"))
             assertEquals(ledger.processNonce, receipt.getString("processNonce"))

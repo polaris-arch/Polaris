@@ -53,7 +53,9 @@ internal object AndroidRuntimeTailscaleBridge {
         val ticket = checkNotNull(owner.nativeTicket)
         val ledger = AndroidNativeAdmissionGate.ledger
         val versionRead = AtomicBoolean()
-        fun currentIncarnation(): String? = if (current() && owner.runtimeTailscaleRegistered(server) && isCurrent(owner, ticket, ledger)) {
+        fun currentIncarnation(): String? = if (current() && owner.runtimeTailscaleRegistered(server) &&
+            isCurrent(owner, ticket, ledger) && owner.tailscaleStore?.hasConfirmedCurrentStart() == true
+        ) {
             owner.runtimeAdmission?.identity?.incarnation
         } else null
 
@@ -113,7 +115,8 @@ internal object AndroidRuntimeTailscaleBridge {
     fun checkAdmission(attempt: MainKernelAttempt<*>, ledger: AndroidNativeAdmission): JSONObject {
         val ticket = checkNotNull(attempt.nativeTicket)
         check(attempt.runtimeTailscaleRegistered() && attempt.ownershipState() == "acknowledged" &&
-            attempt.runtimeAdmission?.identity != null && isCurrent(attempt, ticket, ledger))
+            attempt.runtimeAdmission?.identity != null && isCurrent(attempt, ticket, ledger) &&
+            attempt.tailscaleStore?.hasConfirmedCurrentStart() == true)
         return JSONObject().put("contractVersion", ADMISSION_CONTRACT).put("processNonce", ledger.processNonce)
             .put("nativeTicketId", ticket.id).put("runId", attempt.runId).put("birthNonce", attempt.birthNonce)
     }

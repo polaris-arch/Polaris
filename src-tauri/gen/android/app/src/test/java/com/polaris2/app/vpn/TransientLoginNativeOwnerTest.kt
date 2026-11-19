@@ -262,7 +262,7 @@ class TransientLoginNativeOwnerTest {
         assertTrue(host.contains("schedule(5_000) { close(entry) {} }"))
         assertFalse(host.contains("close(id) {}"))
         assertTrue(adapter.contains("override fun serviceStop() { requestClose() }"))
-        assertTrue(host.contains("createEngine(id, config, entry.stateDirectories) { close(entry) {} }"))
+        assertTrue(host.contains("createEngine(id, config, entry.directories.paths) { close(entry) {} }"))
         val close = host.substringAfter("fun close(id: String,").substringBefore("fun running(")
         assertTrue(close.contains("TransientLoginNativeOwner.retireBeforeStart("))
         assertTrue(close.contains("if (entries[entry.id] === entry) entries.remove(entry.id)"))
