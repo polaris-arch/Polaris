@@ -490,8 +490,8 @@ fn pending_snapshot_blanks_both_exits() {
     );
 }
 
-#[test]
-fn proxy_reachability_reports_only_observed_probe_state() {
+#[tokio::test]
+async fn proxy_reachability_reports_only_observed_probe_state() {
     let local = crate::runtime::proxy::LocalHttpProxy {
         port: 7890,
         auth: None,
@@ -522,6 +522,33 @@ fn proxy_reachability_reports_only_observed_probe_state() {
     assert_eq!(proxy_reachability(&running, None, &verified), "reachable");
     assert_eq!(verified["countryCode"], "US");
     assert!(trace_ipinfo(&vec![b'x'; IPINFO_MAX_BODY + 1]).is_err());
+
+    let inputs = IpinfoProbeInputs {
+        status: running,
+        http: std::sync::Arc::new(HttpRuntime::new().unwrap()),
+        http_route: None,
+        doh_blocked: None,
+        config: Value::Null,
+    };
+    for probe in [
+        ProxyProbe::Standard,
+        ProxyProbe::PostConnect(FirstProxyAttempt::NotAttempted),
+    ] {
+        let tested_route = OnceLock::new();
+        let snapshot = build_ipinfo_snapshot(
+            &inputs,
+            std::future::ready(Ok(json!({ "ip": "192.0.2.1" }))),
+            &tested_route,
+            std::future::ready(None),
+            &probe,
+            (0, 0),
+            |_| panic!("a refused probe cannot publish proxy data"),
+        )
+        .await;
+        assert!(tested_route.get().is_none());
+        assert_eq!(snapshot["proxyReachability"], "unknown");
+        assert_eq!(snapshot["direct"]["ip"], "192.0.2.1");
+    }
 }
 
 /// **α 批回归**：Android 形态（`mixed_port == 0`、有 `probe-proxy-in`）下代理出口**照样探**。

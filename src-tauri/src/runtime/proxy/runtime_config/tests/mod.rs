@@ -121,6 +121,28 @@ async fn exit_ip_routes_reject_active_switch_and_stale_graphs() {
     assert_eq!(wait.await.unwrap().proxy.port, 31002);
     assert_eq!(runtime.with_pinned_exit_ip_route(&pinned, || ()), Some(()));
 
+    let switch = runtime.switch_serial.try_lock().unwrap();
+    assert_eq!(runtime.with_exit_ip_http_route(&route, || ()), None);
+    let wait = runtime.wait_for_exit_ip_http_route(generation);
+    tokio::pin!(wait);
+    assert!(futures::poll!(&mut wait).is_pending());
+    runtime
+        .runtime_config_baseline
+        .write()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .observed_control_revision += 1;
+    drop(switch);
+    let updated_route = wait.await.unwrap();
+    assert_eq!(runtime.with_exit_ip_http_route(&route, || ()), None);
+    assert_eq!(
+        runtime.with_exit_ip_http_route(&updated_route, || ()),
+        Some(())
+    );
+    let route = updated_route;
+    let pinned = runtime.pinned_exit_ip_route().unwrap();
+
     runtime.runtime_config_apply.lock().unwrap().pending = Some(pending.clone());
     assert_eq!(runtime.with_exit_ip_http_route(&route, || ()), None);
     assert_eq!(runtime.with_pinned_exit_ip_route(&pinned, || ()), None);
