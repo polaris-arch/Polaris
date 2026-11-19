@@ -53,6 +53,12 @@ function stat(path) {
   catch (cause) { if (cause.code !== 'ENOENT') throw cause; return null; }
 }
 
+function temporaryDirectory(parent, prefix) {
+  // Use the extended spelling for the allocation; keep logical paths in receipts
+  // and tool arguments, including when the Cargo target exceeds MAX_PATH.
+  return join(parent, basename(mkdtempSync(toNamespacedPath(join(parent, prefix)))));
+}
+
 function below(base, path) {
   const name = relative(base, path);
   return !isAbsolute(name) && name !== '..' && !name.startsWith('..\\') && !name.startsWith('../');
@@ -345,7 +351,7 @@ export function forPackage(custody) {
     mkdirSync(toNamespacedPath(release), { recursive: true });
     const releaseIdentity = await dirId(release);
     demand(releaseIdentity[0] === (await dirId(root))[0], 'Cargo release/publication must share a filesystem for atomic retention');
-    const owner = mkdtempSync(join(release, '.polaris-package-'));
+    const owner = temporaryDirectory(release, '.polaris-package-');
     const state = { schema: 'polaris-windows-package-input-v2', owner, root, cargo,
       targetIdentity: await dirId(cargo.targetDirectory), releaseIdentity, ownerIdentity: await dirId(owner),
       sevenzip, sevenzipVersion, ...source, version: await version(), candidate: await candidate() };
@@ -391,11 +397,13 @@ export function forPackage(custody) {
     if (value[3] === 2n) {
       const aliases = [];
       const build = join(dirname(path), 'build/polaris');
-      for (const unit of readdirSync(toNamespacedPath(build))) {
-        const alias = targetApp(join(build, unit, 'out/polaris.exe'));
-        const aliasIdentity = await identity(custody, { ...alias, missing: true });
-        if (aliasIdentity?.[0] === value[0] && aliasIdentity[1] === value[1]) aliases.push(aliasIdentity);
-      }
+      await withHolds(custody, [directory(build)], async () => {
+        for (const unit of readdirSync(toNamespacedPath(build))) {
+          const alias = targetApp(join(build, unit, 'out/polaris.exe'));
+          const aliasIdentity = await identity(custody, { ...alias, missing: true });
+          if (aliasIdentity?.[0] === value[0] && aliasIdentity[1] === value[1]) aliases.push(aliasIdentity);
+        }
+      });
       demand(aliases.length === 1 && aliases[0][3] === 2n, 'unexpected Cargo App hardlink');
     }
     return { path, request, identity: value };
@@ -473,7 +481,7 @@ async function selectResourceStage(api, state) {
     if (parent.length + 12 >= 260) continue;
     await api.dirId(parent);
     let stage;
-    try { stage = mkdtempSync(join(parent, 'r-')); }
+    try { stage = temporaryDirectory(parent, 'r-'); }
     catch (cause) { if (!['EACCES', 'EPERM'].includes(cause.code)) throw cause; continue; }
     if (Object.values(paths).every(path => join(stage, relative(root, path)).length < 260)) return stage;
     rmSync(stage, { recursive: true });
@@ -697,7 +705,7 @@ async function assembleCarriers(custody, api, state, app, source, sources) {
   const stem = 'Polaris_' + state.version + '_x64';
   demand(candidates.length === 1 && candidates[0] === stem + '-setup.exe', 'expected unique current raw NSIS candidate');
   const raw = join(folder, candidates[0]), original = await api.facts(raw);
-  const nsisExpected = carrierExpected(state, app.raw, 'nsis'), scratch = mkdtempSync(join(state.owner, 'nsis-'));
+  const nsisExpected = carrierExpected(state, app.raw, 'nsis'), scratch = temporaryDirectory(state.owner, 'nsis-');
   let nsisObserved;
   try { nsisObserved = await inspectNsisCarriers(custody, api, state.sevenzip, raw, nsisExpected, scratch, await nsisPlugins(api)); }
   finally { rmSync(toNamespacedPath(scratch), { recursive: true }); }
@@ -835,7 +843,7 @@ async function produce(custody, api, nativeProgram) {
     const state = { ...initial, cargoArtifact: { argv: observed.argv, artifact: observed.artifact, identity: current.identity,
       firstApp: observed.firstApp, transport: observed.transport, nativeResourceConfig: scope.config,
       resourceCopies: copies, childConfig: observed.childConfig, tauri: run } };
-    const compiled = mkdtempSync(join(owner, 'compiled-app-'));
+    const compiled = temporaryDirectory(owner, 'compiled-app-');
     try {
       const app = await api.compiledApp(state, compiled);
       requireSame(app.facts, observed.firstApp, 'original-byte-mismatch: Tauri did not restore the first Cargo App');

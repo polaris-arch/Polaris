@@ -5,12 +5,12 @@ import {
   symlinkSync, truncateSync, writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, toNamespacedPath } from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { crc32 } from 'node:zlib';
-import { buildPortableZip, inspectFormalArtifact, inspectPortableZip, nsisMembers, verifyFormalArtifactBytes } from './lib/formal-package-selection.mjs';
-import { expectedWindowsApp, releaseArguments, selectTauriEntry } from './windows-package-integrity.mjs';
+import { buildPortableZip, inspectBoundNsis, inspectFormalArtifact, inspectPortableZip, nsisMembers, verifyFormalArtifactBytes } from './lib/formal-package-selection.mjs';
+import { expectedWindowsApp, forPackage, releaseArguments, selectTauriEntry } from './windows-package-integrity.mjs';
 import { now, parse, startCustody, streamChild, wire } from './lib/windows-package-custody.mjs';
 import { fixtureTar, fixtureZip, writeFormalAssets, writeLinuxFixture } from './lib/formal-package-fixtures.mjs';
 import {
@@ -20,6 +20,8 @@ import {
 import { selectedCoreManifest, writeSelectedCoreManifest } from './lib/core-identity.mjs';
 import { createHash } from 'node:crypto';
 const hash = (value) => createHash('sha256').update(value).digest('hex');
+const windowsCustody = fileURLToPath(new URL('../target/x86_64-pc-windows-msvc/release/polaris-package-custody.exe', import.meta.url));
+const requiresWindowsCustody = { skip: process.platform !== 'win32' || process.env.POLARIS_WINDOWS_PACKAGE_PREVIEW !== '1' };
 async function fixture(action) {
   const root = mkdtempSync(join(realpathSync(tmpdir()), 'polaris-local-selection-'));
   try { await action(root); } finally { rmSync(root, { recursive: true, force: true }); }
@@ -585,14 +587,19 @@ test('formal DMG and NSIS selection reads executable bytes through the carrier r
 }));
 
 test('Windows package producer preserves the exact bundle transform, argv, and full file identity', () => {
-  const token = '__TAURI_BUNDLE_TYPE_VAR_UNK';
-  const source = Buffer.from('compiled App ' + token + ' with embedded source');
+  const prefix = '__TAURI_BUNDLE_TYPE_VAR_';
+  const token = Buffer.from(prefix + 'UNK'), patched = Buffer.from(prefix + 'NSS');
+  const header = Buffer.from([0x4d, 0x5a, 0x00, 0x80, 0xff]);
+  const other = Buffer.from(prefix + 'MSI');
+  const source = Buffer.concat([header, token, other, patched]);
   assert.deepEqual(expectedWindowsApp(source, 'zip', '2.12.5'), source);
-  assert.deepEqual(expectedWindowsApp(source, 'nsis', '2.12.5'), Buffer.from(source.toString().replace('_UNK', '_NSS')));
-  for (const invalid of [Buffer.from('no token'), Buffer.concat([source, source])]) {
+  assert.deepEqual(expectedWindowsApp(source, 'nsis', '2.12.5'), Buffer.concat([header, patched, other, patched]));
+  for (const invalid of [header, Buffer.concat([header, patched]), Buffer.concat([header, other]), Buffer.concat([source, token])]) {
     assert.throws(() => expectedWindowsApp(invalid, 'nsis', '2.12.5'), /unique unpatched bundle token/);
   }
-  assert.throws(() => expectedWindowsApp(source, 'zip', '2.11.4'), /unreviewed Tauri CLI/);
+  for (const kind of ['zip', 'nsis']) {
+    assert.throws(() => expectedWindowsApp(source, kind, '2.11.4'), /unreviewed Tauri CLI/);
+  }
   const target = 'x86_64-pc-windows-msvc', state = { cargo: { target } };
   const argv = ['build', '--locked', '--offline', '--bins', '--release', '--message-format=json',
     '--features', 'tauri/custom-protocol', '--target', target];
@@ -603,6 +610,32 @@ test('Windows package producer preserves the exact bundle transform, argv, and f
   const raw = '{"file":[340282366920938463463374607431768211455,1700000000000000100],"path":"\u901a\u77e5"}';
   assert.equal(wire(parse(raw)), raw.replace('通知', '\\u901a\\u77e5'));
 });
+
+test('Windows package portable ZIP validates its exact names and directory aliases', () => fixture(async root => {
+  const zip = join(root, 'Windows carrier.zip');
+  const app = { name: 'polaris.exe', data: 'portable app' };
+  const core = { name: 'Resources/Win/CORE.exe', data: 'portable core' };
+  const directory = name => ({ name, data: '', mode: 0o040755 });
+  const entries = [app, directory('Resources/Win/'), core];
+  const expected = Object.fromEntries([app, core].map(({ name, data }) => [name, { bytes: Buffer.byteLength(data), sha256: hash(data) }]));
+  writeFileSync(zip, fixtureZip(entries));
+  assert.deepEqual(await inspectPortableZip(zip, expected), expected);
+
+  for (const [alias, error] of [
+    [{ ...app, name: './polaris.exe' }, /non-canonical ZIP path/],
+    [{ ...core, name: 'Resources//Win/CORE.exe' }, /non-canonical ZIP path/],
+    [{ ...core, name: 'Resources/../CORE.exe' }, /non-canonical ZIP path/],
+    ...['polaris.exe.', 'polaris.exe ', 'Resources /CORE.exe'].map(name => [{ ...app, name }, /Windows ZIP path alias/]),
+    [{ ...app, name: 'file:stream' }, /unsafe ZIP member/],
+    ...['CON.exe', 'LPT1.txt', 'COM¹.exe'].map(name => [{ ...app, name, flags: 0x800 }, /Windows ZIP device name/]),
+    [{ ...core, name: core.name.toLowerCase() }, /duplicate\/alias member/],
+    [directory('resources/win/'), /duplicate\/alias member/],
+    [{ ...app, name: 'Resources' }, /file\/directory alias collision/],
+  ]) {
+    writeFileSync(zip, fixtureZip([...entries, alias]));
+    await assert.rejects(inspectPortableZip(zip, expected), error, alias.name);
+  }
+}));
 
 test('Windows package NSIS listing rejects aliases and retains unlisted byte counts for literal reads', () => {
   const listing = (...rows) => ['Type = Nsis', '----------', rows.join('\r\n\r\n'), ''].join('\r\n');
@@ -615,6 +648,73 @@ test('Windows package NSIS listing rejects aliases and retains unlisted byte cou
     listing(row('bad', '1', '\r\nSymbolic Link = target')), listing(row('too-large', '536870913')),
   ]) assert.throws(() => nsisMembers(invalid));
 });
+
+test('Windows package NSIS named extraction verifies opened members before accepting child completion', () => fixture(async root => {
+  const reader = join(root, 'inert-reader.mjs');
+  const win = process.platform === 'win32', tool = join(root, win ? 'reader.cmd' : 'reader');
+  writeFileSync(tool, win
+    ? `@echo off\r\nsetlocal DisableDelayedExpansion\r\n"${process.execPath}" "${reader}" %*\r\nexit /b %ERRORLEVEL%\r\n`
+    : `#!/bin/sh\nexec "${process.execPath}" "${reader}" "$@"\n`, { mode: 0o755 });
+  writeFileSync(reader, `
+    import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+    import { dirname, join } from 'node:path';
+    const args = process.argv.slice(2), [action] = args;
+    const literal = args.includes('-so');
+    const archive = args[literal ? args.length - 2 : args.length - 1];
+    const { log, listing, files, extra } = JSON.parse(readFileSync(archive, 'utf8'));
+    appendFileSync(log, (literal ? 'literal:' + args.at(-1) : action) + '\\n');
+    if (action === 'l') process.stdout.write(listing);
+    else if (literal) process.stdout.write(files[args.at(-1)]);
+    else {
+      const dst = args.find(arg => arg.startsWith('-o')).slice(2);
+      const select = args.find(arg => arg.startsWith('-i@')).slice(3);
+      const names = readFileSync(select, 'utf8').trimEnd().split('\\n');
+      if (extra) names.push(extra);
+      for (const name of names) {
+        const path = join(dst, name);
+        mkdirSync(dirname(path), { recursive: true });
+        writeFileSync(path, files[name]);
+      }
+    }
+  `);
+  // On a preview runner use the normal FILE_ID/HANDLE server. Elsewhere
+  // the fixture exercises real files and child processes with local stat facts.
+  const inspect = ({ path }) => {
+    const row = statSync(path, { bigint: true });
+    return [row.dev, row.ino, row.mode, row.nlink, row.size, row.mtimeNs, row.ctimeNs];
+  };
+  const native = requiresWindowsCustody.skip ? null : startCustody(windowsCustody);
+  const custody = native ?? {
+    inspect: async requests => requests.map(inspect),
+    hold: async requests => requests.map(request => ({ identity: inspect(request) })),
+    release: async () => {},
+  };
+  const api = forPackage(custody), app = '$R6/polaris.exe', uninstaller = 'uninstall.exe';
+  const good = 'test app', nested = 'inert generated uninstaller';
+  const expected = { [app]: { bytes: Buffer.byteLength(good), sha256: hash(good) } };
+  try {
+    for (const [name, contents, listedSize, extra, error] of [
+      ['exact', good, good.length, undefined, undefined],
+      ['size', good, good.length - 1, undefined, /listed NSIS size differs/],
+      ['hash', 'bad data', good.length, undefined, /final member SHA\/size differs/],
+      ['unlisted', good, good.length, 'unexpected.exe', /unregistered or oversized NSIS extracted member/],
+    ]) {
+      const archive = join(root, name + '.exe'), log = join(root, name + '.log');
+      writeFileSync(archive, JSON.stringify({ log, files: { [app]: contents, [uninstaller]: nested, 'unexpected.exe': 'extra' }, extra,
+        listing: `Type = Nsis\n----------\nPath = ${app}\nSize = ${listedSize}\n\nPath = ${uninstaller}\nSize = \n` }));
+      const budget = { bytes: 0 };
+      const result = inspectBoundNsis(tool, archive, join(root, name), { [app]: good.length, [uninstaller]: 1024 }, expected,
+        { custody, budget, facts: api.facts, tree: api.tree, timeout: 5000 });
+      if (error) await assert.rejects(result, error, name);
+      else {
+        const { members } = await result;
+        assert.deepEqual({ ...members }, { ...expected, [uninstaller]: { bytes: nested.length, sha256: hash(nested) } });
+        assert.equal(budget.bytes, good.length + nested.length);
+      }
+      assert.deepEqual(readFileSync(log, 'utf8').trim().split('\n'), name === 'size' ? ['l'] : ['l', 'literal:uninstall.exe', 'x']);
+    }
+  } finally { await native?.close(); }
+}));
 
 test('Windows package Tauri lookup selects the first admissible executable after npm shims', () => fixture(root => {
   const shim = join(root, 'tauri'), powershell = join(root, 'tauri.ps1');
@@ -672,11 +772,8 @@ test('Windows package child transport requires guarded primary exit and bounds p
   }
 }));
 
-test('Windows package native custody retains the exact App across capture exit', {
-  skip: process.platform !== 'win32' || process.env.POLARIS_WINDOWS_PACKAGE_PREVIEW !== '1',
-}, () => fixture(async root => {
-  const executable = fileURLToPath(new URL('../target/x86_64-pc-windows-msvc/release/polaris-package-custody.exe', import.meta.url));
-  const owner = startCustody(executable);
+test('Windows package native custody retains the exact App across capture exit', requiresWindowsCustody, () => fixture(async root => {
+  const owner = startCustody(windowsCustody);
   const source = join(root, 'polaris.exe'), renamed = join(root, 'renamed.exe');
   const app = { path: source, kind: 'app' }, resource = { path: join(root, 'resource'), kind: 'file' };
   try {
@@ -687,7 +784,7 @@ test('Windows package native custody retains the exact App across capture exit',
     await owner.release([frozen]);
     assert.equal(readFileSync(resource.path, 'utf8'), 'frozen resource');
 
-    const capture = startCustody(executable);
+    const capture = startCustody(windowsCustody);
     let held, retained;
     try {
       [held] = await capture.hold([app]);
@@ -700,5 +797,37 @@ test('Windows package native custody retains the exact App across capture exit',
     await owner.release([retained]);
     renameSync(source, renamed);
     assert.equal(readFileSync(renamed, 'utf8'), 'compiled App');
+  } finally { await owner.close(); }
+}));
+
+test('Windows package native custody admits long Cargo paths and rejects hidden redirect and App aliases', requiresWindowsCustody, () => fixture(async root => {
+  const releaseDirectory = join(root, 'own target', ...Array(5).fill('cargo-long-native-folder-'.repeat(2)), 'release');
+  const unit = join(releaseDirectory, 'build/polaris/known/out');
+  const app = join(releaseDirectory, 'polaris.exe'), alias = join(unit, 'polaris.exe');
+  const state = { cargo: { releaseDirectory } };
+  assert.ok(app.length > 260);
+  mkdirSync(toNamespacedPath(unit), { recursive: true });
+  writeFileSync(toNamespacedPath(app), 'inert App bytes');
+
+  const owner = startCustody(windowsCustody);
+  const api = forPackage(owner);
+  try {
+    const original = await api.cargoApp(state);
+    assert.equal(original.path, app);
+    assert.equal(original.identity[3], 1n);
+    linkSync(toNamespacedPath(app), toNamespacedPath(alias));
+    const known = await api.cargoApp(state);
+    assert.deepEqual(known.identity.slice(0, 2), original.identity.slice(0, 2));
+    assert.equal(known.identity[3], 2n);
+    await assert.rejects(api.facts(app), /hard-linked file/);
+    renameSync(toNamespacedPath(alias), toNamespacedPath(join(unit, 'foreign.exe')));
+    await assert.rejects(api.cargoApp(state), /unexpected Cargo App hardlink/);
+
+    const redirected = join(root, 'junction');
+    symlinkSync(releaseDirectory, redirected, 'junction');
+    const missing = path => ({ path: join(path, 'not-created', 'target'), kind: 'directory', missing: true });
+    assert.deepEqual(await owner.inspect([missing(releaseDirectory)]), [null]);
+    await assert.rejects(owner.inspect([missing(redirected)]), /redirected Windows package ancestor/);
+    assert.equal(existsSync(toNamespacedPath(join(releaseDirectory, 'not-created'))), false);
   } finally { await owner.close(); }
 }));

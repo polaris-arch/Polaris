@@ -58,7 +58,7 @@ enum Request {
     },
 }
 
-fn check_path(path: &Path, kind: Kind) -> io::Result<()> {
+fn check_path(path: &Path, kind: Kind, allow_missing: bool) -> io::Result<()> {
     let mut parts = path.components();
     let Some(Component::Prefix(prefix)) = parts.next() else {
         return Err(error("absolute Windows path required"));
@@ -73,7 +73,11 @@ fn check_path(path: &Path, kind: Kind) -> io::Result<()> {
     }
     if kind != Kind::Tool {
         for ancestor in path.ancestors().skip(1).filter(|parent| parent.has_root()) {
-            let metadata = fs::symlink_metadata(ancestor)?;
+            let metadata = match fs::symlink_metadata(ancestor) {
+                Ok(metadata) => metadata,
+                Err(cause) if allow_missing && cause.kind() == io::ErrorKind::NotFound => continue,
+                Err(cause) => return Err(cause),
+            };
             if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
             {
                 return Err(error("redirected Windows package ancestor"));
@@ -84,7 +88,7 @@ fn check_path(path: &Path, kind: Kind) -> io::Result<()> {
 }
 
 fn open(input: &Input, hold: bool) -> io::Result<File> {
-    check_path(&input.path, input.kind)?;
+    check_path(&input.path, input.kind, input.missing && !hold)?;
     let mut options = OpenOptions::new();
     if hold {
         options
