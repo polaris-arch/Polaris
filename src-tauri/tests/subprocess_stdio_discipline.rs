@@ -827,7 +827,7 @@ fn offsets_of(haystack: &str, needle: &str) -> Vec<usize> {
     out
 }
 
-/// 该文件里被登记覆盖的全部块区间（注册表 1 + 注册表 2 + 透传表）。
+/// 该文件里被登记覆盖的全部块区间。
 fn covered_ranges(index: &BTreeMap<&str, &Scanned>, rel: &str) -> Vec<(usize, usize)> {
     if matches!(
         rel,
@@ -850,6 +850,22 @@ fn covered_ranges(index: &BTreeMap<&str, &Scanned>, rel: &str) -> Vec<(usize, us
     }
     for pass in PIPE_PASSTHROUGH.iter().filter(|p| p.file == rel) {
         out.push(block_range(file_of(index, rel), pass.anchor));
+    }
+    if rel == "src-tauri/src/runtime/core_execution.rs" {
+        let source = file_of(index, rel);
+        let (start, end) = block_range(source, "fn android_libbox_request(");
+        let request = &source.masked[start..end];
+        let body: String = request
+            .split_once('{')
+            .unwrap()
+            .1
+            .split_whitespace()
+            .collect();
+        assert_eq!(
+            body, "SpawnRequest::unadmitted_intent(binary,config,StdioPolicy::Discard)}",
+            "Android Libbox 接线只能传配置，不授予执行权限或创建管道",
+        );
+        out.push((start, end));
     }
     if rel == UTILITY_PIPE_OWNER {
         let owner = file_of(index, rel);
