@@ -3,6 +3,7 @@ import { createServer, type ViteDevServer } from 'vite';
 import { mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import type { UserConfig } from '../../contracts/types';
 
 // A real mobile form saves through each consumer; the screenshot is the actual TS settings
 // form with an explicit allowlist. No native service, device, or account is contacted.
@@ -10,8 +11,11 @@ const root = path.resolve(import.meta.dirname, '../../..');
 const entry = `
 import React from 'react';
 import { createRoot } from 'react-dom/client';
+import { mockIPC } from '@tauri-apps/api/mocks';
 import { api } from '/src/ipc';
 import { systemApi } from '/src/ipc/api-client';
+import type { SaveOutcome, UserConfig } from '/src/contracts/types';
+import { configBaseVersion } from '/src/lib/staged-config';
 import { useAppStore } from '/src/store/app-store';
 import { useMobileFormStore } from '/src/mobile/forms/form-store';
 import { NodeFormPanel } from '/src/mobile/forms/NodeFormPanel';
@@ -37,8 +41,30 @@ const base = mode === 'node'
       privateKey: 'synthetic-private', localAddress: ['10.0.0.2/32'], peerPublicKey: 'synthetic-public' } }
   : { ...common, id: 'ts-1', protocol: 'tailscale', address: '', port: 0,
       tailscaleSettings: { hostname: 'synthetic-phone', sourceTag: 'imported' } };
-const test = window.__meshPolicyTest = { saved: [], mode };
-api.server.update = async server => { test.saved.push(server); };
+let disk = { servers: [base], subscriptions: [] } as UserConfig;
+const test = window.__meshPolicyTest = { saved: [] as UserConfig[] };
+mockIPC((command, payload) => {
+  switch (command) {
+    case 'config_get':
+      return { success: true, data: structuredClone(disk) };
+    case 'app_take_clean_exit_flag':
+      return { success: true, data: false };
+    case 'config_save': {
+      const args = payload as { config?: UserConfig; baseVersion?: string; hotOnly?: boolean };
+      if (!args?.config || args.hotOnly !== true) throw new Error('Expected automatic config_save');
+      const diskVersion = configBaseVersion(disk);
+      if (args.baseVersion !== diskVersion) {
+        return { success: true, data: { status: 'conflict', diskVersion } satisfies SaveOutcome };
+      }
+      disk = structuredClone(args.config);
+      test.saved.push(disk);
+      return { success: true, data: {
+        status: 'saved', version: configBaseVersion(disk), config: structuredClone(disk),
+      } satisfies SaveOutcome };
+    }
+    default: throw new Error('Unexpected IPC: ' + command);
+  }
+}, { shouldMockEvents: true });
 // This fixture models no persisted account, independently of its synthetic peers.
 api.server.tailscaleStateExists = async ids => Object.fromEntries(ids.map(id => [id, false]));
 const peer = (name, ip) => ({ hostName: name, ip, online: true, exitNode: false,
@@ -48,8 +74,7 @@ api.server.tailscaleGetStatus = async () => ({ connected: true, statuses: [
   { serverId: 'ts-2', peers: [peer('Other-Peer', '100.2.2.2')] },
 ] });
 systemApi.listNetworkInterfaces = async () => [];
-useAppStore.setState({ servers: [base], config: { servers: [base], subscriptions: [] },
-  loadConfig: async () => {} });
+await useAppStore.getState().loadConfig();
 const kind = mode === 'node' ? 'node' : mode === 'wg' ? 'wg' : mode === 'ts-exit' ? 'ts-exit' : 'ts-settings';
 const instanceId = useMobileFormStore.getState().open({ kind, serverId: base.id });
 const Panel = mode === 'node' ? NodeFormPanel : mode === 'wg' ? WgPanel : mode === 'ts-exit' ? TsExitPanel : TsSettingsPanel;
@@ -89,11 +114,12 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile mesh inbound p
         await page.getByText('授权规则 1').waitFor();
         await page.locator('.m-form-foot .primary').click();
         await page.waitForFunction(() => (window as any).__meshPolicyTest.saved.length === 1);
-        const saved = await page.evaluate(() => (window as any).__meshPolicyTest.saved[0]);
-        expect(saved.meshInboundPolicy).toEqual({ mode: 'allowlist', rules: [
+        const saved = await page.evaluate(() => (window as any).__meshPolicyTest.saved[0] as UserConfig);
+        expect(saved.servers).toHaveLength(1);
+        expect(saved.servers[0].meshInboundPolicy).toEqual({ mode: 'allowlist', rules: [
           { sourceCidrs: ['10.0.0.2/32'], network: 'tcp', ports: ['443'], target: 'local' },
         ] });
-        if (mode === 'ts') expect(saved.tailscaleSettings.sourceTag).toBe('imported');
+        if (mode === 'ts') expect(saved.servers[0].tailscaleSettings?.sourceTag).toBe('imported');
         expect(pageErrors).toEqual([]);
       } finally { await page.close(); }
     }, 30_000);
