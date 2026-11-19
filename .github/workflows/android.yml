@@ -509,38 +509,7 @@ jobs:
             --tests com.polaris2.app.vpn.RuntimePersistenceSourceTest \
             --tests com.polaris2.app.vpn.RuntimeProtocolAdmissionTest \
             -PpolarisAllowUnsigned=true -x :app:rustBuildArm64Release --max-workers=2 --no-daemon
-          python3 -I - "$RUNNER_TEMP/s5-android-unit-results.json" <<'PYRESULT'
-          import hashlib, json, re, subprocess, sys
-          from pathlib import Path
-          from xml.etree import ElementTree as ET
-          base = Path('src-tauri/gen/android/app')
-          classes = ['DefaultNetworkObservationTest', 'NetworkMonitorSessionTest', 'LoadedLibboxIdentityTest', 'AndroidCallbackSchedulingSourceTest', 'AndroidNativeAdmissionTest', 'AndroidNativeMainControlsTest', 'MainNativeAdmissionWiringTest', 'DualModeEndpointWiringTest', 'RuntimePersistenceSourceTest', 'RuntimeProtocolAdmissionTest']
-          rows = []
-          for name in classes:
-              source = base / 'src/test/java/com/polaris2/app/vpn' / (name + '.kt')
-              raw = source.read_bytes()
-              methods = re.findall(r'^\s*@Test(?:\([^\n)]*\))?\s+fun\s+(\w+)\s*\(', raw.decode(), re.M)
-              assert methods and len(methods) == len(set(methods)), 'Empty/duplicate S5 test source inventory'
-              report = base / 'build/test-results/testArm64ReleaseUnitTest' / ('TEST-com.polaris2.app.vpn.' + name + '.xml')
-              result = report.read_bytes()
-              assert 0 < len(result) <= 2 * 1024 * 1024, 'Missing/oversized S5 JUnit report'
-              suite = ET.fromstring(result)
-              classname = 'com.polaris2.app.vpn.' + name
-              assert suite.tag == 'testsuite' and suite.get('name') == classname, 'Different S5 JUnit suite'
-              cases = suite.findall('testcase')
-              assert len(cases) == len(methods) == int(suite.get('tests', '-1')), 'S5 methods missing or duplicated'
-              assert all(int(suite.get(k, '-1')) == 0 for k in ('failures', 'errors', 'skipped')), 'S5 JUnit failure/error/skip'
-              assert sorted(c.get('name') for c in cases) == sorted(methods), 'S5 method results differ from frozen source'
-              assert all(c.get('classname') == classname and not any(c.find(k) is not None for k in ('failure', 'error', 'skipped')) for c in cases), 'Different/failed/skipped S5 case'
-              rows.append({'class': classname, 'tests': len(cases), 'methods': sorted(methods),
-                           'sourceSha256': hashlib.sha256(raw).hexdigest(), 'reportSha256': hashlib.sha256(result).hexdigest()})
-          receipt = {'schema': 'polaris-s5-android-gradle-unit-results-v1',
-                     'candidate': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
-                     'variant': 'arm64Release', 'classes': rows,
-                     'scope': 'Real Gradle unit tests with the actual app/AAR inputs; no JNI/callback/device execution claim'}
-          Path(sys.argv[1]).write_text(json.dumps(receipt, indent=2) + '\n')
-          print(json.dumps(receipt))
-          PYRESULT
+          "$JAVA_HOME/bin/java" scripts/VerifyAndroidS5.java "$RUNNER_TEMP/s5-android-unit-results.json"
 
       - name: wry keep 规则与生成物对拍
         run: node scripts/verify-wry-keep-rules.mjs
