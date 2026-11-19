@@ -2218,7 +2218,7 @@ impl ProxyRuntime {
         tokio::select! {
             biased;
             () = self.debounced.wait_for_ticket_invalidation(ticket) => None,
-            () = self.wait_for_restart_generation_change(generation) => None,
+            () = self.wait_for_main_generation_change(generation) => None,
             claim = async {
                 let rule_publication = if force_id.is_none() {
                     Some(self.config.lock_builtin_rule_publication().await)
@@ -2253,7 +2253,8 @@ impl ProxyRuntime {
         }
     }
 
-    async fn wait_for_restart_generation_change(&self, generation: u64) {
+    pub(super) async fn wait_for_main_generation_change(&self, generation: u64) {
+        // Same-generation API handoffs also notify this signal.
         loop {
             let changed = self.gen_changed.notified();
             tokio::pin!(changed);

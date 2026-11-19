@@ -133,6 +133,8 @@ async fn exit_ip_routes_reject_active_switch_and_stale_graphs() {
         .as_mut()
         .unwrap()
         .observed_control_revision += 1;
+    runtime.gen_changed.notify_waiters();
+    assert!(futures::poll!(&mut wait).is_pending());
     drop(switch);
     let updated_route = wait.await.unwrap();
     assert_eq!(runtime.with_exit_ip_http_route(&route, || ()), None);
