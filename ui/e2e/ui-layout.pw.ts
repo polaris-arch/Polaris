@@ -29,14 +29,28 @@ test('warning upgrade action reaches a real actionable Helper state', async ({ p
   await open(page, false);
   const toast = page.locator('.toast.warn');
   await expect(toast).toBeVisible();
-  const cdp = await page.context().newCDPSession(page);
-  const color = await cdp.send('Runtime.evaluate', { expression: `(() => {
-    const toast=document.querySelector('.toast.warn'); const probe=document.createElement('span');
-    probe.style.color='hsl(var(--warn))'; toast.append(probe);
-    const result={actual:getComputedStyle(toast).color,expected:getComputedStyle(probe).color};probe.remove();return result;
-  })()`, returnByValue: true });
-  expect(color.result.value.actual).toBe(color.result.value.expected);
-  await cdp.detach();
+  await expect(toast.locator('.toast-status-icon')).toBeVisible();
+  const colors = await toast.evaluate(element => {
+    const probe = document.createElement('span');
+    probe.hidden = true;
+    probe.style.color = 'hsl(var(--warn))';
+    probe.style.borderTopColor = 'hsl(var(--warn)/.36)';
+    probe.style.outlineColor = 'hsl(var(--fg))';
+    element.append(probe);
+    try {
+      const expected = getComputedStyle(probe);
+      const actual = getComputedStyle(element);
+      return {
+        actual: {
+          icon: getComputedStyle(element.querySelector('.toast-status-icon')!).color,
+          border: actual.borderTopColor,
+          text: actual.color,
+        },
+        expected: { icon: expected.color, border: expected.borderTopColor, text: expected.outlineColor },
+      };
+    } finally { probe.remove(); }
+  });
+  expect(colors.actual).toEqual(colors.expected);
   await toast.locator('.toast-action').click();
   await expect(page.locator('[data-s="needs-upgrade"]')).toBeVisible();
   await expect(page.locator('[data-s="needs-upgrade"] button').first()).toBeEnabled();

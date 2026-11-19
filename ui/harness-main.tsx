@@ -19,7 +19,8 @@ import { DEMO_CONFIG, DEMO_SERVERS } from './harness-fixture';
 import type { CoexSnapshot } from './src/contracts/coex-snapshot';
 import rustCoexFixture from './src/contracts/coex-snapshot.rust.fixture.json';
 import rustWindowsFixture from './src/contracts/coex-windows.rust.fixture.json';
-import { TOPOLOGY_OTHERS_KEY, type ConnectionsAggregate } from './src/contracts/types';
+import { TOPOLOGY_OTHERS_KEY, type ConnectionsAggregate, type SaveOutcome } from './src/contracts/types';
+import { configBaseVersion } from './src/lib/staged-config';
 
 // 交互验证不能把配置夹具当只读快照：DNS 资源的增删改都经 config_save 整份回写，
 // 随后的 config_get 必须读到新值，否则受控表单会被旧夹具立即覆盖。
@@ -195,11 +196,22 @@ mockIPC((cmd, payload) => {
     }
   }
   switch (cmd) {
-    case 'config_get': return Promise.resolve(demoConfig);
+    case 'config_get': return Promise.resolve(structuredClone(demoConfig));
     case 'config_save': {
-      const next = (payload as { config?: typeof DEMO_CONFIG } | null)?.config;
-      if (next) demoConfig = structuredClone(next);
-      return Promise.resolve({ status: 'saved', version: 'harness' });
+      const args = payload as { config?: typeof DEMO_CONFIG; baseVersion?: string; hotOnly?: boolean } | null;
+      if (!args?.config) return Promise.reject(new Error('missing configuration'));
+      if (meshIngressFixture && args.hotOnly !== true) {
+        return Promise.reject(new Error('mesh ingress edit requires automatic admission'));
+      }
+      const diskVersion = configBaseVersion(demoConfig);
+      if (args.baseVersion !== diskVersion) {
+        return Promise.resolve({ status: 'conflict', diskVersion } satisfies SaveOutcome);
+      }
+      demoConfig = structuredClone(args.config);
+      if (meshIngressFixture) window.sessionStorage.setItem(meshIngressStorageKey, JSON.stringify(demoConfig));
+      return Promise.resolve({
+        status: 'saved', version: configBaseVersion(demoConfig), config: structuredClone(demoConfig),
+      } satisfies SaveOutcome);
     }
     case 'config_get_privacy_mode': return Promise.resolve(false);
     case 'config_get_value': return Promise.resolve((demoConfig as unknown as Record<string, unknown>)[(payload as { key: string })?.key] ?? null);
@@ -221,7 +233,6 @@ mockIPC((cmd, payload) => {
       const server = (payload as { server?: typeof DEMO_SERVERS[number] } | null)?.server;
       if (!server) return Promise.reject(new Error('missing server'));
       demoConfig.servers = demoConfig.servers.map((existing) => existing.id === server.id ? structuredClone(server) : existing);
-      if (meshIngressFixture) window.sessionStorage.setItem(meshIngressStorageKey, JSON.stringify(demoConfig));
       return Promise.resolve(null);
     }
     case 'app_presets_list': return Promise.resolve([]);
