@@ -71,14 +71,14 @@ export const HOME_PARITY: ScreenParityRegister = {
       note: '同上，加一条直连规则。两颗共用一条腿（接线层的 `addSubjectRule`），一并登记，避免只判一半。',
     },
 
-    /* ── HomeScreen（连接控制卡）─────────────────────────────────────────────── */
+    /* ── HomeScreen（首页提示与连接控制卡）────────────────────────────────────── */
     {
       id: 'HomeScreen.tsx|k:home.addServer',
       disposition: {
         kind: 'ported',
         mobile: { file: 'ui/src/mobile/home/HomeScreenView.tsx', mustContain: "t('home.addServer')" },
       },
-      note: '空态（一个节点都没有、且没选哨兵出口）时的「添加节点」直达入口。桌面那颗落到桌面的造节点弹窗，移动端落到自己的表单宿主（`mobile/forms/` 的 `{kind:\'node\'}`）—— 同一条能力换了宿主。空态判据与桌面 `emptyState` 逐字同源，哨兵那半句不能省。',
+      note: '无代理节点时，首页顶部提示保留「添加节点」入口。桌面跳到节点页并打开弹窗，移动端打开自己的 `node` 表单。',
     },
     {
       id: 'HomeScreen.tsx|k:home.addSubscription',
@@ -86,7 +86,7 @@ export const HOME_PARITY: ScreenParityRegister = {
         kind: 'ported',
         mobile: { file: 'ui/src/mobile/home/HomeScreenView.tsx', mustContain: "t('home.addSubscription')" },
       },
-      note: '空态时的「添加订阅」直达入口，与上一条同一族，落到表单宿主的 `{kind:\'sub\'}` 那一支。两颗并排在节点卡上，与桌面同一个位置语义。',
+      note: '无代理节点时，首页顶部提示的「添加订阅」入口打开移动端的 `sub` 表单。',
     },
     {
       id: 'HomeScreen.tsx|#node-trigger',

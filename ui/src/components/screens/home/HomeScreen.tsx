@@ -330,8 +330,7 @@ export function HomeScreen() {
     connected: connState === 'connected',
     dohBlocked: ipInfo?.dohBlocked,
   });
-  /** 空状态：一个节点都没有、且没选哨兵出口（直连/阻断都是有效出口配置，不算空）。 */
-  const emptyState = servers.length === 0 && !sentinelSelected;
+  const noServers = !!config && servers.length === 0;
   /** 阻断在「直连模式」下无效：route.final 恒 = direct，没有流量经过 proxy-selector ⇒ 选了也是 no-op。
    *  返回禁用原因文案（null = 可选），交给选单渲染 disabled + tooltip，不留静默无效项。 */
   const blockDisabledReason = useMemo(
@@ -341,7 +340,7 @@ export function HomeScreen() {
         : null,
     [config?.proxyMode, t]
   );
-  /** 空状态两条入口：**先落 action 再导航**——反过来会让节点页在 action 落库前就挂载完，
+  /** 顶部提示的两条入口：**先落 action 再导航**——反过来会让节点页在 action 落库前就挂载完，
    *  一次性意图消费不到（消费在挂载 effect 里）。 */
   const goServerPage = useCallback(
     (action: 'add-server' | 'add-sub') => {
@@ -1102,6 +1101,20 @@ export function HomeScreen() {
         </div>
       )}
 
+      {noServers && (
+        <div className="pending-bar info" role="status">
+          <div className="pb-tx pb-static">{t('home.noServerConfig')}</div>
+          <div className="pb-acts">
+            <button type="button" className="btn ghost sm" onClick={() => goServerPage('add-server')}>
+              {t('home.addServer')}
+            </button>
+            <button type="button" className="btn ghost sm" onClick={() => goServerPage('add-sub')}>
+              {t('home.addSubscription')}
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* 统一连接控制卡（一卡两列） */}
       <div className="card conn-card">
         <div className="cc-cols">
@@ -1116,36 +1129,6 @@ export function HomeScreen() {
                 </span>
               </div>
               <div className="exit-row">
-                {/* 空状态（契约「主页 Home · 空状态」）：一个节点都没有时，出口下拉里除了「直连」什么也
-                    选不出来，摆着它等于让用户对着空菜单找出路。换成两条直达入口，并**携 action** 跳节点页
-                    ——到站即弹对应对话框，意图不在导航途中丢掉（机制见 app-store 的 ServerPageAction）。
-                    `directSelected` 时不进空态：用户已明确选了直连出口，那是有效配置而非「还没配」。 */}
-                {emptyState ? (
-                  <div className="home-empty-exit">
-                    <span className="he-tx">{t('home.noServerConfig')}</span>
-                    <button
-                      type="button"
-                      className="btn ghost sm"
-                      onClick={() => goServerPage('add-server')}
-                    >
-                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9">
-                        <path d="M12 5v14M5 12h14" strokeLinecap="round" />
-                      </svg>
-                      {t('home.addServer')}
-                    </button>
-                    <button
-                      type="button"
-                      className="btn ghost sm"
-                      onClick={() => goServerPage('add-sub')}
-                    >
-                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9">
-                        <path d="M4 11a9 9 0 019 9M4 4a16 16 0 0116 16" strokeLinecap="round" />
-                        <circle cx="5" cy="19" r="1.4" fill="currentColor" stroke="none" />
-                      </svg>
-                      {t('home.addSubscription')}
-                    </button>
-                  </div>
-                ) : (
                 <div className={cn('node-dd', nodeMenuOpen && 'open')} id="home-node-dd" ref={nodeDdRef}>
                   <button
                     className="node-trigger"
@@ -1218,7 +1201,6 @@ export function HomeScreen() {
                     }}
                   />
                 </div>
-                )}
                 {/* 网络检测（原「延迟测试」⚡）：出口选单里已有「全部测速」，这颗再只做延迟就是重复入口。
                     改为一次跑完三件事 —— 延迟 + 解锁重检 + 出口 IP 强制重探（陈先生 2026-07-30 裁定），
                     原先分散在解锁区那颗 `.ub-detect` 上的能力整体并过来，那颗随之删除。

@@ -414,7 +414,7 @@
     "networkProfileRulesPruned": "部分網路場景規則本次未生效（場景失效、探測來源本機不可用或判據永不命中）· 請到「路由」頁檢查網路場景",
     "networkSettingsTip": "網路設定",
     "noActiveConnections": "暫無活動連線",
-    "noServerConfig": "暫無伺服器設定",
+    "noServerConfig": "尚無代理節點。選擇直連或封鎖即可連線。",
     "others": "其他",
     "pageTitle": "主頁",
     "nativeReconnectRequired": "連線變更需要重連。請在主頁點選連線；若仍顯示已連線，先中斷再連線。",

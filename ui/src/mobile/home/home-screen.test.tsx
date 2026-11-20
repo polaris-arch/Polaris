@@ -1424,23 +1424,20 @@ describe('⑬ 哨兵出口 / 空态入口 / 主机行规则面板：能力真的
 
   /* ── 空态两颗直达入口（`HomeScreen.tsx|k:home.addServer` / `addSubscription`）── */
 
-  it('空态给出路：两颗直达入口在，且落到移动端自己的表单宿主', () => {
-    const html = render({ noServers: true, node: { kind: 'none' } });
-    expect(html).toContain('home.addServer');
-    expect(html).toContain('home.addSubscription');
-    // 两颗必须在**节点卡**里（空态的出路要贴着「还没选节点」那句话，不能飘到别的卡上）。
-    const card = cardSegments(html).get('node-status-card') ?? '';
-    expect(card, '两颗入口没落在节点卡上').toContain('home.addServer');
-    expect(card).toContain('home.addSubscription');
+  it('没有代理节点时保留直连出口，并在出口卡上方提供添加入口', () => {
+    const html = render({ noServers: true, node: { kind: 'direct' } });
+    const notice = html.slice(0, html.indexOf('data-home-card="node-status-card"'));
+    expect(notice).toContain('home.noServerConfig');
+    expect(notice).toContain('home.addServer');
+    expect(notice).toContain('home.addSubscription');
+    expect(cardSegments(html).get('node-status-card')).toContain('home.routingDirect');
     // 接线层：开的是 `mobile/forms` 的两支，不是桌面弹窗。
     expect(WIRING_RAW).toContain("openMobileForm({ kind: 'node' })");
     expect(WIRING_RAW).toContain("openMobileForm({ kind: 'sub' })");
   });
 
-  it('反向对照：有节点（或选了哨兵）时不画那两颗 —— 否则它们就是常驻噪音', () => {
+  it('有代理节点时隐藏首页添加提示', () => {
     expect(render({ noServers: false })).not.toContain('home.addServer');
-    // 判据本体在接线层：哨兵那半句不能省，否则选了直连的人也会看到「去加节点」。
-    expect(WIRING_RAW).toContain('servers.length === 0 && !isSentinelSelection(selectedServerId)');
   });
 
   /* ── 主机行的规则面板（拓扑图那一族六条）── */

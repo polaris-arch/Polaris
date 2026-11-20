@@ -613,6 +613,21 @@ export function HomeScreenView(props: HomeScreenViewProps): ReactElement {
 
       {/* 相关能力共用外框；内部各卡仍持有原来的动作、错误和弹层。 */}
       <div className="h-flow">
+        {props.noServers && (
+          <div className="h-notice" role="status">
+            <div>
+              <p className="h-noticetext">{t('home.noServerConfig')}</p>
+              <div className="h-emptyacts">
+                <button type="button" className="h-emptyact" onClick={props.onAddServer}>
+                  {t('home.addServer')}
+                </button>
+                <button type="button" className="h-emptyact" onClick={props.onAddSubscription}>
+                  {t('home.addSubscription')}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
         <div className="h-connection-panel">
         {/* ① 节点状态卡（动作行已并入本卡）。整卡 = 出口 scope。 */}
         <div className="h-control-panel">
@@ -710,25 +725,6 @@ export function HomeScreenView(props: HomeScreenViewProps): ReactElement {
           {props.latencyCheck?.error && <p className="h-latency-error" role="alert">{props.latencyCheck.error}</p>}
           {props.latencyCheck?.allUnavailable && <p className="h-latency-note">{props.latencyCheck.allUnavailable}</p>}
           {props.latencyCheck?.feedback && <p className={`h-latency-note ${props.latencyCheck.feedback.tone}`} role="status">{props.latencyCheck.feedback.text}</p>}
-
-          {/*
-            空态两条直达入口（桌面 `HomeScreen.tsx` 的 `home.addServer` / `home.addSubscription`）。
-            桌面那两颗落到桌面的造节点弹窗，整条链不进移动端；这里落到移动端**自己的**表单宿主
-            （`mobile/forms/`，批 2 接的那一层）—— 同一条能力，不同的宿主。
-
-            判据（`noServers`）与桌面 `emptyState` 逐字同源：一个节点都没有**且**没选哨兵出口。
-            选了直连 / 阻断的人不缺节点，给他两颗「去加节点」是噪音。
-          */}
-          {props.noServers && (
-            <div className="h-emptyacts">
-              <button type="button" className="h-emptyact" onClick={props.onAddServer}>
-                {t('home.addServer')}
-              </button>
-              <button type="button" className="h-emptyact" onClick={props.onAddSubscription}>
-                {t('home.addSubscription')}
-              </button>
-            </div>
-          )}
 
           <hr className="h-hair" />
 

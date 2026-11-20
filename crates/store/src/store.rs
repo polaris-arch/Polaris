@@ -318,7 +318,7 @@ pub fn default_config() -> Value {
     serde_json::json!({
         "subscriptions": [],
         "servers": [],
-        "selectedServerId": null,
+        "selectedServerId": polaris_config_engine::user_config::dns_constants::DIRECT_SERVER_ID,
         "autoSelectEnabled": false,
         "autoSelectPins": [],
         // 分流策略默认「智能」（D1，2026-08-19 陈先生拍板：rule-based 是大多数用户想要的

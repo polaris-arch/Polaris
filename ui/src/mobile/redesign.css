@@ -181,7 +181,7 @@
 .h-latency-error { grid-column: 1 / -1; margin: 0 0 6px; color: hsl(var(--err)); font-size: .75rem; }
 .h-latency-note { grid-column: 1 / -1; margin: 0 0 6px; color: hsl(var(--fg-dim)); font-size: .75rem; overflow-wrap: anywhere; }
 .h-latency-note.ok { color: hsl(var(--ok)); }
-.h-control-panel .h-emptyacts, .h-control-panel .h-notice, .h-control-panel .h-werr, .h-control-panel .h-sheet { grid-column: 1 / -1; }
+.h-control-panel .h-notice, .h-control-panel .h-werr, .h-control-panel .h-sheet { grid-column: 1 / -1; }
 .h-control-panel .h-card[data-home-card='mode-chips'] { padding-top: 8px; border-top: 1px solid hsl(var(--hair)); }
 .h-control-panel .h-card[data-home-card='mode-chips'] .h-cardhead { display: inline-flex; margin: 0 10px 0 0; vertical-align: middle; }
 .h-control-panel .h-card[data-home-card='mode-chips'] .h-routing { display: inline-flex; vertical-align: middle; }

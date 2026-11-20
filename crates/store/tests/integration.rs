@@ -97,6 +97,8 @@ fn missing_file_loads_default_and_marks_was_missing() {
     assert!(res.was_missing);
     assert!(!res.loaded_from_disk);
     assert!(res.error.is_none());
+    assert_eq!(res.config["selectedServerId"], "__direct__");
+    assert_eq!(res.config["servers"], serde_json::json!([]));
     assert_eq!(res.config["proxyMode"], serde_json::json!("smart"));
     assert_eq!(res.config["keepTrayMenuWarm"], serde_json::json!(true));
     assert_eq!(

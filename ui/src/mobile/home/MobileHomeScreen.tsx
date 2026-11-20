@@ -72,7 +72,6 @@ import {
   DIRECT_SERVER_ID,
   isBlockSelection,
   isDirectSelection,
-  isSentinelSelection,
 } from '@/domain/direct-selection';
 import { ruleSubjectForValue, ruleTypeNameKey, type RuleSubject } from '@/domain/rules';
 import {
@@ -453,11 +452,7 @@ export function MobileHomeScreen(): ReactElement {
    */
   const blockDisabledReason = routing === 'direct' ? t('home.blockExitUnavailableInDirect') : null;
 
-  /**
-   * 空态：一个节点都没有、**且**没选哨兵出口。后半句不能省（桌面同一条判据）——
-   * 直连 / 阻断都是有效的出口配置，选了它的人不缺节点。
-   */
-  const noServers = servers.length === 0 && !isSentinelSelection(selectedServerId);
+  const noServers = !!config && servers.length === 0;
 
   /* ── ⑦ 主机 Top 行上的规则面板：判据全部复用桌面那批纯函数 ─────────────── */
 

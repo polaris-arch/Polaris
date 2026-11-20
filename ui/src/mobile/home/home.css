@@ -596,6 +596,10 @@
   color: hsl(var(--warn));
 }
 
+.h-flow > .h-notice {
+  margin-top: 0;
+}
+
 .h-noticeicon {
   flex: none;
   line-height: 0;

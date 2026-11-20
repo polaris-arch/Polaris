@@ -175,12 +175,6 @@
 .exit-row{ display:flex; align-items:center; gap:9px; }
 .exit-row .icon-btn{ width:32px; height:32px; }
 .exit-row .connect-btn{ width:44px; height:44px; }
-/* 空状态（一个节点都没有）：占据 `.node-dd` 原来的弹性槽位，虚线边框表明「这里还没有内容」，
-   两条直达入口就地给出下一步（对齐 上游 connection-control-card 的 isEmptyState 形态）。 */
-.home-empty-exit{ flex:1; min-width:0; display:flex; flex-wrap:wrap; align-items:center; gap:8px;
-  padding:11px; border:1px dashed hsl(var(--line)); border-radius:9px; background:hsl(var(--surface-2)); }
-.home-empty-exit .he-tx{ font-size:12.5px; color:hsl(var(--fg-dim)); }
-.home-empty-exit .btn svg{ width:13px; height:13px; }
 /* 分流策略切换在飞：整组置灰（契约 L21 的 routingBusy 反馈）。 */
 .seg2 button:disabled{ opacity:.5; cursor:default; }
 /* phead meta 行的「系统代理未生效」。
