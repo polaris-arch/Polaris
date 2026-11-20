@@ -958,12 +958,14 @@ fn whole_core_verdict_checks_every_required_symbol_and_reports_missing_separatel
         })
         .collect();
     let build = |tables: &BTreeMap<&str, BTreeMap<String, u32>>| {
-        let messages: Vec<_> = CHECKED_SYMBOLS
+        let messages: Vec<_> = tables
             .iter()
-            .filter(|(kind, name)| {
-                *kind == SymbolKind::Message && *name != "Log" && *name != "Log.Message"
+            .filter(|(name, _)| {
+                **name != "Log"
+                    && **name != "Log.Message"
+                    && !CHECKED_SYMBOLS.contains(&(SymbolKind::Enum, **name))
             })
-            .filter_map(|(_, name)| tables.get(name).map(|fields| (*name, fields)))
+            .map(|(name, fields)| (*name, fields))
             .collect();
         let enums: Vec<_> = CHECKED_SYMBOLS
             .iter()
@@ -1006,6 +1008,53 @@ fn whole_core_verdict_checks_every_required_symbol_and_reports_missing_separatel
             other => panic!("missing {name} lost its diagnostic category: {other:?}"),
         }
     }
+
+    let snapshot_layouts: &[(&str, &[(&str, u32)])] = &[
+        (
+            "ConnectionSnapshotChunk",
+            &[("entries", 1), ("complete", 2)],
+        ),
+        ("ConnectionSnapshotEntry", &[("id", 1), ("chainList", 2)]),
+    ];
+    let mut upgraded = tables;
+    for (name, fields) in snapshot_layouts {
+        upgraded.insert(name, to_map(fields));
+    }
+    assert_eq!(
+        verdict_for_core_bytes(&build(&upgraded)),
+        WireVerdict::Match
+    );
+    for (name, fields) in snapshot_layouts {
+        let mut missing = upgraded.clone();
+        missing.remove(name);
+        assert!(
+            matches!(verdict_for_core_bytes(&build(&missing)), WireVerdict::Mismatch(report) if report.contains(name)),
+            "a partially advertised snapshot must reject a missing {name}"
+        );
+        for (field, number) in *fields {
+            let mut drifted = upgraded.clone();
+            drifted
+                .get_mut(name)
+                .unwrap()
+                .insert((*field).into(), number + 1);
+            let mut missing = upgraded.clone();
+            missing.get_mut(name).unwrap().remove(*field);
+            for candidate in [&drifted, &missing] {
+                assert!(
+                    matches!(verdict_for_core_bytes(&build(candidate)), WireVerdict::Mismatch(report) if report.contains(name) && report.contains(field)),
+                    "{name}.{field} must be present at field number {number}"
+                );
+            }
+        }
+    }
+    upgraded
+        .get_mut("ClashMode")
+        .unwrap()
+        .insert("mode".into(), 4);
+    assert!(
+        matches!(verdict_for_core_bytes(&build(&upgraded)), WireVerdict::Mismatch(report) if report.contains("ClashMode")),
+        "snapshot support must leave the required symbol checks in place"
+    );
     assert!(matches!(
         verdict_for_core_bytes(b"invalid descriptor"),
         WireVerdict::Unobservable(_)

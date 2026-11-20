@@ -716,44 +716,67 @@ mod proto_wire_check {
         (SymbolKind::Message, "DownloadTaildropFileChunk"),
     ];
 
+    // Older cores (including 12.32) have neither snapshot message. Once a
+    // core exposes either message, both layouts are part of its wire contract.
+    const CONNECTION_SNAPSHOT_SYMBOLS: &[(SymbolKind, &str)] = &[
+        (SymbolKind::Message, "ConnectionSnapshotChunk"),
+        (SymbolKind::Message, "ConnectionSnapshotEntry"),
+    ];
+
     /// 对**内存里的一份核**做整表对拍的三态结论。
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub enum WireVerdict {
-        /// 表里每个符号的字段号都对得上。
+        /// 必选符号与已出现的可选契约字段号都对得上。
         Match,
-        /// **有字段号对不上** —— 唯一「危险到该拦」的一档，附人类可读报告。
+        /// 字段号对不上，或连接快照描述符只含一条消息。
         Mismatch(String),
-        /// 取不到判据（抠不出 descriptor / 表里的符号在该核里不存在 / vendored 侧解析失败）。
+        /// 取不到判据（抠不出 descriptor / 缺必选符号 / vendored 侧解析失败）。
         Unobservable(String),
     }
 
     /// 整表对拍一份**内存中的**核（不落盘、不需要路径）。
     ///
-    /// # 为什么「符号缺失」与「提取失败」都判 `Unobservable` 而不是 `Mismatch`
+    /// # 为什么「必选符号缺失」与「提取失败」判 `Unobservable`
     ///
     /// 两档的**失败响度**不同，而这个结论会被用来拦一次用户主动发起的换核：
     ///
     /// - **字段号对不上** ⇒ prost 整帧解码失败 ⇒ `ReconnectingStream` 当断线无限重连 ⇒
     ///   功能整块**静默**消失（2026-08-05 真机实证）。用户看不出，必须拦。
-    /// - **符号根本不在** ⇒ 对应 rpc 直接 `Unimplemented` / 空表，失败是**响亮**的。
+    /// - **必选符号根本不在** ⇒ 对应 rpc 直接 `Unimplemented` / 空表，失败是**响亮**的。
     /// - **抠不出 descriptor** ⇒ 我们对这份核一无所知 —— 「没观测到 ≠ 观测到没问题」，
     ///   据此拦下用户自选的核属于把一次读失败升级成一次功能剥夺。
     ///
-    /// 故只有第一档拦，其余两档放行 + 大声告警。判据方向与 `runtime::proxy::process_supervision::pid_identity_verdict`
-    /// 一致（那里同样是「取不到材料一律 Unobservable，绝不折成不匹配」）。
+    /// 连接快照允许两条消息同时缺失。任一消息出现便有可验证的契约，缺少另一条判为 `Mismatch`。
     pub fn verdict_for_core_bytes(bytes: &[u8]) -> WireVerdict {
         let desc = match descriptor_from_core(bytes) {
             Ok(d) => d,
             Err(e) => return WireVerdict::Unobservable(e),
         };
+        if CONNECTION_SNAPSHOT_SYMBOLS
+            .iter()
+            .any(|(_, name)| desc.messages.contains_key(*name))
+        {
+            let verdict = check_symbols(&desc, CONNECTION_SNAPSHOT_SYMBOLS, WireVerdict::Mismatch);
+            if verdict != WireVerdict::Match {
+                return verdict;
+            }
+        }
+        check_symbols(&desc, CHECKED_SYMBOLS, WireVerdict::Unobservable)
+    }
+
+    fn check_symbols(
+        desc: &CoreDescriptor,
+        symbols: &[(SymbolKind, &str)],
+        missing_verdict: fn(String) -> WireVerdict,
+    ) -> WireVerdict {
         let mut bad = Vec::new();
-        for (kind, name) in CHECKED_SYMBOLS {
+        for (kind, name) in symbols {
             let table = match kind {
                 SymbolKind::Message => &desc.messages,
                 SymbolKind::Enum => &desc.enums,
             };
             let Some(real) = table.get(*name) else {
-                return WireVerdict::Unobservable(format!(
+                return missing_verdict(format!(
                     "该核的 descriptor 里没有 {} `{name}`",
                     kind.label()
                 ));
