@@ -1113,13 +1113,34 @@ pub(crate) fn run_menu_action(app: &tauri::AppHandle, action: MenuAction) {
             });
         }
         MenuAction::Takeover(kind) => {
+            let Ok(mode) = serde_json::from_value(serde_json::json!(kind)) else {
+                return;
+            };
             let app = app.clone();
-            tauri::async_runtime::spawn_blocking(move || {
+            tauri::async_runtime::spawn(async move {
                 let lang = i18n::app_lang(&app);
                 let state = app.state::<AppRuntime>();
-                // Read/transform/save the latest config under the same writer boundary.
-                let response = commands::config::config_takeover(app.clone(), state, kind);
-                notify_menu_response_failure(&app, lang, i18n::key::TRAY_GROUP_TAKEOVER, &response);
+                let response = Box::pin(commands::config::apply_takeover_edit(
+                    &app, &state, mode, false,
+                ))
+                .await;
+                if response.code.as_deref()
+                    == Some(commands::config::CONFIG_TAKEOVER_BLOCKED_BY_PENDING)
+                    || response.data.as_ref().is_some_and(|data| {
+                        data.get("pendingApply")
+                            .and_then(serde_json::Value::as_bool)
+                            == Some(true)
+                    })
+                {
+                    show_main_window(&app);
+                } else {
+                    notify_menu_response_failure(
+                        &app,
+                        lang,
+                        i18n::key::TRAY_GROUP_TAKEOVER,
+                        &response,
+                    );
+                }
             });
         }
         MenuAction::SelectExit(server_id) => {

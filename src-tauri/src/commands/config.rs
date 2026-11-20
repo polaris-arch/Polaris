@@ -31,7 +31,7 @@ use crate::events::channel::{
     EVENT_CONFIG_CHANGED, EVENT_ENTER_PRIVACY_MODE, EVENT_EXIT_PRIVACY_MODE,
 };
 use crate::response::{ok_void, ApiResponse};
-use crate::runtime::config::{ConfigManager, Decision};
+use crate::runtime::config::{ConfigManager, Decision, PreparedConfigEdit};
 use crate::runtime::proxy::runtime_config::{
     HotConfigEditOutcome, RuntimeApplyReason, StagedSaveOwner, TakeoverApplyOwner,
 };
@@ -710,22 +710,21 @@ fn app_only_config_patch(previous: &Value, saved: &Value) -> bool {
         .all(|key| is_app_patch_key(key) || previous.get(key) == saved.get(key))
 }
 
-fn config_takeover_core(
+fn prepare_takeover_edit(
     config: &ConfigManager,
     mode: ProxyModeType,
-) -> Result<(Option<String>, Value, bool), polaris_store::StoreError> {
-    config_takeover_edit(config, mode, &std::cell::Cell::new(false))
+) -> Result<(bool, PreparedConfigEdit), polaris_store::StoreError> {
+    let (corrected, edit) =
+        config.prepare_config_edit(|next| Decision::Write(write_takeover_config(next, mode)))?;
+    Ok((
+        corrected,
+        edit.expect("takeover edit always proposes a candidate"),
+    ))
 }
 
-fn config_takeover_edit(
-    config: &ConfigManager,
-    mode: ProxyModeType,
-    corrected: &std::cell::Cell<bool>,
-) -> Result<(Option<String>, Value, bool), polaris_store::StoreError> {
-    config_takeover_edit_if(config, mode, corrected, || true).map(|committed| {
-        let (old_selected, saved, changed, _) = committed.expect("unconditional edit");
-        (old_selected, saved, changed)
-    })
+fn write_takeover_config(next: &mut Value, mode: ProxyModeType) -> bool {
+    next["proxyModeType"] = json!(mode);
+    crate::tray::apply_fake_ip_tun_entry(next)
 }
 
 type ConfigEdit = (Option<String>, Value, bool, u64);
@@ -737,8 +736,7 @@ fn config_takeover_edit_if(
     admitted: impl FnOnce() -> bool,
 ) -> Result<Option<ConfigEdit>, polaris_store::StoreError> {
     config_edit_with_revision(config, admitted, move |next| {
-        next["proxyModeType"] = json!(mode);
-        corrected.set(crate::tray::apply_fake_ip_tun_entry(next));
+        corrected.set(write_takeover_config(next, mode));
         true
     })
 }
@@ -846,47 +844,45 @@ pub async fn config_patch(
     }))
 }
 
-pub(crate) fn config_takeover(
-    app: AppHandle,
-    state: State<'_, AppRuntime>,
-    mode: &str,
-) -> ApiResponse<Value> {
-    let result = serde_json::from_value::<ProxyModeType>(json!(mode))
-        .map_err(|_| polaris_store::StoreError::validation("invalid takeover mode"))
-        .and_then(|mode| config_takeover_core(state.config(), mode));
-    config_edit_response(&app, &state, result)
+pub(crate) const CONFIG_TAKEOVER_BLOCKED_BY_PENDING: &str = "CONFIG_TAKEOVER_BLOCKED_BY_PENDING";
+
+fn takeover_conflict() -> ApiResponse<Value> {
+    ApiResponse::err_with_code("接管配置已变更，请重新确认", "CONFIG_TAKEOVER_CONFLICT")
 }
 
-/// Home and native tray share the same lock-local takeover edit.
+/// Home retains the confirmed owner path. Both trays use prospective hot admission.
 #[allow(clippy::needless_pass_by_value, reason = "Tauri IPC owns its payload")]
 #[tauri::command]
-pub fn config_set_takeover(
+pub async fn config_set_takeover(
     app: AppHandle,
     state: State<'_, AppRuntime>,
     mode: ProxyModeType,
     preview: Option<bool>,
     expected_owner: Option<TakeoverApplyOwner>,
-) -> ApiResponse<Value> {
-    let conflict =
-        || ApiResponse::err_with_code("接管配置已变更，请重新确认", "CONFIG_TAKEOVER_CONFLICT");
+    hot_only: Option<bool>,
+) -> Result<ApiResponse<Value>, ()> {
+    let hot_only = hot_only.unwrap_or(false);
+    if hot_only && (preview == Some(true) || expected_owner.is_some()) {
+        return Ok(takeover_conflict());
+    }
     if preview == Some(true) {
         if expected_owner.is_some() {
-            return conflict();
+            return Ok(takeover_conflict());
         }
-        return state
-            .proxy()
-            .takeover_preview()
-            .map_or_else(conflict, |(owner, pending_apply)| {
+        return Ok(state.proxy().takeover_preview().map_or_else(
+            takeover_conflict,
+            |(owner, pending_apply)| {
                 ApiResponse::ok(json!({"owner": owner, "pendingApply": pending_apply}))
-            });
+            },
+        ));
     }
-    let corrected = std::cell::Cell::new(false);
     if let Some(owner) = expected_owner {
+        let corrected = std::cell::Cell::new(false);
         let saved = config_takeover_edit_if(state.config(), mode, &corrected, || {
             state.config().saved_revision() == owner.saved_revision
                 && state.proxy().takeover_owner_is_live(owner)
         });
-        return match saved {
+        return Ok(match saved {
             Ok(Some((old_selected, mut cfg, changed, revision))) => {
                 if changed {
                     emit_config_changed_signal(&app);
@@ -908,27 +904,82 @@ pub fn config_set_takeover(
                     json!({"config": cfg, "corrected": corrected.get(), "owner": owner}),
                 )
             }
-            Ok(None) => conflict(),
+            Ok(None) => takeover_conflict(),
             Err(error) => config_store_error(error),
-        };
+        });
     }
-    let result = config_takeover_edit(state.config(), mode, &corrected);
-    let response = config_edit_response(&app, &state, result);
-    if response.success {
-        ApiResponse::ok(json!({"config": response.data, "corrected": corrected.get()}))
-    } else {
-        response
-    }
+    Ok(Box::pin(apply_takeover_edit(&app, &state, mode, hot_only)).await)
 }
 
-fn config_edit_response(
+pub(crate) async fn apply_takeover_edit(
     app: &AppHandle,
     state: &AppRuntime,
-    result: Result<(Option<String>, Value, bool), polaris_store::StoreError>,
+    mode: ProxyModeType,
+    hot_only: bool,
 ) -> ApiResponse<Value> {
-    config_edit_response_with(app, state, result, |saved| {
-        broadcast_config_changed(app, saved)
-    })
+    let (corrected, edit) = match prepare_takeover_edit(state.config(), mode) {
+        Ok(prepared) => prepared,
+        Err(error) => return config_store_error(error),
+    };
+    let proxy = state.proxy();
+    let owner = StagedSaveOwner::capture(proxy, edit.revision);
+    let changed = edit.previous != edit.candidate;
+    let store_error = |error| {
+        if matches!(error, polaris_store::StoreError::CommitUncertain(_)) {
+            proxy.push_pending_changes();
+            emit_config_changed_signal(app);
+        }
+        config_store_error(error)
+    };
+    let pending_apply = match Box::pin(proxy.apply_hot_config_edit(&edit)).await {
+        Ok(HotConfigEditOutcome::Saved {
+            runtime_apply,
+            saved_offline,
+            ..
+        }) => runtime_apply.map_or_else(
+            || changed && !saved_offline && proxy.pending_changes().pending_apply,
+            |result| result.pending_apply,
+        ),
+        Ok(HotConfigEditOutcome::NeedsManual { .. }) if hot_only => {
+            let mut config = edit.previous;
+            apply_frontend_view(&mut config);
+            return ApiResponse::ok(
+                json!({"status": "needsManual", "config": config, "corrected": false}),
+            );
+        }
+        Ok(HotConfigEditOutcome::NeedsManual { .. }) => {
+            match proxy.commit_manual_resource_edit(&edit, owner).await {
+                Ok(Some(_)) => true,
+                Ok(None) => return takeover_conflict(),
+                Err(error) => return store_error(error),
+            }
+        }
+        Ok(HotConfigEditOutcome::BlockedByPending) => {
+            return ApiResponse::err_with_code(
+                "请先处理当前待应用配置，再切换接管方式",
+                CONFIG_TAKEOVER_BLOCKED_BY_PENDING,
+            );
+        }
+        Ok(HotConfigEditOutcome::Conflict) => return takeover_conflict(),
+        Ok(HotConfigEditOutcome::Retryable) => {
+            return ApiResponse::err("暂时无法切换接管方式，请重试");
+        }
+        Ok(HotConfigEditOutcome::Rejected) => {
+            return ApiResponse::err("内核拒绝了接管方式配置");
+        }
+        Err(error) => return store_error(error),
+    };
+    if changed {
+        emit_config_changed_signal(app);
+        if pending_apply {
+            proxy.push_pending_changes();
+        }
+    }
+    let mut config = edit.candidate;
+    apply_frontend_view(&mut config);
+    ApiResponse::ok(
+        json!({"status": "saved", "config": config, "corrected": corrected, "pendingApply": pending_apply}),
+    )
 }
 
 fn config_edit_response_with(

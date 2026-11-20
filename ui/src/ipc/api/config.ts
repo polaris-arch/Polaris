@@ -91,8 +91,8 @@ export const configApi = {
     return invoke(IPC_CHANNELS.CONFIG_SET_TAKEOVER, { mode, preview: true });
   },
 
-  async setTakeover(mode: NonNullable<UserConfig['proxyModeType']>, expectedOwner?: TakeoverApplyOwner): Promise<{ config: UserConfig; corrected: boolean; owner?: TakeoverApplyOwner }> {
-    return invoke(IPC_CHANNELS.CONFIG_SET_TAKEOVER, { mode, expectedOwner });
+  async setTakeover(mode: NonNullable<UserConfig['proxyModeType']>, expectedOwner?: TakeoverApplyOwner, hotOnly?: boolean): Promise<{ config: UserConfig; corrected: boolean; owner?: TakeoverApplyOwner; pendingApply?: boolean; status?: 'saved' | 'needsManual' }> {
+    return invoke(IPC_CHANNELS.CONFIG_SET_TAKEOVER, { mode, expectedOwner, hotOnly });
   },
 
   /** 在后端最新配置上按实体主键原子 upsert/delete；同一数组的并发编辑不会整字段互相覆盖。 */

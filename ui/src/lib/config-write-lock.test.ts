@@ -136,7 +136,7 @@ describe('接线：主窗里的配置事务必须都在闸门内', () => {
     // patch would overwrite concurrent DNS edits; wrapping it in saveConfig would
     // also split the atomic correction from the chosen mode.
     const takeover = tray.slice(tray.indexOf('  const setTakeover ='), tray.indexOf('  const switchExit ='));
-    expect(takeover).toMatch(/const \{ corrected \} = await api\.config\.setTakeover\(modeType\);/);
+    expect(takeover).toMatch(/await api\.config\.setTakeover\(modeType\);/);
     expect(takeover).not.toMatch(/saveConfig\(|api\.config\.(?:patch|save)\(|withConfigWriteLock\(/);
     expect((tray.match(/api\.config\.setTakeover\(/g) ?? []).length).toBe(1);
     expect(tray).not.toContain('api.config.patch(');

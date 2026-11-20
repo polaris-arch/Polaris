@@ -446,18 +446,26 @@ fn takeover_consumes_latest_fake_ip_flag_without_overwriting_dns_edits() {
             Decision::Write(())
         })
         .unwrap();
-    let corrected = std::cell::Cell::new(false);
-    let (_, saved, _) = config_takeover_edit(&manager, ProxyModeType::Tun, &corrected).unwrap();
-    assert!(corrected.get());
-    assert_eq!(saved["dnsConfig"]["enableFakeIp"], json!(true));
-    assert_eq!(saved["dnsConfig"]["concurrent"], json!("latest-dns-edit"));
+    let previous = manager.current().unwrap();
+    let (corrected, edit) = prepare_takeover_edit(&manager, ProxyModeType::Tun).unwrap();
+    assert!(corrected);
+    assert_eq!(manager.current().unwrap(), previous);
+    assert_eq!(edit.candidate["dnsConfig"]["enableFakeIp"], json!(true));
     assert_eq!(
-        saved["subscriptionUserAgent"],
+        edit.candidate["dnsConfig"]["concurrent"],
+        json!("latest-dns-edit")
+    );
+    assert_eq!(
+        edit.candidate["subscriptionUserAgent"],
         json!("latest-scheduler-edit")
     );
-    let corrected_again = std::cell::Cell::new(false);
-    config_takeover_edit(&manager, ProxyModeType::Tun, &corrected_again).unwrap();
-    assert!(!corrected_again.get());
+    assert!(manager
+        .commit_prepared_config_edit(&edit, || true, |_| {})
+        .unwrap()
+        .is_some());
+    let (corrected_again, edit) = prepare_takeover_edit(&manager, ProxyModeType::Tun).unwrap();
+    assert!(!corrected_again);
+    assert_eq!(edit.previous, edit.candidate);
 }
 
 #[test]

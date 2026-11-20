@@ -25,7 +25,7 @@ import { withConfigWriteLock } from '@/lib/config-write-lock';
  */
 
 import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { invoke } from '@/ipc/ipc-client';
+import { invoke, IpcError } from '@/ipc/ipc-client';
 import { IPC_CHANNELS } from '@/domain/ipc-channels';
 import { api } from '@/ipc';
 import PolarisStarSprite from '@/components/brand-icons/PolarisStarSprite';
@@ -586,9 +586,7 @@ export default function TrayMenu() {
     });
   };
 
-  // 与首页复用后端最新配置事务；只发送用户选择的mode，不发送托盘旧DNS快照。
-  // 只落盘、不应用（浮层无 dialog 层，无从承载重启/影响确认）：已连接时新接管方式进入主窗待应用条，
-  // 须在主窗「立即应用」后才生效；未连接则下次连接生效。
+  // 只提交用户选择的接管方式。后端判定热应用，需用户确认的变更交给主窗待应用条。
   const setTakeover = async (modeType: ProxyModeType) => {
     const life = trayLifecycle.current, operation = interactionEpoch.current;
     const current = () => mounted.current && interactionActive.current && life === trayLifecycle.current && operation === interactionEpoch.current;
@@ -602,17 +600,28 @@ export default function TrayMenu() {
       // 与主窗 `HomeScreen.applyIntercept` 的 notifyDesktop 那条腿）+ 浮层内 notice 行双管——
       // 托盘切换常在主窗关闭时发生，主窗那条 toast 此刻看不到；而浮层这行只在浮层还开着时有用。
       // 开关门控由 hydrate 里的 `setDesktopNotificationsEnabled` 负责（用户关了就静默不发）。
-      const { corrected } = await api.config.setTakeover(modeType);
+      const { corrected, pendingApply } = await api.config.setTakeover(modeType);
       if (!current()) return;
+      const guidance = pendingApply ? t('tray.manageInMain') : undefined;
       if (corrected) {
         const title = t('tray.takeoverTun');
         const body = t('tray.fakeIpAutoEnabled');
-        setNotice(body);
+        setNotice(guidance ? `${body} ${guidance}` : body);
         void notifyDesktop(title, body);
         return; // 保持浮层打开，让 notice 有机会被看到
       }
+      if (guidance) {
+        setNotice(guidance);
+        return;
+      }
     } catch (err) {
-      if (current()) noticeActionFailure(t('tray.groupTakeover'), err);
+      if (current()) {
+        if (err instanceof IpcError && err.code === 'CONFIG_TAKEOVER_BLOCKED_BY_PENDING') {
+          setNotice(t('tray.manageInMain'));
+        } else {
+          noticeActionFailure(t('tray.groupTakeover'), err);
+        }
+      }
       return; // 失败不关浮层（W14）；成功才 hide
     }
     hide();

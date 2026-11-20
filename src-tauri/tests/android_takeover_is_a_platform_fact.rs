@@ -158,7 +158,7 @@ const RAW_JSON_REGISTRY: &[RawJsonSite] = &[
         "src-tauri/src/commands/config.rs",
         "next[\"proxyModeType\"] = json!(mode)",
         1,
-        "config_takeover_edit 把已解析的 ProxyModeType 用户输入写入最新配置，不是从原始状态作平台判据；Android 运行态仍由 effective_on 强制 TUN。",
+        "write_takeover_config 把已解析的 ProxyModeType 用户输入写入最新配置，不是从原始状态作平台判据；Android 运行态仍由 effective_on 强制 TUN。",
     ),
     (
         "src-tauri/src/app_tray.rs",
