@@ -29,6 +29,8 @@ futures = "0.3"
 # upstream command line. Remove this patch when upstream swift-rs includes it.
 [patch.crates-io]
 swift-rs = { path = "vendor/swift-rs" }
+# Backport tauri-apps/tao#1245 for this local iOS device build.
+tao = { path = "vendor/tao" }
 
 # ════════════════════════════════════════════════════════════════════════════
 # 发行构型
