@@ -39,6 +39,22 @@ describe('traffic time axis', () => {
     b = pushTotals(b, 1, 1, 2000);
     expect(b.samples).toEqual([]);
   });
+  it('keeps steady rates and continuous paths through wall-clock jumps', () => {
+    const observedTimes = [10000, 11000, 2000, 3000, 4000, 12000, 120000];
+    let b = EMPTY_TRAFFIC_BUFFER;
+    for (const [second, observedAt] of observedTimes.entries()) {
+      b = pushTotals(b, second * 100, second * 200, second * 1000, observedAt);
+      if (second > 0) expect(trafficObservationLabel(b.samples, String)).toBe(String(observedAt));
+    }
+    expect(b.samples).toEqual(observedTimes.slice(1).map((observedAt, i) => ({
+      at: (i + 1) * 1000, observedAt, up: 100, down: 200,
+    })));
+    for (const field of ['up', 'down'] as const) {
+      const path = timedTrafficPath(b.samples, field, 300, 100, 200);
+      expect(path.match(/M /g)).toHaveLength(1);
+      expect(path).toMatch(/^M 275\.00 /);
+    }
+  });
 });
 
 it('a stopped stream keeps its last observation timestamp instead of claiming Now', () => {

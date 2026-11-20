@@ -247,7 +247,7 @@ export function MobileHomeScreen(): ReactElement {
       },
       (s) => {
         setStats(s);
-        bufRef.current = pushTotals(bufRef.current, s.totalUpload, s.totalDownload, Date.now());
+        bufRef.current = pushTotals(bufRef.current, s.totalUpload, s.totalDownload, performance.now(), Date.now());
         setBuffer(bufRef.current);
       },
     );

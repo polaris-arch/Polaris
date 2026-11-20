@@ -26,7 +26,10 @@
 
 /** 一个采样点：两条序列各一个 bytes/s。 */
 export interface RateSample {
+  /** Monotonic arrival time for rate and axis spacing. */
   readonly at?: number;
+  /** Wall time captured at arrival, for the observation label. */
+  readonly observedAt?: number;
   readonly up: number;
   readonly down: number;
 }
@@ -64,6 +67,7 @@ export function pushTotals(
   totalUp: number,
   totalDown: number,
   atMs: number,
+  observedAt?: number,
 ): TrafficBuffer {
   const base = buf.baseline;
   if (base === null) {
@@ -78,7 +82,7 @@ export function pushTotals(
   const perSec = 1000 / dt;
   const next = [
     ...buf.samples,
-    { at: atMs, up: (totalUp - base.up) * perSec, down: (totalDown - base.down) * perSec },
+    { at: atMs, observedAt, up: (totalUp - base.up) * perSec, down: (totalDown - base.down) * perSec },
   ];
   return {
     samples: next.filter((sample) => sample.at !== undefined && sample.at >= atMs - TRAFFIC_WINDOW * 1000).slice(-TRAFFIC_WINDOW),
@@ -166,6 +170,7 @@ export function timedTrafficPath(samples: readonly RateSample[], field: 'up' | '
 
 /** Right edge is the observation timestamp, never a claim of freshness. */
 export function trafficObservationLabel(samples: readonly RateSample[], format: (at: number) => string): string {
-  const at = samples[samples.length - 1]?.at;
+  const last = samples[samples.length - 1];
+  const at = last?.observedAt ?? last?.at;
   return at === undefined ? '—' : format(at);
 }
