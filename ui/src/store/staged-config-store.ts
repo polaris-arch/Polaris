@@ -652,12 +652,19 @@ function isScalarAssignment({ entityPath, nextValue }: StagedEntry): boolean {
 }
 
 function dependsOnDraft(disk: UserConfig, drafts: StagedEntry[], entries: StagedEntry[]): boolean {
-  return drafts.some(({ entityPath }) => {
+  return drafts.some(({ entityPath, nextValue: draftValue }) => {
     const [field, id] = entityPath;
     const newEntity = id !== undefined && isAbsentSnapshot(entitySnapshot(disk, entityPath));
-    return entries.some(({ entityPath: submitted, nextValue, selectedServerFallback }) =>
-      (submitted[0] === field && (id === undefined || submitted[1] === undefined || submitted[1] === id))
-      || (newEntity && (selectedServerFallback === id || refersTo(nextValue, id))));
+    const profileDraft = field === 'networkProfiles' && id === undefined && Array.isArray(draftValue);
+    return entries.some(({ entityPath: submitted, nextValue, selectedServerFallback }) => {
+      if (submitted[0] === field && (id === undefined || submitted[1] === undefined || submitted[1] === id)) return true;
+      if (newEntity && (selectedServerFallback === id || refersTo(nextValue, id))) return true;
+      if (!profileDraft || !nextValue || typeof nextValue !== 'object' || !('networkProfileId' in nextValue)) return false;
+      const { networkProfileId } = nextValue;
+      return typeof networkProfileId === 'string'
+        && draftValue.some((profile) => profile?.id === networkProfileId)
+        && !disk.networkProfiles?.some(({ id }) => id === networkProfileId);
+    });
   });
 }
 

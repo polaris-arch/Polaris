@@ -507,7 +507,7 @@ describe('edit admission before creating a manual draft', () => {
     expect(saveMock.mock.calls[0][0]).toMatchObject({ servers: [next.nextValue] });
   });
 
-  it('keeps a dependency on an unsaved node out of its existing draft', async () => {
+  it('keeps rules that depend on unsaved resources out of the native candidate', async () => {
     const store = useStagedConfigStore;
     await hydrateStagedConfig(CONFIG);
     const node = entry('n2');
@@ -517,6 +517,19 @@ describe('edit admission before creating a manual draft', () => {
     expect(await store.getState().submit(rule)).toBe('ignored');
     expect(store.getState().entries).toEqual([node]);
     expect(saveMock).not.toHaveBeenCalled();
+
+      store.getState().revert(node.id);
+      const profiles = {
+        id: 'setting:networkProfiles', kind: 'setting', label: 'new network profile',
+        entityPath: ['networkProfiles'],
+        nextValue: [{ id: 'profile1', name: 'Office', dnsServerCidrs: ['192.0.2.0/24'] }],
+      } as const;
+      store.getState().stage(profiles);
+      expect(await store.getState().submit({
+        ...rule, nextValue: { id: '1', networkProfileId: 'profile1' },
+      })).toBe('ignored');
+      expect(store.getState().entries).toEqual([profiles]);
+      expect(saveMock).not.toHaveBeenCalled();
   });
 
   it('keeps an unclassified edit separate from earlier saved changes awaiting apply', async () => {
