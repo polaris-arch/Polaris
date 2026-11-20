@@ -921,7 +921,7 @@ pub(crate) async fn apply_takeover_edit(
         Ok(prepared) => prepared,
         Err(error) => return config_store_error(error),
     };
-    let proxy = state.proxy();
+    let proxy = &state.proxy;
     let owner = StagedSaveOwner::capture(proxy, edit.revision);
     let changed = edit.previous != edit.candidate;
     let store_error = |error| {
