@@ -229,10 +229,15 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS==='1')('five real mounted Auto 
    await takeover.getByRole('button', { name: '系统', exact: true }).click();
    await expect.poll(readTakeover).toEqual({ mode: 'systemProxy', preview: [], dialog: null,
     requests: [{ mode: 'systemProxy', hotOnly: true }] });
+   await expect.poll(async () => (await state(page)).messages).toContainEqual(['success', '已保存 · 系统']);
+   expect((await state(page)).config.proxyModeType).toBe('manual');
+   await takeover.getByRole('button', { name: '本地', exact: true }).click();
+   const reversed = [{ mode: 'systemProxy', hotOnly: true }, { mode: 'manual', hotOnly: true }];
+   await expect.poll(readTakeover).toEqual({ mode: 'manual', preview: [], dialog: null, requests: reversed });
    await page.evaluate(() => { (window as any).__actions.takeoverNeedsManual = true; });
    await takeover.getByRole('button', { name: 'TUN', exact: true }).click();
-   await expect.poll(readTakeover).toEqual({ mode: 'systemProxy', preview: ['tun'], dialog: 'confirm',
-    requests: [{ mode: 'systemProxy', hotOnly: true }, { mode: 'tun', hotOnly: true }] });
+   await expect.poll(readTakeover).toEqual({ mode: 'manual', preview: ['tun'], dialog: 'confirm',
+    requests: [...reversed, { mode: 'tun', hotOnly: true }] });
   } finally {
    await page.close();
   }

@@ -286,7 +286,11 @@ export function HomeScreen() {
   /** 本次解锁快照是否由用户点「网络检测」触发（喂 onUpdated 里的完成 toast，见 onUnlockRefresh）。 */
   const unlockUserRequested = useRef(false);
   const unlockRequestLifetime = useRef(0);
-  useEffect(() => () => { unlockRequestLifetime.current += 1; }, []);
+  const takeoverPreviewRequest = useRef(0);
+  useEffect(() => () => {
+    unlockRequestLifetime.current += 1;
+    takeoverPreviewRequest.current += 1;
+  }, []);
   /** 当前出口显示名。走 ref 而非直接读闭包：解锁事件订阅 effect 不该因换节点重挂（重挂会丢事件），
    *  但完成 toast 又要报出「经哪个出口」——ref 让订阅保持长命的同时读到最新名字。 */
   const exitNameRef = useRef('');
@@ -832,8 +836,6 @@ export function HomeScreen() {
   }, [onSpeedTest, onUnlockRefresh]);
 
   /* 接管模式及 FakeIP-TUN 修正在后端最新配置事务内一次完成。 */
-  const takeoverPreviewRequest = useRef(0);
-  const takeoverInFlight = useRef(false);
   const applyIntercept = useCallback(
     async (v: InterceptKind, request: number, expectedOwner?: TakeoverApplyOwner) => {
       if (!diskConfig) return;
@@ -880,9 +882,8 @@ export function HomeScreen() {
   /* 运行中先尝试热应用。需要手动应用时才获取确认令牌。 */
   const onInterceptChange = useCallback(
     async (v: InterceptKind) => {
-      if (!config || (v === config.proxyModeType && !takeoverInFlight.current)) return;
+      if (!config) return;
       const request = ++takeoverPreviewRequest.current;
-      takeoverInFlight.current = true;
       try {
         const status = await applyIntercept(v, request);
         if (status !== 'needsManual' || request !== takeoverPreviewRequest.current) return;
@@ -907,8 +908,6 @@ export function HomeScreen() {
         console.error('[home] preview intercept failed:', error);
         toast.error(t(error instanceof IpcError && error.code === 'CONFIG_TAKEOVER_CONFLICT'
           ? 'home.pendingHotConflict' : 'settings.proxyMode.failUpdate'));
-      } finally {
-        if (request === takeoverPreviewRequest.current) takeoverInFlight.current = false;
       }
     },
     [config, applyIntercept, openDialog, closeDialog, t]
