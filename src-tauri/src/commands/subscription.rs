@@ -1058,12 +1058,18 @@ async fn perform_subscription_update_inner(
 
     // A built-in update publishes its file and metadata together. Keep that
     // publication outside the refresh's prepared edit and Core settlement.
-    let Ok(_resource_publication) = tokio::time::timeout_at(
+    let publication_wait_started = std::time::Instant::now();
+    let resource_publication = tokio::time::timeout_at(
         operation_deadline.into(),
         state.config().lock_builtin_rule_publication(),
     )
-    .await
-    else {
+    .await;
+    let publication_wait_ms = publication_wait_started.elapsed().as_millis();
+    let Ok(_resource_publication) = resource_publication else {
+        log::info!(
+            "subscription reconcile timing: outcome=publication_timeout initial_config_ms={initial_config_ms} fetch_pipeline_ms={fetch_pipeline_ms} publication_wait_ms={publication_wait_ms} total_ms={}",
+            update_started.elapsed().as_millis()
+        );
         return update_classified_failure(&operation_timeout_error());
     };
 
@@ -1084,7 +1090,7 @@ async fn perform_subscription_update_inner(
         }
         let transaction_ms = transaction_started.elapsed().as_millis();
         log::info!(
-            "subscription reconcile timing: outcome=not_modified initial_config_ms={initial_config_ms} fetch_pipeline_ms={fetch_pipeline_ms} config_transaction_ms={transaction_ms} reconcile_total_ms={} total_ms={}",
+            "subscription reconcile timing: outcome=not_modified initial_config_ms={initial_config_ms} fetch_pipeline_ms={fetch_pipeline_ms} publication_wait_ms={publication_wait_ms} config_transaction_ms={transaction_ms} reconcile_total_ms={} total_ms={}",
             apply_started.elapsed().as_millis(),
             update_started.elapsed().as_millis()
         );
@@ -1192,7 +1198,7 @@ async fn perform_subscription_update_inner(
             "unchanged"
         };
         log::info!(
-            "subscription reconcile timing: outcome={outcome} initial_config_ms={initial_config_ms} fetch_pipeline_ms={fetch_pipeline_ms} config_transaction_ms={transaction_ms} commit_ms={commit_ms} reconcile_total_ms={} total_ms={}",
+            "subscription reconcile timing: outcome={outcome} initial_config_ms={initial_config_ms} fetch_pipeline_ms={fetch_pipeline_ms} publication_wait_ms={publication_wait_ms} config_transaction_ms={transaction_ms} commit_ms={commit_ms} reconcile_total_ms={} total_ms={}",
             apply_started.elapsed().as_millis(),
             update_started.elapsed().as_millis()
         );
@@ -1209,7 +1215,7 @@ async fn perform_subscription_update_inner(
         receipt.as_ref(),
     );
     log::info!(
-        "subscription reconcile timing: outcome=changed initial_config_ms={initial_config_ms} fetch_pipeline_ms={fetch_pipeline_ms} config_transaction_ms={transaction_ms} commit_ms={commit_ms} reconcile_total_ms={} total_ms={}",
+        "subscription reconcile timing: outcome=changed initial_config_ms={initial_config_ms} fetch_pipeline_ms={fetch_pipeline_ms} publication_wait_ms={publication_wait_ms} config_transaction_ms={transaction_ms} commit_ms={commit_ms} reconcile_total_ms={} total_ms={}",
         apply_started.elapsed().as_millis(),
         update_started.elapsed().as_millis()
     );

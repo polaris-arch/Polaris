@@ -216,6 +216,10 @@ pub(super) async fn fetch_parse_resolve<L: DnsLookup>(
         sink.primary_fetched();
     }
     if fetched.not_modified {
+        log::info!(
+            "subscription pipeline timing: operation={operation} outcome=not_modified main_fetch_ms={main_fetch_ms} retries={retries_done} total_ms={}",
+            pipeline_started.elapsed().as_millis()
+        );
         return Ok(FetchOutcome {
             not_modified: true,
             etag: fetched.etag,
