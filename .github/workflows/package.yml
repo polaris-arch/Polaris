@@ -1037,6 +1037,10 @@ jobs:
         run: |
           & $env:CARGO build --locked --offline --release --target x86_64-pc-windows-msvc --target-dir target -p polaris-windows-cleaner --features packaging --bin polaris-package-custody
           if ($LASTEXITCODE -ne 0) { throw 'Windows packaging custody build failed' }
+          # Cargo may hard-link this output to release/deps; the producer holds a single-link executable.
+          $custody = Join-Path $PWD 'target/x86_64-pc-windows-msvc/release/polaris-package-custody.exe'
+          [IO.File]::Copy($custody, "$custody.copy")
+          [IO.File]::Move("$custody.copy", $custody, $true)
           node --test --test-concurrency=1 --test-name-pattern '^Windows package' scripts/local-development-selection.test.mjs
           if ($LASTEXITCODE -ne 0) { throw 'Windows package custody fixtures failed' }
           node scripts/windows-package-integrity.mjs prepare
