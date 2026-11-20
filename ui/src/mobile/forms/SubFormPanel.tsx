@@ -37,7 +37,7 @@ import {
 import { SUBSCRIPTION_ERROR_I18N_KEY } from '@/contracts/subscription-preview';
 import { subscriptionErrorDetail } from '@/domain/subscription-error-text';
 import { resolveSubscriptionViaProxy } from '@/domain/subscription-proxy';
-import { subAutoUpdateNoticeKey, subAutoUpdateNoticeMode, subEffectiveIntervalHours } from '@/domain/subscription-auto-update';
+import { subAutoUpdateNoticeKey, subAutoUpdateStatus, subEffectiveIntervalHours } from '@/domain/subscription-auto-update';
 import { useAppStore, useEffectiveConfig } from '@/store/app-store';
 import { toast } from '@/lib/error-handler';
 import {
@@ -113,9 +113,7 @@ export function SubFormPanel({
   const [ua, setUa] = useState(base?.userAgent ?? '');
   const uaInfo = useSubscriptionUserAgent(ua);
   const [autoUpdate, setAutoUpdate] = useState(base?.autoUpdate ?? false);
-  const autoUpdateNoticeKey = subAutoUpdateNoticeKey(
-    subAutoUpdateNoticeMode({ autoUpdate }, config, config?.restartOnNodeChange === true),
-  );
+  const autoUpdateNoticeKey = subAutoUpdateNoticeKey(subAutoUpdateStatus({ autoUpdate }, config));
   const [viaProxy, setViaProxy] = useState(base?.updateViaProxy ?? false);
   const [proxyBindInterface, setProxyBindInterface] = useState(base?.proxyBindInterface ?? '');
   const periodic = usePeriodicSpeedTestFields(base);

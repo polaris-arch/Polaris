@@ -35,43 +35,15 @@ export function subAutoUpdateStatus(
   return 'active';
 }
 
-/**
- * 订阅弹窗需要披露的“调度 × 应用策略”组合。名称描述用户可观察到的行为，不把实现细节
- * `restartOnNodeChange` 直接泄漏到组件分支里。
- */
-export type SubAutoUpdateNoticeMode =
-  | 'hidden'
-  | 'master-off'
-  | 'startup-auto-apply'
-  | 'startup-selective'
-  | 'scheduled-auto-apply'
-  | 'scheduled-selective';
-
-export function subAutoUpdateNoticeMode(
-  sub: { autoUpdate?: boolean },
-  config: SubAutoUpdateConfigLike | null | undefined,
-  applyAllNodeChanges: boolean,
-): SubAutoUpdateNoticeMode {
-  const status = subAutoUpdateStatus(sub, config);
-  if (status === 'manual') return 'hidden';
-  if (status === 'master-off') return 'master-off';
-  if (status === 'startup-only') {
-    return applyAllNodeChanges ? 'startup-auto-apply' : 'startup-selective';
-  }
-  return applyAllNodeChanges ? 'scheduled-auto-apply' : 'scheduled-selective';
-}
-
-/** Desktop and mobile explain the same schedule and apply policy using the existing copy. */
-export function subAutoUpdateNoticeKey(mode: SubAutoUpdateNoticeMode): string {
-  const keys: Record<SubAutoUpdateNoticeMode, string> = {
-    hidden: '',
+/** Desktop and mobile explain the same refresh schedule. */
+export function subAutoUpdateNoticeKey(status: SubAutoUpdateStatus): string {
+  const keys: Record<SubAutoUpdateStatus, string> = {
+    manual: '',
     'master-off': 'sub.autoUpdateNoticeMasterOff',
-    'startup-auto-apply': 'sub.autoUpdateNoticeStartupAutoApply',
-    'startup-selective': 'sub.autoUpdateNoticeStartupSelective',
-    'scheduled-auto-apply': 'sub.autoUpdateNoticeScheduledAutoApply',
-    'scheduled-selective': 'sub.autoUpdateNoticeScheduledSelective',
+    'startup-only': 'sub.autoUpdateNoticeStartup',
+    active: 'sub.autoUpdateNoticeScheduled',
   };
-  return keys[mode];
+  return keys[status];
 }
 
 /**

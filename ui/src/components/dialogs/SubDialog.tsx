@@ -47,8 +47,8 @@ import { InfoIcon } from '@/components/InfoIcon';
 import { Csel, type CselOption } from './Csel';
 import { buildNetworkInterfaceChoices, useNetworkInterfaces } from '@/hooks/use-network-interfaces';
 import {
-  subAutoUpdateNoticeMode,
   subAutoUpdateNoticeKey,
+  subAutoUpdateStatus,
   subEffectiveIntervalHours,
 } from '@/domain/subscription-auto-update';
 
@@ -81,7 +81,6 @@ function SubForm({ instanceId, base, focus, onAdded }: SubFormProps) {
   const proxyPolicy = useEffectiveConfig((c) => c?.subscriptionProxyPolicy) ?? 'follow';
   const autoUpdateMaster = useEffectiveConfig((c) => c?.autoUpdateSubscriptionOnStart);
   const autoUpdateInterval = useEffectiveConfig((c) => c?.subscriptionUpdateIntervalHours);
-  const restartOnNodeChange = useEffectiveConfig((c) => c?.restartOnNodeChange) === true;
   // 全局策略 proxy/direct 时强制覆盖 per-sub → 本弹窗「经代理更新」开关置灰、只显示被覆盖后的实际值。
   const proxyOverridden = proxyPolicy !== 'follow';
 
@@ -118,19 +117,12 @@ function SubForm({ instanceId, base, focus, onAdded }: SubFormProps) {
   const [submitting, setSubmitting] = useState(false);
   const [previewing, setPreviewing] = useState(false);
 
-  const autoUpdateMode = subAutoUpdateNoticeMode(
-    { autoUpdate },
-    {
-      autoUpdateSubscriptionOnStart: autoUpdateMaster,
-      subscriptionUpdateIntervalHours: autoUpdateInterval,
-    },
-    restartOnNodeChange,
-  );
-  const intervalHours = subEffectiveIntervalHours({
+  const autoUpdateConfig = {
     autoUpdateSubscriptionOnStart: autoUpdateMaster,
     subscriptionUpdateIntervalHours: autoUpdateInterval,
-  });
-  const autoUpdateNoticeKey = subAutoUpdateNoticeKey(autoUpdateMode);
+  };
+  const intervalHours = subEffectiveIntervalHours(autoUpdateConfig);
+  const autoUpdateNoticeKey = subAutoUpdateNoticeKey(subAutoUpdateStatus({ autoUpdate }, autoUpdateConfig));
   const autoUpdateNotice = autoUpdateNoticeKey === '' ? '' : t(autoUpdateNoticeKey, { h: intervalHours });
 
   // 周期的取值范围由后端给出；还没拿到时不显示范围。

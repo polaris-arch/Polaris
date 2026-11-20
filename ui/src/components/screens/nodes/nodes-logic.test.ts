@@ -20,7 +20,7 @@ import {
 } from './nodes-logic';
 import {
   subAutoUpdateStatus,
-  subAutoUpdateNoticeMode,
+  subAutoUpdateNoticeKey,
   subEffectiveIntervalHours,
   SUB_DEFAULT_INTERVAL_HOURS,
 } from '@/domain/subscription-auto-update';
@@ -40,6 +40,7 @@ describe('subAutoUpdateStatus —— per-sub 开关开 ≠ 真会周期刷新', 
     expect(subAutoUpdateStatus({}, { autoUpdateSubscriptionOnStart: true })).toBe('manual');
     // 缺省（老配置无该键）也算关：后端 `!= Some(true)` 严格真才跑。
     expect(subAutoUpdateStatus({ autoUpdate: undefined }, {})).toBe('manual');
+    expect(subAutoUpdateNoticeKey('manual')).toBe('');
   });
 
   it('per-sub 开但总开关关 → master-off（旧代码会显绿点说在自动刷新）', () => {
@@ -47,6 +48,7 @@ describe('subAutoUpdateStatus —— per-sub 开关开 ≠ 真会周期刷新', 
     // 总开关缺省 = 关（后端 `!= Some(true)`）——若这里写成 `!== false` 会误判成 active。
     expect(subAutoUpdateStatus(on, {})).toBe('master-off');
     expect(subAutoUpdateStatus(on, null)).toBe('master-off');
+    expect(subAutoUpdateNoticeKey('master-off')).toBe('sub.autoUpdateNoticeMasterOff');
   });
 
   it('间隔 0（仅手动）→ startup-only：周期腿不跑，但启动补更腿仍会跑', () => {
@@ -56,6 +58,7 @@ describe('subAutoUpdateStatus —— per-sub 开关开 ≠ 真会周期刷新', 
         subscriptionUpdateIntervalHours: 0,
       }),
     ).toBe('startup-only');
+    expect(subAutoUpdateNoticeKey('startup-only')).toBe('sub.autoUpdateNoticeStartup');
   });
 
   it('三门全通 → active（唯一给绿点的态）', () => {
@@ -67,6 +70,7 @@ describe('subAutoUpdateStatus —— per-sub 开关开 ≠ 真会周期刷新', 
     ).toBe('active');
     // 间隔缺省 → 后端回落 12h，照跑。
     expect(subAutoUpdateStatus(on, { autoUpdateSubscriptionOnStart: true })).toBe('active');
+    expect(subAutoUpdateNoticeKey('active')).toBe('sub.autoUpdateNoticeScheduled');
   });
 });
 
@@ -82,42 +86,6 @@ describe('subEffectiveIntervalHours —— 徽标不再写死 12h', () => {
     expect(subEffectiveIntervalHours({ subscriptionUpdateIntervalHours: Number.NaN })).toBe(12);
     // 0 = 「仅手动」：不参与徽标数字（状态已是 startup-only），回落值只是兜底不炸。
     expect(subEffectiveIntervalHours({ subscriptionUpdateIntervalHours: 0 })).toBe(12);
-  });
-});
-
-describe('subAutoUpdateNoticeMode —— 调度与节点应用策略组合披露', () => {
-  it('订阅开关关闭时不显示说明；总开关关闭时明确未生效', () => {
-    expect(subAutoUpdateNoticeMode({ autoUpdate: false }, {}, false)).toBe('hidden');
-    expect(
-      subAutoUpdateNoticeMode(
-        { autoUpdate: true },
-        { autoUpdateSubscriptionOnStart: false },
-        true,
-      ),
-    ).toBe('master-off');
-  });
-
-  it('启动补更与周期刷新分别保留自动应用/选择性应用语义', () => {
-    const startup = {
-      autoUpdateSubscriptionOnStart: true,
-      subscriptionUpdateIntervalHours: 0,
-    };
-    const scheduled = {
-      autoUpdateSubscriptionOnStart: true,
-      subscriptionUpdateIntervalHours: 12,
-    };
-    expect(subAutoUpdateNoticeMode({ autoUpdate: true }, startup, true)).toBe(
-      'startup-auto-apply',
-    );
-    expect(subAutoUpdateNoticeMode({ autoUpdate: true }, startup, false)).toBe(
-      'startup-selective',
-    );
-    expect(subAutoUpdateNoticeMode({ autoUpdate: true }, scheduled, true)).toBe(
-      'scheduled-auto-apply',
-    );
-    expect(subAutoUpdateNoticeMode({ autoUpdate: true }, scheduled, false)).toBe(
-      'scheduled-selective',
-    );
   });
 });
 

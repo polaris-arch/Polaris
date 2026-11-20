@@ -136,12 +136,12 @@ describe('subscription interface field', () => {
     expect(render(sub({ autoUpdate: false }))).not.toContain('m-form-auto-update-notice');
   });
 
-  it.each([false, true])('scheduled notice shows the actual interval and apply policy (auto-apply=%s)', (apply) => {
+  it.each([0, 6])('auto update explains the schedule and apply behavior at interval %s', (hours) => {
     const html = render(sub({ autoUpdate: true }), {
-      autoUpdateSubscriptionOnStart: true, subscriptionUpdateIntervalHours: 6, restartOnNodeChange: apply,
+      autoUpdateSubscriptionOnStart: true, subscriptionUpdateIntervalHours: hours, restartOnNodeChange: true,
     });
-    const key = apply ? 'sub.autoUpdateNoticeScheduledAutoApply' : 'sub.autoUpdateNoticeScheduledSelective';
-    expect(html).toContain(tx(key, { h: 6 }));
+    const key = hours === 0 ? 'sub.autoUpdateNoticeStartup' : 'sub.autoUpdateNoticeScheduled';
+    expect(html).toContain(tx(key, { h: hours }));
     expect(html).not.toContain(tx('sub.autoUpdateNoticeMasterOff'));
   });
 
