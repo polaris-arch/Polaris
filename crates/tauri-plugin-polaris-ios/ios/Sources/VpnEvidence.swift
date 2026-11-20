@@ -44,8 +44,10 @@ func vpnObservationMessage(identity: [String: Any], nonce: String, expectedGener
     return message
 }
 
+let vpnForegroundRequired = "ForegroundRequired: Return to the foreground and explicitly retry the connection."
+
 func vpnForegroundFailure(appActive: Bool, foregroundScene: Bool) -> String? {
-    appActive && foregroundScene ? nil : "ForegroundRequired: Return to the foreground and explicitly retry the connection."
+    appActive && foregroundScene ? nil : vpnForegroundRequired
 }
 
 final class VpnStartIntent {
@@ -80,6 +82,14 @@ func vpnIdentityMatches(_ expected: [String: Any], _ actual: [String: Any]?) -> 
         guard let value = expected[key] as? String, !value.isEmpty else { return false }
         return actual[key] as? String == value
     }
+}
+
+func vpnProfileWasNeverSubmitted(preference: [String: Any]?, identity: [String: Any], report: [String: Any]?) -> Bool {
+    guard let preference, preference["pending"] as? Bool == false,
+          preference["requestID"] as? String == identity["requestID"] as? String,
+          let unsubmitted = preference["unsubmittedIdentity"] as? [String: Any],
+          vpnIdentityMatches(unsubmitted, identity) else { return false }
+    return !vpnIdentityMatches(unsubmitted, report?["identity"] as? [String: Any])
 }
 
 /// A live message is ordinary readiness only; cleanup evidence stays unknown.
@@ -196,6 +206,31 @@ func vpnStartFailure(_ error: Error, stage: String) -> String {
 func vpnIdleFailure(evidence: [String: Any], profileExists: Bool, active: Bool) -> String? {
     guard !active else { return nil }
     return vpnStopFailure(evidence: evidence, profileExists: profileExists)
+}
+
+/// The OS reported provider death. Only an exact original run with an empty
+/// directory and auth inventory may reuse its profile without a Go stop receipt.
+/// This grants no retirement or journal-deletion authority.
+func vpnMayReuseProfileAfterProviderExit(identity: [String: Any], report: [String: Any]) -> Bool {
+    guard vpnIdentityMatches(identity, report["identity"] as? [String: Any]),
+          let digest = identity["configDigest"] as? String,
+          report["lifecycle"] as? String == "running",
+          report["runtimeStopped"] as? Bool == false,
+          report["generation"] as? Int == 1,
+          report["operationRequestID"] as? String == identity["requestID"] as? String,
+          report["stopSourceGeneration"] == nil,
+          report["uncertainSettingsGeneration"] == nil,
+          report["cleanupError"] == nil, report["lastError"] == nil,
+          let auth = vpnTailscaleStoreExport(report: report, configDigest: digest, terminal: false),
+          let directory = vpnTailscaleDirectoryExport(raw: report["tailscaleDirectoryScope"] as? String,
+                                                      configDigest: digest, terminal: false),
+          let authRuns = auth["instances"] as? [[String: Any]], authRuns.count == 1,
+          let directoryRuns = directory["instances"] as? [[String: Any]], directoryRuns.count == 1,
+          let authRun = authRuns.first, let directoryRun = directoryRuns.first,
+          authRun["runNonce"] as? String == directoryRun["runNonce"] as? String,
+          (authRun["nodes"] as? [[String: Any]])?.isEmpty == true,
+          (directoryRun["nodes"] as? [[String: Any]])?.isEmpty == true else { return false }
+    return true
 }
 
 func vpnStopFailure(evidence: [String: Any], profileExists: Bool) -> String? {

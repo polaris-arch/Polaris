@@ -347,7 +347,12 @@ pub(crate) fn probe_main_window_visible(app: &AppHandle) -> Result<bool, String>
         }
         return Ok(true);
     }
-    #[cfg(not(target_os = "android"))]
+    #[cfg(target_os = "ios")]
+    {
+        // UIKit windows can be hidden. They have no desktop minimized state.
+        w.is_visible().map_err(|e| format!("is_visible: {e}"))
+    }
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
         if !w.is_visible().map_err(|e| format!("is_visible: {e}"))? {
             return Ok(false);

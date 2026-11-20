@@ -280,6 +280,7 @@ export const IPC_CHANNELS = {
   // 覆盖全部路径。上面两条**保留不动**（后端的订阅调度器仍听它们：订阅补更会真联网，
   // 收口过去等于每次内部重启都多跑一遍）。
   EVENT_PROXY_LIFECYCLE: 'event:proxyLifecycle',
+  EVENT_IOS_VPN_DISCONNECTED: 'event:iosVpnDisconnected',
   // 无载荷：payload 恒为 {}，本文件三个订阅方（App.tsx / TrayMenu.tsx / use-config.ts）全部丢弃，
   // 详见后端 commands/config.rs::broadcast_config_changed_with 与其调用点守卫。
   EVENT_CONFIG_CHANGED: 'event:configChanged',

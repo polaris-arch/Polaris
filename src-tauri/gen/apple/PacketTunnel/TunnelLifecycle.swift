@@ -174,7 +174,8 @@ final class TunnelLifecycle {
     }
 
     @discardableResult
-    func complete(_ token: UInt64, phase: String, stopped: Bool?, error: String? = nil, cleanup: String? = nil) -> Bool {
+    func complete(_ token: UInt64, phase: String, stopped: Bool?, error: String? = nil,
+                  cleanup: String? = nil, beforeObservation: (() -> Void)? = nil) -> Bool {
         lock.lock()
         guard generation == token else { lock.unlock(); return false }
         // The acceptance check and ready publication are atomic with Stop/timeout.
@@ -190,6 +191,7 @@ final class TunnelLifecycle {
         if pending != nil { stopObservation = nil }
         let observed = pending.map { TunnelObservation(observationNonce: $0.nonce, report: reportLocked()) }
         lock.unlock()
+        beforeObservation?()
         if let pending, let observed { pending.callback(observed) }
         return true
     }

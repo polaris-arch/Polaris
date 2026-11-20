@@ -146,6 +146,7 @@ vi.mock('@/ipc', async () => ({
       onStopped: channel<void>('stopped'),
       onAndroidStatusChangedReady: (listener: () => void) => registerAndroidStatusMock(listener),
       onLifecycle: channel<{ phase: string }>('lifecycle'),
+      onIosVpnDisconnected: channel<void>('iosVpnDisconnected'),
       onLifecycleReady: async (fn: () => void) => channel('lifecycle')(fn),
       onStartedReady: async (fn: () => void) => channel('started')(fn),
       onStoppedReady: async (fn: () => void) => channel('stopped')(fn),

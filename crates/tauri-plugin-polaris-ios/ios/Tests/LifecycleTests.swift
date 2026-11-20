@@ -279,6 +279,31 @@ struct LifecycleTests {
     }
 
     static func main() throws {
+        let exitDigest = String(repeating: "d", count: 64)
+        let exitIdentity: [String: Any] = ["sessionID": "exit-session", "requestID": "original-start", "configDigest": exitDigest]
+        var exitRun: [String: Any] = ["runNonce": String(repeating: "1", count: 64), "configDigest": exitDigest,
+                                      "terminal": "Unknown", "censusComplete": true, "nodes": [[String: Any]]()]
+        func exitExport(_ contract: String, _ run: [String: Any]) throws -> String {
+            String(decoding: try JSONSerialization.data(withJSONObject: [
+                "contractVersion": contract, "globalCleanupEvidence": "CleanupUnknown", "instances": [run]
+            ]), as: UTF8.self)
+        }
+        let emptyDirectoryExport = try exitExport("polaris-ts-directory-retirement-v1", exitRun)
+        exitRun["censusComplete"] = false // A live auth inventory is not a terminal writer receipt.
+        let emptyAuthExport = try exitExport("polaris-ts-auth-writer-retirement-v1", exitRun)
+        var exited: [String: Any] = ["identity": exitIdentity, "lifecycle": "running", "runtimeStopped": false,
+                                    "generation": 1, "operationRequestID": "original-start",
+                                    "tailscaleStoreScope": emptyAuthExport, "tailscaleDirectoryScope": emptyDirectoryExport]
+        assert(vpnMayReuseProfileAfterProviderExit(identity: exitIdentity, report: exited))
+        assert(!vpnIdempotentStopIsConfirmed(evidence: exited, expectedGeneration: nil))
+        exited["operationRequestID"] = "reload"
+        assert(!vpnMayReuseProfileAfterProviderExit(identity: exitIdentity, report: exited))
+        exited["operationRequestID"] = "original-start"
+        exited["uncertainSettingsGeneration"] = 1
+        assert(!vpnMayReuseProfileAfterProviderExit(identity: exitIdentity, report: exited))
+        exited.removeValue(forKey: "uncertainSettingsGeneration")
+        exited.removeValue(forKey: "tailscaleDirectoryScope")
+        assert(!vpnMayReuseProfileAfterProviderExit(identity: exitIdentity, report: exited))
         let executable = URL(fileURLWithPath: "/app/PlugIns/PacketTunnel.appex/PacketTunnel")
         assert(tlsCapabilityImageMatches(executable.path, executable: executable))
         assert(!tlsCapabilityImageMatches("/other/PacketTunnel", executable: executable))
@@ -578,6 +603,20 @@ struct LifecycleTests {
         assert(vpnForegroundFailure(appActive: true, foregroundScene: true) == nil)
         assert(vpnForegroundFailure(appActive: false, foregroundScene: true)?.hasPrefix("ForegroundRequired:") == true)
         assert(vpnForegroundFailure(appActive: true, foregroundScene: false)?.hasPrefix("ForegroundRequired:") == true)
+        // Permission may save a profile while UIKit is inactive. Only a reconciled
+        // write of this exact profile, with no attempted submission, permits retry.
+        let savedUnsubmitted: [String: Any] = [
+            "requestID": profile["requestID"]!, "pending": false, "unsubmittedIdentity": profile,
+        ]
+        assert(vpnProfileWasNeverSubmitted(preference: savedUnsubmitted, identity: profile, report: nil))
+        assert(!vpnProfileWasNeverSubmitted(preference: savedUnsubmitted, identity: replaced, report: nil))
+        assert(!vpnProfileWasNeverSubmitted(preference: savedUnsubmitted, identity: profile, report: ["identity": profile]))
+        var pendingUnsubmitted = savedUnsubmitted
+        pendingUnsubmitted["pending"] = true
+        assert(!vpnProfileWasNeverSubmitted(preference: pendingUnsubmitted, identity: profile, report: nil))
+        var submitted = savedUnsubmitted
+        submitted.removeValue(forKey: "unsubmittedIdentity")
+        assert(!vpnProfileWasNeverSubmitted(preference: submitted, identity: profile, report: nil))
         let denied = NSError(domain: NSPOSIXErrorDomain, code: 1)
         assert(vpnStartFailure(denied, stage: "save").hasPrefix("PermissionDenied:"))
         let cancelledPermit = NSError(domain: NSCocoaErrorDomain, code: NSUserCancelledError)

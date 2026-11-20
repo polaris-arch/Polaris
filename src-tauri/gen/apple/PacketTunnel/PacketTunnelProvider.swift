@@ -118,9 +118,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
         worker.async {
             let cleanup = self.closeCore()
-            self.lifecycle.complete(token, phase: "stopped", stopped: true, cleanup: cleanup)
-            // Publish before NE tells the host that the system tunnel is disconnected.
-            self.publishReport()
+            // Persist before either the IPC observer or NE can see the Stop complete.
+            self.lifecycle.complete(token, phase: "stopped", stopped: true, cleanup: cleanup,
+                                    beforeObservation: { self.publishReport() })
             completion.finish(())
         }
     }

@@ -44,6 +44,7 @@ vi.mock('@/ipc', () => {
       onStarted: noop,
       onStopped: noop,
       onLifecycle: noop,
+      onIosVpnDisconnected: noop,
       onLifecycleReady: async () => noop(),
       onStartedReady: async () => noop(),
       onStoppedReady: async () => noop(),
