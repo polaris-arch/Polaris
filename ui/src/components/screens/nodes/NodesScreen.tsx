@@ -192,7 +192,7 @@ export function NodesScreen() {
   const serverPageAction = useAppStore((s) => s.serverPageAction);
   const setServerPageAction = useAppStore((s) => s.setServerPageAction);
   useEffect(() => {
-    if (!serverPageAction) return;
+    if (!serverPageAction || useAppStore.getState().serverPageAction !== serverPageAction) return;
     setServerPageAction(null);
     openDialog(serverPageAction === 'add-server' ? { kind: 'node' } : { kind: 'sub' });
   }, [serverPageAction, setServerPageAction, openDialog]);
