@@ -805,25 +805,30 @@ fn config_edit_with_revision(
     reason = "Tauri IPC command owns its deserialized payload across the call"
 )]
 #[tauri::command]
-pub fn config_patch(
+pub async fn config_patch(
     app: AppHandle,
     state: State<'_, AppRuntime>,
     patch: Value,
-) -> ApiResponse<Value> {
+) -> Result<ApiResponse<Value>, ()> {
     let Some(patch) = patch.as_object().cloned() else {
-        return ApiResponse::err(crate::i18n::t(
+        return Ok(ApiResponse::err(crate::i18n::t(
             crate::i18n::app_lang(&app),
             crate::i18n::key::NATIVE_UNKNOWN_ERROR,
-        ));
+        )));
     };
     let mut previous = Value::Null;
     let capture_previous = patch.keys().any(|key| is_app_patch_key(key));
+    let _serial = if capture_previous && patch.keys().all(|key| is_app_patch_key(key)) {
+        Some(state.proxy().lock_app_config_patch().await)
+    } else {
+        None
+    };
     let result = config_patch_with_previous(
         state.config(),
         patch,
         capture_previous.then_some(&mut previous),
     );
-    config_edit_response_with(&app, &state, result, |saved| {
+    Ok(config_edit_response_with(&app, &state, result, |saved| {
         if app_only_config_patch(&previous, saved) {
             emit_config_changed_signal(&app);
             let proxy = state.proxy.clone();
@@ -838,7 +843,7 @@ pub fn config_patch(
         } else {
             broadcast_config_changed(&app, saved);
         }
-    })
+    }))
 }
 
 pub(crate) fn config_takeover(

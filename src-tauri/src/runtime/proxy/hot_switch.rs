@@ -1308,10 +1308,15 @@ impl ProxyRuntime {
         }
     }
 
+    /// Keep App-only patches from replacing the saved revision during a live commit.
+    pub(crate) async fn lock_app_config_patch(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.switch_serial.lock().await
+    }
+
     /// App-only writes refresh process projections in publication order without
     /// acquiring a selector intent or offering any persisted graph to the Core.
     pub(crate) async fn project_latest_saved_config(&self, on_current: impl FnOnce(&Value) + Send) {
-        let _serial = self.switch_serial.lock().await;
+        let _serial = self.lock_app_config_patch().await;
         if let Ok(current) = self.config.current() {
             on_current(&current);
         }
