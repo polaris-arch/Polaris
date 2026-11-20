@@ -17,6 +17,10 @@ async fn not_ready_client_returns_not_ready_for_all_methods() {
         api.first_connection_snapshot().await,
         Err(ManagementError::NotReady)
     ));
+    assert!(matches!(
+        api.selector_connection_snapshot().await,
+        Err(ManagementError::NotReady)
+    ));
 }
 
 /// 读侧同样必须 NotReady 而**不是空快照**：空快照 = 「核确实没有 group」，NotReady = 「没读到」。

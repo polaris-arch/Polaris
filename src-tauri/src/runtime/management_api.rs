@@ -195,7 +195,7 @@ pub async fn close_live_connections(
     use futures::StreamExt;
 
     let snapshot = api.first_connection_snapshot().await?;
-    // 与 `select_connections_to_close` 共用活连接判据，兼容返回历史记录的实现。
+    // 快照首帧含历史环死连接（closed_at > 0），与 `select_connections_to_close` 同一判据。
     // 先取 owned id 再进 stream：借用快照元素的闭包会让外层 future 撞上高阶生命周期推断
     // （tokio::spawn / tauri::command 要求 Send 时报「FnOnce is not general enough」）。
     let ids: Vec<String> = snapshot
@@ -279,6 +279,36 @@ impl ManagementApi for GrpcManagementApi {
     }
 
     fn first_connection_snapshot<'a, 'async_trait>(
+        &'a self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Vec<ConnectionSnapshot>, ManagementError>>
+                + Send
+                + 'async_trait,
+        >,
+    >
+    where
+        'a: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            let conns = self
+                .client()?
+                .first_connection_snapshot()
+                .await
+                .map_err(map_err)?;
+            Ok(conns
+                .into_iter()
+                .map(|c| ConnectionSnapshot {
+                    id: c.id,
+                    chains: c.chain_list,
+                    closed_at: c.closed_at,
+                })
+                .collect())
+        })
+    }
+
+    fn selector_connection_snapshot<'a, 'async_trait>(
         &'a self,
     ) -> Pin<
         Box<

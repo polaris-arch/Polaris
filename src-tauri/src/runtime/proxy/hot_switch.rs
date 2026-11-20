@@ -320,6 +320,15 @@ struct GenerationManagementApi<'a> {
     intent_generation: u64,
 }
 
+impl GenerationManagementApi<'_> {
+    fn current_api(&self) -> Result<&dyn ManagementApi, ManagementError> {
+        self.runtime
+            .selector_operation_is_current(self.generation, self.intent_generation)
+            .then_some(self.api)
+            .ok_or(ManagementError::NotReady)
+    }
+}
+
 #[async_trait::async_trait]
 impl ManagementApi for GenerationManagementApi<'_> {
     async fn select_outbound(
@@ -327,33 +336,23 @@ impl ManagementApi for GenerationManagementApi<'_> {
         selector_tag: &str,
         member_tag: &str,
     ) -> Result<(), ManagementError> {
-        if !self
-            .runtime
-            .selector_operation_is_current(self.generation, self.intent_generation)
-        {
-            return Err(ManagementError::NotReady);
-        }
-        self.api.select_outbound(selector_tag, member_tag).await
+        self.current_api()?
+            .select_outbound(selector_tag, member_tag)
+            .await
     }
 
     async fn close_connection(&self, id: &str) -> Result<(), ManagementError> {
-        if !self
-            .runtime
-            .selector_operation_is_current(self.generation, self.intent_generation)
-        {
-            return Err(ManagementError::NotReady);
-        }
-        self.api.close_connection(id).await
+        self.current_api()?.close_connection(id).await
     }
 
     async fn first_connection_snapshot(&self) -> Result<Vec<ConnectionSnapshot>, ManagementError> {
-        if !self
-            .runtime
-            .selector_operation_is_current(self.generation, self.intent_generation)
-        {
-            return Err(ManagementError::NotReady);
-        }
-        self.api.first_connection_snapshot().await
+        self.current_api()?.first_connection_snapshot().await
+    }
+
+    async fn selector_connection_snapshot(
+        &self,
+    ) -> Result<Vec<ConnectionSnapshot>, ManagementError> {
+        self.current_api()?.selector_connection_snapshot().await
     }
 }
 
@@ -374,7 +373,7 @@ impl PendingLogicalExitDisconnect {
             Some(if pairs.is_empty() {
                 PrecisionDisconnectOutcome::default()
             } else {
-                match api.first_connection_snapshot().await {
+                match api.selector_connection_snapshot().await {
                     Ok(snapshot) => select_connections_to_close(&snapshot, &pairs),
                     Err(error) => PrecisionDisconnectOutcome {
                         snapshot_error: Some(error.to_string()),

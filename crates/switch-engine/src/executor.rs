@@ -63,12 +63,19 @@ pub trait ManagementApi: Send + Sync {
     /// 上游 `client.closeConnection(id)`。best-effort：失败仅记日志（不阻断断连流程）。
     async fn close_connection(&self, id: &str) -> Result<(), ManagementError>;
 
-    /// 取连接列表首帧快照（精准断连用）。
+    /// 取连接列表首帧快照，供逐条关闭活连接使用。
     ///
     /// 上游 `subscribeConnections(1_000_000_000, cb)` 的首帧（reset 帧 = 内核当前全量连接）。
     /// 带 3s 兜底超时（上游 `guard = setTimeout(..., 3000)`）：首帧不来时返回错误（跳过断连并报告，
     /// 宁可漏关不泄漏订阅）。返回当前全量连接快照（含已关闭的死连接历史环，由本层过滤）。
     async fn first_connection_snapshot(&self) -> Result<Vec<ConnectionSnapshot>, ManagementError>;
+
+    /// Read the IDs and outbound chains used by the selector disconnect policy.
+    async fn selector_connection_snapshot(
+        &self,
+    ) -> Result<Vec<ConnectionSnapshot>, ManagementError> {
+        self.first_connection_snapshot().await
+    }
 }
 
 /// 管理 API 错误（gRPC status / 超时 / 客户端未就绪）。
@@ -181,7 +188,7 @@ impl SwitchExecutor {
             return PrecisionDisconnectOutcome::default();
         }
         // 连接首帧（3s 兜底超时由 trait 实现负责）。超时 / 失败 → 显式错误结果（跳过断连，不阻断热切）。
-        let snapshot = match api.first_connection_snapshot().await {
+        let snapshot = match api.selector_connection_snapshot().await {
             Ok(s) => s,
             Err(error) => {
                 return PrecisionDisconnectOutcome {

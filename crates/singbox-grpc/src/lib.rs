@@ -534,7 +534,7 @@ impl SingBoxApiClient {
         .await
     }
 
-    /// Read the active connection IDs and chains before applying a selector change.
+    /// Read the active connection IDs and chains used by selector disconnects.
     pub async fn live_connection_snapshot(
         &self,
     ) -> Result<Vec<daemon::ConnectionSnapshotEntry>, ClientError> {
