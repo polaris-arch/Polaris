@@ -38,6 +38,19 @@ impl Drop for ReconcileGuard<'_> {
     }
 }
 
+pub(super) fn selected_tailscale_exit(raw: &Value) -> Option<&str> {
+    let selected = raw
+        .get("selectedServerId")?
+        .as_str()
+        .filter(|id| !id.is_empty())?;
+    let server = raw
+        .get("servers")?
+        .as_array()?
+        .iter()
+        .find(|server| server.get("id").and_then(Value::as_str) == Some(selected))?;
+    (server.get("protocol").and_then(Value::as_str) == Some("tailscale")).then_some(selected)
+}
+
 impl ProxyRuntime {
     // ════════════════ A4：组网登录期出口让位（零重启热切 selector 编排）════════════════
     //
@@ -86,25 +99,40 @@ impl ProxyRuntime {
         let Ok(guard) = self.current_config.read() else {
             return false;
         };
-        let Some(raw) = guard.as_ref() else {
+        guard.as_ref().and_then(selected_tailscale_exit).is_some()
+    }
+
+    pub(super) fn project_saved_login_fallback(&self, saved: &Value, server_id: &str) -> bool {
+        if saved.get("selectedServerId").and_then(Value::as_str) != Some(server_id) {
             return false;
-        };
-        let Some(selected) = raw
-            .get("selectedServerId")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
+        }
+        let Some(enabled) = saved
+            .get("meshLoginFallbackDirect")
+            .and_then(Value::as_bool)
         else {
             return false;
         };
-        raw.get("servers")
-            .and_then(Value::as_array)
-            .and_then(|servers| {
-                servers
-                    .iter()
-                    .find(|s| s.get("id").and_then(Value::as_str) == Some(selected))
-            })
-            .and_then(|s| s.get("protocol").and_then(Value::as_str))
-            == Some("tailscale")
+        let Ok(mut current) = self.current_config.write() else {
+            return false;
+        };
+        let Some(running) = current
+            .as_ref()
+            .filter(|raw| selected_tailscale_exit(raw) == Some(server_id))
+        else {
+            return false;
+        };
+        if running
+            .get("meshLoginFallbackDirect")
+            .and_then(Value::as_bool)
+            != Some(enabled)
+        {
+            // The policy remains authoritative across later unapplied saves.
+            // The engaged receipt changes only if the actual selector PUT succeeds.
+            let mut projected = running.clone();
+            projected["meshLoginFallbackDirect"] = Value::Bool(enabled);
+            self.coex.commit_config(&mut current, projected);
+        }
+        true
     }
 
     /// 内存态写：置/清 `(engaged, server_id)`。
@@ -228,9 +256,20 @@ impl ProxyRuntime {
         &self,
         switch_guard: &AsyncMutexGuard<'_, ()>,
     ) {
-        let generation = self.gate.generation();
-        let intent_generation = self.selector_reconcile.intent_generation();
+        self.reconcile_login_fallback_for_generation(
+            switch_guard,
+            self.gate.generation(),
+            self.selector_reconcile.intent_generation(),
+        )
+        .await;
+    }
 
+    pub(super) async fn reconcile_login_fallback_for_generation(
+        &self,
+        switch_guard: &AsyncMutexGuard<'_, ()>,
+        generation: u64,
+        intent_generation: u64,
+    ) {
         // ── 早退闸：本帧结构性不可能有任何可观测效果时，跳过下面两份整配置分配 ──
         //
         // 三态决策矩阵（`eligible` = 配置层符合让位形态，**蕴含**「选中出口是 TS 协议」；
@@ -277,6 +316,9 @@ impl ProxyRuntime {
         let Ok(config) = UserConfig::deserialize(&raw) else {
             return;
         };
+        if !self.selector_operation_is_current(generation, intent_generation) {
+            return;
+        }
         let sel_id = config.selected_server_id.clone().filter(|s| !s.is_empty());
         let eligible = sel_id.is_some() && self.login_fallback_eligible(&config, &raw);
         let backend_state = sel_id
@@ -336,8 +378,8 @@ impl ProxyRuntime {
                         return;
                     }
                 } else {
-                    // tag 缺失（罕见：核停/gate 剔除）→ 无法 PUT 回；清 flag 避免永卡，selector 由起核预置兜底。
-                    log::warn!("组网出口让位撤销：找不到出口 tag（{eid}），跳过 selector 切回");
+                    log::warn!("组网出口让位撤销待重试：找不到运行出口 tag（{eid}）");
+                    return;
                 }
                 let name = config
                     .servers

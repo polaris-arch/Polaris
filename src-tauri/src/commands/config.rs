@@ -816,16 +816,34 @@ pub async fn config_patch(
     };
     let mut previous = Value::Null;
     let capture_previous = patch.keys().any(|key| is_app_patch_key(key));
-    let _serial = if capture_previous && patch.keys().all(|key| is_app_patch_key(key)) {
-        Some(state.proxy().lock_app_config_patch().await)
+    let login_fallback_only = patch.len() == 1
+        && patch
+            .get("meshLoginFallbackDirect")
+            .is_some_and(Value::is_boolean);
+    let serial = if login_fallback_only
+        || (capture_previous && patch.keys().all(|key| is_app_patch_key(key)))
+    {
+        Some(state.proxy().lock_config_patch().await)
     } else {
         None
     };
+    let fallback_generation = login_fallback_only.then(|| state.proxy().core_generation());
     let result = config_patch_with_previous(
         state.config(),
         patch,
         capture_previous.then_some(&mut previous),
     );
+    if let Some(generation) = fallback_generation {
+        if let (Some(guard), Ok((_, saved, true))) = (&serial, &result) {
+            state
+                .proxy()
+                .apply_saved_login_fallback_patch(saved, generation, guard)
+                .await;
+        }
+        return Ok(config_edit_response_with(&app, &state, result, |_| {
+            emit_config_changed_signal(&app)
+        }));
+    }
     Ok(config_edit_response_with(&app, &state, result, |saved| {
         if app_only_config_patch(&previous, saved) {
             emit_config_changed_signal(&app);

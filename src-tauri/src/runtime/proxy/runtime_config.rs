@@ -29,6 +29,7 @@ use polaris_singbox_grpc::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::sync::MutexGuard as AsyncMutexGuard;
 use tokio::time::Instant;
 pub(crate) mod api_handoff;
 pub(crate) mod host_effects;
@@ -1951,6 +1952,40 @@ impl ProxyRuntime {
             state.impact = None;
         }
         result
+    }
+
+    /// Reconcile the live policy for the active TS exit without admitting the saved graph.
+    pub(crate) async fn apply_saved_login_fallback_patch(
+        &self,
+        saved: &Value,
+        generation: u64,
+        switch_guard: &AsyncMutexGuard<'_, ()>,
+    ) {
+        if let Some(selected) = saved.get("selectedServerId").and_then(Value::as_str) {
+            let owner = StagedSaveOwner {
+                generation,
+                ..StagedSaveOwner::capture(self, self.config.saved_revision())
+            };
+            let projected = self
+                .try_runtime_saved_commit(Some(owner), None, |latest| {
+                    if !self.saved_revision_matches(Some(owner.revision)) {
+                        return Err(RuntimeClaimError::Rejected);
+                    }
+                    self.with_runtime_candidate_claim(true, generation, owner.intent, || {
+                        self.project_saved_login_fallback(latest, selected)
+                    })
+                })
+                .await;
+            if projected == Some(true) {
+                self.reconcile_login_fallback_for_generation(
+                    switch_guard,
+                    generation,
+                    owner.intent,
+                )
+                .await;
+            }
+        }
+        self.push_pending_changes();
     }
 
     /// A Save can authorize only the freshly persisted candidate. An old saved

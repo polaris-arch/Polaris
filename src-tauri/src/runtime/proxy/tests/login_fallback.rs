@@ -224,6 +224,88 @@ async fn reconcile_engages_when_ts_exit_needs_login() {
     );
 }
 
+#[tokio::test]
+async fn disabling_login_fallback_preserves_older_tun_debt() {
+    let tags = BTreeMap::from([("ts1".to_string(), "组网出口".to_string())]);
+    let mut running = ts_and_vless_config("ts1");
+    running["servers"][1]["uuid"] = serde_json::json!("00000000-0000-0000-0000-000000000001");
+    running["proxyModeType"] = serde_json::json!("tun");
+    running["tunConfig"] = serde_json::json!({"mtu": 1500, "autoRoute": true, "strictRoute": true});
+    running["meshLoginFallbackDirect"] = Value::Bool(true);
+    let (rt, _dir, sink, _i, _r, fb) = reassert_runtime(&running, tags, BTreeMap::new());
+    let mut stored = rt.config.current().unwrap();
+    stored
+        .as_object_mut()
+        .unwrap()
+        .extend(running.as_object().unwrap().clone());
+    rt.config.save_full(&stored).unwrap();
+    let running = rt.config.current().unwrap();
+    *rt.current_config.write().unwrap() = Some(running.clone());
+    *rt.startup_snapshot.write().unwrap() = Some(running.clone());
+    seed_backend_state(&rt, "ts1", "NeedsLogin");
+    rt.reconcile_login_fallback().await;
+    assert!(rt.login_fallback_engaged());
+
+    let mut saved = running.clone();
+    saved["tunConfig"]["mtu"] = serde_json::json!(1400);
+    rt.config.save_full(&saved).unwrap();
+    assert!(rt.pending_changes().pending_apply);
+    saved["meshLoginFallbackDirect"] = Value::Bool(false);
+    rt.config.save_full(&saved).unwrap();
+
+    let generation = rt.core_generation();
+    let saved = rt.config.current().unwrap();
+    let admission = rt.lock_config_patch().await;
+    rt.apply_saved_login_fallback_patch(&saved, generation.wrapping_add(1), &admission)
+        .await;
+    let mut stale = saved.clone();
+    stale["selectedServerId"] = Value::String("node-a".into());
+    rt.apply_saved_login_fallback_patch(&stale, generation, &admission)
+        .await;
+    assert_eq!(sink.calls().len(), 1);
+    assert_eq!(
+        rt.current_config_snapshot().unwrap()["meshLoginFallbackDirect"],
+        true
+    );
+
+    sink.fail_first.store(1, Ordering::SeqCst);
+    rt.apply_saved_login_fallback_patch(&saved, generation, &admission)
+        .await;
+    assert!(
+        rt.login_fallback_engaged(),
+        "failed PUT must preserve the actual fallback receipt"
+    );
+    assert_eq!(
+        fb.lock().unwrap().as_slice(),
+        &[(true, Some("组网出口".into()))]
+    );
+    drop(admission);
+    rt.reconcile_login_fallback().await;
+    rt.config.save_full(&stale).unwrap();
+    rt.reconcile_login_fallback().await;
+
+    assert_eq!(rt.core_generation(), generation);
+    assert_eq!(
+        sink.calls(),
+        vec![
+            ("proxy-selector".to_string(), "direct".to_string()),
+            ("proxy-selector".to_string(), "组网出口".to_string()),
+            ("proxy-selector".to_string(), "组网出口".to_string()),
+        ],
+        "closing fallback must restore the selected TS exit and keep it on later STATUS frames"
+    );
+    assert!(!rt.login_fallback_engaged());
+    assert_eq!(
+        fb.lock().unwrap().last(),
+        Some(&(false, Some("组网出口".into())))
+    );
+    let mut expected = running;
+    expected["meshLoginFallbackDirect"] = Value::Bool(false);
+    assert_eq!(rt.current_config_snapshot(), Some(expected));
+    assert_eq!(rt.config.current().unwrap()["tunConfig"]["mtu"], 1400);
+    assert!(rt.pending_changes().pending_apply);
+}
+
 /// 矩阵第 2 行（同一选中出口）：已让位 + `Running` → PUT 回该出口 tag、清 flag、emit(false, 出口名)。
 ///
 /// **变异锁**：把 `should_disengage` 里的 `Running` 腿删掉 ⇒ 无 PUT、flag 仍真 ⇒ 转红。
@@ -319,7 +401,7 @@ async fn reconcile_holds_through_transitional_backend_states() {
 fn login_fallback_early_gate_is_a_conjunction_before_the_clone() {
     let body = method_body(
         &module_code("runtime/proxy"),
-        "    pub(super) async fn reconcile_login_fallback_locked(",
+        "    pub(super) async fn reconcile_login_fallback_for_generation(",
     );
     let gate = body
         .find("if !self.login_fallback_engaged() && !self.selected_exit_is_tailscale() {")
