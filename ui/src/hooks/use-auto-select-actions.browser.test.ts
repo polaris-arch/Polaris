@@ -28,6 +28,7 @@ import { HomeScreen } from '/src/components/screens/home/HomeScreen';
 import { MobileHomeScreen } from '/src/mobile/home/MobileHomeScreen';
 import TrayMenu from '/src/tray/TrayMenu';
 import { useAppStore } from '/src/store/app-store';
+import { useDialogStore } from '/src/components/dialogs/dialog-store';
 import { configReadGeneration } from '/src/lib/config-read-generation';
 import { useStagedConfigStore } from '/src/store/staged-config-store';
 import { api } from '/src/ipc';
@@ -51,7 +52,8 @@ const ipSnapshot={direct:{ip:'198.51.100.1'},proxy:{ip:'203.0.113.1'}};
 const jobs=[],readJobs=[];let app;
 const f=window.__actions={calls:[],proxyCalls:[],reads:0,jobs,readJobs,messages:[],readFail:false,hold:false,
  state:()=>structuredClone(useAppStore.getState().config),saved:()=>structuredClone(disk),
- cleanReads:0,statusReads:0,ipReads:0,liveReads:0,liveJobs:[],ipJobs:[],patchJobs:[],takeoverJobs:[],hides:[],notifications:[],focusEvents:0,
+ cleanReads:0,statusReads:0,ipReads:0,liveReads:0,liveJobs:[],ipJobs:[],patchJobs:[],takeoverJobs:[],takeoverPreviews:[],takeoverNeedsManual:false,hides:[],notifications:[],focusEvents:0,
+ dialogKind:()=>useDialogStore.getState().stack.at(-1)?.kind ?? null,
  configListeners:()=>listeners.filter(l=>l.event===C.EVENT_CONFIG_CHANGED).length,
  nativeConfigSignal(){for(const l of [...listeners])if(l.event===C.EVENT_CONFIG_CHANGED)handlers.get(l.handler)?.({payload:{}});},
  setProxy(value){proxyState={...proxyState,...value};},
@@ -70,9 +72,17 @@ const f=window.__actions={calls:[],proxyCalls:[],reads:0,jobs,readJobs,messages:
   queueMicrotask(()=>{f.newGeneration=advance?configReadGeneration.beginRead():configReadGeneration.current();resolve();});
  });});},
  finishPatch(index=0){const job=f.patchJobs[index];disk={...disk,...job.patch};job.resolve({success:true,data:structuredClone(disk)});},
- // Dedicated takeover writes edit the latest saved config and broadcast it,
- // matching config_set_takeover's {config,corrected} response contract.
- finishTakeover(index=0){const job=f.takeoverJobs[index];const result=applyFakeIpTunEntry({...disk,proxyModeType:job.mode});disk=result.config;f.nativeConfigSignal();job.resolve({success:true,data:{config:structuredClone(disk),corrected:result.corrected}});},
+ finishTakeover(index=0){
+  const job=f.takeoverJobs[index];
+  if(job.hotOnly&&f.takeoverNeedsManual){
+   job.resolve({success:true,data:{status:'needsManual',config:structuredClone(disk),corrected:false}});
+   return;
+  }
+  const result=applyFakeIpTunEntry({...disk,proxyModeType:job.mode});
+  disk=result.config;
+  f.nativeConfigSignal();
+  job.resolve({success:true,data:{status:'saved',config:structuredClone(disk),corrected:result.corrected,pendingApply:false}});
+ },
  proxySignal(running){proxyState={running,starting:false};for(const l of [...listeners])if(l.event===(running?C.EVENT_PROXY_STARTED:C.EVENT_PROXY_STOPPED))handlers.get(l.handler)?.({payload:{}});},
  stageOnly(){useStagedConfigStore.setState({enabled:true});useStagedConfigStore.getState().stage({id:'server:staged-only',kind:'server',label:'Local draft',entityPath:['servers','staged-only'],nextValue:{id:'staged-only',name:'Local draft',protocol:'socks',address:'draft.invalid',port:1}});},
  staged:()=>useStagedConfigStore.getState().entries,
@@ -110,7 +120,16 @@ window.__TAURI_INTERNALS__={metadata:{currentWindow:{label:surface==='tray'?'tra
   if(cmd==='plugin:notification|is_permission_granted')return Promise.resolve(true);
   if(cmd==='plugin:notification|notify'){f.notifications.push(args);return Promise.resolve();}
   if(cmd===C.CONFIG_PATCH)return new Promise(resolve=>{f.patchJobs.push({patch:args.patch,resolve});if(!f.holdPatch)f.finishPatch(f.patchJobs.length-1);});
-  if(cmd===C.CONFIG_SET_TAKEOVER)return new Promise(resolve=>{f.takeoverJobs.push({mode:args.mode,resolve});if(!f.holdTakeover)f.finishTakeover(f.takeoverJobs.length-1);});
+  if(cmd===C.CONFIG_SET_TAKEOVER){
+   if(args.preview){
+    f.takeoverPreviews.push(args.mode);
+    return Promise.resolve({success:true,data:{owner:{savedRevision:1,generation:1,intent:1},pendingApply:false}});
+   }
+   return new Promise(resolve=>{
+    f.takeoverJobs.push({mode:args.mode,hotOnly:args.hotOnly,resolve});
+    if(!f.holdTakeover)f.finishTakeover(f.takeoverJobs.length-1);
+   });
+  }
   if(cmd===C.SERVER_IDENTITY_CONFLICTS)return Promise.resolve({success:true,data:{version:'fixture-config-version',groups:[]}});
   if(cmd===C.CONFIG_GET){f.reads++;if(f.delayNextRead){f.delayNextRead=false;const captured=structuredClone(disk);return new Promise(resolve=>{const release=()=>resolve({success:true,data:captured});f.releaseRead=release;readJobs.push({captured,release});});}return f.readFail?Promise.reject(Error('saved readback failed')):Promise.resolve({success:true,data:structuredClone(disk)});}
   if(cmd===C.AUTO_SELECT_STATUS)return Promise.resolve({success:true,data:structuredClone(status)});
@@ -195,6 +214,29 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS==='1')('five real mounted Auto 
    } finally { await page.close(); }
   });
  }
+ it('desktop home confirms takeover only after a hot edit requires manual apply', async () => {
+  const page = await browser.newPage({ viewport: { width: 1100, height: 844 } });
+  try {
+   await page.goto(`${origin}/__actions?surface=desktop-home`);
+   const takeover = page.getByRole('group', { name: '接管方式' });
+   await takeover.waitFor();
+   await page.evaluate(() => (window as any).__actions.runtime({ running: true }));
+   const readTakeover = () => page.evaluate(() => {
+    const f = (window as any).__actions;
+    return { mode: f.saved().proxyModeType, preview: f.takeoverPreviews, dialog: f.dialogKind(),
+     requests: f.takeoverJobs.map(({ mode, hotOnly }: any) => ({ mode, hotOnly })) };
+   });
+   await takeover.getByRole('button', { name: '系统', exact: true }).click();
+   await expect.poll(readTakeover).toEqual({ mode: 'systemProxy', preview: [], dialog: null,
+    requests: [{ mode: 'systemProxy', hotOnly: true }] });
+   await page.evaluate(() => { (window as any).__actions.takeoverNeedsManual = true; });
+   await takeover.getByRole('button', { name: 'TUN', exact: true }).click();
+   await expect.poll(readTakeover).toEqual({ mode: 'systemProxy', preview: ['tun'], dialog: 'confirm',
+    requests: [{ mode: 'systemProxy', hotOnly: true }, { mode: 'tun', hotOnly: true }] });
+  } finally {
+   await page.close();
+  }
+ });
  for(const surface of surfaces){
   it(`${surface}: Auto choice preserves real nodes and has no separate mode switch`,async()=>{
     const page=await open(surface);try{

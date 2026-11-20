@@ -32,6 +32,7 @@ import { api } from '@/ipc';
 import { IpcError } from '@/ipc/ipc-client';
 import { unlockApi, ipInfoApi } from '@/ipc/api-client';
 import { toast } from '@/lib/error-handler';
+import { withConfigWriteLock } from '@/lib/config-write-lock';
 import { cn } from '@/lib/utils';
 import { relativeTimeText } from '@/lib/relative-time';
 import { useDialogStore } from '@/components/dialogs/dialog-store';
@@ -831,12 +832,19 @@ export function HomeScreen() {
   }, [onSpeedTest, onUnlockRefresh]);
 
   /* 接管模式及 FakeIP-TUN 修正在后端最新配置事务内一次完成。 */
+  const takeoverPreviewRequest = useRef(0);
+  const takeoverInFlight = useRef(false);
   const applyIntercept = useCallback(
-    async (v: InterceptKind, expectedOwner?: TakeoverApplyOwner) => {
+    async (v: InterceptKind, request: number, expectedOwner?: TakeoverApplyOwner) => {
       if (!diskConfig) return;
       try {
-        const { corrected, owner } = await api.config.setTakeover(v, expectedOwner);
-        if (owner) useAppStore.getState().setApplyRequested(owner);
+        const result = await withConfigWriteLock(async () => {
+          if (request === takeoverPreviewRequest.current) {
+            return api.config.setTakeover(v, expectedOwner, expectedOwner === undefined);
+          }
+        });
+        if (!result) return;
+        const { corrected, owner, status, pendingApply } = result;
         // 仅在真把 false 改回 true 时提示（罕见且有实际副作用需告知）；纯消费 flag 不打扰用户。
         // toast 在主窗可见时够用，但接管方式亦可从**托盘浮层**（独立窗口，FX-tray 已加入口）切换 →
         // 主窗 toast 此时看不到，故并发一条系统通知兜底（对齐 上游 notify-user；正文不含节点身份）。
@@ -848,27 +856,36 @@ export function HomeScreen() {
             t('notify.fakeIpTun.body')
           );
         }
+        if (request !== takeoverPreviewRequest.current) return;
+        if (owner) useAppStore.getState().setApplyRequested(owner);
+        if (!expectedOwner && status === 'saved' && !pendingApply) {
+          const label = INTERCEPT_OPTS.find((option) => option.v === v)?.labelKey;
+          if (label) toast.success(`${t('common.saved')} · ${t(label)}`);
+        }
+        return status;
       } catch (err) {
+        if (request !== takeoverPreviewRequest.current) return;
         console.error('[home] set intercept failed:', err);
-        toast.error(t(err instanceof IpcError && err.code === 'CONFIG_TAKEOVER_CONFLICT'
-          ? 'home.pendingHotConflict' : 'settings.proxyMode.failUpdate'));
+        const code = err instanceof IpcError ? err.code : undefined;
+        if (code === 'CONFIG_TAKEOVER_BLOCKED_BY_PENDING') {
+          toast.warning(t('home.pendingSavedStillNeedsApply'));
+        } else {
+          toast.error(t(code === 'CONFIG_TAKEOVER_CONFLICT' ? 'home.pendingHotConflict' : 'settings.proxyMode.failUpdate'));
+        }
       }
     },
     [diskConfig, t]
   );
 
-  /* ── 接管方式切换入口：已连接时切换要立即应用到运行中的核（可能重启、瞬断当前连接）→ 先弹一次确认，
-   *    确认后写盘并直接应用；未连接直接落盘（下次连接生效）。 */
-  const takeoverPreviewRequest = useRef(0);
+  /* 运行中先尝试热应用。需要手动应用时才获取确认令牌。 */
   const onInterceptChange = useCallback(
     async (v: InterceptKind) => {
-      if (!config || v === config.proxyModeType) return;
+      if (!config || (v === config.proxyModeType && !takeoverInFlight.current)) return;
       const request = ++takeoverPreviewRequest.current;
-      if (!connected) {
-        void applyIntercept(v);
-        return;
-      }
+      takeoverInFlight.current = true;
       try {
+        const status = await applyIntercept(v, request);
+        if (status !== 'needsManual' || request !== takeoverPreviewRequest.current) return;
         const { owner, pendingApply } = await api.config.previewTakeover(v);
         if (request !== takeoverPreviewRequest.current) return;
         openDialog({
@@ -881,7 +898,7 @@ export function HomeScreen() {
             confirmLabel: t('settings.proxyMode.confirmBtn'),
             onConfirm: () => {
               closeDialog();
-              void applyIntercept(v, owner);
+              void applyIntercept(v, request, owner);
             },
           },
         });
@@ -890,9 +907,11 @@ export function HomeScreen() {
         console.error('[home] preview intercept failed:', error);
         toast.error(t(error instanceof IpcError && error.code === 'CONFIG_TAKEOVER_CONFLICT'
           ? 'home.pendingHotConflict' : 'settings.proxyMode.failUpdate'));
+      } finally {
+        if (request === takeoverPreviewRequest.current) takeoverInFlight.current = false;
       }
     },
-    [config, connected, applyIntercept, openDialog, closeDialog, t]
+    [config, applyIntercept, openDialog, closeDialog, t]
   );
 
   /* 分流策略的写入回包确认配置已保存。 */
