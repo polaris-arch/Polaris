@@ -60,6 +60,15 @@ pub(super) enum HttpResolutionMode {
     TestOverride,
 }
 
+pub(super) struct PinnedClient {
+    origin: String,
+    target: GuardedTarget,
+    client: reqwest::Client,
+    created: Instant,
+}
+
+const DIRECT_PINNED_REUSE_WINDOW: Duration = Duration::from_secs(30);
+
 // ── 适配 ①：net-stack HttpClient（订阅拉取）──────────────────────────────────
 
 /// reqwest 的错误 Display 即使去掉 URL，也可能只剩 `error sending request for url`；真正的
@@ -169,10 +178,50 @@ pub(super) fn build_direct_pinned_client(
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
         .user_agent(app_user_agent())
+        .pool_max_idle_per_host(1)
+        .pool_idle_timeout(DIRECT_PINNED_REUSE_WINDOW)
         // URL hostname 保持不变（Host/SNI 仍是域名），只把底层 socket 解析钉到 guard 的同一组 IP。
         .resolve_to_addrs(&target.host, &addrs)
         .build()
         .map_err(|e| format!("建 DNS-pinned HTTP 客户端失败: {e}"))
+}
+
+impl HttpRuntime {
+    fn direct_client_for_target(
+        &self,
+        url: &str,
+        target: &GuardedTarget,
+    ) -> Result<reqwest::Client, String> {
+        let origin = reqwest::Url::parse(url)
+            .map_err(|_| "订阅请求地址无效".to_string())?
+            .origin()
+            .ascii_serialization();
+        // 每跳仍由 guard 重新解析和放行。仅复用同源、同一组已校验地址的连接。
+        if let Some(entry) = self
+            .direct_pinned
+            .lock()
+            .map_err(|_| "直连客户端缓存不可用".to_string())?
+            .as_ref()
+            .filter(|entry| {
+                entry.origin == origin
+                    && entry.target == *target
+                    && entry.created.elapsed() < DIRECT_PINNED_REUSE_WINDOW
+            })
+        {
+            return Ok(entry.client.clone());
+        }
+        let client = build_direct_pinned_client(target)?;
+        *self
+            .direct_pinned
+            .lock()
+            .map_err(|_| "直连客户端缓存不可用".to_string())? = Some(PinnedClient {
+            origin,
+            target: target.clone(),
+            client: client.clone(),
+            created: Instant::now(),
+        });
+        Ok(client)
+    }
 }
 
 async fn fetch_one_hop(
@@ -247,7 +296,7 @@ impl HttpClient for HttpRuntime {
         target: &GuardedTarget,
     ) -> impl Future<Output = Result<MinimalResponse, String>> + Send {
         let client = match self.resolution_mode {
-            HttpResolutionMode::DirectPinned => build_direct_pinned_client(target),
+            HttpResolutionMode::DirectPinned => self.direct_client_for_target(url, target),
             // SOCKS5h/HTTP proxy 必须保留 hostname 交代理端解析；使用本地 guard 地址会破坏抗污染与
             // 外部 FakeIP。代理端最终 IP 无法由 SOCKS5 协议回传，故该模式的 TOCTOU 是显式残留。
             HttpResolutionMode::ProxyRemoteDns => Ok(self.client.clone()),

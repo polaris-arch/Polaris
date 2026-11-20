@@ -156,6 +156,7 @@ pub use subscription_transport::SystemDnsLookup;
 pub struct HttpRuntime {
     client: reqwest::Client,
     resolution_mode: HttpResolutionMode,
+    direct_pinned: std::sync::Mutex<Option<subscription_transport::PinnedClient>>,
     /// WARP 注册专用 client（**TLS1.2-only + HTTP/1.1-only**）。
     ///
     /// 共享 `client` 走 rustls-default（ClientHello 提供 TLS1.3 + h2 ALPN），会被 `api.cloudflareclient.com`
@@ -199,6 +200,7 @@ impl HttpRuntime {
         Ok(Self {
             client,
             resolution_mode: HttpResolutionMode::DirectPinned,
+            direct_pinned: Default::default(),
             warp_client: std::sync::OnceLock::new(),
         })
     }
@@ -231,6 +233,7 @@ impl HttpRuntime {
         Ok(Self {
             client,
             resolution_mode: HttpResolutionMode::TestOverride,
+            direct_pinned: Default::default(),
             warp_client: std::sync::OnceLock::new(),
         })
     }
@@ -346,6 +349,7 @@ impl HttpRuntime {
         Ok(Self {
             client,
             resolution_mode: HttpResolutionMode::ProxyRemoteDns,
+            direct_pinned: Default::default(),
             warp_client: std::sync::OnceLock::new(),
         })
     }

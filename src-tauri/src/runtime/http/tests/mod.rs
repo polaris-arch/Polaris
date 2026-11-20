@@ -338,38 +338,59 @@ impl DnsLookup for StaticLookup {
 async fn direct_guarded_fetch_pins_socket_but_preserves_hostname_header() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind 回环端口");
     let addr = listener.local_addr().unwrap();
-    let (tx, rx) = std::sync::mpsc::channel();
-    thread::spawn(move || {
+    let server = thread::spawn(move || {
         let (mut socket, _) = listener.accept().unwrap();
-        let mut buf = [0u8; 4096];
-        let n = socket.read(&mut buf).unwrap_or(0);
-        tx.send(String::from_utf8_lossy(&buf[..n]).into_owned())
-            .unwrap();
         socket
-            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            .set_read_timeout(Some(Duration::from_secs(4)))
             .unwrap();
+        let mut buf = [0u8; 4096];
+        let mut requests = Vec::new();
+        for _ in 0..3 {
+            let n = socket.read(&mut buf).unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            requests.push(String::from_utf8_lossy(&buf[..n]).into_owned());
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .unwrap();
+        }
+        requests
     });
 
     let runtime = HttpRuntime::new().unwrap();
-    let response = runtime
-        .fetch_guarded(
-            &format!("http://pin.invalid:{}/sub", addr.port()),
-            &FetchInit::default(),
-            &GuardedTarget {
-                host: "pin.invalid".to_string(),
-                addresses: vec![addr.ip()],
-            },
-        )
-        .await
-        .expect("真实 dial 应使用 guard 提供的地址");
-    assert_eq!(response.body, b"ok");
-    let request = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    let init = FetchInit {
+        timeout_ms: Some(2_000),
+        ..FetchInit::default()
+    };
+    let url = format!("http://pin.invalid:{}/sub", addr.port());
+    let mut target = GuardedTarget {
+        host: "pin.invalid".to_string(),
+        addresses: vec![addr.ip()],
+    };
+    for _ in 0..2 {
+        let response = runtime
+            .fetch_guarded(&url, &init, &target)
+            .await
+            .expect("真实 dial 应使用 guard 提供的地址");
+        assert_eq!(response.body, b"ok");
+    }
+    target.addresses[0] = "127.0.0.2".parse().unwrap();
     assert!(
-        request
-            .lines()
-            .any(|line| line.eq_ignore_ascii_case(&format!("host: pin.invalid:{}", addr.port()))),
-        "DNS pin 不得把 HTTP Host 改写成 IP: {request:?}"
+        runtime.fetch_guarded(&url, &init, &target).await.is_err(),
+        "地址变更后不得复用旧连接"
     );
+    drop(runtime);
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 2, "相同来源和地址应复用一条连接");
+    for request in requests {
+        assert!(
+            request.lines().any(
+                |line| line.eq_ignore_ascii_case(&format!("host: pin.invalid:{}", addr.port()))
+            ),
+            "DNS pin 不得把 HTTP Host 改写成 IP: {request:?}"
+        );
+    }
 }
 
 #[tokio::test]
