@@ -2003,7 +2003,9 @@ impl ProxyRuntime {
             self.push_pending_changes();
             return self.selector_operation_is_current(generation, intent);
         }
-        self.gate.generation() == generation && !self.core_running() && !self.gate.is_busy()
+        // The Android bridge can be unavailable while this lifecycle still owns a Core.
+        self.status.read().is_ok_and(|status| !status.running)
+            && self.gate.try_idle_generation() == Some(generation)
     }
 
     /// A Save can authorize only the freshly persisted candidate. An old saved
