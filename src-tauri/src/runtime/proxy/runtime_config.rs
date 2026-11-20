@@ -3015,13 +3015,27 @@ impl ProxyRuntime {
                 // The accepted single policy is independent of native mode.
                 // Align it before restoring mode-specific route/DNS. Core
                 // serializes the control write against graph publication.
-                let claim = self.with_runtime_candidate_claim(
-                    saved_revision.is_some(),
-                    generation,
-                    intent,
-                    || self.saved_revision_matches(saved_revision),
-                );
-                if !matches!(claim, Ok(true)) {
+                let claimed = if let Some(owner) = saved_owner {
+                    let automatic =
+                        self.automatic_admission_owner(saved_owner, &desired, &candidate);
+                    self.try_runtime_saved_commit(automatic, None, |current| {
+                        if current != &desired || !self.saved_revision_matches(saved_revision) {
+                            return Err(RuntimeClaimError::Rejected);
+                        }
+                        self.with_runtime_candidate_claim(
+                            true,
+                            owner.generation,
+                            owner.intent,
+                            || (),
+                        )
+                    })
+                    .await
+                    .is_some()
+                } else {
+                    self.with_runtime_candidate_claim(false, generation, intent, || ())
+                        .is_ok()
+                };
+                if !claimed {
                     return decline(RuntimeApplyResult::status("conflict"));
                 }
                 if client.set_clash_mode(mode).await.is_err() {
@@ -3419,12 +3433,27 @@ impl ProxyRuntime {
         }
     }
 
-    fn automatic_edit_owner(&self, pending: &PendingOperation) -> Option<StagedSaveOwner> {
-        let owner = pending.staged_save_owner()?;
+    fn is_automatic_edit_owner(&self, owner: StagedSaveOwner) -> bool {
         self.runtime_config_apply
             .lock()
-            .ok()
-            .and_then(|state| state.automatic_edit.filter(|current| *current == owner))
+            .is_ok_and(|state| state.automatic_edit == Some(owner))
+    }
+
+    fn automatic_admission_owner(
+        &self,
+        owner: Option<StagedSaveOwner>,
+        desired: &Value,
+        candidate: &Value,
+    ) -> Option<StagedSaveOwner> {
+        let owner = owner?;
+        if self.is_automatic_edit_owner(owner) {
+            return Some(owner);
+        }
+        let selected = desired.get("selectedServerId").and_then(Value::as_str)?;
+        (candidate.get("selectedServerId").and_then(Value::as_str) == Some(selected)
+            && owner.is_current(self)
+            && self.executing_automatic_selection(selected, owner.revision))
+        .then_some(owner)
     }
 
     async fn try_runtime_saved_commit<T>(
@@ -3524,7 +3553,11 @@ impl ProxyRuntime {
         let saved_revision = pending.saved_revision.or(expected_confirmation
             .as_ref()
             .map(|(_, revision)| *revision));
-        let automatic = self.automatic_edit_owner(&pending);
+        let automatic = self.automatic_admission_owner(
+            pending.staged_save_owner(),
+            &pending.desired,
+            &pending.candidate,
+        );
         let plan_expiry = pending.plan.expires_at_unix_milli;
         let admit = |desired: &Value| {
             if desired != &pending.desired || !self.saved_revision_matches(saved_revision) {
@@ -4417,7 +4450,9 @@ impl ProxyRuntime {
         }
         let publication = self
             .try_runtime_saved_commit(
-                self.automatic_edit_owner(&pending),
+                pending
+                    .staged_save_owner()
+                    .filter(|owner| self.is_automatic_edit_owner(*owner)),
                 Some(pending.plan.expires_at_unix_milli),
                 |desired| {
                     if desired != &pending.desired

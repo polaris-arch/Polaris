@@ -822,7 +822,24 @@ async fn hot_config_edit_retries_only_before_local_apply_admission() {
 
 #[tokio::test]
 async fn hot_config_edit_retries_a_contended_publication_claim_for_its_exact_owner() {
-    let (rt, _dir, running, saved) = host_dns_restart_fixture();
+    use crate::runtime::config::Decision;
+    use polaris_config_engine::user_config::dns_constants::BLOCK_SERVER_ID;
+
+    let (rt, _dir, running, _) = host_dns_restart_fixture();
+    let mut selection = rt
+        .config
+        .update(|disk| {
+            disk["selectedServerId"] = json!(DIRECT_SERVER_ID);
+            let intent = rt.register_selector_intent();
+            Decision::Write(
+                rt.own_automatic_selection(DIRECT_SERVER_ID, intent)
+                    .unwrap(),
+            )
+        })
+        .unwrap()
+        .0;
+    selection.mark_committed();
+    let saved = rt.config.current().unwrap();
     let mut pending = ts_pending_raw_fixture(&rt, saved);
     pending.saved_revision = Some(rt.config.saved_revision());
     let owner = pending.staged_save_owner().unwrap();
@@ -831,24 +848,33 @@ async fn hot_config_edit_retries_a_contended_publication_claim_for_its_exact_own
         .unwrap()
         .as_millis()
         + 5000) as i64;
-    let publication = rt.gate.lock_generation_publication();
-    let admitted = std::cell::Cell::new(0);
-    assert_eq!(
-        rt.with_runtime_candidate_claim(true, owner.generation, owner.intent, || ()),
-        Err(RuntimeClaimError::Contended)
-    );
-    let attempt = rt.try_runtime_saved_commit(Some(owner), Some(expiry), |_| {
-        rt.with_runtime_candidate_claim(true, owner.generation, owner.intent, || {
-            admitted.set(admitted.get() + 1);
-        })
-    });
-    let release = async {
-        tokio::time::sleep(HOT_EDIT_WRITER_RETRY_INTERVAL * 2).await;
-        assert_eq!(admitted.get(), 0);
-        drop(publication);
-    };
-    assert_eq!(tokio::join!(attempt, release).0, Some(()));
-    assert_eq!(admitted.get(), 1);
+    let retry_owner =
+        rt.automatic_admission_owner(Some(owner), &pending.desired, &pending.candidate);
+    let mut other_target = pending.candidate.clone();
+    other_target["selectedServerId"] = json!(BLOCK_SERVER_ID);
+    assert!(rt
+        .automatic_admission_owner(Some(owner), &pending.desired, &other_target)
+        .is_none());
+    for plan_expiry in [Some(expiry), None] {
+        let publication = rt.gate.lock_generation_publication();
+        let admitted = std::cell::Cell::new(0);
+        assert_eq!(
+            rt.with_runtime_candidate_claim(true, owner.generation, owner.intent, || ()),
+            Err(RuntimeClaimError::Contended)
+        );
+        let attempt = rt.try_runtime_saved_commit(retry_owner, plan_expiry, |_| {
+            rt.with_runtime_candidate_claim(true, owner.generation, owner.intent, || {
+                admitted.set(admitted.get() + 1);
+            })
+        });
+        let release = async {
+            tokio::time::sleep(HOT_EDIT_WRITER_RETRY_INTERVAL * 2).await;
+            assert_eq!(admitted.get(), 0);
+            drop(publication);
+        };
+        assert_eq!(tokio::join!(attempt, release).0, Some(()));
+        assert_eq!(admitted.get(), 1);
+    }
 
     // Exercise the R publisher used after a verified Core commit. The Plan
     // ticket can expire now, because no Core Apply is sent by this retry.
@@ -876,7 +902,7 @@ async fn hot_config_edit_retries_a_contended_publication_claim_for_its_exact_own
 
     // A selector change during contention is terminal for the old owner.
     let publication = rt.gate.lock_generation_publication();
-    let attempt = rt.try_runtime_saved_commit(Some(owner), Some(expiry), |_| {
+    let attempt = rt.try_runtime_saved_commit(retry_owner, Some(expiry), |_| {
         rt.with_runtime_candidate_claim(true, owner.generation, owner.intent, || {
             panic!("superseded work must not enter its saved authority")
         })
