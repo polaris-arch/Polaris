@@ -113,6 +113,10 @@ impl LifecycleState {
     pub(crate) fn running(&self) -> bool {
         self.running == Some(true)
     }
+
+    pub(crate) fn observed_running(&self) -> Option<bool> {
+        self.running
+    }
 }
 
 #[cfg(test)]

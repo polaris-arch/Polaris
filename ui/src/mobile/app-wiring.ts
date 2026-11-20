@@ -280,6 +280,7 @@ export function startMobileAppWiring(t: WiringT): () => void {
      **不再 pull 差集**：后端在同一跃迁点已经 PUSH 过（`push_pending_changes` 与 `push_lifecycle`
      严格配对），再拉一次是纯重复往返。 */
   offs.push(api.proxy.onLifecycle(() => void store().refreshProxyStatus()));
+  offs.push(api.proxy.onIosVpnDisconnected(() => void store().refreshProxyStatus()));
 
   /* 待应用差集 PUSH：后端 `switch_mode` 末尾 emit，载荷与 pull 腿同构。 */
   offs.push(api.proxy.onPendingChanges((data) => store().setPendingChanges(normalizePendingChanges(data))));

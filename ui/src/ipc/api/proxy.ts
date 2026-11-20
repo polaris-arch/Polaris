@@ -179,6 +179,10 @@ export const proxyApi = {
     return listen(IPC_CHANNELS.EVENT_PROXY_LIFECYCLE, listener);
   },
 
+  onIosVpnDisconnected(listener: () => void): () => void {
+    return listen(IPC_CHANNELS.EVENT_IOS_VPN_DISCONNECTED, listener);
+  },
+
   onStartedReady(listener: () => void): Promise<() => void> {
     return listenReady(IPC_CHANNELS.EVENT_PROXY_STARTED, listener);
   },

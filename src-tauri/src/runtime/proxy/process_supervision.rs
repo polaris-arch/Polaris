@@ -737,6 +737,14 @@ impl ProxyRuntime {
                 // An ordinary Stop without the original birth cannot release a TS claim.
                 return tauri_plugin_polaris_ios::stop().await.map(|_| ());
             };
+            if owner.main_token.is_none()
+                && tauri_plugin_polaris_ios::observed_running() == Some(false)
+            {
+                let session = tauri_plugin_polaris_ios::status().await?;
+                if self.clear_exited_ios_owner(&session)? {
+                    return Ok(());
+                }
+            }
             // A successfully consumed original Stop already retired this owner.
             // Keep its exact target/receipt for journal retry; do not re-observe a
             // stopped provider or manufacture a new terminal census.
@@ -831,6 +839,12 @@ impl ProxyRuntime {
                 .stop_target
                 .as_ref()
                 .is_some_and(|target| !target.cleanup_proof_eligible())
+                && !(owner.main_token.is_none()
+                    && matches!(&owner.origin, super::IosMainOrigin::LocalStart(_))
+                    && stopped.snapshot().has_confirmed_stop()
+                    && stopped.snapshot().request_id.as_deref() == Some(owner.request_id())
+                    && stopped.snapshot().config_digest.as_deref()
+                        == Some(owner.config_digest.as_str()))
             {
                 return Err("nativeRetirementUnknown".into());
             }
@@ -1367,9 +1381,12 @@ impl ProxyRuntime {
             } else {
                 super::code::STARTUP_FAILED
             };
-            return session
+            session
                 .require_idle()
-                .map_err(|error| StartError::coded(error, error_code));
+                .map_err(|error| StartError::coded(error, error_code))?;
+            self.clear_exited_ios_owner(&session)
+                .map_err(|error| StartError::coded(error, error_code))?;
+            return Ok(());
         }
         let candidates = scan_running_cores();
         // 排除表（受管主核 + 两种在飞瞬态核）**必须读在扫描之后**，顺序契约见 `sweep_exclusions`。
@@ -1481,6 +1498,30 @@ impl ProxyRuntime {
         self.escalate_root_orphans(&survivors, io).await
     }
 
+    #[cfg(target_os = "ios")]
+    fn clear_exited_ios_owner(
+        &self,
+        session: &tauri_plugin_polaris_ios::TunnelStatus,
+    ) -> Result<bool, String> {
+        if !session.provider_exited_without_stores {
+            return Ok(false);
+        }
+        let mut slot = self
+            .ios_ready_session
+            .write()
+            .map_err(|_| "nativeRetirementUnknown")?;
+        let matches = slot.as_ref().is_some_and(|owner| {
+            owner.main_token.is_none()
+                && session.request_id.as_deref() == Some(owner.request_id())
+                && session.config_digest.as_deref() == Some(owner.config_digest.as_str())
+        });
+        if matches {
+            // Process death cannot retire a scoped writer or authorize filesystem cleanup.
+            *slot = None;
+        }
+        Ok(matches)
+    }
+
     /// A cold host has no running configuration to adopt. Preserve the NE session
     /// and expose its state while keeping the host runtime's configuration unclaimed.
     #[cfg(target_os = "ios")]
@@ -1497,6 +1538,9 @@ impl ProxyRuntime {
                     session.status, session.active, session.ownership,
                     session.runtime_stopped, session.cleanup_evidence
                 );
+                if let Some(reason) = &session.system_disconnect_error {
+                    log::warn!("iOS 系统报告 VPN 断开原因：{reason}");
+                }
                 if session.active {
                     self.set_nonfatal_error(
                         "系统仍有 Polaris iOS VPN 会话；请先在系统设置中停止现有 VPN，再返回连接。",

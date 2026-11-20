@@ -7,7 +7,7 @@ import UIKit
 
 private struct StartArgs: Decodable { let configContent: String; let requestID: String; let managedBootstrap: Bool?; let expectedDirectorySourceIdentity: String? }
 private struct StopArgs: Decodable {
-    let requestID: String; let observationNonce: String; let stopOnly: Bool?
+    let requestID: String; let observationNonce: String; let stopOnly: Bool?; let ordinaryStop: Bool?
     let expectedStartRequestID: String?; let expectedSessionID: String?
     let expectedConfigDigest: String?; let expectedExtensionGeneration: UInt64?
 }
@@ -22,6 +22,7 @@ private struct LoadedVpnManager {
     let manager: NETunnelProviderManager?
     let existing: Bool
 }
+private struct StatusArgs: Decodable { let checkDisconnect: Bool? }
 
 private final class VpnOperation {
     let invoke: Invoke
@@ -125,6 +126,19 @@ final class VpnPlugin: Plugin {
         }
     }
 
+    private func loadManagerForStart(_ completion: @escaping (Result<(NETunnelProviderManager, [String: Any]), Error>) -> Void) {
+        loadManager(create: true) { result in
+            do {
+                let loaded: LoadedVpnManager
+                do { loaded = try result.get() } catch { throw vpnError(vpnStartFailure(error, stage: "load")) }
+                guard let manager = loaded.manager else { throw vpnError("VPN manager is unavailable") }
+                self.readSnapshot(manager, profileExists: loaded.existing, checkDisconnect: true) {
+                    completion($0.map { (manager, $0) })
+                }
+            } catch { completion(.failure(error)) }
+        }
+    }
+
     private func begin(_ invoke: Invoke, kind: String, requestID: String) -> VpnOperation? {
         guard operation == nil else { invoke.reject("A VPN operation is already in progress"); return nil }
         guard kind != "start" || !preferenceMutation.pending else {
@@ -199,18 +213,17 @@ final class VpnPlugin: Plugin {
             DispatchQueue.main.async {
                 do { try self.requireForeground() } catch { invoke.reject(error.localizedDescription); return }
                 guard let op = self.begin(invoke, kind: "start", requestID: args.requestID) else { return }
-                self.loadManager(create: true) { result in
+                self.loadManagerForStart { result in
                     guard self.current(op) else { return }
                     do {
-                        let loaded: LoadedVpnManager
-                        do { loaded = try result.get() } catch { throw vpnError(vpnStartFailure(error, stage: "load")) }
-                        guard let manager = loaded.manager else { throw vpnError("VPN manager is unavailable") }
+                        let (manager, before) = try result.get()
                         op.manager = manager
-                        let before = try self.snapshot(manager, profileExists: loaded.existing)
-                        guard before["active"] as? Bool != true else {
+                        guard before["active"] as? Bool != true,
+                              manager.connection.status == .invalid || manager.connection.status == .disconnected else {
                             throw vpnError("A Polaris VPN session is already active. Stop it explicitly before starting another session.")
                         }
-                        if let error = before["cleanupError"] as? String ?? before["lastError"] as? String { throw vpnError(error) }
+                        if before["providerExitedWithoutStores"] as? Bool != true,
+                           let error = before["cleanupError"] as? String ?? before["lastError"] as? String { throw vpnError(error) }
                         let sessionID = UUID().uuidString
                         let digest = SHA256.hash(data: Data(args.configContent.utf8)).map { String(format: "%02x", $0) }.joined()
                         guard let configuration = manager.protocolConfiguration as? NETunnelProviderProtocol else { throw vpnError("Unexpected VPN protocol") }
@@ -634,6 +647,7 @@ final class VpnPlugin: Plugin {
     }
 
     @objc func status(_ invoke: Invoke) {
+        let checkDisconnect = (try? invoke.parseArgs(StatusArgs.self))?.checkDisconnect == true
         DispatchQueue.main.async {
             var completed = false
             let deadline = DispatchWorkItem {
@@ -642,10 +656,52 @@ final class VpnPlugin: Plugin {
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + 10, execute: deadline)
             self.loadManager(create: false) { result in
-                guard !completed else { return }; completed = true; deadline.cancel()
-                do { invoke.resolve(try self.snapshot(result.get().manager)) } catch { invoke.reject(error.localizedDescription) }
+                guard !completed else { return }
+                let finish: (Result<[String: Any], Error>) -> Void = { snapshot in
+                    guard !completed else { return }; completed = true; deadline.cancel()
+                    do { invoke.resolve(try snapshot.get()) } catch { invoke.reject(error.localizedDescription) }
+                }
+                do { self.readSnapshot(try result.get().manager, checkDisconnect: checkDisconnect, completion: finish) }
+                catch { finish(.failure(error)) }
             }
         }
+    }
+
+    private func readSnapshot(_ manager: NETunnelProviderManager?, profileExists: Bool? = nil, checkDisconnect: Bool,
+                              completion: @escaping (Result<[String: Any], Error>) -> Void) {
+        do {
+            let initial = try snapshot(manager, profileExists: profileExists)
+            guard checkDisconnect, let manager, initial["profileExists"] as? Bool == true,
+                  manager.connection.status == .disconnected, initial["lastError"] != nil,
+                  let identity = (manager.protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration
+            else { completion(.success(initial)); return }
+            manager.connection.fetchLastDisconnectError { error in
+                DispatchQueue.main.async {
+                    self.loadManager(create: false) { reloaded in
+                        completion(Result {
+                            guard let current = try reloaded.get().manager,
+                                  current.connection.status == .disconnected,
+                                  vpnIdentityMatches(identity, (current.protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration)
+                            else { throw vpnError("CleanupUnknown: VPN profile changed during disconnect observation") }
+                            var observed = try self.snapshot(current)
+                            if let error = error as NSError?, error.domain == NEVPNConnectionErrorDomain {
+                                observed["systemDisconnectError"] = "\(error.domain) (\(error.code))"
+                                if error.code == NEVPNConnectionError.pluginFailed.rawValue,
+                                   !self.preferenceMutation.pending,
+                                   self.pendingPreferenceFailure(try self.readPreferenceIntent()) == nil,
+                                   self.uncertainReason == nil || (self.uncertainSession != nil
+                                       && self.uncertainSession == identity["sessionID"] as? String),
+                                   let report = try self.readLifecycleReport(),
+                                   vpnMayReuseProfileAfterProviderExit(identity: identity, report: report) {
+                                    observed["providerExitedWithoutStores"] = true
+                                }
+                            }
+                            return observed
+                        })
+                    }
+                }
+            }
+        } catch { completion(.failure(error)) }
     }
 
     private func observe(_ op: VpnOperation, wanted: NEVPNStatus) {
@@ -749,6 +805,13 @@ final class VpnPlugin: Plugin {
                       manager.connection.status == .disconnected || manager.connection.status == .invalid,
                       vpnIdentityMatches(expected, (manager.protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration)
                 else { throw vpnError("CleanupUnknown: Original ordinary Stop owner changed or remains active") }
+                if op.stopArgs?.ordinaryStop == true {
+                    let prior = try self.snapshot(manager, includeHostUncertainty: false)
+                    if vpnIdempotentStopIsConfirmed(evidence: prior, expectedGeneration: op.stopArgs?.expectedExtensionGeneration) {
+                        self.finish(op, snapshot: prior)
+                        return
+                    }
+                }
                 self.finish(op, snapshot: ["status": manager.connection.status.rawValue,
                     "running": false, "active": false, "profileExists": true,
                     "ownership": "ownedSessionUnproven", "sessionId": expected["sessionID"] as? String ?? "",
@@ -759,7 +822,19 @@ final class VpnPlugin: Plugin {
     }
 
     private func finishStopped(_ op: VpnOperation) {
-        guard current(op), !op.awaitingStopObservation, !op.readingStopped else { return }
+        guard current(op), !op.readingStopped else { return }
+        if op.awaitingStopObservation {
+            // The original provider's atomic write precedes NE
+            // disconnect. An ordinary Stop may use that exact report even if
+            // the framework tears down its deferred IPC reply.
+            guard op.stopArgs?.ordinaryStop == true,
+                  let snapshot = try? snapshot(op.manager, stopRequestID: op.requestID, includeHostUncertainty: false),
+                  vpnIdempotentStopIsConfirmed(evidence: snapshot, expectedGeneration: op.stopArgs?.expectedExtensionGeneration)
+            else { return }
+            uncertainSession = nil; uncertainReason = nil
+            finish(op, snapshot: snapshot)
+            return
+        }
         if op.stopArgs?.stopOnly == true { finishOrdinaryStop(op); return }
         if let observation = op.stopObservation, let expected = op.identity, let args = op.stopArgs {
             op.readingStopped = true
@@ -821,11 +896,7 @@ final class VpnPlugin: Plugin {
             if result["lastError"] == nil, let error = vpnIdleFailure(evidence: result, profileExists: exists, active: active) { result["lastError"] = error }
             return result
         }
-        let url = try directory().appendingPathComponent("tunnel-lifecycle.json")
-        let report: [String: Any]?
-        if FileManager.default.fileExists(atPath: url.path) {
-            report = try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any]
-        } else { report = nil }
+        let report = try readLifecycleReport()
         let expectedStop = try stopRequestID ?? stopIntent(for: values)
         result.merge(vpnSessionEvidence(profileIdentity: values, report: report, stopRequestID: expectedStop)) { _, evidence in evidence }
         if includeHostUncertainty, uncertainReason != nil,
@@ -834,6 +905,12 @@ final class VpnPlugin: Plugin {
         if result["lastError"] == nil, !vpnProfileWasNeverSubmitted(preference: preference, identity: values, report: report),
            let error = vpnIdleFailure(evidence: result, profileExists: exists, active: active) { result["lastError"] = error }
         return result
+    }
+
+    private func readLifecycleReport() throws -> [String: Any]? {
+        let url = try directory().appendingPathComponent("tunnel-lifecycle.json")
+        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+        return try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any]
     }
 
     private func writePreferenceIntent(_ requestID: String, pending: Bool, unsubmitted: [String: Any]? = nil) throws {

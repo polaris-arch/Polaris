@@ -502,7 +502,15 @@ impl ProxyRuntime {
                 snap.actual_server_id = None;
             }
         }
-        #[cfg(not(target_os = "android"))]
+        #[cfg(target_os = "ios")]
+        if snap.running && tauri_plugin_polaris_ios::observed_running() == Some(false) {
+            // NE liveness is enough to update display; original stop custody is unchanged.
+            snap.running = false;
+            snap.start_time = None;
+            snap.uptime = None;
+            snap.actual_server_id = None;
+        }
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         let _ = snap;
     }
 

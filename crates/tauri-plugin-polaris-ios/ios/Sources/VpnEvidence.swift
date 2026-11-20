@@ -205,6 +205,31 @@ func vpnIdleFailure(evidence: [String: Any], profileExists: Bool, active: Bool) 
     return vpnStopFailure(evidence: evidence, profileExists: profileExists)
 }
 
+/// The OS reported provider death. Only an exact original run with an empty
+/// directory and auth inventory may reuse its profile without a Go stop receipt.
+/// This grants no retirement or journal-deletion authority.
+func vpnMayReuseProfileAfterProviderExit(identity: [String: Any], report: [String: Any]) -> Bool {
+    guard vpnIdentityMatches(identity, report["identity"] as? [String: Any]),
+          let digest = identity["configDigest"] as? String,
+          report["lifecycle"] as? String == "running",
+          report["runtimeStopped"] as? Bool == false,
+          report["generation"] as? Int == 1,
+          report["operationRequestID"] as? String == identity["requestID"] as? String,
+          report["stopSourceGeneration"] == nil,
+          report["uncertainSettingsGeneration"] == nil,
+          report["cleanupError"] == nil, report["lastError"] == nil,
+          let auth = vpnTailscaleStoreExport(report: report, configDigest: digest, terminal: false),
+          let directory = vpnTailscaleDirectoryExport(raw: report["tailscaleDirectoryScope"] as? String,
+                                                      configDigest: digest, terminal: false),
+          let authRuns = auth["instances"] as? [[String: Any]], authRuns.count == 1,
+          let directoryRuns = directory["instances"] as? [[String: Any]], directoryRuns.count == 1,
+          let authRun = authRuns.first, let directoryRun = directoryRuns.first,
+          authRun["runNonce"] as? String == directoryRun["runNonce"] as? String,
+          (authRun["nodes"] as? [[String: Any]])?.isEmpty == true,
+          (directoryRun["nodes"] as? [[String: Any]])?.isEmpty == true else { return false }
+    return true
+}
+
 func vpnStopFailure(evidence: [String: Any], profileExists: Bool) -> String? {
     guard profileExists else { return nil }
     if let error = evidence["cleanupError"] as? String ?? evidence["lastError"] as? String {

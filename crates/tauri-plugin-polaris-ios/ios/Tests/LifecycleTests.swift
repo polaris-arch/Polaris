@@ -279,6 +279,31 @@ struct LifecycleTests {
     }
 
     static func main() throws {
+        let exitDigest = String(repeating: "d", count: 64)
+        let exitIdentity: [String: Any] = ["sessionID": "exit-session", "requestID": "original-start", "configDigest": exitDigest]
+        var exitRun: [String: Any] = ["runNonce": String(repeating: "1", count: 64), "configDigest": exitDigest,
+                                      "terminal": "Unknown", "censusComplete": true, "nodes": [[String: Any]]()]
+        func exitExport(_ contract: String, _ run: [String: Any]) throws -> String {
+            String(decoding: try JSONSerialization.data(withJSONObject: [
+                "contractVersion": contract, "globalCleanupEvidence": "CleanupUnknown", "instances": [run]
+            ]), as: UTF8.self)
+        }
+        let emptyDirectoryExport = try exitExport("polaris-ts-directory-retirement-v1", exitRun)
+        exitRun["censusComplete"] = false // A live auth inventory is not a terminal writer receipt.
+        let emptyAuthExport = try exitExport("polaris-ts-auth-writer-retirement-v1", exitRun)
+        var exited: [String: Any] = ["identity": exitIdentity, "lifecycle": "running", "runtimeStopped": false,
+                                    "generation": 1, "operationRequestID": "original-start",
+                                    "tailscaleStoreScope": emptyAuthExport, "tailscaleDirectoryScope": emptyDirectoryExport]
+        assert(vpnMayReuseProfileAfterProviderExit(identity: exitIdentity, report: exited))
+        assert(!vpnIdempotentStopIsConfirmed(evidence: exited, expectedGeneration: nil))
+        exited["operationRequestID"] = "reload"
+        assert(!vpnMayReuseProfileAfterProviderExit(identity: exitIdentity, report: exited))
+        exited["operationRequestID"] = "original-start"
+        exited["uncertainSettingsGeneration"] = 1
+        assert(!vpnMayReuseProfileAfterProviderExit(identity: exitIdentity, report: exited))
+        exited.removeValue(forKey: "uncertainSettingsGeneration")
+        exited.removeValue(forKey: "tailscaleDirectoryScope")
+        assert(!vpnMayReuseProfileAfterProviderExit(identity: exitIdentity, report: exited))
         let executable = URL(fileURLWithPath: "/app/PlugIns/PacketTunnel.appex/PacketTunnel")
         assert(tlsCapabilityImageMatches(executable.path, executable: executable))
         assert(!tlsCapabilityImageMatches("/other/PacketTunnel", executable: executable))

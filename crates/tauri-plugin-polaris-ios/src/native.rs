@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tauri::plugin::mobile::PluginInvokeError;
 use tauri::plugin::PluginHandle;
+use tauri::Emitter;
 
 tauri::ios_plugin_binding!(init_plugin_polaris_ios);
 static PLUGIN: OnceLock<PluginHandle<tauri::Wry>> = OnceLock::new();
@@ -16,15 +17,20 @@ fn state() -> &'static Mutex<LifecycleState> {
 
 pub fn init() -> tauri::plugin::TauriPlugin<tauri::Wry> {
     tauri::plugin::Builder::new("polaris-ios")
-        .setup(|_, api| {
+        .setup(|app, api| {
             let plugin = api.register_ios_plugin(init_plugin_polaris_ios)?;
             PLUGIN
                 .set(plugin)
                 .map_err(|_| "iOS VPN plugin was registered twice")?;
             // This cache observes NE liveness, never ownership or Go disposal evidence.
-            tauri::async_runtime::spawn(async {
+            let app = app.clone();
+            tauri::async_runtime::spawn(async move {
                 loop {
-                    let _ = status().await;
+                    let before = observed_running();
+                    let _ = read_status(false).await;
+                    if before == Some(true) && observed_running() == Some(false) {
+                        let _ = app.emit("event:iosVpnDisconnected", ());
+                    }
                     tokio::time::sleep(Duration::from_secs(5)).await;
                 }
             });
@@ -64,6 +70,9 @@ pub struct TunnelStatus {
     pub lifecycle: Option<String>,
     pub extension_generation: Option<u64>,
     pub uncertain_settings_generation: Option<u64>,
+    #[serde(default)]
+    pub provider_exited_without_stores: bool,
+    pub system_disconnect_error: Option<String>,
     pub tailscale_store_scope: Option<TailscaleStoreExport>,
     tailscale_store_retirement: Option<NativeScopedRetirement>,
     tailscale_directory_retirement: Option<NativeDirectoryRetirement>,
@@ -636,22 +645,33 @@ impl TunnelStatus {
                 "系统仍有 Polaris iOS VPN 会话；请先在系统设置中停止现有 VPN，再返回连接。".into(),
             );
         }
+        if self.provider_exited_without_stores {
+            return Ok(());
+        }
         if let Some(error) = self.cleanup_error.as_ref().or(self.last_error.as_ref()) {
             return Err(format!(
                 "iOS VPN 上次操作未确认完成：{error}。请检查系统 VPN 状态。"
             ));
         }
-        if self.profile_exists
-            && (self.ownership != "ownedSessionReported"
-                || self.runtime_stopped != Some(true)
-                || self.lifecycle.as_deref() != Some("stopped"))
-        {
+        if self.profile_exists && !self.has_confirmed_stop() {
             return Err(
                 "已有 iOS VPN 配置尚无可靠的扩展停止报告；清理状态未知，请检查系统设置后再连接。"
                     .into(),
             );
         }
         Ok(())
+    }
+
+    pub fn has_confirmed_stop(&self) -> bool {
+        !self.active
+            && !self.running
+            && self.profile_exists
+            && self.ownership == "ownedSessionReported"
+            && self.runtime_stopped == Some(true)
+            && self.lifecycle.as_deref() == Some("stopped")
+            && self.cleanup_error.is_none()
+            && self.last_error.is_none()
+            && self.uncertain_settings_generation.is_none()
     }
 }
 
@@ -731,13 +751,23 @@ pub async fn device_conditions() -> Result<DeviceConditions, String> {
 }
 
 pub async fn status() -> Result<TunnelStatus, String> {
+    read_status(true).await
+}
+
+async fn read_status(check_disconnect: bool) -> Result<TunnelStatus, String> {
     let generation = state()
         .lock()
         .map_err(|_| "iOS VPN state lock poisoned")?
         .generation();
-    let result = call::<TunnelStatus>("status", serde_json::json!({}), 12, None, None)
-        .await
-        .map_err(NativeCallFailure::message);
+    let result = call::<TunnelStatus>(
+        "status",
+        serde_json::json!({"checkDisconnect": check_disconnect}),
+        12,
+        None,
+        None,
+    )
+    .await
+    .map_err(NativeCallFailure::message);
     state()
         .lock()
         .map_err(|_| "iOS VPN state lock poisoned")?
@@ -1208,6 +1238,13 @@ pub async fn stop_target(target: &StopSessionTarget) -> Result<StoppedSessionRec
         .cleanup_proof_eligible
         .swap(false, std::sync::atomic::Ordering::SeqCst);
     expected["stopOnly"] = serde_json::json!(!eligible);
+    expected["ordinaryStop"] = serde_json::json!(
+        !target.original_instances.is_empty()
+            && target
+                .original_instances
+                .iter()
+                .all(|run| run.nodes.is_empty())
+    );
     if eligible {
         expected["expectedExtensionGeneration"] = serde_json::json!(target.extension_generation);
     }
@@ -1371,6 +1408,10 @@ pub async fn observe_current_session() -> Result<ObservedSessionReceipt, String>
 }
 pub fn started() -> bool {
     state().lock().map(|state| state.running()).unwrap_or(false)
+}
+
+pub fn observed_running() -> Option<bool> {
+    state().lock().ok()?.observed_running()
 }
 
 #[cfg(test)]
