@@ -3,7 +3,10 @@
 //! 父模块继续持有共享 reqwest client 与通用 body 读取 primitive；本模块只负责 net-stack 的
 //! DnsLookup / HttpClient 端口，避免订阅专属解析策略挤占通用更新传输实现。
 
-use std::{future::Future, time::Duration};
+use std::{
+    future::Future,
+    time::{Duration, Instant},
+};
 
 use polaris_net_stack::safe_redirect::{FetchInit, GuardedTarget, HttpClient, MinimalResponse};
 use polaris_net_stack::ssrf::DnsLookup;
@@ -28,9 +31,14 @@ impl DnsLookup for SystemDnsLookup {
     fn lookup_all(&self, host: &str) -> impl Future<Output = Result<Vec<String>, String>> + Send {
         let host = host.to_string();
         async move {
+            let lookup_started = Instant::now();
             let addrs = tokio::net::lookup_host((host.as_str(), 0))
                 .await
                 .map_err(|e| format!("DNS 解析失败 {host}: {e}"))?;
+            log::debug!(
+                "guarded DNS timing: lookup_ms={}",
+                lookup_started.elapsed().as_millis()
+            );
             // 逐 IP 交给 guard 判定（**全部**返回，不只首个：rebinding 常把恶意 IP 藏在第二条）。
             let ips: Vec<String> = addrs.map(|a| a.ip().to_string()).collect();
             if ips.is_empty() {
@@ -182,10 +190,12 @@ async fn fetch_one_hop(
     let response_timeout = init
         .timeout_ms
         .map_or(RESPONSE_TIMEOUT, Duration::from_millis);
+    let send_started = Instant::now();
     let mut resp = tokio::time::timeout(response_timeout, req.send())
         .await
         .map_err(|_| "request timeout".to_string())?
         .map_err(|e| sanitized_reqwest_error(&e))?;
+    let headers_ms = send_started.elapsed().as_millis();
 
     let status = resp.status().as_u16();
     let headers = collect_headers(&resp);
@@ -195,6 +205,7 @@ async fn fetch_one_hop(
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
 
+    let body_started = Instant::now();
     let body = if (300..400).contains(&status) {
         Vec::new()
     } else {
@@ -203,6 +214,11 @@ async fn fetch_one_hop(
             .await
             .map_err(sanitized_body_read_error)?
     };
+    log::debug!(
+        "guarded HTTP timing: status={status} response_headers_ms={headers_ms} body_ms={} body_bytes={}",
+        body_started.elapsed().as_millis(),
+        body.len()
+    );
 
     Ok(MinimalResponse {
         status,
