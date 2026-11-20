@@ -482,6 +482,14 @@ body {
   margin-inline-start: auto;
 }
 
+.m-pending-acts[data-revert-pair='true'] {
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: minmax(0, 1fr);
+  gap: var(--sp-2);
+  overflow-wrap: anywhere;
+}
+
 .m-pending-btn {
   position: relative;
   isolation: isolate;
@@ -518,6 +526,9 @@ body {
   color: #00141d;
 }
 .m-pending-primary::before { border-color: transparent; background: hsl(var(--mobile-action-fill)); }
+
+.m-pending-revert { color: hsl(var(--warn)); }
+.m-pending-revert::before { border-color: hsl(var(--warn)); background: hsl(var(--warn-weak)); }
 
 /* 武装态：翻实心红 + 换文案（同桌面 `.btn.confirming` 的两条动作）。 */
 .m-pending-confirming {

@@ -497,7 +497,7 @@ export function MobilePendingBar(): ReactElement | null {
           <span className="m-pending-detail">{t('home.pendingSavedStillNeedsApply')}</span>
         )}
       </div>
-      <div className="m-pending-acts">
+      <div className="m-pending-acts" data-revert-pair={view.actions.length === 2 && view.actions[0].id === 'revertSaved'}>
         {view.actions.map((a) => {
           const arming = (a.id === 'reset' && armed === RESET_KEY)
             || (a.id === 'revertSaved' && armed === REVERT_SAVED_KEY + pending.savedSettingsRevertToken);
@@ -506,6 +506,8 @@ export function MobilePendingBar(): ReactElement | null {
               key={a.id}
               type="button"
               className={`m-pending-btn${PRIMARY_ACTIONS.has(a.id) ? ' m-pending-primary' : ''}${
+                a.id === 'revertSaved' ? ' m-pending-revert' : ''
+              }${
                 arming ? ' m-pending-confirming confirming' : ''
               }`}
               disabled={a.disabled}

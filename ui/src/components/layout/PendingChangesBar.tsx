@@ -84,7 +84,7 @@ const ACTION_LABEL: Record<BarActionId, string> = {
   checkNative: 'home.pendingCheckNativeBtn',
 };
 
-/** `btn flow`（主）vs `btn ghost`（次）。断流的那颗永远是主按钮，与今天的单按钮形态一致。 */
+/** 实心主按钮与其他动作区分。断流的那颗永远是主按钮。 */
 const PRIMARY_ACTIONS: ReadonlySet<BarActionId> = new Set<BarActionId>(['apply', 'retryApply', 'retryPersistence', 'retryHost']);
 
 /**
@@ -550,7 +550,7 @@ export default function PendingChangesBar() {
         {view.accountDetailKeys?.map(key => <div key={key}>{t(key)}</div>)}
         {view.detailKey !== '' && <div>{t(view.detailKey)}</div>}
       </button>
-      <div className="pb-acts">
+      <div className="pb-acts" data-revert-pair={view.actions.length === 2 && view.actions[0].id === 'revertSaved'}>
         {view.actions.map((a) => {
           // 武装态：翻实心红（`.btn.confirming`）+ 换文案，与原型 confirmTwice 对文字按钮的两条动作一致。
           const arming = (a.id === 'reset' && armed === RESET_KEY)
@@ -561,7 +561,7 @@ export default function PendingChangesBar() {
               type="button"
               className={cn(
                 'btn sm',
-                PRIMARY_ACTIONS.has(a.id) ? 'flow' : 'ghost',
+                a.id === 'revertSaved' ? 'pb-revert' : PRIMARY_ACTIONS.has(a.id) ? 'flow' : 'ghost',
                 arming && 'confirming',
               )}
               disabled={a.disabled}

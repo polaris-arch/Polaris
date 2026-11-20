@@ -493,7 +493,7 @@
     "pendingGroupStaged": "待保存 · 尚未落盘",
     "pendingIgnoreBtn": "忽略",
     "pendingResetBtn": "重置",
-    "pendingRevertSavedSettings": "撤销待应用设置和规则",
+    "pendingRevertSavedSettings": "撤销",
     "pendingResetConfirm": "放弃全部未保存改动？",
     "pendingRetryBtn": "重试",
     "pendingRetrySaveBtn": "重试保存",

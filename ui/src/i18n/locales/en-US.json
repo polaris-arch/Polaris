@@ -493,7 +493,7 @@
     "pendingGroupStaged": "Unsaved — not written to disk yet",
     "pendingIgnoreBtn": "Dismiss",
     "pendingResetBtn": "Reset",
-    "pendingRevertSavedSettings": "Revert pending settings and rules",
+    "pendingRevertSavedSettings": "Revert",
     "pendingResetConfirm": "Discard all unsaved changes?",
     "pendingRetryBtn": "Retry",
     "pendingRetrySaveBtn": "Retry save",
