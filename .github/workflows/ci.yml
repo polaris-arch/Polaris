@@ -913,13 +913,17 @@ jobs:
 
       - name: Verify exact candidate Go toolchain
         if: ${{ needs.cheap_format.outputs.native_dns_formal == 'true' }}
+        timeout-minutes: 5
         shell: bash
         env:
           EXPECTED_GO: ${{ steps.native_dns_host.outputs.go_version }}
+          GOWORK: 'off'
         run: |
           set -euo pipefail
           [ "$(go env GOVERSION)" = "go$EXPECTED_GO" ]
           go version
+          # Warm the same BuildID reader as the native DNS candidate gate.
+          go tool buildid "$(go env GOROOT)/bin/go$(go env GOEXE)" >/dev/null
 
       - name: Acquire all four explicit candidate payloads before placeholders
         id: native_dns_acquire
