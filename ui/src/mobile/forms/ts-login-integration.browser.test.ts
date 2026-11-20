@@ -910,6 +910,51 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile TS attempt lif
     } finally { await page.close(); }
   }, 30_000);
 
+  it.each(['__ts-login', '__ts-desktop'])('%s preserves a pushed URL when an older receipt arrives', async endpoint => {
+    const page = await browser.newPage({ viewport: { width: 1100, height: 850 }, locale: 'zh-CN' });
+    try {
+      await page.goto(`${origin}/${endpoint}`);
+      await page.locator(endpoint === '__ts-login' ? '.m-form-foot .primary' : '.dlg-foot .btn.flow').click();
+      await page.waitForFunction(() => (window as any).__tsTest.starts === 1);
+      await page.evaluate(() => {
+        const test = (window as any).__tsTest;
+        test.holdProgress = true;
+        test.receipt = { ...test.attempt(), phase: 'starting' };
+        window.dispatchEvent(new Event('focus'));
+      });
+      await page.waitForFunction(() => !!(window as any).__tsTest.releaseProgress);
+      const url = 'https://login.example/fresh-url';
+      expect(await page.evaluate(async url => {
+        const test = (window as any).__tsTest;
+        test.emit('onTailscaleLoginProgress', { ...test.receipt, phase: 'awaitingAuth', url });
+        test.holdProgress = false;
+        test.releaseProgress();
+        await new Promise(requestAnimationFrame);
+        return { phase: test.attempt().phase, receiptUrl: test.attempt().url, cachedUrl: test.authUrl() };
+      }, url)).toEqual({ phase: 'awaitingAuth', receiptUrl: url, cachedUrl: url });
+
+      const newUrl = 'https://login.example/later-url';
+      await page.evaluate(url => {
+        const test = (window as any).__tsTest;
+        test.receipt = { ...test.receipt, phase: 'awaitingAuth', url };
+        window.dispatchEvent(new Event('focus'));
+      }, newUrl);
+      await page.waitForFunction(url => {
+        const test = (window as any).__tsTest;
+        return test.attempt().url === url && test.authUrl() === url;
+      }, newUrl);
+
+      await page.evaluate(() => {
+        const test = (window as any).__tsTest;
+        test.receipt = { ...test.receipt, phase: 'authorized', url: null };
+        window.dispatchEvent(new Event('focus'));
+      });
+      await page.waitForFunction(() => (window as any).__tsTest.attempt().phase === 'authorized');
+      expect(await page.evaluate(() => (window as any).__tsTest.authUrl())).toBeFalsy();
+      expect(await page.evaluate(() => (window as any).__tsTest.cancels)).toEqual([]);
+    } finally { await page.close(); }
+  }, 30_000);
+
   it('a failed receipt read reports unknown status and a later read clears it without changing authorization', async () => {
     const page = await browser.newPage({ viewport: { width: 390, height: 844 }, locale: 'zh-CN' });
     try {

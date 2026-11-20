@@ -120,11 +120,15 @@ export function TsLoginDialog({ instanceId, serverId, replaceIdentity = false }:
     let revision = 0;
     const reconcile = async () => {
       const observed = ++revision;
+      const progressAtRead = useTailscaleLoginProgressStore.getState().attempts[request.serverId];
       try {
         const receipt = await api.server.tailscaleLoginProgress(request.serverId, request.attemptId);
         if (disposed || observed !== revision || activeRequest.current?.attemptId !== request.attemptId
           || !receipt || (receipt.url && !validatedTailscaleAuthUrl(receipt.url))) return;
-        if (!useTailscaleLoginProgressStore.getState().apply(receipt)) return;
+        const progressStore = useTailscaleLoginProgressStore.getState();
+        // A push during the read can supersede active progress. Terminal receipts still use the attempt guard.
+        if (progressStore.attempts[request.serverId] !== progressAtRead && loginAttemptActive(receipt.phase)) return;
+        if (!progressStore.apply(receipt)) return;
         const store = useAppStore.getState();
         store.setTailscaleLoginInitiated(receipt.serverId, loginAttemptActive(receipt.phase));
         store.setTailscaleAuthUrl(receipt.serverId, loginAttemptActive(receipt.phase) ? receipt.url ?? null : null);

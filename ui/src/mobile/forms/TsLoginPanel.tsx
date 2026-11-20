@@ -154,15 +154,17 @@ export function TsLoginPanel({
     let revision = 0;
     const reconcile = async (): Promise<void> => {
       const request = ++revision;
+      const progressAtRead = useTailscaleLoginProgressStore.getState().attempts[serverId];
       try {
         const receipt = await api.server.tailscaleLoginProgress(serverId, attemptId);
         if (disposed || request !== revision || pendingRef.current?.attemptId !== attemptId
           || !hasInstance(instanceId)) return;
         setProgressReadFailedAttempt(null);
         if (!receipt || (receipt.url && !validatedTailscaleAuthUrl(receipt.url))) return;
-        const current = useTailscaleLoginProgressStore.getState().attempts[serverId];
-        if (current?.attemptId !== attemptId) return;
-        if (!useTailscaleLoginProgressStore.getState().apply(receipt)) return;
+        const progressStore = useTailscaleLoginProgressStore.getState();
+        const current = progressStore.attempts[serverId];
+        if (current?.attemptId !== attemptId || (current !== progressAtRead && loginAttemptActive(receipt.phase))) return;
+        if (!progressStore.apply(receipt)) return;
         setTailscaleAuthUrl(serverId, loginAttemptActive(receipt.phase) ? receipt.url ?? null : null);
         setTailscaleLoginInitiated(serverId, loginAttemptActive(receipt.phase));
         if (receipt.phase === 'authorized') setTailscaleLoginState(serverId, true);
