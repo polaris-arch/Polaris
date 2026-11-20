@@ -231,6 +231,7 @@ const READ_CALLS: readonly string[] = [
   'api.proxy.getStatus',
   'api.proxy.onStarted',
   'api.proxy.onStopped',
+  'api.proxy.onIosVpnDisconnected',
   'api.proxy.onPendingChanges',
   'api.proxy.onError',
   'api.proxy.onTailscaleStatus',

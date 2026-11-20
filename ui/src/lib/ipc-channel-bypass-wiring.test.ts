@@ -70,6 +70,9 @@ const FILES = collectSources(SRC, /\.tsx?$/).map((f) => ({
 const RUST = collectSources(TAURI_SRC, /\.rs$/)
   .map((f) => readFileSync(f, 'utf8'))
   .join('\n');
+const IOS_PLUGIN_NATIVE = code(readFileSync(join(
+  REPO, 'crates/tauri-plugin-polaris-ios/src/native.rs',
+), 'utf8'));
 
 const PRODUCTION_RUST_FILES = productionRsFilesUnder('src-tauri/src').map((file) => ({
   rel: relative(REPO, file).split(sep).join('/'),
@@ -363,11 +366,15 @@ describe('G11-3：Rust 注入脚本的 raw invoke 与三份机器真值闭环', 
 });
 
 describe('G11-4：跨语言通道名单一真值源（两侧字符串必须相等）', () => {
-  it('全部 EVENT_* 值都能在 src-tauri 里逐字找到（前端改名而 Rust 没跟 ⇒ 订阅静默收不到）', () => {
+  it('全部 EVENT_* 值都与各自 Rust 发送端一致（前端改名而 Rust 没跟 ⇒ 订阅静默收不到）', () => {
     // 变异对照：把 EVENT_PROXY_STARTED 改成 'event:proxyStarted2' → 本条转红。
     const evs = Object.entries(CHANNELS).filter(([k]) => k.startsWith('EVENT_'));
     expect(evs.length, 'EVENT_* 一条都没解析出来 —— 本条会恒绿').toBeGreaterThan(20);
-    const missing = evs.filter(([, v]) => !RUST.includes(`"${v}"`)).map(([k, v]) => `${k}=${v}`);
+    const missing = evs
+      .filter(([k, v]) => k === 'EVENT_IOS_VPN_DISCONNECTED'
+        ? !IOS_PLUGIN_NATIVE.includes(`app.emit("${v}",`)
+        : !RUST.includes(`"${v}"`))
+      .map(([k, v]) => `${k}=${v}`);
     expect(missing, 'Rust 侧找不到同名事件字符串 —— 跨语言派发已失联').toEqual([]);
   });
 
