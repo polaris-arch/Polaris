@@ -544,8 +544,18 @@ impl SingBoxApiClient {
                 .max_decoding_message_size(CONNECTION_SNAPSHOT_MAX_FRAME_BYTES);
             let mut request = self.with_auth(Request::new(daemon::Empty {}));
             request.set_timeout(SNAPSHOT_TIMEOUT);
-            let mut stream = match client.stream_connection_snapshot(request).await {
-                Ok(response) => response.into_inner(),
+            // Older grpc-go h2c servers can report an unknown RPC in trailers
+            // after sending headers, so also include the first message read.
+            let open = async {
+                let mut stream = client
+                    .stream_connection_snapshot(request)
+                    .await?
+                    .into_inner();
+                let first = stream.message().await?;
+                Ok::<_, tonic::Status>((stream, first))
+            };
+            let (mut stream, mut next) = match open.await {
+                Ok(opened) => opened,
                 Err(status) if status.code() == tonic::Code::Unimplemented => {
                     return Ok(self
                         .first_connection_reset()
@@ -565,7 +575,7 @@ impl SingBoxApiClient {
 
             let mut entries = Vec::new();
             let mut bytes = 0;
-            while let Some(chunk) = stream.message().await? {
+            while let Some(chunk) = next {
                 if chunk.complete {
                     if chunk.entries.is_empty() && stream.message().await?.is_none() {
                         return Ok(entries);
@@ -583,6 +593,7 @@ impl SingBoxApiClient {
                     .into());
                 }
                 entries.extend(chunk.entries);
+                next = stream.message().await?;
             }
             Err(tonic::Status::data_loss("connection snapshot ended before completion").into())
         })

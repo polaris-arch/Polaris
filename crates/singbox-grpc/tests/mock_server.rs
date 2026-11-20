@@ -1977,6 +1977,13 @@ async fn live_connection_snapshot_only_returns_complete_authenticated_data() {
         assert!(matches!(error, ClientError::Status(status) if status.code() == code));
     }
     assert_eq!(state.connection_calls.load(Ordering::Relaxed), 0);
+
+    *state.connection_snapshot.lock().unwrap() =
+        Some(vec![Err(Status::unimplemented("unknown RPC in trailers"))]);
+    let legacy = client.live_connection_snapshot().await.unwrap();
+    assert_eq!(legacy.len(), 1);
+    assert_eq!(legacy[0].id, "conn-1");
+    assert_eq!(state.connection_calls.load(Ordering::Relaxed), 1);
 }
 
 #[tokio::test]
