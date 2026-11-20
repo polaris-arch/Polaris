@@ -255,13 +255,6 @@ export function NetworkPage({ config, update, commit }: MobileSettingsPageProps)
           config.interruptConnectionsOnSwitch !== false,
           (v) => update({ interruptConnectionsOnSwitch: v }),
         )}
-        {toggleRow(
-          'restart-on-node-change',
-          'settings.network.restartOnNodeChange',
-          'settings.network.restartOnNodeChangeDesc',
-          !!config.restartOnNodeChange,
-          (v) => update({ restartOnNodeChange: v }),
-        )}
       </SettingsGroup>
 
       <SettingsGroup header={t('settings.network.updateAndSpeedTest')}>

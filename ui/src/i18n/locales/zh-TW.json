@@ -849,8 +849,6 @@
       "webrtcTunOnlyNote": "僅 TUN 模式生效——在主頁把接管方式切到 TUN 後可用",
       "interruptOnSwitch": "切換節點即中斷舊連線",
       "interruptOnSwitchDesc": "預設開：切換節點即中斷舊連線。關 = 平順切換，現有連線保留至自然關閉",
-      "restartOnNodeChange": "節點變更自動套用",
-      "restartOnNodeChangeDesc": "開啟後所有節點變動都會自動套用，必要時重新啟動代理；關閉後僅未使用節點等待手動套用，正在使用的節點仍會自動處理",
       "mgmtBlock": "管理面板",
       "mgmtEnable": "啟用管理 API 與內嵌面板",
       "mgmtEnableDesc": "預設關閉。在 127.0.0.1 開放 sing-box 控制 API，供內嵌面板使用",

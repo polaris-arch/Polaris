@@ -849,8 +849,6 @@
       "webrtcTunOnlyNote": "仅 TUN 模式生效——在主页把接管方式切到 TUN 后可用",
       "interruptOnSwitch": "切换节点即断旧连接",
       "interruptOnSwitchDesc": "默认开：切换节点即断开旧连接。关 = 优雅切换，现有连接保留至自然关闭",
-      "restartOnNodeChange": "节点变更自动应用",
-      "restartOnNodeChangeDesc": "开启后所有节点变动都会自动应用，必要时重启代理；关闭后仅未使用节点等待手动应用，正在使用的节点仍会自动处理",
       "mgmtBlock": "管理面板",
       "mgmtEnable": "启用管理 API 与内嵌面板",
       "mgmtEnableDesc": "默认关闭。在 127.0.0.1 暴露 sing-box 控制 API，供内嵌面板使用",

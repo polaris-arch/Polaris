@@ -392,7 +392,6 @@ const EXPECTED_SWITCHES: Record<MobileSettingsPageId, readonly string[]> = {
     'auto-switch-node',
     'mesh-login-fallback',
     'interrupt-on-switch',
-    'restart-on-node-change',
     'main-session-via-proxy',
     // 周期测速的全局总开关（2026-10-08）：五个平台同一项，执行侧是后端的周期测速调度器。
     'periodic-speed-test',
@@ -1507,7 +1506,7 @@ describe('⑧ 触屏解释由常驻文字或可操作的详情按钮承载', () 
   it('常驻说明和机制详情入口都落在对应设置页上', () => {
     const missing = RESIDENT.filter(([page, key]) => !MARKUP[page].includes(copy(key)));
     expect(missing.map(([p, k]) => `${p} ← ${k}`), '这些解释在移动端没有常驻落点').toEqual([]);
-    for (const id of ['block-quic', 'webrtc-leak', 'tls-fragment', 'auto-switch-node', 'mesh-login-fallback', 'interrupt-on-switch', 'restart-on-node-change', 'main-session-via-proxy', 'periodic-speed-test']) {
+    for (const id of ['block-quic', 'webrtc-leak', 'tls-fragment', 'auto-switch-node', 'mesh-login-fallback', 'interrupt-on-switch', 'main-session-via-proxy', 'periodic-speed-test']) {
       expect(rowOf(MARKUP.network, id)).toContain('aria-haspopup="dialog"');
     }
     expect(rowOf(MARKUP.dns, 'race-strategy')).toContain('aria-haspopup="dialog"');
@@ -1695,7 +1694,6 @@ describe('⑩ 写失败必须可见：每一个写操作都有行内回显（裁
       'auto-switch-node',
       'mesh-login-fallback',
       'interrupt-on-switch',
-      'restart-on-node-change',
       'main-session-via-proxy',
     ],
     dns: [

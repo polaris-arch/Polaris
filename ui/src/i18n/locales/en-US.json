@@ -849,8 +849,6 @@
       "webrtcTunOnlyNote": "Only takes effect in TUN mode — switch the takeover mode to TUN on the home screen to use it",
       "interruptOnSwitch": "Drop old connections on node switch",
       "interruptOnSwitchDesc": "On by default: switching nodes drops the old connections. Off means a graceful switch — existing connections stay until they close on their own",
-      "restartOnNodeChange": "Apply node changes automatically",
-      "restartOnNodeChangeDesc": "When on, all node changes apply automatically and restart the proxy only when needed. When off, unused-node changes wait for manual apply; nodes in use are still handled automatically.",
       "mgmtBlock": "Management dashboard",
       "mgmtEnable": "Enable the management API and built-in dashboard",
       "mgmtEnableDesc": "Off by default. Exposes the sing-box control API on 127.0.0.1 for the built-in dashboard",

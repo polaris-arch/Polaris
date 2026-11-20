@@ -527,15 +527,6 @@ export default function SettingsNetwork({ config, update }: SettingsNetworkProps
             onChange={(v) => void update({ interruptConnectionsOnSwitch: v })}
           />
         </SetRow>
-        <SetRow
-          label={t('settings.network.restartOnNodeChange')}
-          tip={t('settings.network.restartOnNodeChangeDesc')}
-        >
-          <Switch
-            checked={!!config.restartOnNodeChange}
-            onChange={(v) => void update({ restartOnNodeChange: v })}
-          />
-        </SetRow>
       </SetBlock>
 
       {/* 4. 更新与测速（契约指定归属本页；上一批因本页被占临时寄放在通用页，此处归位） */}

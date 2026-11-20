@@ -447,22 +447,6 @@ const REGISTRY: readonly PromiseRow[] = [
     evidence: { kind: 'config-key', key: 'autoSwitchNode' },
   },
   {
-    snippet: '开启后所有节点变动都会自动应用',
-    evidence: {
-      kind: 'anchors',
-      items: [
-        {
-          file: 'src-tauri/src/runtime/proxy',
-          needle: '.get("restartOnNodeChange")',
-        },
-        {
-          file: 'crates/switch-engine/src/decision.rs',
-          needle: 'if !input.restart_on_node_change && input.only_added_unreferenced',
-        },
-      ],
-    },
-  },
-  {
     snippet: '自动生成，加载面板时校验',
     evidence: {
       kind: 'anchor',
