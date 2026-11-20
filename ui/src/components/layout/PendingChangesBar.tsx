@@ -561,7 +561,7 @@ export default function PendingChangesBar() {
               type="button"
               className={cn(
                 'btn sm',
-                a.id === 'revertSaved' ? 'pb-revert' : PRIMARY_ACTIONS.has(a.id) ? 'flow' : 'ghost',
+                a.id === 'revertSaved' ? 'warn-action' : PRIMARY_ACTIONS.has(a.id) ? 'flow' : 'ghost',
                 arming && 'confirming',
               )}
               disabled={a.disabled}

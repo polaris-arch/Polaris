@@ -929,8 +929,6 @@
 .pending-bar .pb-acts{ margin-left:auto; display:flex; gap:8px; flex:none; }
 .pending-bar .pb-acts[data-revert-pair='true']{ display:grid; grid-auto-flow:column; grid-auto-columns:1fr; }
 .pb-acts[data-revert-pair='true'] > .btn{ justify-content:center; }
-.pending-bar .pb-revert{ color:hsl(var(--warn)); background:hsl(var(--warn-weak)); border-color:hsl(var(--warn)); }
-.pending-bar .pb-revert:hover{ background:color-mix(in srgb, hsl(var(--warn-weak)), hsl(var(--warn)) 12%); }
 .pd-pop{ position:absolute; z-index:210; width:min(360px,calc(100% - 24px)); padding:6px;
   background:hsl(var(--surface)); border:1px solid hsl(var(--line)); border-radius:var(--r-md); box-shadow:var(--shadow-pop); }
 .pd-pop[hidden]{ display:none; }
