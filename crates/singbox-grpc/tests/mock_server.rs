@@ -42,8 +42,7 @@ const SECRET: &str = "test-secret-123";
 /// 免得重连把订阅计数搅成不确定值。
 const NO_RECONNECT: Duration = Duration::from_secs(3600);
 
-/// `SubscribeConnections` 的逐帧脚本。
-type ConnectionScript = Vec<Result<ConnectionEvents, Status>>;
+type FrameScript<T> = Vec<Result<T, Status>>;
 
 /// mock server 状态：记录收到的调用 + 可配置的流行为。
 #[derive(Default)]
@@ -90,11 +89,12 @@ struct MockState {
     openvpn_cancels: Arc<std::sync::Mutex<Vec<daemon::OpenVpnChallengeCancel>>>,
     /// `SubscribeConnections` 逐帧回放的脚本（`None` = 沿用下面按 interval 决定的单帧行为）。
     /// 脚本放完后流保持打开，直到客户端退订；脚本里的 `Err` 即流中途报错。
-    connection_script: Arc<std::sync::Mutex<Option<ConnectionScript>>>,
+    connection_script: Arc<std::sync::Mutex<Option<FrameScript<ConnectionEvents>>>>,
     /// `SubscribeConnections` 被订阅的次数。
     connection_calls: Arc<AtomicU64>,
     /// 为真时 `SubscribeConnections` 永不应答（核卡死）。
     connection_hang: Arc<std::sync::atomic::AtomicBool>,
+    connection_snapshot: std::sync::Mutex<Option<FrameScript<daemon::ConnectionSnapshotChunk>>>,
 }
 
 struct MockService {
@@ -563,6 +563,23 @@ impl StartedService for MockService {
             }
         });
         Ok(Response::new(ReceiverStream::new(rx)))
+    }
+
+    type StreamConnectionSnapshotStream =
+        tokio_stream::Iter<std::vec::IntoIter<Result<daemon::ConnectionSnapshotChunk, Status>>>;
+    async fn stream_connection_snapshot(
+        &self,
+        req: Request<Empty>,
+    ) -> Result<Response<Self::StreamConnectionSnapshotStream>, Status> {
+        check_auth(&req, &self.secret)?;
+        let script = self
+            .state
+            .connection_snapshot
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or_else(|| Status::unimplemented("legacy started service"))?;
+        Ok(Response::new(tokio_stream::iter(script)))
     }
 
     type SubscribeGroupsStream = ReceiverStream<Result<Groups, Status>>;
@@ -1881,6 +1898,11 @@ async fn connection_events_at_decodes_a_first_frame_beyond_the_default_limit() {
         .await
         .expect("bounded large snapshot");
     assert_eq!(snapshot.len(), 6000);
+    let live = client
+        .live_connection_snapshot()
+        .await
+        .expect("legacy fallback must handle the same bounded frame");
+    assert_eq!(live.len(), 6000);
 
     // Replay the same large reset after a forced disconnect. Every open must
     // install the shared limit, including the second (reconnected) client.
@@ -1899,6 +1921,62 @@ async fn connection_events_at_decodes_a_first_frame_beyond_the_default_limit() {
         assert_eq!(reset.events.len(), 6000);
     }
     assert!(state.connection_calls.load(Ordering::Relaxed) >= before + 2);
+}
+
+#[tokio::test]
+async fn live_connection_snapshot_only_returns_complete_authenticated_data() {
+    use daemon::{ConnectionSnapshotChunk, ConnectionSnapshotEntry};
+
+    let (addr, state, _h) = spawn_server(SECRET, 0).await;
+    let client = SingBoxApiClient::connect(Endpoint::new("127.0.0.1", addr.port()), SECRET)
+        .await
+        .unwrap();
+    let wrong_secret = SingBoxApiClient::connect(Endpoint::new("127.0.0.1", addr.port()), "wrong")
+        .await
+        .unwrap();
+    assert!(matches!(
+        wrong_secret.live_connection_snapshot().await,
+        Err(ClientError::Status(status)) if status.code() == tonic::Code::Unauthenticated
+    ));
+    let frame = |id: &str| ConnectionSnapshotChunk {
+        entries: vec![ConnectionSnapshotEntry {
+            id: id.into(),
+            chain_list: vec!["selector".into(), "old-member".into()],
+        }],
+        complete: false,
+    };
+    let complete = ConnectionSnapshotChunk {
+        entries: Vec::new(),
+        complete: true,
+    };
+    *state.connection_snapshot.lock().unwrap() =
+        Some(vec![Ok(frame("1")), Ok(frame("2")), Ok(complete.clone())]);
+    let entries = client.live_connection_snapshot().await.unwrap();
+    assert_eq!(
+        entries,
+        [frame("1").entries[0].clone(), frame("2").entries[0].clone()]
+    );
+
+    for (script, code) in [
+        (vec![Ok(frame("1"))], tonic::Code::DataLoss),
+        (
+            vec![Ok(frame("1")), Err(Status::unimplemented("midstream"))],
+            tonic::Code::Unimplemented,
+        ),
+        (
+            vec![
+                Ok(frame("1")),
+                Ok(complete),
+                Err(Status::unavailable("bad trailer")),
+            ],
+            tonic::Code::Unavailable,
+        ),
+    ] {
+        *state.connection_snapshot.lock().unwrap() = Some(script);
+        let error = client.live_connection_snapshot().await.unwrap_err();
+        assert!(matches!(error, ClientError::Status(status) if status.code() == code));
+    }
+    assert_eq!(state.connection_calls.load(Ordering::Relaxed), 0);
 }
 
 #[tokio::test]

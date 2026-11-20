@@ -103,6 +103,10 @@ pub const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(3);
 /// 只取首帧（reset 全量），间隔实际不影响结果。
 const SNAPSHOT_INTERVAL_NS: i64 = 1_000_000_000;
 
+// Match the daemon's limits for the one-shot ID and outbound chain projection.
+const CONNECTION_SNAPSHOT_MAX_FRAME_BYTES: usize = 256 * 1024;
+const CONNECTION_SNAPSHOT_MAX_BYTES: usize = 4 * 1024 * 1024;
+
 /// 单会话 Connection 事件流的单帧解码上限：64 MiB（tonic 默认是 4 MiB）。
 ///
 /// 这条流的首帧躲不开全量：内核的 `SubscribeConnections` 进循环前无条件发一帧「全部活动连接 +
@@ -511,7 +515,7 @@ impl SingBoxApiClient {
         })
     }
 
-    /// 取连接列表**首帧全量快照**（精准断连用），带 [`SNAPSHOT_TIMEOUT`] 兜底。
+    /// 取连接列表**首帧全量快照**，带 [`SNAPSHOT_TIMEOUT`] 兜底。
     ///
     /// SubscribeConnections 的首帧是 reset 帧（内核当前全量连接），Polaris
     /// `closeOldNodeConnectionsAfterHotSwitch` 正是订阅后取首帧即退订。此处用**一次性**订阅
@@ -520,23 +524,89 @@ impl SingBoxApiClient {
     /// 首帧超时（3s）→ [`ClientError::SnapshotTimeout`]（调用方跳过断连，不阻断已成功的 PUT）。
     /// 返回快照含**已关闭的死连接**（内核历史环）——由调用方按 `closedAt` 过滤。
     pub async fn first_connection_snapshot(&self) -> Result<Vec<daemon::Connection>, ClientError> {
+        self.within_snapshot_deadline(async {
+            Ok(self
+                .first_connection_reset()
+                .await?
+                .map(|ev| ev.events.into_iter().filter_map(|e| e.connection).collect())
+                .unwrap_or_default())
+        })
+        .await
+    }
+
+    /// Read the active connection IDs and chains before applying a selector change.
+    pub async fn live_connection_snapshot(
+        &self,
+    ) -> Result<Vec<daemon::ConnectionSnapshotEntry>, ClientError> {
+        self.within_snapshot_deadline(async {
+            let mut client = self
+                .client()
+                .max_decoding_message_size(CONNECTION_SNAPSHOT_MAX_FRAME_BYTES);
+            let mut request = self.with_auth(Request::new(daemon::Empty {}));
+            request.set_timeout(SNAPSHOT_TIMEOUT);
+            let mut stream = match client.stream_connection_snapshot(request).await {
+                Ok(response) => response.into_inner(),
+                Err(status) if status.code() == tonic::Code::Unimplemented => {
+                    return Ok(self
+                        .first_connection_reset()
+                        .await?
+                        .into_iter()
+                        .flat_map(|frame| frame.events)
+                        .filter_map(|event| event.connection)
+                        .filter(|conn| conn.closed_at <= 0)
+                        .map(|conn| daemon::ConnectionSnapshotEntry {
+                            id: conn.id,
+                            chain_list: conn.chain_list,
+                        })
+                        .collect());
+                }
+                Err(status) => return Err(status.into()),
+            };
+
+            let mut entries = Vec::new();
+            let mut bytes = 0;
+            while let Some(chunk) = stream.message().await? {
+                if chunk.complete {
+                    if chunk.entries.is_empty() && stream.message().await?.is_none() {
+                        return Ok(entries);
+                    }
+                    return Err(tonic::Status::data_loss("invalid snapshot completion").into());
+                }
+                if chunk.entries.is_empty() {
+                    return Err(tonic::Status::data_loss("empty snapshot data frame").into());
+                }
+                bytes += prost::Message::encoded_len(&chunk);
+                if bytes > CONNECTION_SNAPSHOT_MAX_BYTES {
+                    return Err(tonic::Status::resource_exhausted(
+                        "connection snapshot exceeds its byte limit",
+                    )
+                    .into());
+                }
+                entries.extend(chunk.entries);
+            }
+            Err(tonic::Status::data_loss("connection snapshot ended before completion").into())
+        })
+        .await
+    }
+
+    async fn first_connection_reset(
+        &self,
+    ) -> Result<Option<daemon::ConnectionEvents>, ClientError> {
         let mut c = self
             .client()
             .max_decoding_message_size(CONNECTION_EVENTS_MAX_FRAME_BYTES);
         let req = self.with_auth(Request::new(daemon::SubscribeConnectionsRequest {
             interval: SNAPSHOT_INTERVAL_NS,
         }));
-        let fut = async move {
-            let mut stream = c.subscribe_connections(req).await?.into_inner();
-            // 首帧 = reset 全量。流结束（None）→ 空快照（核已停/无连接），非错误。
-            let first = stream.message().await?;
-            Ok::<_, ClientError>(
-                first
-                    .map(|ev| ev.events.into_iter().filter_map(|e| e.connection).collect())
-                    .unwrap_or_default(),
-            )
-        };
-        // deadline 必须裹住「建流 + 首帧」整体：核 wedged 时 subscribe 本身就可能永不返回。
+        let mut stream = c.subscribe_connections(req).await?.into_inner();
+        Ok(stream.message().await?)
+    }
+
+    async fn within_snapshot_deadline<T>(
+        &self,
+        fut: impl std::future::Future<Output = Result<T, ClientError>>,
+    ) -> Result<T, ClientError> {
+        // The same deadline covers opening, reading, and any legacy fallback.
         match in_api_lifetime(&self._retained_lifetime, async {
             Ok(tokio::time::timeout(SNAPSHOT_TIMEOUT, fut).await)
         })
@@ -1034,7 +1104,7 @@ pub enum ClientError {
     Status(#[from] tonic::Status),
     #[error("gRPC request stream closed before the Taildrop transfer completed")]
     RequestStreamClosed,
-    /// 连接首帧订阅超时（[`SNAPSHOT_TIMEOUT`] 兜底）。调用方据此跳过精准断连。
-    #[error("connection snapshot first-frame timeout")]
+    /// 连接快照超时（[`SNAPSHOT_TIMEOUT`] 兜底）。调用方据此跳过精准断连。
+    #[error("connection snapshot timeout")]
     SnapshotTimeout,
 }
