@@ -386,8 +386,6 @@
     "copySubject": "Copy {{type}}"
   },
   "home": {
-    "addServer": "Add Server",
-    "addSubscription": "Add Subscription",
     "cancelStarting": "Starting — click to cancel",
     "clear": "Clear",
     "connectErrorClickToRetry": "Connection failed — click to retry",
@@ -414,7 +412,6 @@
     "networkProfileRulesPruned": "Some network-profile rules are not in effect (profile invalid, probe unavailable on this device, or criteria that can never match) · check network profiles on the Routing page",
     "networkSettingsTip": "Network settings",
     "noActiveConnections": "No active connections",
-    "noServerConfig": "Direct and Block work without a proxy node.",
     "others": "Others",
     "pageTitle": "Home",
     "nativeReconnectRequired": "Connection changes need a reconnect. Connect on Home; if still connected, disconnect first.",

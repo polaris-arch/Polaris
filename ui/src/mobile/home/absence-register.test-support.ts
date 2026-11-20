@@ -18,11 +18,8 @@
  *    也接上了，落在同一张卡内部（`home.clear`）：此前判 `absent`，理由是「主机 Top 固定 5 行，
  *    不构成在大集合里定位的问题」—— 那句话只在「筛那 5 行」的读法下成立，而筛的应当是整个活动
  *    连接窗口（先筛后排名），于是问题是真的、能力是缺的。
- *  · **空态那两颗直达入口**（`home.addServer` / `home.addSubscription`）。它们与节点屏那张表的
- *    `nodes.mobileNeedsFormLayer` 是同一条腿，而那一层（`mobile/forms/`）批 2 已经落地 ——
- *    此前缺的只是首页这个入口。
  *
- * ⚠️ 三条都不是「桌面新加的」，是移动端从第一天起就没有、而没有任何门看得见的。
+ * ⚠️ 这些能力在移动端第一版就已缺席。
  */
 import type { ScreenParityRegister } from '../parity-registry.test-support';
 
@@ -72,22 +69,6 @@ export const HOME_PARITY: ScreenParityRegister = {
     },
 
     /* ── HomeScreen（首页提示与连接控制卡）────────────────────────────────────── */
-    {
-      id: 'HomeScreen.tsx|k:home.addServer',
-      disposition: {
-        kind: 'ported',
-        mobile: { file: 'ui/src/mobile/home/HomeScreenView.tsx', mustContain: "t('home.addServer')" },
-      },
-      note: '无代理节点时，首页顶部提示保留「添加节点」入口。桌面跳到节点页并打开弹窗，移动端打开自己的 `node` 表单。',
-    },
-    {
-      id: 'HomeScreen.tsx|k:home.addSubscription',
-      disposition: {
-        kind: 'ported',
-        mobile: { file: 'ui/src/mobile/home/HomeScreenView.tsx', mustContain: "t('home.addSubscription')" },
-      },
-      note: '无代理节点时，首页顶部提示的「添加订阅」入口打开移动端的 `sub` 表单。',
-    },
     {
       id: 'HomeScreen.tsx|#node-trigger',
       disposition: {

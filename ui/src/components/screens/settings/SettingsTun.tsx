@@ -251,8 +251,7 @@ export default function SettingsTun({ config, update }: SettingsTunProps) {
         </svg>
         <span id="tun-anchor-tx">{t('settings.tun.currentIntercept', { mode: interceptLabel })}</span>
         {/* 原型 `goto-home-intercept`（:4052）不是「只导航」：落地首页后还要在接管方式分段控件上
-            冒一枚「在此切换接管方式」浮标。**先落意图再导航**，顺序反了首页会在意图落库前挂载完
-            （同 HomeScreen.goServerPage 的理由）。 */}
+            冒一枚「在此切换接管方式」浮标。**先落意图再导航**，顺序反了首页会在意图落库前挂载完。 */}
         <a
           role="button"
           tabIndex={0}

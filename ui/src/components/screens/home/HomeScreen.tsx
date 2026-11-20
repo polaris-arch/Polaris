@@ -241,7 +241,6 @@ export function HomeScreen() {
   const switchNode = useSwitchNode();
   const openDialog = useDialogStore((s) => s.open);
   const closeDialog = useDialogStore((s) => s.close);
-  const setServerPageAction = useAppStore((s) => s.setServerPageAction);
 
   const modeLine = useHomeModeLine();
 
@@ -330,7 +329,6 @@ export function HomeScreen() {
     connected: connState === 'connected',
     dohBlocked: ipInfo?.dohBlocked,
   });
-  const noServers = !!config && servers.length === 0;
   /** 阻断在「直连模式」下无效：route.final 恒 = direct，没有流量经过 proxy-selector ⇒ 选了也是 no-op。
    *  返回禁用原因文案（null = 可选），交给选单渲染 disabled + tooltip，不留静默无效项。 */
   const blockDisabledReason = useMemo(
@@ -339,15 +337,6 @@ export function HomeScreen() {
         ? t('home.blockExitUnavailableInDirect')
         : null,
     [config?.proxyMode, t]
-  );
-  /** 顶部提示的两条入口：**先落 action 再导航**——反过来会让节点页在 action 落库前就挂载完，
-   *  一次性意图消费不到（消费在挂载 effect 里）。 */
-  const goServerPage = useCallback(
-    (action: 'add-server' | 'add-sub') => {
-      setServerPageAction(action);
-      navigate('nodes');
-    },
-    [setServerPageAction, navigate]
   );
   /** 出口旗面：与状态栏同一次探测，但**断开态一律留空**（本框旗面紧贴节点名/地址，画本机地区旗会被
    *  读成「这个节点在中国」——理由详见 domain/exit-flag.ts 的 resolveExitNodeFlagCode）。 */
@@ -1098,20 +1087,6 @@ export function HomeScreen() {
               </button>
             </div>
           )}
-        </div>
-      )}
-
-      {noServers && (
-        <div className="pending-bar info" role="status">
-          <div className="pb-tx pb-static"><b>{t('home.noServerConfig')}</b></div>
-          <div className="pb-acts">
-            <button type="button" className="btn ghost sm" onClick={() => goServerPage('add-server')}>
-              {t('home.addServer')}
-            </button>
-            <button type="button" className="btn ghost sm" onClick={() => goServerPage('add-sub')}>
-              {t('home.addSubscription')}
-            </button>
-          </div>
         </div>
       )}
 

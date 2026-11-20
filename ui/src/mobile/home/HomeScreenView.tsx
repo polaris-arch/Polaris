@@ -613,21 +613,6 @@ export function HomeScreenView(props: HomeScreenViewProps): ReactElement {
 
       {/* 相关能力共用外框；内部各卡仍持有原来的动作、错误和弹层。 */}
       <div className="h-flow">
-        {props.noServers && (
-          <div className="h-notice" role="status">
-            <div>
-              <p className="h-noticetext"><strong>{t('home.noServerConfig')}</strong></p>
-              <div className="h-emptyacts">
-                <button type="button" className="h-emptyact" onClick={props.onAddServer}>
-                  {t('home.addServer')}
-                </button>
-                <button type="button" className="h-emptyact" onClick={props.onAddSubscription}>
-                  {t('home.addSubscription')}
-                </button>
-              </div>
-            </div>
-          </div>
-        )}
         <div className="h-connection-panel">
         {/* ① 节点状态卡（动作行已并入本卡）。整卡 = 出口 scope。 */}
         <div className="h-control-panel">

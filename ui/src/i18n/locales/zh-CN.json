@@ -386,8 +386,6 @@
     "copySubject": "复制{{type}}"
   },
   "home": {
-    "addServer": "添加服务器",
-    "addSubscription": "添加订阅",
     "cancelStarting": "启动中 · 点击取消",
     "clear": "清空",
     "connectErrorClickToRetry": "连接失败 · 点击重试",
@@ -414,7 +412,6 @@
     "networkProfileRulesPruned": "部分网络场景规则本次未生效（场景失效、探测源本机不可用或判据永不命中）· 请到「路由」页检查网络场景",
     "networkSettingsTip": "网络设置",
     "noActiveConnections": "暂无活动连接",
-    "noServerConfig": "直连和阻断无需添加节点。",
     "others": "其他",
     "pageTitle": "主页",
     "nativeReconnectRequired": "连接更改需要重连。请在首页点击连接；若仍显示已连接，先断开再连接。",

@@ -311,7 +311,7 @@
 .m-form-foot { min-height: 58px; align-items: center; padding: 6px 0 calc(6px + var(--m-overlay-safe-b, var(--safe-b))); }
 /* Text actions share one 44px hit area and a 36px painted surface. Multiline labels
    grow with their text; the 10px padding keeps every line inside that surface. */
-.m-settings-btn, .m-form-btn, .h-sheetsubmit, .h-emptyact {
+.m-settings-btn, .m-form-btn, .h-sheetsubmit {
   position: relative; isolation: isolate; box-sizing: border-box;
   display: inline-flex; align-items: center; justify-content: center;
   min-height: var(--mobile-action-hit); padding: 10px 12px;
@@ -320,20 +320,18 @@
   text-align: center; white-space: normal; overflow-wrap: anywhere;
   cursor: pointer; touch-action: manipulation;
 }
-.m-settings-btn::before, .m-form-btn::before, .h-sheetsubmit::before, .h-emptyact::before {
+.m-settings-btn::before, .m-form-btn::before, .h-sheetsubmit::before {
   content: ''; position: absolute; z-index: -1; inset: var(--mobile-action-inset) 0;
   box-sizing: border-box; border: 1px solid hsl(var(--line)); border-radius: 8px;
   background: hsl(var(--mobile-action-neutral));
 }
 .m-settings-btn { max-width: 100%; color: hsl(var(--fg)); }
-.h-emptyact { color: hsl(var(--fg)); }
 .m-settings-btn.primary, .m-form-btn.primary, .h-sheetsubmit { font-weight: 600; }
 .m-settings-btn.primary { color: #00141d; }
 .m-settings-btn.primary::before, .h-sheetsubmit::before { border-color: transparent; background: hsl(var(--mobile-action-fill)); }
 .m-settings-btn:disabled { opacity: .5; cursor: default; }
 .m-settings-btn:focus-visible, .m-settings-list-remove:focus-visible { outline: 2px solid hsl(var(--ring)); outline-offset: -2px; }
-.m-shell .m-settings-btn:not(.primary):not(:disabled):active::before,
-.m-shell .h-emptyact:not(:disabled):active::before { background: hsl(var(--surface-2)); }
+.m-shell .m-settings-btn:not(.primary):not(:disabled):active::before { background: hsl(var(--surface-2)); }
 .m-settings-list-remove {
   position: relative; isolation: isolate; box-sizing: border-box;
   flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center;

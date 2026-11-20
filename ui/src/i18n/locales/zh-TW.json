@@ -386,8 +386,6 @@
     "copySubject": "複製{{type}}"
   },
   "home": {
-    "addServer": "新增伺服器",
-    "addSubscription": "新增訂閱",
     "cancelStarting": "啟動中 · 點擊取消",
     "clear": "清空",
     "connectErrorClickToRetry": "連線失敗 · 點擊重試",
@@ -414,7 +412,6 @@
     "networkProfileRulesPruned": "部分網路場景規則本次未生效（場景失效、探測來源本機不可用或判據永不命中）· 請到「路由」頁檢查網路場景",
     "networkSettingsTip": "網路設定",
     "noActiveConnections": "暫無活動連線",
-    "noServerConfig": "直連和封鎖無需新增節點。",
     "others": "其他",
     "pageTitle": "主頁",
     "nativeReconnectRequired": "連線變更需要重連。請在主頁點選連線；若仍顯示已連線，先中斷再連線。",

@@ -95,7 +95,7 @@ function App(){
   pickerQuery:query,onPickerQuery:setQuery,
   pickRows:servers.map(server=>({server,isCurrent:server.id==='sub-a',stagedOnly:false,latencyMs:server.id==='sub-a'?24:undefined,latencyStale:false,protocolLabel:server.protocol})),
   pickerSubscriptions:[{id:'first',name:'First subscription'}],onUseAsExit:noop,onPickSentinel:noop,blockDisabledReason:null,
-  noServers:false,onAddServer:noop,onAddSubscription:noop,routing:'smart',reverseRouting:false,
+  routing:'smart',reverseRouting:false,
   exitRegion:{kind:'flag',code:'hk'},exitFlagSrc:null,exitIsDirect:false,exitProbing:false,onSetRouting:noop,exitIp:null,
   unlock:[],unlockCheckedLabel:'mobileHome.checkedJustNow',unlockRunning:false,unlockDetailId:null,onOpenUnlockDetail:noop,onCloseUnlockDetail:noop,
   samples:[],composition:[],ruleHits:[],hosts:[],hostsMasked:false,hostQuery:'',onHostQuery:noop,

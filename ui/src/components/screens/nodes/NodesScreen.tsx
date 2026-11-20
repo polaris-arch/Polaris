@@ -184,19 +184,6 @@ export function NodesScreen() {
     };
   }, [addMenu]);
 
-  /* ── 消费首页空状态携带的一次性意图（契约「主页 Home · 空状态」：跳 server 页携 `serverPageAction`）──
-   *
-   * 对齐 上游 `pages/server-page.tsx:177-191`。**读到立刻清**：不清的话用户手动关掉对话框、切走再切回
-   * 本页（ScreenRouter 是裸 switch，切屏即重挂）会被同一个意图反复弹窗。清空写在同一个 effect 里，
-   * 与「打开对话框」原子发生，中间没有可被别的渲染插入的窗口。 */
-  const serverPageAction = useAppStore((s) => s.serverPageAction);
-  const setServerPageAction = useAppStore((s) => s.setServerPageAction);
-  useEffect(() => {
-    if (!serverPageAction || useAppStore.getState().serverPageAction !== serverPageAction) return;
-    setServerPageAction(null);
-    openDialog(serverPageAction === 'add-server' ? { kind: 'node' } : { kind: 'sub' });
-  }, [serverPageAction, setServerPageAction, openDialog]);
-
   // 分组（单一真值：自建 → 组网 → 各订阅）
   const groups = useMemo(
     () => nodeViewGroups(servers, subscriptions, { manual: t('nodes.tab.manual'), mesh: t('nodes.tab.mesh') }),

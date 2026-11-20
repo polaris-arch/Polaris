@@ -929,32 +929,6 @@
   touch-action: manipulation;
 }
 
-/* 空态两条直达入口（加节点 / 加订阅）。等分一行，与下面的动作行同一套触控下限。 */
-.h-emptyacts {
-  display: flex;
-  gap: var(--sp-3);
-  margin-top: var(--sp-3);
-}
-
-.h-emptyact {
-  flex: 1 1 0;
-  min-width: 0;
-  min-height: var(--tap-min);
-  margin: 0;
-  padding: 0 var(--sp-2);
-  border: 1px solid hsl(var(--line));
-  border-radius: var(--r-sm);
-  background: none;
-  appearance: none;
-  -webkit-appearance: none;
-  cursor: pointer;
-  font-family: inherit;
-  font-size: 0.875rem;
-  font-weight: 600;
-  color: hsl(var(--flow));
-  touch-action: manipulation;
-}
-
 /* ═══════════ ② 模式芯片 ═══════════ */
 
 .h-exit-flag {
@@ -1467,7 +1441,6 @@
 }
 
 .h-hostrow:focus-visible,
-.h-emptyact:focus-visible,
 .h-searchclear:focus-visible,
 .h-sheetsubmit:focus-visible {
   outline: 2px solid hsl(var(--ring));

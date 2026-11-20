@@ -452,8 +452,6 @@ export function MobileHomeScreen(): ReactElement {
    */
   const blockDisabledReason = routing === 'direct' ? t('home.blockExitUnavailableInDirect') : null;
 
-  const noServers = !!config && servers.length === 0;
-
   /* ── ⑦ 主机 Top 行上的规则面板：判据全部复用桌面那批纯函数 ─────────────── */
 
   /** 客户端启发式覆盖提示（`analyzeRuleCoverage`）。只影响提示与排序，不禁用任何动作。 */
@@ -846,10 +844,6 @@ export function MobileHomeScreen(): ReactElement {
       onUseAsExit={onUseAsExit}
       onPickSentinel={onPickSentinel}
       blockDisabledReason={blockDisabledReason}
-      noServers={noServers}
-      /* 两条直达入口落到移动端自己的表单宿主（批 2 接的那一层），不是桌面弹窗。 */
-      onAddServer={() => openMobileForm({ kind: 'node' })}
-      onAddSubscription={() => openMobileForm({ kind: 'sub' })}
       routing={routing}
       /* 真机 2026-07-20 §1.4 的移植：反向（回国）分流在首页必须是**常驻可见**的。
          判据复用 `domain/region-routing.ts`，不在本屏就地写 `config?.regionRouting?.reverse`

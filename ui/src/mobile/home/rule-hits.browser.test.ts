@@ -31,7 +31,7 @@ function App(){
  const props={t:(key,options)=>i18n.t(key,options),writeErrors:{},core:'stopped',connState:'disconnected',node:{kind:'direct'},
   onToggleConnect:noop,onNetworkCheck:noop,networkCheckBusy:false,networkCheckTip:'网络检测',tsExitWarning:'none',onTsExitAction:noop,
   pickerOpen:false,onOpenPicker:noop,onClosePicker:noop,pickerQuery:'',onPickerQuery:noop,pickRows:[],onUseAsExit:noop,onPickSentinel:noop,
-  blockDisabledReason:null,noServers:false,onAddServer:noop,onAddSubscription:noop,routing:'smart',reverseRouting:false,onSetRouting:noop,
+  blockDisabledReason:null,routing:'smart',reverseRouting:false,onSetRouting:noop,
   exitRegion:{kind:'unknown'},exitFlagSrc:null,exitIsDirect:true,exitProbing:false,exitIp:null,
   unlock:[],unlockRunning:false,unlockDetailId:null,onOpenUnlockDetail:noop,onCloseUnlockDetail:noop,
   samples:[],composition:[],ruleHits,hosts:[],hostsMasked:false,hostQuery:'',onHostQuery:noop,

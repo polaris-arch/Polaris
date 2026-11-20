@@ -611,10 +611,13 @@ class BoxService(
     // SSH agent 转发要一个能连到宿主 agent 的 fd，Android 上没有对应物。
     override fun connectSSHAgent(): Int = -1
 
-    // ── 内核发起的通知（证书过期、Tailscale 需要登录之类）────────────────────────
+    // ── 内核发起的通知（证书过期、Taildrop 等）──────────────────────────────────
     // 与前台服务那条常驻通知分开：这些是**事件**，可点掉，且各自有自己的频道。
 
     fun sendNotification(notification: Notification) {
+        // 登录由应用内绑定请求处理。主核每次启动上报的待授权状态只用于界面显示。
+        if (notification.identifier == "tailscale-authentication" && notification.typeID == 10) return
+
         val channel = "polaris-event-${notification.typeID}"
         val builder = NotificationCompat.Builder(service, channel)
             .setShowWhen(false)

@@ -245,9 +245,6 @@ const baseProps = (over: Partial<HomeScreenViewProps> = {}): HomeScreenViewProps
      才能让「置灰 + 原因」那条断言的对照有意义。 */
   blockDisabledReason: null,
   /* 默认**有**节点（空态两颗入口的反向对照靠它）。 */
-  noServers: false,
-  onAddServer: () => {},
-  onAddSubscription: () => {},
   routing: 'smart',
   /* 正向语义（默认）。反向那一档由 ⑫ 组自己覆写 —— 夹具给 false 才能让那组的对照有意义。 */
   reverseRouting: false,
@@ -1422,22 +1419,11 @@ describe('⑬ 哨兵出口 / 空态入口 / 主机行规则面板：能力真的
     expect(body).not.toContain('update({ selectedServerId: id })');
   });
 
-  /* ── 空态两颗直达入口（`HomeScreen.tsx|k:home.addServer` / `addSubscription`）── */
-
-  it('没有代理节点时保留直连出口，并在出口卡上方提供添加入口', () => {
-    const html = render({ noServers: true, node: { kind: 'direct' } });
-    const notice = html.slice(0, html.indexOf('data-home-card="node-status-card"'));
-    expect(notice).toContain('home.noServerConfig');
-    expect(notice).toContain('home.addServer');
-    expect(notice).toContain('home.addSubscription');
+  it('没有代理节点时显示直连出口，无首页添加提示', () => {
+    const html = render({ pickRows: [], node: { kind: 'direct' } });
+    const aboveExitCard = html.slice(0, html.indexOf('data-home-card="node-status-card"'));
+    expect(aboveExitCard).not.toContain('role="status"');
     expect(cardSegments(html).get('node-status-card')).toContain('home.routingDirect');
-    // 接线层：开的是 `mobile/forms` 的两支，不是桌面弹窗。
-    expect(WIRING_RAW).toContain("openMobileForm({ kind: 'node' })");
-    expect(WIRING_RAW).toContain("openMobileForm({ kind: 'sub' })");
-  });
-
-  it('有代理节点时隐藏首页添加提示', () => {
-    expect(render({ noServers: false })).not.toContain('home.addServer');
   });
 
   /* ── 主机行的规则面板（拓扑图那一族六条）── */

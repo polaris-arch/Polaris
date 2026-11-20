@@ -95,19 +95,6 @@ export function normalizePendingChanges(
   };
 }
 
-/**
- * 跨屏一次性意图（契约「主页 Home · 空状态」：无节点 → 「添加节点/添加订阅」跳 server 页并**携 action**）。
- *
- * 为什么要一个 store 字段而不是「跳过去让用户自己再点一次添加」：空状态那两个按钮的语义就是
- * 「我要加一个节点/订阅」，落到节点页却只看到同样空的列表 = 意图在导航途中被丢掉，用户得在陌生页面
- * 重新找入口。对齐 上游 `serverPageAction`（`renderer/store/app-store.ts:139`，消费点
- * `pages/server-page.tsx:178-191`）。
- *
- * **一次性**：消费方（NodesScreen）读到后必须立刻置回 null，否则用户手动关掉对话框、切走再切回节点页时
- * 会被同一个意图反复弹窗。
- */
-export type ServerPageAction = 'add-server' | 'add-sub';
-
 export interface ConfigEntityMutation {
   collection: 'customAppPresets' | 'appRules';
   entityId: string;
@@ -407,8 +394,6 @@ export interface AppState {
   // 代理关时也有值）——本切片是**未折叠的原始帧**，只在核跑着时有，两者不互相替代。
   tailscaleStatuses: Record<string, TailscaleStatusEvent | undefined>;
 
-  // ── 跨屏一次性意图（Home 空状态 → Nodes 页自动唤起对应对话框）──
-  serverPageAction: ServerPageAction | null;
   // ── 一次性意图：用户已在确认框确认「立即生效」→ 待应用条直接走应用流程（消费点 PendingChangesBar）──
   applyRequested: TakeoverApplyOwner | null;
   // ── 跨屏一次性意图（设置页「在主页切换 →」→ Home 页高亮落点，原型 :4052）──
@@ -449,7 +434,6 @@ export interface AppState {
   setTailscaleLoginInitiated: (serverId: string, initiated: boolean) => void;
   /** 当前配置删除节点后统一驱逐所有以 serverId 为键的派生状态。 */
   retainServerIds: (serverIds: readonly string[]) => void;
-  setServerPageAction: (action: ServerPageAction | null) => void;
   setApplyRequested: (requested: TakeoverApplyOwner | null) => void;
   reset: () => void;
 }
@@ -510,7 +494,6 @@ export const useAppStore = create<AppState>((set, get) => ({
   helperStatus: null,
   privacyMode: true,
   tailscaleStatuses: {},
-  serverPageAction: null,
   applyRequested: null,
 
   loadConfig: async (force?: boolean) => {
@@ -914,8 +897,6 @@ export const useAppStore = create<AppState>((set, get) => ({
       };
     }),
 
-  /** 置/清跨屏一次性意图。消费方读到后立刻 `setServerPageAction(null)`（见类型注释）。 */
-  setServerPageAction: (action) => set({ serverPageAction: action }),
   setApplyRequested: (requested) => set({ applyRequested: requested }),
 
   /** 同上，首页版（消费点 HomeScreen 的高亮 effect）。 */
@@ -947,7 +928,6 @@ export const useAppStore = create<AppState>((set, get) => ({
       // 「无帧 → 出口告警不据陈旧帧下认证/离线结论」。
       tailscaleStatuses: {},
       // 一次性跨屏意图是瞬时态：reset 后没人再该被它弹窗/高亮。
-      serverPageAction: null,
       applyRequested: null,
           // 登录中的瞬时态随 reset 清掉；tailscaleLoginStates 刻意不清——它是缓存/state 文件支撑的持久登录态，
       // 不随一次 app 状态重置而「变成未登录」。

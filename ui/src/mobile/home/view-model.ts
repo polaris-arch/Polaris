@@ -215,15 +215,6 @@ export interface HomeScreenViewProps {
    * 留一颗静默无效的选项比置灰更坏 —— 用户会以为自己断网了，实际什么都没发生。
    */
   readonly blockDisabledReason: string | null;
-  /**
-   * 一个节点都没有、且没选哨兵出口 ⇒ 空态：节点卡上给两条**直达入口**（加节点 / 加订阅）。
-   *
-   * 判据与桌面 `HomeScreen.tsx` 的 `emptyState` 逐字同源（`servers.length === 0 && !哨兵`）：
-   * 哨兵是一个有效的出口配置，选了它的人不缺节点，给他两颗「去加节点」是噪音。
-   */
-  readonly noServers: boolean;
-  readonly onAddServer: () => void;
-  readonly onAddSubscription: () => void;
 
   /* ── ② 模式芯片 ────────────────────────────────────────────────────────────
    *
