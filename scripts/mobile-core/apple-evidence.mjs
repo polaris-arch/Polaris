@@ -1,9 +1,9 @@
 // Collect and retire originals for the hosted, unsigned Apple delivery.
 import { createHash } from 'node:crypto';
 import {
-  appendFileSync, chmodSync, closeSync, constants, fstatSync, fsyncSync, linkSync, lstatSync,
+  appendFileSync, chmodSync, closeSync, constants, fstatSync, fsyncSync, lchmodSync, linkSync, lstatSync,
   mkdirSync, mkdtempSync, openSync, readdirSync, readlinkSync, readSync, realpathSync,
-  rmSync, statSync, statfsSync, utimesSync, writeFileSync, writeSync,
+  rmSync, statSync, statfsSync, symlinkSync, utimesSync, writeFileSync, writeSync,
 } from 'node:fs';
 import { dirname, isAbsolute, join, relative, sep } from 'node:path';
 import { Readable, Writable } from 'node:stream';
@@ -320,12 +320,16 @@ function stageOriginals(root, view, paths) {
     require(total <= CONTENT_BYTES, 'selected original evidence exceeds 4GiB budget');
     const staged = join(view, name);
     mkdirSync(dirname(staged), { recursive: true, mode: 0o700 });
-    // The lease guarantees one filesystem. Hard-link the selected inode (even
-    // a symlink leaf) instead of copying multiple GiB of retained originals.
-    linkSync(path, staged);
-    const observed = stat(staged);
-    require(observed && observed.ino === info.ino && observed.dev === info.dev &&
-      observed.mode === info.mode && (row.link === undefined || readlinkSync(staged) === row.link),
+    // Darwin rejects hard links to framework aliases. Keep regular originals
+    // on the same inode and recreate only the symbolic links in the view.
+    if (row.link === undefined) linkSync(path, staged);
+    else {
+      symlinkSync(row.link, staged);
+      if (stat(staged).mode !== info.mode) lchmodSync(staged, mode(info));
+    }
+    const observed = stat(staged), original = row.link === undefined ? observed : stat(path);
+    require(original && original.ino === info.ino && original.dev === info.dev && original.mode === info.mode &&
+      observed?.mode === info.mode && (row.link === undefined || readlinkSync(staged) === row.link),
     'original archive view differs: ' + name);
     rows[name] = row;
     modes.set(name, mode(info));

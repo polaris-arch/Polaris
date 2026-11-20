@@ -1,8 +1,12 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync,
+  symlinkSync, writeFileSync } from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
+import os, { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { fixtureZip } from '../lib/formal-package-fixtures.mjs';
+import { evidence } from './apple-evidence.mjs';
 import { bindCommand, canonical, declaredPlan, gitEnvironment, load, sha, toolEnvironment } from './fork-input.mjs';
 import { boundedModuleDownload, compilerFact, equivalentBinding, PRODUCER_FILES } from './producer.mjs';
 import { install, recover } from './transaction.mjs';
@@ -107,6 +111,41 @@ test('compiler fact runs the bound symlink driver then refuses a changed physica
     writeFileSync(tool, 'new');
     return 'clang version';
   }), /physical bytes changed/);
+});
+
+test('component originals retain framework aliases without hard-linking them', async t => {
+  const home = realpathSync(temporary(t)), root = join(home, 'Code/polaris-mobile-apple-ci/1-1');
+  const framework = 'component/Libbox.xcframework/ios-arm64-simulator/Libbox.framework';
+  const alias = framework + '/Headers', target = 'Versions/A/Headers', header = framework + '/' + target + '/Libbox.h';
+  mkdirSync(join(root, framework, target), { recursive: true, mode: 0o700 });
+  writeFileSync(join(root, header), 'original header');
+  symlinkSync(target, join(root, alias));
+  const homedir = t.mock.method(os, 'homedir', () => home);
+  syncBuiltinESMExports();
+  t.after(() => { homedir.mock.restore(); syncBuiltinESMExports(); });
+  t.mock.property(process, 'platform', 'darwin');
+  t.mock.property(process, 'env', { ...process.env, GITHUB_ACTIONS: 'true',
+    GITHUB_RUN_ID: '1', GITHUB_RUN_ATTEMPT: '1', POLARIS_APPLE_SCOPE: 'device-only', POLARIS_APPLE_CARRIER_SLOT: undefined });
+
+  await evidence({}, {
+    withLease: async (_work, _cache, _source, action) => action(),
+    async runBounded(argv, { cwd }) {
+      const members = readFileSync(argv.at(-1), 'utf8').slice(0, -1).split('\0');
+      assert.deepEqual(members, [alias, header, 'EVIDENCE-INDEX.json']);
+      const stagedAlias = join(cwd, alias), stagedHeader = join(cwd, header);
+      assert.ok(lstatSync(stagedAlias).isSymbolicLink());
+      assert.equal(readlinkSync(stagedAlias), target);
+      assert.notEqual(lstatSync(stagedAlias).ino, lstatSync(join(root, alias)).ino);
+      assert.equal(lstatSync(stagedHeader).ino, lstatSync(join(root, header)).ino);
+      writeFileSync(argv[argv.indexOf('-f') + 1], fixtureZip(members.map(name => {
+        const path = join(cwd, name), info = lstatSync(path);
+        return { name, mode: info.mode, data: info.isSymbolicLink() ? readlinkSync(path) : readFileSync(path) };
+      })));
+      return { complete: true };
+    },
+  });
+  assert.ok(existsSync(join(root, 'apple-original-evidence.zip')));
+  assert.equal(readlinkSync(join(root, alias)), target);
 });
 
 test('module collection admits exact split JSON and records curated bounded failure without raw data', async t => {
