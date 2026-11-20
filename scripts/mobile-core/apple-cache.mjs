@@ -295,7 +295,7 @@ function cacheSample(samples, name) {
 async function exportCache(root, stage, slot, runner) {
   const owner = await state(root, stage, runner), roles = allowedRoles(slot);
   const pin = readReceipt(join(root, 'evidence-' + slot + '-pin.json'));
-  require(pin.slot === slot && equal(pin.context, await context(runner)) && pin.receiptReadErrors.length === 0
+  require(pin.slot === slot && equal(pin.context, await context(runner)) && equal(pin.receiptReadErrors, {})
     && equal(pin.archive, transportPin(join(root, 'apple-original-' + slot + '-evidence.zip'))),
   'cache export requires intact preserved carrier originals');
   require(stat(join(root, 'summaries', slot, 'carrier-' + slot + '.json'))?.isFile(), 'cache export requires current carrier summary');
