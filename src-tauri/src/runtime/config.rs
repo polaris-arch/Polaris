@@ -1094,8 +1094,8 @@ impl ConfigManager {
         Ok(commit(&saved.value))
     }
 
-    /// Serialize built-in file replacement with a restart of the applied configuration.
-    /// Take this before the saved writer. Downloads and their subsequent live Apply do not hold it.
+    /// Serialize built-in file and metadata publication with subscription settlement.
+    /// Acquire before the saved writer. Rule downloads and the rule update's own Apply run outside it.
     pub(crate) async fn lock_builtin_rule_publication(&self) -> tokio::sync::MutexGuard<'_, ()> {
         self.builtin_rule_publication.lock().await
     }

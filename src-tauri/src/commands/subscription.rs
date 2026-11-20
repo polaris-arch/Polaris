@@ -1056,6 +1056,17 @@ async fn perform_subscription_update_inner(
     };
     let fetch_pipeline_ms = pipeline_started.elapsed().as_millis();
 
+    // A built-in update publishes its file and metadata together. Keep that
+    // publication outside the refresh's prepared edit and Core settlement.
+    let Ok(_resource_publication) = tokio::time::timeout_at(
+        operation_deadline.into(),
+        state.config().lock_builtin_rule_publication(),
+    )
+    .await
+    else {
+        return update_classified_failure(&operation_timeout_error());
+    };
+
     // 3) 304 无变化 → 仅刷元数据（lastUpdated + 验证器），不 reconcile；落盘后发空配置失效信号，不发布 HOT 事务。
     if outcome.not_modified {
         let apply_started = std::time::Instant::now();
