@@ -148,7 +148,7 @@ fn bundled_core_accepts_every_full_generated_config() {
         expected_dashboards += usize::from(expected_dashboard);
         actual_dashboards += usize::from(actual_dashboard);
         let path = temp.path().join(format!("full-{}.json", ratchet.checked));
-        std::fs::write(&path, serde_json::to_vec_pretty(&value).expect("JSON 编码"))
+        std::fs::write(&path, serde_json::to_vec(&cfg).expect("JSON 编码"))
             .expect("写完整配置到 TempDir");
         let (ok, diag) = check(&core, &path);
         if case.input.proxy_mode_type == ProxyModeType::Tun {

@@ -2618,7 +2618,7 @@ impl ProxyRuntime {
         if !self.selector_operation_is_current(generation, intent) {
             return decline(RuntimeApplyResult::status("conflict"));
         }
-        let typed: UserConfig = match serde_json::from_value(candidate.clone()) {
+        let typed = match UserConfig::deserialize(&candidate) {
             Ok(value) => value,
             Err(_) => return decline(RuntimeApplyResult::status("rejected")),
         };
@@ -2686,11 +2686,12 @@ impl ProxyRuntime {
         if let Some(endpoint) = baseline.management.as_ref() {
             deps.tailscale_api_port = endpoint.port;
         }
-        if let Ok(previous) = serde_json::from_value::<UserConfig>(previous_raw.clone()) {
+        let previous = UserConfig::deserialize(&previous_raw);
+        if let Ok(previous) = &previous {
             let requested =
                 polaris_config_engine::user_config::proxy_ports::control_api_port(&typed);
             if requested
-                != polaris_config_engine::user_config::proxy_ports::control_api_port(&previous)
+                != polaris_config_engine::user_config::proxy_ports::control_api_port(previous)
             {
                 deps.tailscale_api_port = requested;
             }
@@ -2798,6 +2799,7 @@ impl ProxyRuntime {
             );
             return decline(result);
         }
+        let t_candidate = std::time::Instant::now();
         let outcome = match generate_running_candidate(
             &typed,
             &deps,
@@ -2814,6 +2816,7 @@ impl ProxyRuntime {
             }
             _ => return decline(RuntimeApplyResult::status("rejected")),
         };
+        let candidate_ms = t_candidate.elapsed().as_millis();
         if let Err(code) = super::lan_gateway::check(&outcome.config, &deps.platform) {
             let mut result = RuntimeApplyResult::status("rejected");
             result.reasons.push(RuntimeApplyReason {
@@ -2879,23 +2882,19 @@ impl ProxyRuntime {
             Ok(value) => value,
             Err(_) => return decline(RuntimeApplyResult::status("rejected")),
         };
-        // Native directory custody is host-issued, not recreated by the graph builder.
-        if let Ok(previous) = serde_json::to_value(&baseline.generated) {
-            if let Some(custody) = previous.get("polaris_windows_directory") {
-                content["polaris_windows_directory"] = custody.clone();
-            }
-        }
         if inline_custom_rules(&mut content, &typed, &deps.custom_rules_dir).is_err() {
             return decline(RuntimeApplyResult::status("rejected"));
         }
         // Compare with the current R projection, not startup defaults, which may
         // have diverged after explicit live selection. Snapshot paths are CAS-bound
         // by the kernel, including automatic URLTest winners.
-        let previous: UserConfig = match serde_json::from_value(previous_raw).ok() {
-            Some(value) => value,
-            None => return decline(RuntimeApplyResult::status("unconfirmed")),
+        let previous = match previous {
+            Ok(value) => value,
+            Err(_) => return decline(RuntimeApplyResult::status("unconfirmed")),
         };
-        let previous = match generate_running_candidate(
+        let t_previous = std::time::Instant::now();
+        // Only the serialized outbounds are used below, including custom selector fields.
+        let previous_outbounds = match generate_running_candidate(
             &previous,
             &baseline.deps,
             &previous_bindings,
@@ -2903,17 +2902,24 @@ impl ProxyRuntime {
             baseline.android_mesh_id.as_deref(),
         )
         .ok()
-        .and_then(|value| serde_json::to_value(value.config).ok())
+        .and_then(|value| serde_json::to_value(value.config.outbounds).ok())
         {
             Some(value) => value,
             None => return decline(RuntimeApplyResult::status("rejected")),
         };
+        log::debug!(
+            "热应用配置生成耗时：候选构建={candidate_ms}ms，运行配置及出站投影={}ms",
+            t_previous.elapsed().as_millis()
+        );
         let groups = match client.first_groups_snapshot().await {
             Ok(groups) => groups,
             Err(_) => return decline(RuntimeApplyResult::status("unconfirmed")),
         };
         let selector_intents = match selector_intents(
-            &previous,
+            &Value::Object(serde_json::Map::from_iter([(
+                "outbounds".into(),
+                previous_outbounds,
+            )])),
             &content,
             &groups,
             self.current_config_snapshot()

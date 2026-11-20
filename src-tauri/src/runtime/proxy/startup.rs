@@ -586,12 +586,12 @@ pub(super) fn kernel_gate_cache_record(
     config: &SingBoxConfig,
 ) -> Option<KernelGateCacheRecord> {
     let digest = crate::runtime::tls_fingerprints::binary_digest(binary).ok()?;
-    kernel_gate_cache_record_with_digest(binary, config, &digest)
+    kernel_gate_cache_record_with_digest(binary, serde_json::to_value(config).ok()?, &digest)
 }
 
 fn kernel_gate_cache_record_with_digest(
     binary: &Path,
-    config: &SingBoxConfig,
+    mut normalized: Value,
     digest: &str,
 ) -> Option<KernelGateCacheRecord> {
     let metadata = std::fs::metadata(binary).ok()?;
@@ -600,7 +600,6 @@ fn kernel_gate_cache_record_with_digest(
         .unwrap_or_else(|_| binary.to_path_buf())
         .to_string_lossy()
         .into_owned();
-    let mut normalized = serde_json::to_value(config).ok()?;
     normalize_kernel_gate_config(&mut normalized);
     let normalized = serde_json::to_vec(&normalized).ok()?;
     Some(KernelGateCacheRecord {
@@ -4436,6 +4435,7 @@ impl ProxyRuntime {
                 "Linux Helper resolved ownership requires a checkable selected Core".into(),
             );
         }
+        let t_admission = std::time::Instant::now();
         if cfg!(not(any(target_os = "android", target_os = "ios"))) {
             self.settle_kernel_validation_admission(binary).await?;
         }
@@ -4454,11 +4454,15 @@ impl ProxyRuntime {
         #[cfg(any(target_os = "android", target_os = "ios"))]
         let capabilities = self.tls_fingerprint_capabilities().await;
         let started = std::time::Instant::now();
+        log::debug!(
+            "起核配置准入准备耗时={}ms",
+            t_admission.elapsed().as_millis()
+        );
         let mut checks_run: u32 = 0;
+        let mut effective = user_config.clone();
+        effective.servers.retain(|s| !peeled.contains_key(&s.id));
         loop {
-            // 已剥的节点从 `servers` 摘掉后重新生成（空集合时等价于原配置）。
-            let mut effective = user_config.clone();
-            effective.servers.retain(|s| !peeled.contains_key(&s.id));
+            let t_generate = std::time::Instant::now();
             #[allow(unused_mut)]
             let mut gen_out = generate_sing_box_config_with_report_and_runtime_bindings(
                 &effective,
@@ -4473,12 +4477,17 @@ impl ProxyRuntime {
                 self.config.dir(),
             )?;
             super::lan_gateway::check(&gen_out.config, &deps.platform).map_err(str::to_owned)?;
-            capabilities.validate_config(
-                &serde_json::to_value(&gen_out.config).map_err(|e| e.to_string())?,
-            )?;
+            let generate_ms = t_generate.elapsed().as_millis();
+            let t_render = std::time::Instant::now();
+            let config_value = serde_json::to_value(&gen_out.config).map_err(|e| e.to_string())?;
+            capabilities.validate_config(&config_value)?;
+            // 无缓存身份时立即释放 Value。归一化只用于缓存键，实际下发的 JSON 保持原样。
+            let cache_input = binary
+                .zip(capabilities.binary_sha256.as_deref())
+                .map(|(bin, digest)| (bin, digest, config_value));
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             validate_startup_cli_proof(binary, capabilities, cli_observation.as_ref().ok())?;
-            let json = serde_json::to_string_pretty(&gen_out.config)
+            let json = serde_json::to_string(&gen_out.config)
                 .map_err(|e| format!("sing-box 配置序列化失败: {e}"))?;
             // Android publishes the restart source only after the exact bridge
             // attempt reaches native readiness. Preflight can lose to SystemStart.
@@ -4490,6 +4499,10 @@ impl ProxyRuntime {
                 write_private_runtime_config(config_path, &json)
                     .map_err(|e| format!("写 sing-box 配置失败 {}: {e}", config_path.display()))?;
             }
+            log::debug!(
+                "起核配置生成耗时：构建={generate_ms}ms，序列化、指纹校验及写入={}ms",
+                t_render.elapsed().as_millis()
+            );
 
             // 核解析不到（首启未落核 / 单测未注入）→ 闸门无从判定，照原样下发（failOpen）。
             //
@@ -4508,27 +4521,29 @@ impl ProxyRuntime {
             // 已接受身份缓存以「哪个核 + 哪份配置」为键。Android 上没有核文件可取身份（mtime/size）
             // ⇒ 不进缓存、每次真跑一次 check。这比伪造一个身份诚实：伪造出来的键会在换核（换 aar）
             // 之后仍然命中，等于把闸门静默关掉。
-            let cache_record = binary.and_then(|bin| {
-                capabilities.binary_sha256.as_deref().and_then(|digest| {
-                    kernel_gate_cache_record_with_digest(bin, &gen_out.config, digest)
-                })
+            let t_cache = std::time::Instant::now();
+            let cache_record = cache_input.and_then(|(bin, digest, value)| {
+                kernel_gate_cache_record_with_digest(bin, value, digest)
             });
-            if cache_record
+            let cache_hit = cache_record
                 .as_ref()
-                .is_some_and(|record| self.kernel_gate_cache_hit(record))
-            {
+                .is_some_and(|record| self.kernel_gate_cache_hit(record));
+            log::debug!("起核配置缓存查找耗时={}ms", t_cache.elapsed().as_millis());
+            if cache_hit {
                 log::info!("起核内核闸门命中已接受的核/配置身份，跳过重复 sing-box check");
                 return Ok(GateOutcome::assemble(
                     gen_out, effective, json, peeled, checks_run, None,
                 ));
             }
             checks_run += 1;
+            let t_check = std::time::Instant::now();
             let verdict = match binary {
                 Some(bin) => self.startup_config_check(bin, config_path).await?,
                 // 只有 Android 走得到这里（上面的 failOpen 早退挡住了其余平台）。传的是**内存里
                 // 那一份字符串**，与刚写下去的盘上那份是同一个 `json` 变量 —— 两者不可能漂。
                 None => super::android_bridge::check_config(&json).await,
             };
+            log::debug!("起核内核配置校验耗时={}ms", t_check.elapsed().as_millis());
             let rejection = match decide_peel(&verdict, started.elapsed(), PEEL_TIME_BUDGET) {
                 PeelStep::Proceed => {
                     if let Some(record) = cache_record {
@@ -4626,8 +4641,9 @@ impl ProxyRuntime {
                         "起核内核闸门：内核拒收节点「{tag}」（id={id}），已剔除并上报，其余节点照常起核 —— {}",
                         rejection.detail
                     );
-                    // 剥除集合与上报清单是**同一次插入**：分成两个容器写就会漂，而漂的方向恰好是
-                    // 「节点从配置里消失、用户侧却没有任何标记」——本仓明文判定它比报错更坏。
+                    // 保留其余节点的顺序，下一轮用这个集合重新生成。
+                    // `peeled` 同时记录跨起核尝试的剔除项和上报数据。
+                    effective.servers.retain(|s| s.id != id);
                     peeled.insert(
                         id.clone(),
                         InvalidNode {

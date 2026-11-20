@@ -410,7 +410,6 @@ fn generate_base_config(
     crate::node_dns::upstream::validate_selected_upstreams(config.dns_config.as_ref())?;
     crate::user_config::auto_select::validate_test_url(config.speed_test_url.as_deref())
         .map_err(str::to_owned)?;
-    let cfg = config.clone();
 
     // ── 2. selectedServer 校验（L3475-3487）─────────────────────────────────────
     // direct / block 哨兵都不是节点 id：其出口由 proxy-selector 的 default 直接接到内置出站
@@ -478,11 +477,10 @@ fn generate_base_config(
         log: deps.log,
     };
     let outbounds_result = crate::builder::outbounds::build_outbounds_with_runtime_bindings(
-        &cfg,
+        config,
         &mut outbounds_deps,
         runtime_bind_interfaces,
     )?;
-    let pending_endpoints = outbounds_result.pending_endpoints.clone();
 
     // ── 5. buildLogConfig（L3518）───────────────────────────────────────────────
     // proto Platform::parse 兼容 "darwin"/"win32"，未知串 → Other；log builder 视 Other 同 Linux
@@ -506,7 +504,7 @@ fn generate_base_config(
     // selectedServerTag 恒 'proxy-selector'（Polaris L3521 硬编码）。
     let dns_deps = DnsConfigDeps {
         lan_resolver_for_dns: deps.lan_resolver_for_dns.clone(),
-        pending_endpoints: pending_endpoints.clone(),
+        pending_endpoints: outbounds_result.pending_endpoints,
         log: deps.log,
         // DNS 侧的 detour 必须跟随 route 侧**同一条**出口回退（2026-08-11 修）。
         //
@@ -543,7 +541,8 @@ fn generate_base_config(
         system_dns_takeover_active: deps.system_dns_takeover_active,
         netenv_dhcp_suppressed: deps.netenv_dhcp_suppressed,
     };
-    let mut dns = build_dns_config(&cfg, &id_to_tag_map, &dns_deps);
+    let mut dns = build_dns_config(config, &id_to_tag_map, &dns_deps);
+    let pending_endpoints = dns_deps.pending_endpoints;
     // The configuration graph can be valid while platform gates remove a node used
     // by a DNS transport. Validate actual emitted dependencies before any missing
     // policy action can disappear into the domestic default.
@@ -562,7 +561,11 @@ fn generate_base_config(
                 .map(|endpoint| endpoint.tag.as_str()),
         )
         .collect();
-    for resource in cfg.dns_servers.iter().filter(|resource| resource.enabled) {
+    for resource in config
+        .dns_servers
+        .iter()
+        .filter(|resource| resource.enabled)
+    {
         if !dns_tags.contains(crate::user_config::dns_server_tag(&resource.id).as_str()) {
             return Err(format!(
                 "DNS 解析器「{}」无法生成，请检查端点和出口依赖",
@@ -592,13 +595,13 @@ fn generate_base_config(
     // 网络场景环境项按**已生成的** DNS server 预解析（第一道防线：只引用类型合格、确实生成了的 tag）。
     // DNS builder 内部以同一函数、同一 server 集自建一份，二者同源。
     let network_env = NetworkEnv::new(
-        &cfg.network_profiles,
+        &config.network_profiles,
         &ProbeFacts {
             platform: Platform::parse(deps.platform.as_str()),
             // 接管方式取**本平台生效值**（[`ProxyModeType::effective_on`]，config-engine 全仓无例外的规则）。
             // 对本字段零行为差：`tun` 只在 Linux/Other 的 dhcp 特权判据里起作用（生效值只对移动端分叉，
             // 移动端那一臂在 `dhcp_privileged` 里不看 `tun`）。
-            tun: cfg
+            tun: config
                 .proxy_mode_type
                 .effective_on(Platform::parse(deps.platform.as_str()))
                 .is_tun(),
@@ -655,7 +658,7 @@ fn generate_base_config(
         is_valid_srs_fn: deps.is_valid_srs_fn,
         tailnet_rules_dir: deps.tailnet_rules_dir.clone(),
         observed_tailnet_addresses: deps.observed_tailnet_addresses.clone(),
-        network_env: network_env.clone(),
+        network_env,
     };
     let route_outcome = build_route_config_with_report(config, &id_to_tag_map, &route_deps);
     let mut route = route_outcome.route;
@@ -665,7 +668,8 @@ fn generate_base_config(
     // 生成的引用为准补齐定义，保证交给 sing-box 的图闭合。无法投影的未知引用则 fail-closed
     // 剪掉对应 DNS 规则，宁可回落默认 DNS 策略也绝不让整核因 `rule-set not found` 退出。
     let dns_pruned_rule_set_tags =
-        close_dns_rule_set_graph(&cfg, &mut dns, &mut route, &route_deps);
+        close_dns_rule_set_graph(config, &mut dns, &mut route, &route_deps);
+    let network_env = route_deps.network_env;
 
     // ── 9. 装配顶层 SingBoxConfig + experimental.cache_file（L3517-3571）────────
     let mut singbox = SingBoxConfig {
@@ -673,8 +677,8 @@ fn generate_base_config(
         log,
         dns: Some(dns),
         inbounds,
-        outbounds: outbounds_result.outbounds.clone(),
-        endpoints: None,
+        outbounds: outbounds_result.outbounds,
+        endpoints: (!pending_endpoints.is_empty()).then_some(pending_endpoints),
         route: Some(route),
         experimental: Some(Experimental {
             cache_file: Some(CacheFile {
@@ -703,22 +707,17 @@ fn generate_base_config(
             direct.domain_resolver = Some(crate::singbox::DomainResolver::Rules {
                 mode: "rules".into(),
                 policy: crate::builder::dns::DIRECT_LAN_FALLBACK_POLICY.into(),
-                strategy: if cfg.enable_ipv6.unwrap_or(false) {
+                strategy: if config.enable_ipv6.unwrap_or(false) {
                     crate::singbox::DomainStrategy::PreferIpv4
                 } else {
                     crate::singbox::DomainStrategy::Ipv4Only
                 },
                 timeout: format!(
                     "{}ms",
-                    2 * crate::builder::dns::lan_fallback_timeout_ms(&cfg)
+                    2 * crate::builder::dns::lan_fallback_timeout_ms(config)
                 ),
             });
         }
-    }
-
-    // ── 10. endpoints 注入顶层（L3575-3577）─────────────────────────────────────
-    if !pending_endpoints.is_empty() {
-        singbox.endpoints = Some(pending_endpoints.clone());
     }
 
     // ── 11. services 注入（L3581-3600，has_management_api 门控）──────────────────
@@ -753,12 +752,16 @@ fn generate_base_config(
     // ── 12. fixRouteDeadReferences（L3605）──────────────────────────────────────
     // route 规则指向「已被跳过/不存在的出站」→ sing-box "outbound not found" 启动失败。改写为 proxy-selector。
     if let Some(route) = singbox.route.as_mut() {
-        fix_route_dead_references(&singbox.outbounds, &pending_endpoints, &mut route.rules);
+        fix_route_dead_references(
+            &singbox.outbounds,
+            singbox.endpoints.as_deref().unwrap_or_default(),
+            &mut route.rules,
+        );
     }
 
     // ── 12b. 网络场景：builder 阶段剔除的规则 + 后置剪枝（第二道防线，看最终 JSON）──────────
     // 两类都进报告；运行时据此发非致命信号（N2：`NETWORK_PROFILE_RULES_PRUNED`）。
-    let mut pruned_env_rules = builder_skipped_rules(&cfg, &network_env);
+    let mut pruned_env_rules = builder_skipped_rules(config, &network_env);
     pruned_env_rules.extend(prune_invalid_env_condition_refs(&mut singbox));
     if !pruned_env_rules.is_empty() {
         let warned = pruned_env_rules.iter().filter(|r| r.is_warning()).count();

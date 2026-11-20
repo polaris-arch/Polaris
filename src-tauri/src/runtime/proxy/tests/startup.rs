@@ -3638,7 +3638,7 @@ async fn accepted_kernel_config_cache_survives_runtime_restart_and_misses_on_str
     let user_config: UserConfig = serde_json::from_value(cfg.clone()).unwrap();
     let path = dir.join("gate-cache.json");
 
-    let deps = rt.generate_deps(0, 0, 0, None, &[], &cfg, false);
+    let deps = rt.generate_deps(17601, 0, 0, None, &[], &cfg, false);
     let mut peeled = BTreeMap::new();
     let first = rt
         .generate_and_gate(&user_config, &deps, &path, Some(&binary), &mut peeled)
@@ -3647,12 +3647,25 @@ async fn accepted_kernel_config_cache_survives_runtime_restart_and_misses_on_str
     assert_eq!(first.checks_run, 1, "首次必须调用 checker");
     assert_eq!(std::fs::read_to_string(&counter).unwrap().trim(), "1");
 
+    let mut reassigned_deps = deps.clone();
+    reassigned_deps.tailscale_api_port = 17602;
     let second = rt
-        .generate_and_gate(&user_config, &deps, &path, Some(&binary), &mut peeled)
+        .generate_and_gate(
+            &user_config,
+            &reassigned_deps,
+            &path,
+            Some(&binary),
+            &mut peeled,
+        )
         .await
         .unwrap();
-    assert_eq!(second.checks_run, 0, "同运行时的相同核/配置应命中");
+    assert_eq!(second.checks_run, 0, "仅重新分配 API 端口仍应命中");
     assert_eq!(std::fs::read_to_string(&counter).unwrap().trim(), "1");
+    let written = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(written, second.config_json);
+    assert_eq!(written, serde_json::to_string(&second.config).unwrap());
+    let config: Value = serde_json::from_str(&written).unwrap();
+    assert_eq!(config["services"][0]["listen_port"], 17602);
     drop(deps);
     drop(rt);
 

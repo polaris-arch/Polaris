@@ -312,6 +312,9 @@ pub fn vision_route_targets_valid(config: &UserConfig) -> bool {
 }
 
 fn vision_targets_intersect(config: &UserConfig, incompatible: &BTreeSet<&str>) -> bool {
+    if incompatible.is_empty() {
+        return false;
+    }
     let targets = crate::builder::endpoint_routes::engaged_rule_targeted_server_ids(config);
     config
         .effective_selected_server_id()
@@ -348,15 +351,15 @@ pub fn build_outbounds_with_runtime_bindings(
     runtime_bind_interfaces: &BTreeMap<String, String>,
 ) -> Result<OutboundsResult, String> {
     validate_detour_graph(config)?;
-    if !vision_route_targets_valid(config) {
-        return Err("INVALID_ROUTE_TARGET: vision-transport-unsupported".into());
-    }
-    let incompatible: Vec<&str> = config
+    let incompatible: BTreeSet<&str> = config
         .servers
         .iter()
         .filter(|server| crate::builder::outbound::validate_vision_transport(server).is_err())
         .map(|server| server.id.as_str())
         .collect();
+    if vision_targets_intersect(config, &incompatible) {
+        return Err("INVALID_ROUTE_TARGET: vision-transport-unsupported".into());
+    }
     for id in incompatible {
         deps.gate_invalid_nodes
             .insert(id.to_string(), INVALID_REASON_VISION_TRANSPORT);
@@ -378,8 +381,7 @@ pub fn build_outbounds_with_runtime_bindings(
     };
 
     // id→tag 映射（build_id_to_tag_map 的副本，buildOutbounds 内可变——detour 死引用剔除时删 entry）。
-    let mut id_to_tag: BTreeMap<String, String> = BTreeMap::new();
-    {
+    let mut id_to_tag = {
         struct SrvLike<'a>(&'a ServerConfig);
         impl<'a> ServerLike for SrvLike<'a> {
             fn id(&self) -> &str {
@@ -390,11 +392,8 @@ pub fn build_outbounds_with_runtime_bindings(
             }
         }
         let wrappers: Vec<SrvLike> = config.servers.iter().map(SrvLike).collect();
-        let map = build_id_to_tag_map(&wrappers);
-        for (k, v) in map {
-            id_to_tag.insert(k, v);
-        }
-    }
+        build_id_to_tag_map(&wrappers)
+    };
 
     for server in &config.servers {
         let tag = id_to_tag
@@ -1132,15 +1131,27 @@ fn apply_shadow_tls_postprocess(
     outbounds: &mut Vec<Outbound>,
     platform: &str,
 ) -> Result<(), String> {
+    let mut servers_by_tag: BTreeMap<_, Option<&ServerConfig>> = config
+        .servers
+        .iter()
+        .filter(|server| server.shadow_tls_settings.is_some())
+        .filter_map(|server| id_to_tag.get(&server.id).map(|tag| (tag.as_str(), None)))
+        .collect();
+    if servers_by_tag.is_empty() {
+        return Ok(());
+    }
+    // Match the first config entry for an ID, including preexisting duplicate IDs.
+    for server in &config.servers {
+        if let Some(entry) = id_to_tag
+            .get(&server.id)
+            .and_then(|tag| servers_by_tag.get_mut(tag.as_str()))
+        {
+            entry.get_or_insert(server);
+        }
+    }
     let mut stls_outbounds: Vec<Outbound> = Vec::new();
     for ob in outbounds.iter_mut() {
-        // 根据 tag 反查 ServerConfig（selector/direct/block 等非节点出站匹配不到 → 跳过）。
-        let srv_id = id_to_tag
-            .iter()
-            .find(|(_, t)| *t == &ob.tag)
-            .map(|(id, _)| id.clone());
-        let Some(srv_id) = srv_id else { continue };
-        let Some(srv) = config.servers.iter().find(|s| s.id == srv_id) else {
+        let Some(srv) = servers_by_tag.get(ob.tag.as_str()).copied().flatten() else {
             continue;
         };
         if srv.shadow_tls_settings.is_none() {

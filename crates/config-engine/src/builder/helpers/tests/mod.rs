@@ -27,13 +27,23 @@ fn id_to_tag_unique() {
         },
         Srv {
             id: "s3".into(),
-            name: "JP".into(),
+            name: "HK (2)".into(),
+        },
+        Srv {
+            id: "s4".into(),
+            name: "HK".into(),
+        },
+        Srv {
+            id: "s5".into(),
+            name: "HK (1)".into(),
         },
     ];
     let map = build_id_to_tag_map(&servers);
     assert_eq!(map.get("s1").unwrap(), "HK");
     assert_eq!(map.get("s2").unwrap(), "HK (1)"); // 撞名追加
-    assert_eq!(map.get("s3").unwrap(), "JP");
+    assert_eq!(map.get("s3").unwrap(), "HK (2)");
+    assert_eq!(map.get("s4").unwrap(), "HK (3)");
+    assert_eq!(map.get("s5").unwrap(), "HK (1) (1)");
 }
 
 #[test]

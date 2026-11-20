@@ -1021,6 +1021,7 @@ async fn perform_subscription_update_inner(
              已中止本次更新以避免订阅地址明文外泄；请先启动代理，或把订阅代理策略改为「跟随」/「直连」。",
         );
     }
+    drop(cfg);
 
     let pipeline_started = std::time::Instant::now();
     let lookup = SystemDnsLookup;
@@ -1151,6 +1152,7 @@ async fn perform_subscription_update_inner(
         Ok(_) => unreachable!("subscription reconcile decision and candidate must agree"),
         Err(e) => return update_failure(format!("{e}")),
     };
+    let commit_started = std::time::Instant::now();
     let (revision, receipt) = match commit_subscription_refresh(
         app,
         state,
@@ -1166,6 +1168,7 @@ async fn perform_subscription_update_inner(
         }
         Err(result) => return result,
     };
+    let commit_ms = commit_started.elapsed().as_millis();
 
     // 7) 节点内容未变时只刷新元数据。部分拉取仍保留自己的终态。
     if !content_changed {
@@ -1178,7 +1181,7 @@ async fn perform_subscription_update_inner(
             "unchanged"
         };
         log::info!(
-            "subscription reconcile timing: outcome={outcome} initial_config_ms={initial_config_ms} fetch_pipeline_ms={fetch_pipeline_ms} config_transaction_ms={transaction_ms} reconcile_total_ms={} total_ms={}",
+            "subscription reconcile timing: outcome={outcome} initial_config_ms={initial_config_ms} fetch_pipeline_ms={fetch_pipeline_ms} config_transaction_ms={transaction_ms} commit_ms={commit_ms} reconcile_total_ms={} total_ms={}",
             apply_started.elapsed().as_millis(),
             update_started.elapsed().as_millis()
         );
@@ -1195,7 +1198,7 @@ async fn perform_subscription_update_inner(
         receipt.as_ref(),
     );
     log::info!(
-        "subscription reconcile timing: outcome=changed initial_config_ms={initial_config_ms} fetch_pipeline_ms={fetch_pipeline_ms} config_transaction_ms={transaction_ms} reconcile_total_ms={} total_ms={}",
+        "subscription reconcile timing: outcome=changed initial_config_ms={initial_config_ms} fetch_pipeline_ms={fetch_pipeline_ms} config_transaction_ms={transaction_ms} commit_ms={commit_ms} reconcile_total_ms={} total_ms={}",
         apply_started.elapsed().as_millis(),
         update_started.elapsed().as_millis()
     );
@@ -1804,36 +1807,29 @@ fn reconcile_subscription_servers(
 
     // Compare dependency structure, not ephemeral imported IDs. Include unrelated
     // persisted nodes for existing local references, in a separate ID namespace.
-    let graph_nodes = |values: &[Value]| -> Vec<(String, String, Option<String>)> {
-        values
-            .iter()
-            .map(|value| {
-                let id = value
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
-                let detour = value
-                    .get("detour")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned);
-                let mut projection = value.clone();
-                if let Some(object) = projection.as_object_mut() {
-                    object.remove("detour");
-                }
-                // Unparseable nodes retain an exact serialized signature rather than
-                // masquerading as a valid source node with an empty identity.
-                let signature = node_generation_identity(&projection)
-                    .unwrap_or_else(|| format!("invalid:{}", projection));
-                (id, signature, detour)
-            })
-            .collect()
+    let graph_node = |value: &Value| {
+        let id = value
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let detour = value
+            .get("detour")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let mut projection = value.clone();
+        if let Some(object) = projection.as_object_mut() {
+            object.remove("detour");
+        }
+        // Unparseable nodes retain an exact serialized signature rather than
+        // masquerading as a valid source node with an empty identity.
+        let signature = node_generation_identity(&projection)
+            .unwrap_or_else(|| format!("invalid:{}", projection));
+        (id, signature, detour)
     };
-    let mut old_graph_values = this_sub.clone();
-    old_graph_values.extend(others.iter().cloned());
     let classes = polaris_net_stack::subscription::dependency_identity_classes(&[
-        graph_nodes(&old_graph_values),
-        graph_nodes(&new_vals),
+        this_sub.iter().chain(&others).map(graph_node).collect(),
+        new_vals.iter().map(graph_node).collect(),
     ]);
     let old_classes = &classes[0];
     let new_classes = &classes[1];

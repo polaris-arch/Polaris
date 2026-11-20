@@ -6,7 +6,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::singbox::{DomainResolver, DomainStrategy, RouteRule, SingBoxConfig};
 use crate::user_config::app_rules_preset::get_app_preset;
@@ -67,11 +67,12 @@ pub trait ServerLike {
 pub fn build_id_to_tag_map<S: ServerLike>(
     servers: &[S],
 ) -> std::collections::BTreeMap<String, String> {
-    let mut id_to_tag = std::collections::BTreeMap::new();
+    let mut id_to_tag = BTreeMap::new();
     let mut used_tags: BTreeSet<String> = RESERVED_OUTBOUND_TAGS
         .iter()
         .map(|s| s.to_string())
         .collect();
+    let mut next_suffix = BTreeMap::new();
     for s in servers {
         let base_tag = {
             let trimmed = s.name().trim();
@@ -87,12 +88,21 @@ pub fn build_id_to_tag_map<S: ServerLike>(
                 trimmed.to_string()
             }
         };
-        let mut tag = base_tag.clone();
-        let mut count = 1;
-        while used_tags.contains(&tag) {
-            tag = format!("{base_tag} ({count})");
-            count += 1;
-        }
+        let tag = if used_tags.contains(&base_tag) {
+            // Already occupied suffixes stay occupied, including explicitly named nodes.
+            let mut suffix = next_suffix.get(&base_tag).copied().unwrap_or(1);
+            let tag = loop {
+                let candidate = format!("{base_tag} ({suffix})");
+                suffix += 1;
+                if !used_tags.contains(&candidate) {
+                    break candidate;
+                }
+            };
+            next_suffix.insert(base_tag, suffix);
+            tag
+        } else {
+            base_tag
+        };
         used_tags.insert(tag.clone());
         id_to_tag.insert(s.id().to_string(), tag);
     }
