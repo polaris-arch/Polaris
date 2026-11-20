@@ -1103,7 +1103,7 @@ export function HomeScreen() {
 
       {noServers && (
         <div className="pending-bar info" role="status">
-          <div className="pb-tx pb-static">{t('home.noServerConfig')}</div>
+          <div className="pb-tx pb-static"><b>{t('home.noServerConfig')}</b></div>
           <div className="pb-acts">
             <button type="button" className="btn ghost sm" onClick={() => goServerPage('add-server')}>
               {t('home.addServer')}

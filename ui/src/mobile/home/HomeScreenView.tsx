@@ -616,7 +616,7 @@ export function HomeScreenView(props: HomeScreenViewProps): ReactElement {
         {props.noServers && (
           <div className="h-notice" role="status">
             <div>
-              <p className="h-noticetext">{t('home.noServerConfig')}</p>
+              <p className="h-noticetext"><strong>{t('home.noServerConfig')}</strong></p>
               <div className="h-emptyacts">
                 <button type="button" className="h-emptyact" onClick={props.onAddServer}>
                   {t('home.addServer')}

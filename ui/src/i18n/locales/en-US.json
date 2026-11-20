@@ -414,7 +414,7 @@
     "networkProfileRulesPruned": "Some network-profile rules are not in effect (profile invalid, probe unavailable on this device, or criteria that can never match) · check network profiles on the Routing page",
     "networkSettingsTip": "Network settings",
     "noActiveConnections": "No active connections",
-    "noServerConfig": "You can use Direct or Block now. For a proxy exit, add a subscription or server.",
+    "noServerConfig": "Direct and Block work without a proxy node.",
     "others": "Others",
     "pageTitle": "Home",
     "nativeReconnectRequired": "Connection changes need a reconnect. Connect on Home; if still connected, disconnect first.",
