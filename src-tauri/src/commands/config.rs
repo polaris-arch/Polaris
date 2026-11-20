@@ -846,6 +846,9 @@ pub async fn config_patch(
 
 pub(crate) const CONFIG_TAKEOVER_BLOCKED_BY_PENDING: &str = "CONFIG_TAKEOVER_BLOCKED_BY_PENDING";
 
+// Owns preparation through commit. Runtime admission acquires switch_serial internally.
+pub(crate) static TAKEOVER_EDIT_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn takeover_conflict() -> ApiResponse<Value> {
     ApiResponse::err_with_code("接管配置已变更，请重新确认", "CONFIG_TAKEOVER_CONFLICT")
 }
@@ -908,9 +911,11 @@ pub async fn config_set_takeover(
             Err(error) => config_store_error(error),
         });
     }
+    let _serial = TAKEOVER_EDIT_SERIAL.lock().await;
     Ok(Box::pin(apply_takeover_edit(&app, &state, mode, hot_only)).await)
 }
 
+/// The caller holds `TAKEOVER_EDIT_SERIAL` before preparing the saved revision.
 pub(crate) async fn apply_takeover_edit(
     app: &AppHandle,
     state: &AppRuntime,
@@ -937,7 +942,7 @@ pub(crate) async fn apply_takeover_edit(
             saved_offline,
             ..
         }) => runtime_apply.map_or_else(
-            || changed && !saved_offline && proxy.pending_changes().pending_apply,
+            || !saved_offline && proxy.pending_changes().pending_apply,
             |result| result.pending_apply,
         ),
         Ok(HotConfigEditOutcome::NeedsManual { .. }) if hot_only => {

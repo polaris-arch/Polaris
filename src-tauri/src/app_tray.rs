@@ -30,6 +30,7 @@
 //! | 测速（[`MenuAction::SpeedTest`]） | 桌面独有（快捷入口） | 应用内已有入口，通知位次不该给它 |
 //! | macOS 菜单栏位置持久化 | 桌面独有 | 已由 `#[cfg(target_os = "macos")]` 门控 |
 //!
+use std::sync::atomic::{AtomicU64, Ordering};
 use tauri::Manager;
 
 use crate::{commands, i18n, show_main_window, tray, AppRuntime, Platform};
@@ -620,6 +621,7 @@ pub(crate) fn reconcile_tray_menu_model(
 pub(crate) const MENU_ID_TAKEOVER: &str = "tray_takeover:";
 pub(crate) const MENU_ID_ROUTING: &str = "tray_routing:";
 pub(crate) const MENU_ID_SELECT: &str = "tray_select:";
+static TAKEOVER_MENU_INTENT: AtomicU64 = AtomicU64::new(0);
 
 /// 原生菜单项点击 → 动作（纯函数：id 字符串是菜单与 handler 之间唯一的契约面，解析必须可单测，
 /// 否则「子菜单 id 拼错 → 点了没反应」这类错只能真机撞）。
@@ -1116,14 +1118,25 @@ pub(crate) fn run_menu_action(app: &tauri::AppHandle, action: MenuAction) {
             let Ok(mode) = serde_json::from_value(serde_json::json!(kind)) else {
                 return;
             };
+            let intent = TAKEOVER_MENU_INTENT.fetch_add(1, Ordering::SeqCst) + 1;
             let app = app.clone();
             tauri::async_runtime::spawn(async move {
                 let lang = i18n::app_lang(&app);
                 let state = app.state::<AppRuntime>();
-                let response = Box::pin(commands::config::apply_takeover_edit(
-                    &app, &state, mode, false,
-                ))
-                .await;
+                let is_current = || TAKEOVER_MENU_INTENT.load(Ordering::SeqCst) == intent;
+                let response = {
+                    let _serial = commands::config::TAKEOVER_EDIT_SERIAL.lock().await;
+                    if !is_current() {
+                        return;
+                    }
+                    Box::pin(commands::config::apply_takeover_edit(
+                        &app, &state, mode, false,
+                    ))
+                    .await
+                };
+                if !is_current() {
+                    return;
+                }
                 if response.code.as_deref()
                     == Some(commands::config::CONFIG_TAKEOVER_BLOCKED_BY_PENDING)
                     || response.data.as_ref().is_some_and(|data| {

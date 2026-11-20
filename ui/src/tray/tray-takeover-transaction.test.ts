@@ -12,36 +12,73 @@ if (start < 0 || end <= start) throw new Error('Tray handler extraction failed')
 const handler = source.slice(start, end).replace('(modeType: ProxyModeType)', '(modeType)');
 
 describe('takeover tray transaction', () => {
-  const make = new Function('api','config','trayLifecycle','interactionEpoch','mounted','interactionActive','hide','setNotice','notifyDesktop','noticeActionFailure','t','IpcError',`${handler}; return setTakeover;`);
+  const make = new Function(
+    'api', 'config', 'trayLifecycle', 'interactionEpoch', 'mounted', 'interactionActive', 'takeoverIntent',
+    'withConfigWriteLock', 'hide', 'setNotice', 'notifyDesktop', 'noticeActionFailure', 't', 'IpcError',
+    `${handler}; return setTakeover;`,
+  );
+  const takeoverFixture = (setTakeover: (mode: string) => Promise<unknown>, config: object) => {
+    const hide = vi.fn(), notice = vi.fn(), notify = vi.fn(), fail = vi.fn();
+    const change = make(
+      { config: { setTakeover } }, config, { current: 1 }, { current: 1 }, { current: true }, { current: true },
+      { current: 0 }, withConfigWriteLock, hide, notice, notify, fail, (key: string) => key, IpcError,
+    );
+    return { change, hide, notice, notify, fail };
+  };
 
   it.each([
-    [false, false, []],
-    [true, false, [['tray.fakeIpAutoEnabled']]],
-    [false, true, [['tray.manageInMain']]],
-    [true, true, [['tray.fakeIpAutoEnabled tray.manageInMain']]],
-  ] as const)('preserves the latest config and reports correction %s and pending %s', async (corrected, pendingApply, notices) => {
+    ['manual', false, false, []],
+    ['manual', true, false, [['tray.fakeIpAutoEnabled']]],
+    ['manual', false, true, [['tray.manageInMain']]],
+    ['manual', true, true, [['tray.fakeIpAutoEnabled tray.manageInMain']]],
+    ['tun', false, true, [['tray.manageInMain']]],
+  ] as const)('from %s preserves the latest config and reports correction %s and pending %s', async (previous, corrected, pendingApply, notices) => {
     const stale = {proxyModeType:'manual', dnsConfig:{server:'old'}, dnsDefaults:{pending:true}};
-    const latest = {proxyModeType:'manual', dnsConfig:{server:'new'}, dnsDefaults:{pending:false}};
-    const hide=vi.fn(), notice=vi.fn(), notify=vi.fn(), fail=vi.fn();
-    const api={config:{setTakeover:vi.fn(async (mode:string)=>{latest.proxyModeType=mode; return {corrected, pendingApply};})}};
-    const apply=make(api,stale,{current:1},{current:1},{current:true},{current:true},hide,notice,notify,fail,(s:string)=>s,IpcError);
-    await apply('tun');
-    expect(api.config.setTakeover.mock.calls).toEqual([['tun']]);
+    const latest = {proxyModeType:previous as string, dnsConfig:{server:'new'}, dnsDefaults:{pending:false}};
+    const setTakeover = vi.fn(async (mode: string) => {
+      latest.proxyModeType = mode;
+      return { corrected, pendingApply };
+    });
+    const { change, hide, notice, notify, fail } = takeoverFixture(setTakeover, stale);
+    await change('tun');
+    expect(setTakeover.mock.calls).toEqual([['tun']]);
     expect(latest.dnsConfig).toEqual({server:'new'});expect(latest.dnsDefaults).toEqual({pending:false});
     expect(notify).toHaveBeenCalledTimes(corrected?1:0);expect(notice.mock.calls).toEqual(notices);
     expect(hide).toHaveBeenCalledTimes(corrected || pendingApply ? 0 : 1);expect(fail).not.toHaveBeenCalled();
   });
 
   it('directs an edit blocked by existing pending work to the main window', async () => {
-    const hide = vi.fn(), notice = vi.fn(), notify = vi.fn(), fail = vi.fn();
     const error = new IpcError('config_set_takeover', 'existing work', 'CONFIG_TAKEOVER_BLOCKED_BY_PENDING');
-    const api = { config: { setTakeover: vi.fn().mockRejectedValue(error) } };
-    const apply = make(api, {}, { current: 1 }, { current: 1 }, { current: true }, { current: true }, hide, notice, notify, fail, (key: string) => key, IpcError);
-    await apply('tun');
+    const { change, hide, notice, notify, fail } = takeoverFixture(vi.fn().mockRejectedValue(error), {});
+    await change('tun');
     expect(notice).toHaveBeenCalledWith('tray.manageInMain');
     expect(hide).not.toHaveBeenCalled();
     expect(notify).not.toHaveBeenCalled();
     expect(fail).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])('serializes a reversal and drops older hide or correction feedback (%s)', async corrected => {
+    let finishFirst!: () => void;
+    const firstReceipt = new Promise<void>(resolve => { finishFirst = resolve; });
+    const setTakeover = vi.fn(async (mode: string) => {
+      if (mode === 'tun') {
+        await firstReceipt;
+        return { corrected, pendingApply: false };
+      }
+      return { corrected: false, pendingApply: true };
+    });
+    const { change, hide, notice, notify } = takeoverFixture(setTakeover, {});
+    const first = change('tun');
+    await Promise.resolve();
+    expect(setTakeover.mock.calls).toEqual([['tun']]);
+    const second = change('manual');
+    expect(setTakeover.mock.calls).toEqual([['tun']]);
+    finishFirst();
+    await Promise.all([first, second]);
+    expect(setTakeover.mock.calls).toEqual([['tun'], ['manual']]);
+    expect(notice.mock.calls).toEqual([['tray.manageInMain']]);
+    expect(hide).not.toHaveBeenCalled();
+    expect(notify).not.toHaveBeenCalled();
   });
 });
 

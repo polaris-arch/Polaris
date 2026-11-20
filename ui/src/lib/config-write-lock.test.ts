@@ -137,13 +137,13 @@ describe('接线：主窗里的配置事务必须都在闸门内', () => {
     // also split the atomic correction from the chosen mode.
     const takeover = tray.slice(tray.indexOf('  const setTakeover ='), tray.indexOf('  const switchExit ='));
     expect(takeover).toMatch(/await api\.config\.setTakeover\(modeType\);/);
-    expect(takeover).not.toMatch(/saveConfig\(|api\.config\.(?:patch|save)\(|withConfigWriteLock\(/);
+    expect(takeover).not.toMatch(/saveConfig\(|api\.config\.(?:patch|save)\(/);
     expect((tray.match(/api\.config\.setTakeover\(/g) ?? []).length).toBe(1);
     expect(tray).not.toContain('api.config.patch(');
     // Tray delegates to the single locked switch/readback implementation.
     expect(tray).toContain('useAppStore.getState().switchServer(id)');
     expect(tray).not.toContain('api.server.switch(');
-    expect((tray.match(/withConfigWriteLock\((?:async )?\(\) =>/g) ?? []).length).toBe(1);
+    expect((tray.match(/withConfigWriteLock\((?:async )?\(\) =>/g) ?? []).length).toBe(2);
   });
 
   it('mutation entry is in the actual locked callback; moving it outside or nesting a lock fails', () => {

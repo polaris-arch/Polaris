@@ -196,6 +196,7 @@ export default function TrayMenu() {
   // 用于：测速集为空、检查更新的"已是最新/失败"、切 TUN 自动开 FakeIP 的告知。
   const [notice, setNotice] = useState('');
   const modeIntent = useRef(0);
+  const takeoverIntent = useRef(0);
   // 「检查更新」在飞（互斥闸：连点会并发发多次 GitHub 请求）。
   const [checking, setChecking] = useState(false);
   // 检查结果属于「检查更新」这一行自身，不进上方 tray-note：提示条会改变自然高，受平台高度上限
@@ -589,42 +590,43 @@ export default function TrayMenu() {
   // 只提交用户选择的接管方式。后端判定热应用，需用户确认的变更交给主窗待应用条。
   const setTakeover = async (modeType: ProxyModeType) => {
     const life = trayLifecycle.current, operation = interactionEpoch.current;
-    const current = () => mounted.current && interactionActive.current && life === trayLifecycle.current && operation === interactionEpoch.current;
+    const intent = ++takeoverIntent.current;
+    const current = () => mounted.current && interactionActive.current && life === trayLifecycle.current
+      && operation === interactionEpoch.current && intent === takeoverIntent.current;
     if (!config) {
       hide();
       return;
     }
-    try {
-      // corrected=true（迁移冻结的 enableFakeIp:false 首次进 TUN 被回 true）→ **必须告知**：这是一次
-      // 用户没要求过的配置变更，且有实际副作用。A6：桌面通知（对齐 上游 托盘 onChangeProxyModeType
-      // 与主窗 `HomeScreen.applyIntercept` 的 notifyDesktop 那条腿）+ 浮层内 notice 行双管——
-      // 托盘切换常在主窗关闭时发生，主窗那条 toast 此刻看不到；而浮层这行只在浮层还开着时有用。
-      // 开关门控由 hydrate 里的 `setDesktopNotificationsEnabled` 负责（用户关了就静默不发）。
-      const { corrected, pendingApply } = await api.config.setTakeover(modeType);
-      if (!current()) return;
-      const guidance = pendingApply ? t('tray.manageInMain') : undefined;
-      if (corrected) {
-        const title = t('tray.takeoverTun');
-        const body = t('tray.fakeIpAutoEnabled');
-        setNotice(guidance ? `${body} ${guidance}` : body);
-        void notifyDesktop(title, body);
-        return; // 保持浮层打开，让 notice 有机会被看到
-      }
-      if (guidance) {
-        setNotice(guidance);
+    return withConfigWriteLock(async () => {
+      if (intent !== takeoverIntent.current) return;
+      try {
+        // 迁移中的 FakeIP 修正同时走桌面通知和当前浮层提示。
+        const { corrected, pendingApply } = await api.config.setTakeover(modeType);
+        if (!current()) return;
+        const guidance = pendingApply ? t('tray.manageInMain') : undefined;
+        if (corrected) {
+          const title = t('tray.takeoverTun');
+          const body = t('tray.fakeIpAutoEnabled');
+          setNotice(guidance ? `${body} ${guidance}` : body);
+          void notifyDesktop(title, body);
+          return;
+        }
+        if (guidance) {
+          setNotice(guidance);
+          return;
+        }
+      } catch (err) {
+        if (current()) {
+          if (err instanceof IpcError && err.code === 'CONFIG_TAKEOVER_BLOCKED_BY_PENDING') {
+            setNotice(t('tray.manageInMain'));
+          } else {
+            noticeActionFailure(t('tray.groupTakeover'), err);
+          }
+        }
         return;
       }
-    } catch (err) {
-      if (current()) {
-        if (err instanceof IpcError && err.code === 'CONFIG_TAKEOVER_BLOCKED_BY_PENDING') {
-          setNotice(t('tray.manageInMain'));
-        } else {
-          noticeActionFailure(t('tray.groupTakeover'), err);
-        }
-      }
-      return; // 失败不关浮层（W14）；成功才 hide
-    }
-    hide();
+      hide();
+    });
   };
 
   const switchExit = async (id: string, node: string) => {
