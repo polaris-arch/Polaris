@@ -242,14 +242,8 @@ impl ProxyRuntime {
                 .is_none()
                 .then(|| self.config.published_config())
                 .flatten();
-            let (executing, recovery) =
-                self.config_edit_pending_observation(saved.as_ref().map(|(_, revision)| *revision));
-            let selection_owned = saved.as_ref().is_some_and(|(config, revision)| {
-                config
-                    .get("selectedServerId")
-                    .and_then(Value::as_str)
-                    .is_some_and(|id| self.executing_automatic_selection(id, *revision))
-            });
+            let (executing, selection_owned, recovery) =
+                self.config_edit_pending_observation(saved.as_ref());
             let fingerprints = self
                 .switch_snapshot
                 .read()

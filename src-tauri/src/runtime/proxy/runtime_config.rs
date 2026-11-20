@@ -2266,26 +2266,41 @@ impl ProxyRuntime {
 
     pub(super) fn config_edit_pending_observation(
         &self,
-        published_revision: Option<u64>,
-    ) -> (bool, bool) {
+        published: Option<&(Value, u64)>,
+    ) -> (bool, bool, bool) {
         let generation = self.gate.generation();
         let intent = self.selector_reconcile.intent_generation();
         let running_idle = self.core_running() && !self.gate.is_busy();
+        let selection = published.and_then(|(config, revision)| {
+            config
+                .get("selectedServerId")
+                .and_then(Value::as_str)
+                .filter(|id| self.executing_automatic_selection(id, *revision))
+        });
+        let owns_current = |owner: &StagedSaveOwner| {
+            published.is_some_and(|(_, revision)| owner.revision == *revision)
+                && owner.generation == generation
+                && owner.intent == intent
+                && running_idle
+        };
         self.runtime_config_apply
             .lock()
-            .map_or((false, true), |state| {
-                let executing = state.automatic_edit.filter(|owner| {
-                    Some(owner.revision) == published_revision
-                        && owner.generation == generation
-                        && owner.intent == intent
-                        && running_idle
+            .map_or((false, selection.is_some(), true), |state| {
+                let executing = state.automatic_edit.filter(owns_current);
+                let recovery = state.pending.as_ref().is_some_and(|pending| {
+                    pending.staged_save_owner().is_some_and(|owner| {
+                        executing != Some(owner)
+                            && !(owns_current(&owner)
+                                && selection.is_some_and(|id| {
+                                    pending
+                                        .candidate
+                                        .get("selectedServerId")
+                                        .and_then(Value::as_str)
+                                        == Some(id)
+                                }))
+                    })
                 });
-                let recovery = state
-                    .pending
-                    .as_ref()
-                    .and_then(PendingOperation::staged_save_owner)
-                    .is_some_and(|owner| executing != Some(owner));
-                (executing.is_some(), recovery)
+                (executing.is_some(), selection.is_some(), recovery)
             })
     }
 
@@ -2323,8 +2338,8 @@ impl ProxyRuntime {
 
     #[cfg(test)]
     fn staged_save_recovery_pending(&self) -> bool {
-        let published = self.config.published_config().map(|(_, revision)| revision);
-        self.config_edit_pending_observation(published).1
+        self.config_edit_pending_observation(self.config.published_config().as_ref())
+            .2
     }
 
     fn saved_revision_matches(&self, revision: Option<u64>) -> bool {

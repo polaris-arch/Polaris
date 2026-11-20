@@ -938,6 +938,62 @@ fn hot_config_edit_pending_projection_does_not_consume_independent_or_failed_wor
     assert!(rt.staged_save_recovery_pending());
 }
 
+#[test]
+fn selected_graph_apply_only_reports_recovery_after_its_exact_owner_releases() {
+    use crate::runtime::config::Decision;
+    use polaris_config_engine::user_config::dns_constants::BLOCK_SERVER_ID;
+
+    for prior_debt in [false, true] {
+        let (rt, _dir, mut running, _) = host_dns_restart_fixture();
+        running["selectedServerId"] = json!(BLOCK_SERVER_ID);
+        *rt.current_config.write().unwrap() = Some(running.clone());
+        *rt.startup_snapshot.write().unwrap() = Some(running.clone());
+        let mut saved = running.clone();
+        if prior_debt {
+            saved["logLevel"] = json!("debug");
+        }
+        rt.config.save_full(&saved).unwrap();
+        let mut owner = rt
+            .config
+            .update(|disk| {
+                disk["selectedServerId"] = json!(DIRECT_SERVER_ID);
+                let intent = rt.register_selector_intent();
+                Decision::Write(
+                    rt.own_automatic_selection(DIRECT_SERVER_ID, intent)
+                        .unwrap(),
+                )
+            })
+            .unwrap()
+            .0;
+        owner.mark_committed();
+
+        running["selectedServerId"] = json!(DIRECT_SERVER_ID);
+        let mut pending = ts_pending_raw_fixture(&rt, running);
+        pending.desired = rt.config.current().unwrap();
+        pending.saved_revision = Some(rt.config.saved_revision());
+        *rt.switch_snapshot.write().unwrap() = Some(ProxyRuntime::build_switch_snapshot(
+            &pending.typed,
+            &pending.generated,
+            &pending.deps,
+        ));
+        rt.runtime_config_apply.lock().unwrap().pending = Some(pending.clone());
+        assert!(!rt.staged_save_recovery_pending());
+        let observed = rt.pending_changes();
+        assert_eq!(observed.pending_apply, prior_debt);
+        assert_eq!(observed.restart_deferred, prior_debt);
+
+        let mut wrong_target = pending.clone();
+        wrong_target.candidate["selectedServerId"] = json!(BLOCK_SERVER_ID);
+        rt.runtime_config_apply.lock().unwrap().pending = Some(wrong_target);
+        assert!(rt.staged_save_recovery_pending());
+        rt.runtime_config_apply.lock().unwrap().pending = Some(pending);
+
+        drop(owner);
+        assert!(rt.staged_save_recovery_pending());
+        assert!(rt.pending_changes().pending_apply);
+    }
+}
+
 #[tokio::test]
 async fn pending_projection_while_subscription_refresh_waits_for_core_admission() {
     use crate::runtime::config::Decision;
