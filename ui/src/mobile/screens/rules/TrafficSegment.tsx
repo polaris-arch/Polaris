@@ -27,6 +27,7 @@ import {
   SwitchRow,
 } from './Primitives';
 import { RuleRow, type RuleRowProps } from './RuleRow';
+import { MobileInfo } from '../../MobileInfo';
 
 export type RuleRowBinding = Omit<RuleRowProps, 't' | 'index' | 'isFirst' | 'isLast' | 'plane'>;
 
@@ -155,13 +156,12 @@ export function TrafficSegment({
         {modeInactive && <NoticeBanner tone="warn" text={t('rules.modeNote')} />}
       </Cards>
 
-      {/* ④ 规则数 + 优先级说明。桌面把说明藏在 `.info-i` 的 `data-tip` 里（:680），这里常驻。 */}
       <div>
         <div className="mr-card-h">
           <span>{t('rules.priority')}</span>
+          <MobileInfo title={t('rules.priority')} details={t('rules.priorityTip')} />
           <span className="mr-cnt">{rows.length}</span>
         </div>
-        <div className="mr-note">{t('rules.priorityTip')}</div>
         {meshInfo && <div className="mr-note">{meshInfo}</div>}
         <InlineError text={errorOf('order:route')} />
       </div>

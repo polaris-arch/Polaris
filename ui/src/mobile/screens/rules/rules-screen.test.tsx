@@ -1021,7 +1021,6 @@ describe('③ §4.12：没有一处解释只挂在 `data-tip` 上', () => {
     ['RuleItem.tsx:449 复制', 'rules.duplicate', () => trafficMarkup()],
     ['RuleItem.tsx:462 编辑', 'common.edit', () => trafficMarkup()],
     ['RuleItem.tsx:476 删除', 'common.delete', () => trafficMarkup()],
-    ['RulesScreen.tsx:680 优先级说明', 'rules.priorityTip', () => trafficMarkup()],
     ['GeoCard.tsx:147 回国说明', 'rules.backHomeTip', () => trafficMarkup()],
     [
       'RulesScreen.tsx:653 系统规则恒优先',
@@ -1051,6 +1050,13 @@ describe('③ §4.12：没有一处解释只挂在 `data-tip` 上', () => {
     const text = textNodesOf(render());
     expect(text, `${key} 在移动端没有任何**可见**的常驻落点（只在属性里不算）`).toContain(key);
   });
+
+  it('流量和 DNS 规则的优先级说明都有详情入口', () => {
+    for (const html of [trafficMarkup(), dnsMarkup()]) {
+      expect(html).toMatch(/class="mr-card-h"[^>]*>[\s\S]*?class="m-info-trigger"[^>]*aria-haspopup="dialog"/);
+      expect(textNodesOf(html)).not.toContain('rules.priorityTip');
+    }
+  });
 });
 
 describe('④ 内容顺序与 IA §2.2 对拍（DOM 顺序即重要性顺序）', () => {
@@ -1065,7 +1071,7 @@ describe('④ 内容顺序与 IA §2.2 对拍（DOM 顺序即重要性顺序）'
       at('rules.modeWarn'),
       at('rules.regionRouting'),
       at('rules.modeNote'),
-      at('rules.priorityTip'),
+      at('rules.priority'),
       at('data-ordered="1"'),
     ];
     // 反面：手动接管那条说明**整条不移植**（Android 没有 manual 接管，见 `TrafficSegment` 注释）。

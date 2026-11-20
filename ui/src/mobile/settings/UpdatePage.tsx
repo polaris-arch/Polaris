@@ -342,7 +342,7 @@ export function UpdatePage({ config, update, commit }: MobileSettingsPageProps):
           stacked
           id="rule-resource-interval"
           label={t('mobileSettings.update.ruleResourceInterval')}
-          desc={t('mobileSettings.update.ruleResourceIntervalDesc')}
+          descDetails={t('mobileSettings.update.ruleResourceIntervalDesc')}
           control={
             <MobileSelect
               value={ruleResourceIntervalSelectValue(config)}

@@ -259,7 +259,7 @@ export function BackupPage({ commit }: { commit: CommitWrite }): ReactElement {
           stacked
           id={ACTIONS_ROW}
           label={t('settings.nav.backup')}
-          desc={t('mobileSettings.backup.pickerNote')}
+          descDetails={t('mobileSettings.backup.pickerNote')}
           control={
             <div style={{ display: 'flex', gap: '8px' }}>
               <MobileButton disabled={busy || selectedArr.length === 0} onClick={doExport}>

@@ -1457,7 +1457,7 @@ describe('⑦ 隐私锁：三条腿都在，且解锁只能走 `privacy_unlock`�
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
-describe('⑧ 只靠悬浮提示承载的解释都换成了常驻通道（§4.12，逐条计数）', () => {
+describe('⑧ 触屏解释由常驻文字或可操作的详情按钮承载', () => {
   /**
    * 桌面把这些解释挂在 `InfoIcon` 的 `tip` 上，触屏没有 hover。机制详情已改为可点 i，关键说明仍常驻。逐条登记它落在**哪一页**，
    * 断言那句话真的出现在那一页的 DOM 里。**这是一份计数，不是印象**（§4.12 的验收口径）。
@@ -1469,14 +1469,6 @@ describe('⑧ 只靠悬浮提示承载的解释都换成了常驻通道（§4.12
     ['display', 'settings.display.languageDesc'],
     ['network', 'settings.network.directInterfaceDesc'],
     ['network', 'settings.network.proxyInterfaceDesc'],
-    ['network', 'settings.network.blockQuicDescFull'],
-    ['network', 'settings.network.webrtcLeakDesc'],
-    ['network', 'settings.advanced.tlsFragmentDesc'],
-    ['network', 'settings.advanced.autoSwitchNodeDesc'],
-    ['network', 'settings.network.meshLoginFallbackDesc'],
-    ['network', 'settings.network.interruptOnSwitchDesc'],
-    ['network', 'settings.network.restartOnNodeChangeDesc'],
-    ['network', 'settings.advanced.mainSessionViaProxyDesc'],
     ['network', 'settings.network.speedTestUrlDesc'],
     ['dns', 'mobileHelp.connectionResolution'],
     ['dns', 'settings.dns.fakeIpDesc'],
@@ -1485,7 +1477,6 @@ describe('⑧ 只靠悬浮提示承载的解释都换成了常驻通道（§4.12
     ['dns', 'settings.dns.takeoverSystemDnsDesc'],
     ['dns', 'settings.advanced.optimisticCacheDesc'],
     ['dns', 'settings.advanced.dnsTimeoutDesc'],
-    ['dns', 'settings.dns.raceStrategyDesc'],
     ['tun', 'settings.tun.mtuDesc'],
     ['tun', 'settings.tun.autoRouteDesc'],
     ['tun', 'settings.tun.natTypeDesc'],
@@ -1513,9 +1504,14 @@ describe('⑧ 只靠悬浮提示承载的解释都换成了常驻通道（§4.12
     .filter((entry) => entry.disposition === 'resident')
     .map<[MobileSettingsPageId, string]>(({ page, key }) => [page, key]);
 
-  it('逐条都落在了对应页面的 DOM 上', () => {
+  it('常驻说明和机制详情入口都落在对应设置页上', () => {
     const missing = RESIDENT.filter(([page, key]) => !MARKUP[page].includes(copy(key)));
     expect(missing.map(([p, k]) => `${p} ← ${k}`), '这些解释在移动端没有常驻落点').toEqual([]);
+    for (const id of ['block-quic', 'webrtc-leak', 'tls-fragment', 'auto-switch-node', 'mesh-login-fallback', 'interrupt-on-switch', 'restart-on-node-change', 'main-session-via-proxy', 'periodic-speed-test']) {
+      expect(rowOf(MARKUP.network, id)).toContain('aria-haspopup="dialog"');
+    }
+    expect(rowOf(MARKUP.dns, 'race-strategy')).toContain('aria-haspopup="dialog"');
+    expect(MARKUP.dns).not.toContain(copy('settings.dns.raceStrategyDesc'));
   });
 
   it('本屏不引桌面那颗悬浮提示图标（它在触屏上没有触发路径）', () => {
@@ -1633,8 +1629,7 @@ describe('⑨ 能力缺席：该缺的块整块不画，不画成禁用（§4.2 
     expect(switchRows(MARKUP.backup)).toEqual([...EXPECTED_SWITCHES.backup]);
     expect(switchRows(MARKUP.backup)).toContain('backup-meshRouting');
     expect(MARKUP.backup).toContain(copy('settings.backup.catMeshRouting'));
-    // 说明那句话改成了实话：说的是「走哪个系统面板」，不再是「这条腿没接」。
-    expect(MARKUP.backup).toContain(copy('mobileSettings.backup.pickerNote'));
+    expect(rowOf(MARKUP.backup, 'backup-actions')).toContain('aria-haspopup="dialog"');
     expect(MARKUP.backup).toContain(copy('settings.backup.exportSelected'));
     expect(MARKUP.backup).toContain(copy('settings.backup.import'));
     /*
@@ -2250,7 +2245,8 @@ describe('⑫ DNS：三块能力补齐，清单缺席带常驻理由（§3.3 规
        而它抛出来的错与「文案又冒出来了」读起来是两回事。同一件事的正面判据搬到了下面
        ⑫quater 那一组：那两格是真控件、且本页一条缺席理由都不剩。 */
     // 正面：解释这三块**是什么**的那几句仍在（有了编辑器也仍要说清编辑的是什么）。
-    expect(on).toContain(copy('settings.dns.fakeIpFilterHint'));
+    expect(rowOf(on, 'fakeip-filter-list-editor')).toContain('aria-haspopup="dialog"');
+    expect(on).not.toContain(copy('settings.dns.fakeIpFilterHint'));
     expect(on).toContain(copy('settings.dns.browserDohFold'));
     expect(on).toContain(copy('mobileHelp.raceUpstreams'));
   });
@@ -2260,9 +2256,7 @@ describe('⑫ DNS：三块能力补齐，清单缺席带常驻理由（§3.3 规
       { resolveNodeDomainsAhead: true },
       { fakeIpFilter: false, blockBrowserDoh: false },
     );
-    for (const note of ['fakeip-filter-list', 'browser-doh-list']) {
-      expect(off, `总开关关着却还挂着清单说明：${note}`).not.toContain(`data-note="${note}"`);
-    }
+    expect(off).not.toContain('data-note="browser-doh-list"');
     /* 清单**编辑器**同理跟着总开关走：一张编辑得动却不生效的名单比一段说明更误导。 */
     for (const row of ['fakeip-filter-list-editor', 'browser-doh-list-editor']) {
       expect(rows(off).map((r) => r.id), `总开关关着却还画着清单编辑器：${row}`).not.toContain(row);
@@ -2277,7 +2271,7 @@ describe('⑫ DNS：三块能力补齐，清单缺席带常驻理由（§3.3 规
 
   it('🔴 缺省安装上不常驻一段描述不生效清单的说明（`blockBrowserDoh` 缺省是关的）', () => {
     // 缺省夹具：`fakeIpFilter` 未设 = 开、`blockBrowserDoh` 未设 = 关。
-    expect(MARKUP.dns).toContain('data-note="fakeip-filter-list"');
+    expect(rowOf(MARKUP.dns, 'fakeip-filter-list-editor')).toContain('aria-haspopup="dialog"');
     expect(MARKUP.dns).not.toContain('data-note="browser-doh-list"');
     /* 编辑器同样跟着走：缺省关的那一块连编辑器一起不画。 */
     expect(rows(MARKUP.dns).map((r) => r.id)).toContain('fakeip-filter-list-editor');

@@ -14,6 +14,7 @@ import type {
 import { toast } from '@/lib/error-handler';
 import { useConfirmTwice } from '@/lib/confirm-twice';
 import { Csel } from '@/components/dialogs/Csel';
+import { InfoIcon } from '@/components/InfoIcon';
 import { useDialogStore } from '@/components/dialogs/dialog-store';
 import {
   dnsGroupReferences,
@@ -207,9 +208,9 @@ export function DnsPolicyWorkspace({ view }: { view: DnsWorkspaceView }) {
         </div>
         {defaultActionValue === 'fakeIp' && (
           <div className="policy-default-detail">
-            <div>
-              <div>{t('settings.dns.realQueryFallback')}</div>
-              <p>{t('settings.dns.realQueryFallbackHint')}</p>
+            <div className="sr-title">
+              <span>{t('settings.dns.realQueryFallback')}</span>
+              <InfoIcon tip={t('settings.dns.realQueryFallbackHint')} />
             </div>
             <Csel
               value={realQueryFallbackValue}

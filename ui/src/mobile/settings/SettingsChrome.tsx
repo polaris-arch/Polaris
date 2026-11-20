@@ -88,12 +88,9 @@ export interface SettingsRowProps {
   /** 稳定标识：判据按它定位一行，不靠文案（文案会被翻译）。 */
   id: string;
   label: ReactNode;
-  /**
-   * 常驻说明。桌面同一句话住在悬浮提示里；移动端**必须**是常驻第二行（IA §4.12），
-   * 故这里没有「hover 才显示」的形态可选。
-   */
+  /** 常驻的状态、约束或简短决策摘要。 */
   desc?: ReactNode;
-  /** Full static explanation; desc remains the explicit decision summary. */
+  /** Static explanation opened by tapping the title's info icon or the icon next to desc. */
   descDetails?: ReactNode;
   descTitle?: string;
   /** 状态/校验行（红色），与 `desc` 并存：`desc` 说的是这项是什么，本行说的是它现在怎么了。 */
@@ -134,12 +131,16 @@ export function SettingsRow({
   const base = stacked ? ROW_STACKED : first ? ROW_FIRST : ROW;
   const style = stacked && first ? { ...base, borderTop: 'none' } : base;
   const writeError = useWriteError(id);
+  const info = descDetails !== undefined && (
+    <MobileInfo title={descTitle ?? (typeof label === 'string' ? label : '')} summary={desc} details={descDetails} />
+  );
   return (
     <div style={style} data-setting={id}>
       <div style={ROW_TEXT}>
-        <span style={ROW_LABEL}>{label}</span>
-        {desc !== undefined && (descDetails === undefined ? <span style={ROW_DESC}>{desc}</span> :
-          <div style={ROW_DESC}><MobileInfo title={descTitle ?? (typeof label === 'string' ? label : '')} summary={desc} details={descDetails} /></div>)}
+        {desc === undefined && info ? (
+          <span style={{ ...ROW_LABEL, display: 'flex', alignItems: 'center' }}>{label}{info}</span>
+        ) : <span style={ROW_LABEL}>{label}</span>}
+        {desc !== undefined && (info ? <div style={ROW_DESC}>{info}</div> : <span style={ROW_DESC}>{desc}</span>)}
         {/* 顺序刻意是 `hint` 在前、`problem` 在后：两条并存时，红字是更急的那一条，压在最下面
             紧贴控件。`data-hint` 只是判据的定位锚，不进 `rows()` 的切行标记表（它不是一行）。 */}
         {hint !== undefined && (

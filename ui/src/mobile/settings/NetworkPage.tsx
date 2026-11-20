@@ -133,7 +133,7 @@ export function NetworkPage({ config, update, commit }: MobileSettingsPageProps)
         first={first}
         id={id}
         label={t(labelKey)}
-        desc={t(descKey)}
+        descDetails={t(descKey)}
         control={
           <MobileSwitch
             checked={checked}
@@ -202,7 +202,7 @@ export function NetworkPage({ config, update, commit }: MobileSettingsPageProps)
           stacked
           id="webrtc-leak"
           label={t('settings.network.webrtcLeakProtection')}
-          desc={t('settings.network.webrtcLeakDesc')}
+          descDetails={t('settings.network.webrtcLeakDesc')}
           control={
             <MobileSelect
               value={config.webrtcLeakProtection ?? 'off'}
@@ -215,7 +215,9 @@ export function NetworkPage({ config, update, commit }: MobileSettingsPageProps)
             </MobileSelect>
           }
         />
-        <SettingsRow stacked id="utls-policy" label={t('settings.utls.label')} desc={[t('settings.utls.description'), isSavedUtlsSelection(config.utlsPolicy) ? t('node.utls.savedHint') : null, tlsFingerprintStatus(tlsFingerprints, t)].filter(Boolean).join(' ')}
+        <SettingsRow stacked id="utls-policy" label={t('settings.utls.label')}
+          descDetails={t('settings.utls.description')}
+          hint={[isSavedUtlsSelection(config.utlsPolicy) ? t('node.utls.savedHint') : null, tlsFingerprintStatus(tlsFingerprints, t)].filter(Boolean).join(' ') || undefined}
           control={
             <MobileSelect value={config.utlsPolicy ?? 'follow'} ariaLabel={t('settings.utls.label')}
               onChange={(value) => commit('utls-policy', update({ utlsPolicy: value }))}>
@@ -302,7 +304,7 @@ export function NetworkPage({ config, update, commit }: MobileSettingsPageProps)
         <SettingsRow
           id="speed-test-metered-policy"
           label={t('settings.network.meteredPolicy')}
-          desc={t('settings.network.meteredPolicyDesc')}
+          descDetails={t('settings.network.meteredPolicyDesc')}
           control={
             <MobileSelect
               value={config.speedTestMeteredPolicy ?? speedLimits?.meteredPolicyDefault ?? ''}

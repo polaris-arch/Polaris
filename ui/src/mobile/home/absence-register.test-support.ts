@@ -35,7 +35,7 @@ export const HOME_PARITY: ScreenParityRegister = {
   // MeasurementLabel owns measurement status/path copy, so its ledger display is
   // a content block even though desktop and mobile use the same implementation.
   extraBlockSources: ['ui/src/components/RuleSubjectMenuItems.tsx', 'ui/src/mobile/MeasurementLabel.tsx'],
-  sharedPrimitives: ['ui/src/components/FlagImg.tsx', 'ui/src/mobile/SavedAutoSelectControls.tsx'],
+  sharedPrimitives: ['ui/src/components/FlagImg.tsx', 'ui/src/components/InfoIcon.tsx', 'ui/src/mobile/SavedAutoSelectControls.tsx'],
   slotHandoffGates: [
     { file: 'ui/src/mobile/mobile-chrome.test.tsx', mustContain: '③ 反向分流指示器（真机 2026-07-20 §1.4 的移植）' },
     { file: 'ui/src/mobile/home/home-screen.test.tsx', mustContain: '① DOM 序 = 重要性序，不许被断点重排' },

@@ -118,13 +118,18 @@ export function MobileField({ spec, value, onChange, t, reality = false, tlsEngi
         </div>
       );
     }
-    case 'select':
+    case 'select': {
+      const labelEl = (
+        <label className="m-form-label" htmlFor={fid}>
+          {label}
+          {spec.opt === true && <span className="m-form-opt">{t('common.optional')}</span>}
+        </label>
+      );
       return (
         <div className="m-form-row">
-          <label className="m-form-label" htmlFor={fid}>
-            {label}
-            {spec.opt === true && <span className="m-form-opt">{t('common.optional')}</span>}
-          </label>
+          {isUtlsField(spec.k)
+            ? <MobileInfo title={label} summary={labelEl} details={t('node.utls.description')} />
+            : labelEl}
           {/* 「点分键才翻译」与「未知当前值并入首位」两条判据走**共用**的
               `normalizeSelectOptions`（`@/components/dialogs/field-spec`），不在这里再抄一份 ——
               抄一份等于让同一张 `ND_SPEC` 在两个客户端上有两种标签，而那类分叉没有任何门守。 */}
@@ -140,7 +145,6 @@ export function MobileField({ spec, value, onChange, t, reality = false, tlsEngi
               </option>
             ))}
           </MobileSelect>
-          {isUtlsField(spec.k) && <p className="m-form-hint">{t('node.utls.description')}</p>}
           {spec.k === 'fp' && nativeUtlsUnsupported(tlsEngine, tlsFingerprints, reality) && <p className="m-form-hint">{t('node.utls.engineUnsupported')}</p>}
           {isUtlsField(spec.k) && isSavedUtlsSelection(value) && <p className="m-form-hint">{t('node.utls.savedHint')}</p>}
           {isUtlsField(spec.k) && <p className="m-form-hint" role="status">{tlsFingerprintStatus(tlsFingerprints, t)}</p>}
@@ -148,6 +152,7 @@ export function MobileField({ spec, value, onChange, t, reality = false, tlsEngi
           <Hint hintKey={spec.hint} title={label} t={t} />
         </div>
       );
+    }
     case 'number':
       return (
         <div className="m-form-row">

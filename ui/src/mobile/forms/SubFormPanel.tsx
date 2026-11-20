@@ -46,6 +46,7 @@ import {
 import { isSubscriptionUrl } from '@/components/dialogs/sub-url';
 import { buildNetworkInterfaceChoices, useNetworkInterfaces } from '@/hooks/use-network-interfaces';
 import { usePeriodicSpeedTestFields } from '@/hooks/use-periodic-speed-test-fields';
+import { MobileInfo } from '../MobileInfo';
 import { MobileSelect } from '../MobileSelect';
 import { FormSheet } from './FormSheet';
 import { PeriodicGlobalOffHint } from './PeriodicGlobalOffHint';
@@ -556,7 +557,9 @@ export function SubFormPanel({
           {periodic.intervalInvalid && !periodic.limits && (
             <p className="m-form-err">{t('sub.speedTestIntervalInvalid')}</p>
           )}
-          <p className="m-form-hint">{t('sub.speedTestIntervalHint')}</p>
+          <div className="m-form-hint">
+            <MobileInfo title={t('sub.speedTestInterval')} summary={t('mobileHelp.speedTestInterval')} details={t('sub.speedTestIntervalHint')} />
+          </div>
         </div>
       )}
 

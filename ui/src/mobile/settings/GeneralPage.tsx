@@ -189,7 +189,7 @@ export function GeneralPage({ config, update, commit }: MobileSettingsPageProps)
           first
           id="auto-privacy-mode"
           label={t('settings.general.autoPrivacyMode')}
-          desc={t('settings.general.autoPrivacyModeDesc')}
+          descDetails={t('settings.general.autoPrivacyModeDesc')}
           control={
             <MobileSwitch
               checked={autoPrivacyMode}

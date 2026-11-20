@@ -34,6 +34,7 @@ import {
   SwitchRow,
 } from './Primitives';
 import { RuleRow } from './RuleRow';
+import { MobileInfo } from '../../MobileInfo';
 import type { RuleRowBinding } from './TrafficSegment';
 
 /** 桌面 `RulesScreen.tsx:62-66` 那三条系统保护规则的文案 key，逐字照搬。 */
@@ -125,9 +126,9 @@ export function DnsSegment({
       <div>
         <div className="mr-card-h">
           <span>{t('rules.chainCustom')}</span>
+          <MobileInfo title={t('rules.chainCustom')} details={t('rules.priorityTip')} />
           <span className="mr-cnt">{rows.length}</span>
         </div>
-        <div className="mr-note">{t('rules.priorityTip')}</div>
         <InlineError text={errorOf('order:dns')} />
       </div>
 

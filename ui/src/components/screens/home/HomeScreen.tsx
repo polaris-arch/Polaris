@@ -35,6 +35,7 @@ import { toast } from '@/lib/error-handler';
 import { cn } from '@/lib/utils';
 import { relativeTimeText } from '@/lib/relative-time';
 import { useDialogStore } from '@/components/dialogs/dialog-store';
+import { InfoIcon } from '@/components/InfoIcon';
 import {
   deriveConnectButtonState,
   connectButtonClass,
@@ -1052,8 +1053,8 @@ export function HomeScreen() {
             </svg>
           </span>
           <div className="pb-tx pb-static">
-            <b>{t('home.proxyExitUnavailable')}</b>
-            <div>{t('home.proxyExitUnavailableHint')}</div>
+            <b>{t('home.proxyExitUnavailable')}</b>{' '}
+            <InfoIcon tip={t('home.proxyExitUnavailableHint')} />
           </div>
         </div>
       )}

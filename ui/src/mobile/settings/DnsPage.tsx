@@ -476,7 +476,7 @@ export function DnsPage({ config, update, commit }: MobileSettingsPageProps): Re
           stacked
           id="race-strategy"
           label={t('settings.dns.raceStrategy')}
-          desc={t('settings.dns.raceStrategyDesc')}
+          descDetails={t('settings.dns.raceStrategyDesc')}
           control={
             <MobileSelect
               value={dns.resolveNodeDomainsAhead === false ? 'single' : 'race'}
@@ -586,13 +586,13 @@ export function DnsPage({ config, update, commit }: MobileSettingsPageProps): Re
         />
         {fakeIpFilterOn && (
           <>
-            <SettingsNote id="fakeip-filter-list">{t('settings.dns.fakeIpFilterHint')}</SettingsNote>
             {/* 例外域名清单。缺省值与桌面 `SettingsDns.tsx:261` 逐值同 —— 缺省不同会让同一份配置
                 在两端显示成两张不同的名单，而这张名单决定哪些域名拿到真实 IP。 */}
             <SettingsRow
               stacked
               id="fakeip-filter-list-editor"
               label={t('settings.dns.fakeIpFilterFold')}
+              descDetails={t('settings.dns.fakeIpFilterHint')}
               control={
                 <MobileListEditor
                   id="fakeip-filter-entries"
@@ -793,7 +793,7 @@ function DnsDefaultsRows({
           stacked
           id="dns-real-query-fallback"
           label={t('settings.dns.realQueryFallback')}
-          desc={t('settings.dns.realQueryFallbackHint')}
+          descDetails={t('settings.dns.realQueryFallbackHint')}
           control={
             <SelectSheetTrigger
               label={t('settings.dns.realQueryFallback')}

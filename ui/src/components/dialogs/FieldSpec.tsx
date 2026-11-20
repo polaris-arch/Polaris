@@ -109,6 +109,7 @@ export function FieldRenderer({ spec, value, onChange, reality = false, tlsEngin
       <span>{label}</span>
       {spec.opt && <span className="fld-opt"> {t('common.optional')}</span>}
       {spec.hint && <InfoIcon tip={t(spec.hint)} />}
+      {isUtlsField(spec.k) && <InfoIcon tip={t('node.utls.description')} />}
     </>
   );
   const labelEl = (
@@ -133,7 +134,6 @@ export function FieldRenderer({ spec, value, onChange, reality = false, tlsEngin
           onChange={(v) => onChange(v)}
           options={opts}
         />
-        {isUtlsField(spec.k) && <p className="fld-hint">{t('node.utls.description')}</p>}
         {spec.k === 'fp' && nativeUtlsUnsupported(tlsEngine, tlsFingerprints, reality) && <p className="fld-hint">{t('node.utls.engineUnsupported')}</p>}
         {isUtlsField(spec.k) && isSavedUtlsSelection(value) && <p className="fld-hint">{t('node.utls.savedHint')}</p>}
         {isUtlsField(spec.k) && <p className="fld-hint" role="status">{tlsFingerprintStatus(tlsFingerprints, t)}</p>}
