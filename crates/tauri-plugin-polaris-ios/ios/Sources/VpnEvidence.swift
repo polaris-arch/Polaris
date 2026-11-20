@@ -44,8 +44,10 @@ func vpnObservationMessage(identity: [String: Any], nonce: String, expectedGener
     return message
 }
 
+let vpnForegroundRequired = "ForegroundRequired: Return to the foreground and explicitly retry the connection."
+
 func vpnForegroundFailure(appActive: Bool, foregroundScene: Bool) -> String? {
-    appActive && foregroundScene ? nil : "ForegroundRequired: Return to the foreground and explicitly retry the connection."
+    appActive && foregroundScene ? nil : vpnForegroundRequired
 }
 
 final class VpnStartIntent {
@@ -80,6 +82,14 @@ func vpnIdentityMatches(_ expected: [String: Any], _ actual: [String: Any]?) -> 
         guard let value = expected[key] as? String, !value.isEmpty else { return false }
         return actual[key] as? String == value
     }
+}
+
+func vpnProfileWasNeverSubmitted(preference: [String: Any]?, identity: [String: Any], report: [String: Any]?) -> Bool {
+    guard let preference, preference["pending"] as? Bool == false,
+          preference["requestID"] as? String == identity["requestID"] as? String,
+          let unsubmitted = preference["unsubmittedIdentity"] as? [String: Any],
+          vpnIdentityMatches(unsubmitted, identity) else { return false }
+    return !vpnIdentityMatches(unsubmitted, report?["identity"] as? [String: Any])
 }
 
 /// A live message is ordinary readiness only; cleanup evidence stays unknown.

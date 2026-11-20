@@ -38,6 +38,7 @@ private final class VpnOperation {
     var identity: [String: Any]?
     var startIntent: VpnStartIntent?
     var observer: NSObjectProtocol?
+    var foregroundObservers: [NSObjectProtocol] = []
     var deadline: DispatchWorkItem?
     var stopArgs: StopArgs?
     var awaitingStopObservation = false
@@ -141,6 +142,10 @@ final class VpnPlugin: Plugin {
         // Deadline includes load/save/reload preferences, not only NE status changes.
         let deadline = DispatchWorkItem {
             guard self.current(op) else { return }
+            if !op.foregroundObservers.isEmpty {
+                self.finish(op, error: vpnError(vpnForegroundRequired))
+                return
+            }
             if op.started || op.kind == "stop" || self.preferenceMutation.pending {
                 self.uncertainSession = (op.manager?.protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration?["sessionID"] as? String
                 self.uncertainReason = "A VPN operation timed out; extension completion is unknown. Stop the VPN and inspect its lifecycle report before retrying."
@@ -163,6 +168,26 @@ final class VpnPlugin: Plugin {
         if let failure = vpnForegroundFailure(appActive: UIApplication.shared.applicationState == .active,
             foregroundScene: UIApplication.shared.connectedScenes.contains(where: { $0.activationState == .foregroundActive })) {
             throw vpnError(failure)
+        }
+    }
+
+    private func afterPermissionReturnsToForeground(_ op: VpnOperation, perform: @escaping () -> Void) {
+        if (try? requireForeground()) != nil {
+            perform()
+            return
+        }
+        // The permission completion can precede both UIKit activation callbacks.
+        // Keep the original operation under its existing deadline and revocation.
+        op.foregroundObservers = [UIApplication.didBecomeActiveNotification, UIScene.didActivateNotification].map { name in
+            NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self, weak op] _ in
+                DispatchQueue.main.async {
+                    guard let self, let op, self.current(op), !op.foregroundObservers.isEmpty,
+                          (try? self.requireForeground()) != nil else { return }
+                    op.foregroundObservers.forEach { NotificationCenter.default.removeObserver($0) }
+                    op.foregroundObservers.removeAll()
+                    perform()
+                }
+            }
         }
     }
 
@@ -207,12 +232,12 @@ final class VpnPlugin: Plugin {
                         manager.isEnabled = true
                         // Persist before handing the write to NE; its OS side
                         // effect can outlive the callback and this host process.
-                        try self.writePreferenceIntent(op.requestID, pending: true)
+                        try self.writePreferenceIntent(op.requestID, pending: true, unsubmitted: op.identity)
                         guard self.preferenceMutation.begin(op.requestID) else { throw vpnError("Another VPN preference write is pending") }
                         manager.saveToPreferences { error in
                             DispatchQueue.main.async {
                                 if self.preferenceMutation.finish(op.requestID) {
-                                    do { try self.finishPreferenceIntent(op.requestID) }
+                                    do { try self.finishPreferenceIntent(op.requestID, saved: error == nil) }
                                     catch {
                                         self.uncertainReason = "The VPN preference write returned, but its pending intent could not be reconciled: " + error.localizedDescription
                                         if self.current(op) { self.finish(op, error: error) }
@@ -225,27 +250,27 @@ final class VpnPlugin: Plugin {
                                     DispatchQueue.main.async {
                                         guard self.current(op) else { return }
                                         if let error { self.finish(op, error: vpnError(vpnStartFailure(error, stage: "reload"))); return }
-                                        do {
-                                            try self.requireForeground()
-                                            guard let expected = op.identity,
-                                                  vpnIdentityMatches(expected, (manager.protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration)
-                                            else { throw vpnError("ReadyUnknown: Saved VPN profile changed before start submission") }
-                                            self.observe(op, wanted: .connected)
-                                            // Register observer before issuing the transition.
-                                            // A throwing submission can still have an OS effect.
-                                            // Mark the original intent before crossing that boundary.
-                                            op.started = true
-                                            op.startIntent?.submitted(expected)
-                                            self.submittedStart = op.startIntent
-                                            let options = vpnStartOptions(sessionID: sessionID, requestID: op.requestID,
-                                                config: args.configContent, managed: args.managedBootstrap == true)
-                                            try manager.connection.startVPNTunnel(options: options)
-                                            if args.managedBootstrap == true { self.beginManagedActivation(op) }
-                                            self.check(op, wanted: .connected, allowInitialDisconnected: true)
-                                        } catch {
-                                            let message = error.localizedDescription
-                                            self.finish(op, error: message.hasPrefix("ForegroundRequired:") || message.hasPrefix("ReadyUnknown:")
-                                                ? error : vpnError(vpnStartFailure(error, stage: "start")))
+                                        self.afterPermissionReturnsToForeground(op) {
+                                            do {
+                                                guard let expected = op.identity,
+                                                      vpnIdentityMatches(expected, (manager.protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration)
+                                                else { throw vpnError("ReadyUnknown: Saved VPN profile changed before start submission") }
+                                                // A throwing submission can still have an OS effect.
+                                                // Invalidate the durable no-submission evidence first.
+                                                try self.writePreferenceIntent(op.requestID, pending: false)
+                                                self.observe(op, wanted: .connected)
+                                                op.started = true
+                                                op.startIntent?.submitted(expected)
+                                                self.submittedStart = op.startIntent
+                                                let options = vpnStartOptions(sessionID: sessionID, requestID: op.requestID,
+                                                    config: args.configContent, managed: args.managedBootstrap == true)
+                                                try manager.connection.startVPNTunnel(options: options)
+                                                if args.managedBootstrap == true { self.beginManagedActivation(op) }
+                                                self.check(op, wanted: .connected, allowInitialDisconnected: true)
+                                            } catch {
+                                                self.finish(op, error: error.localizedDescription.hasPrefix("ReadyUnknown:")
+                                                    ? error : vpnError(vpnStartFailure(error, stage: "start")))
+                                            }
                                         }
                                     }
                                 }
@@ -566,7 +591,7 @@ final class VpnPlugin: Plugin {
                                       self.submittedStart == nil || (self.submittedStart?.requestID == (expectedIdentity["requestID"] as? String)
                                         && self.submittedStart?.revoked == false),
                                       self.uncertainReason == nil || (self.uncertainSession != nil && self.uncertainSession != (expectedIdentity["sessionID"] as? String)),
-                                      try self.pendingPreferenceIntent() == nil else {
+                                      self.pendingPreferenceFailure(try self.readPreferenceIntent()) == nil else {
                                     throw vpnError("ReadyUnknown: The current VPN manager changed during observation")
                                 }
                                 var snapshot: [String: Any] = ["status": currentManager.connection.status.rawValue,
@@ -788,7 +813,8 @@ final class VpnPlugin: Plugin {
         var result: [String: Any] = ["status": ne.rawValue, "running": ne == .connected || ne == .reasserting,
                                     "active": active, "profileExists": exists, "ownership": exists ? "profileMatchedUnattested" : "unobserved",
                                     "cleanupEvidence": "CleanupUnknown"]
-        let preferenceError = try pendingPreferenceIntent()
+        let preference = try readPreferenceIntent()
+        let preferenceError = pendingPreferenceFailure(preference)
         guard let values = (manager?.protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration else {
             if includeHostUncertainty, uncertainSession == nil { result["lastError"] = uncertainReason }
             if let preferenceError { result["lastError"] = preferenceError }
@@ -805,27 +831,36 @@ final class VpnPlugin: Plugin {
         if includeHostUncertainty, uncertainReason != nil,
            uncertainSession == nil || values["sessionID"] as? String == uncertainSession { result["lastError"] = uncertainReason }
         if let preferenceError { result["lastError"] = preferenceError }
-        if result["lastError"] == nil, let error = vpnIdleFailure(evidence: result, profileExists: exists, active: active) { result["lastError"] = error }
+        if result["lastError"] == nil, !vpnProfileWasNeverSubmitted(preference: preference, identity: values, report: report),
+           let error = vpnIdleFailure(evidence: result, profileExists: exists, active: active) { result["lastError"] = error }
         return result
     }
 
-    private func writePreferenceIntent(_ requestID: String, pending: Bool) throws {
+    private func writePreferenceIntent(_ requestID: String, pending: Bool, unsubmitted: [String: Any]? = nil) throws {
         let url = try directory().appendingPathComponent("vpn-preference-intent.json")
-        try JSONSerialization.data(withJSONObject: ["requestID": requestID, "pending": pending]).write(to: url,
+        var intent: [String: Any] = ["requestID": requestID, "pending": pending]
+        intent["unsubmittedIdentity"] = unsubmitted
+        try JSONSerialization.data(withJSONObject: intent).write(to: url,
             options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
     }
-    private func finishPreferenceIntent(_ requestID: String) throws {
-        let url = try directory().appendingPathComponent("vpn-preference-intent.json")
-        guard let object = try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any],
-              object["requestID"] as? String == requestID else { return }
-        try writePreferenceIntent(requestID, pending: false)
+    private func finishPreferenceIntent(_ requestID: String, saved: Bool) throws {
+        guard let object = try readPreferenceIntent(),
+              object["requestID"] as? String == requestID else {
+            throw vpnError("The reconciled VPN preference write has no matching intent.")
+        }
+        try writePreferenceIntent(requestID, pending: false,
+            unsubmitted: saved ? object["unsubmittedIdentity"] as? [String: Any] : nil)
     }
-    private func pendingPreferenceIntent() throws -> String? {
+    private func readPreferenceIntent() throws -> [String: Any]? {
         let url = try directory().appendingPathComponent("vpn-preference-intent.json")
         guard FileManager.default.fileExists(atPath: url.path) else { return nil }
         guard let object = try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any],
-              let pending = object["pending"] as? Bool else { throw vpnError("VPN preference intent is unreadable; state is unknown") }
-        return pending ? "A VPN preference write was submitted without a reconciled completion; no new profile may be created or changed." : nil
+              object["pending"] is Bool else { throw vpnError("VPN preference intent is unreadable; state is unknown") }
+        return object
+    }
+    private func pendingPreferenceFailure(_ preference: [String: Any]?) -> String? {
+        preference?["pending"] as? Bool == true
+            ? "A VPN preference write was submitted without a reconciled completion; no new profile may be created or changed." : nil
     }
     private func writeStopIntent(_ op: VpnOperation) throws {
         try writeStopIntent(values: (op.manager?.protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration ?? [:], requestID: op.requestID)
@@ -856,6 +891,8 @@ final class VpnPlugin: Plugin {
         operation = nil
         op.deadline?.cancel()
         if let observer = op.observer { NotificationCenter.default.removeObserver(observer) }
+        op.foregroundObservers.forEach { NotificationCenter.default.removeObserver($0) }
+        op.foregroundObservers.removeAll()
         if let error, noStoreEligible, let terminal = op.startIntent?.noStoreTerminal() {
             op.invoke.resolve(["nativeNoStoreTerminal": terminal, "startError": error.localizedDescription])
         }

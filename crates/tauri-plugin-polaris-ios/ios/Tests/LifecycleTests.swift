@@ -578,6 +578,20 @@ struct LifecycleTests {
         assert(vpnForegroundFailure(appActive: true, foregroundScene: true) == nil)
         assert(vpnForegroundFailure(appActive: false, foregroundScene: true)?.hasPrefix("ForegroundRequired:") == true)
         assert(vpnForegroundFailure(appActive: true, foregroundScene: false)?.hasPrefix("ForegroundRequired:") == true)
+        // Permission may save a profile while UIKit is inactive. Only a reconciled
+        // write of this exact profile, with no attempted submission, permits retry.
+        let savedUnsubmitted: [String: Any] = [
+            "requestID": profile["requestID"]!, "pending": false, "unsubmittedIdentity": profile,
+        ]
+        assert(vpnProfileWasNeverSubmitted(preference: savedUnsubmitted, identity: profile, report: nil))
+        assert(!vpnProfileWasNeverSubmitted(preference: savedUnsubmitted, identity: replaced, report: nil))
+        assert(!vpnProfileWasNeverSubmitted(preference: savedUnsubmitted, identity: profile, report: ["identity": profile]))
+        var pendingUnsubmitted = savedUnsubmitted
+        pendingUnsubmitted["pending"] = true
+        assert(!vpnProfileWasNeverSubmitted(preference: pendingUnsubmitted, identity: profile, report: nil))
+        var submitted = savedUnsubmitted
+        submitted.removeValue(forKey: "unsubmittedIdentity")
+        assert(!vpnProfileWasNeverSubmitted(preference: submitted, identity: profile, report: nil))
         let denied = NSError(domain: NSPOSIXErrorDomain, code: 1)
         assert(vpnStartFailure(denied, stage: "save").hasPrefix("PermissionDenied:"))
         let cancelledPermit = NSError(domain: NSCocoaErrorDomain, code: NSUserCancelledError)
