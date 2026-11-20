@@ -597,10 +597,22 @@ pub fn merge_categories(
 ) -> MergeOutcome {
     let sel = |c: BackupCategory| selected.contains(&c);
     let mut skipped: Vec<BackupCategory> = Vec::new();
-    let mut result = current.clone();
-    if !result.is_object() {
-        result = Value::Object(Map::new());
-    }
+    // Keep the key in place without cloning the servers array rebuilt below.
+    let mut result = Value::Object(
+        current
+            .as_object()
+            .into_iter()
+            .flatten()
+            .map(|(key, value)| {
+                let value = if key == "servers" {
+                    Value::Null
+                } else {
+                    value.clone()
+                };
+                (key.clone(), value)
+            })
+            .collect(),
+    );
 
     let mut new_servers = Vec::new();
     for cat in [
@@ -689,9 +701,10 @@ pub fn merge_categories(
             } else if let Some(incoming) = backup.get(key).and_then(Value::as_array) {
                 // 另一个平面未选或空跳过：保留其所有依赖。按 id 合并复用 networkProfiles
                 // 的顺序模型，但同 id 异内容不能静默覆盖，否则未选规则语义仍会改变。
-                let mut merged = arr_or_empty(current, key)
-                    .as_array()
-                    .cloned()
+                let mut merged = result
+                    .get_mut(key)
+                    .and_then(Value::as_array_mut)
+                    .map(std::mem::take)
                     .unwrap_or_default();
                 for resource in incoming {
                     let Some(id) = resource.get("id").and_then(Value::as_str) else {
@@ -713,6 +726,7 @@ pub fn merge_categories(
         }
         if !conflicts.is_empty() {
             // 不返回已经替换了一部分规则/节点的中间态，便于所有调用方安全拒绝整笔恢复。
+            drop(result);
             return MergeOutcome {
                 config: current.clone(),
                 skipped: Vec::new(),
@@ -726,9 +740,10 @@ pub fn merge_categories(
     // spec §3.4-2）——**绝不**删掉引用把它变成无条件规则。
     if custom_applied && dns_applied {
         if let Some(incoming) = backup.get("networkProfiles").and_then(Value::as_array) {
-            let mut merged = arr_or_empty(&result, "networkProfiles")
-                .as_array()
-                .cloned()
+            let mut merged = result
+                .get_mut("networkProfiles")
+                .and_then(Value::as_array_mut)
+                .map(std::mem::take)
                 .unwrap_or_default();
             for profile in incoming {
                 let Some(id) = profile.get("id").and_then(Value::as_str) else {
@@ -970,10 +985,12 @@ pub fn sanitize_cross_platform_rules(
         }
     }
     if authoritative_key != "customRules" {
-        let mirror = config.get(authoritative_key).cloned().unwrap_or_default();
-        set(config, "trafficRules", mirror.clone());
-        set(config, "policyRules", mirror.clone());
-        set(config, "customRules", mirror);
+        for key in ["trafficRules", "policyRules", "customRules"] {
+            if key != authoritative_key {
+                let mirror = config[authoritative_key].clone();
+                set(config, key, mirror);
+            }
+        }
     }
     n
 }
