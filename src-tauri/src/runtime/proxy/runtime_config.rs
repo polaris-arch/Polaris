@@ -2028,7 +2028,9 @@ impl ProxyRuntime {
         self: &Arc<Self>,
         edit: &PreparedConfigEdit,
     ) -> Result<HotConfigEditOutcome, polaris_store::StoreError> {
+        let queued_at = Instant::now();
         let _serial = self.switch_serial.lock().await;
+        let started_at = Instant::now();
         let owner = StagedSaveOwner::capture(self, edit.revision);
         let not_committed = |outcome| {
             if self.saved_revision_matches(Some(edit.revision)) {
@@ -2091,6 +2093,11 @@ impl ProxyRuntime {
         {
             Ok(prepared) => prepared,
             Err(result) => {
+                log::debug!(
+                    "automatic config prepare: status={} elapsed_ms={}",
+                    result.status,
+                    started_at.elapsed().as_millis()
+                );
                 let outcome = match result.status {
                     "restartRequired" | "impactConfirmationRequired" => {
                         HotConfigEditOutcome::NeedsManual {
@@ -2104,6 +2111,7 @@ impl ProxyRuntime {
                 return Ok(not_committed(outcome));
             }
         };
+        let prepared_at = Instant::now();
         if !self.verify_prepared_physical_bindings(&pending).await {
             return Ok(not_committed(HotConfigEditOutcome::Retryable));
         }
@@ -2118,6 +2126,7 @@ impl ProxyRuntime {
             runtime: self,
             owner: None,
         };
+        let committing_at = Instant::now();
         let Some(revision) = self.config.commit_prepared_config_edit(
             edit,
             || {
@@ -2131,6 +2140,7 @@ impl ProxyRuntime {
         else {
             return Ok(not_committed(HotConfigEditOutcome::Retryable));
         };
+        let applying_at = Instant::now();
 
         pending.desired = edit.candidate.clone();
         pending.saved_revision = Some(revision);
@@ -2151,6 +2161,15 @@ impl ProxyRuntime {
                 self.remember_runtime_result(result)
             }
         };
+        log::debug!(
+            "automatic config timing: queue_ms={} prepare_ms={} verify_ms={} store_ms={} apply_ms={} status={}",
+            (started_at - queued_at).as_millis(),
+            (prepared_at - started_at).as_millis(),
+            (committing_at - prepared_at).as_millis(),
+            (applying_at - committing_at).as_millis(),
+            applying_at.elapsed().as_millis(),
+            result.status
+        );
         let owner = StagedSaveOwner { revision, ..owner };
         // Execution can return an unconfirmed result after admitting Apply.
         // Carry its exact same-Core recovery independently of a later intent.
@@ -2911,10 +2930,12 @@ impl ProxyRuntime {
             "热应用配置生成耗时：候选构建={candidate_ms}ms，运行配置及出站投影={}ms",
             t_previous.elapsed().as_millis()
         );
+        let groups_started_at = Instant::now();
         let groups = match client.first_groups_snapshot().await {
             Ok(groups) => groups,
             Err(_) => return decline(RuntimeApplyResult::status("unconfirmed")),
         };
+        let groups_ms = groups_started_at.elapsed().as_millis();
         let selector_intents = match selector_intents(
             &Value::Object(serde_json::Map::from_iter([(
                 "outbounds".into(),
@@ -2972,6 +2993,7 @@ impl ProxyRuntime {
                 Err(_) => return decline(RuntimeApplyResult::status("conflict")),
             }
         };
+        let plan_started_at = Instant::now();
         let plan = match client
             .plan_runtime_config(daemon::PlanRuntimeConfigRequest {
                 contract_version: 1,
@@ -2987,6 +3009,10 @@ impl ProxyRuntime {
             Ok(value) => value,
             Err(_) => return decline(RuntimeApplyResult::status("unconfirmed")),
         };
+        log::debug!(
+            "runtime config plan timing: groups_ms={groups_ms} plan_ms={}",
+            plan_started_at.elapsed().as_millis()
+        );
         if plan.contract_version != 1
             || plan.client_impact_policy_version != baseline.pairing.client_impact_policy_version
             || (plan.impact_confirmation_required
@@ -3458,6 +3484,7 @@ impl ProxyRuntime {
             }
             return self.remember_runtime_result(result);
         }
+        let apply_started_at = Instant::now();
         let result = client
             .apply_runtime_config(daemon::ApplyRuntimeConfigRequest {
                 contract_version: 1,
@@ -3469,6 +3496,7 @@ impl ProxyRuntime {
                 expected_control_revision: pending.plan.expected_control_revision,
             })
             .await;
+        let rpc_finished_at = Instant::now();
         let transaction_id = pending.plan.transaction_id.clone();
         let mut result = match result {
             Ok(operation) => {
@@ -3487,6 +3515,12 @@ impl ProxyRuntime {
             }
             Err(_) => Box::pin(self.reconcile_runtime_operation(&client, pending)).await,
         };
+        log::debug!(
+            "runtime config apply timing: rpc_ms={} settle_ms={} status={}",
+            (rpc_finished_at - apply_started_at).as_millis(),
+            rpc_finished_at.elapsed().as_millis(),
+            result.status
+        );
         result.transaction_id = Some(transaction_id);
         result.runtime_generation = Some(generation);
         result.selection_intent_generation = Some(intent);
