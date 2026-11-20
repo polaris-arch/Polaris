@@ -7,7 +7,7 @@ import {
 } from 'node:fs';
 import { isDeepStrictEqual, parseArgs } from 'node:util';
 import { homedir } from 'node:os';
-import { basename, dirname, isAbsolute, join, parse as parsePath, relative, resolve, toNamespacedPath } from 'node:path';
+import { basename, dirname, isAbsolute, join, parse as parsePath, relative, resolve, sep, toNamespacedPath } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import { requireGraph as demand } from './desktop-core/source-graph.mjs';
@@ -669,7 +669,7 @@ export async function inspectNsisCarriers(custody, api, tool, archive, expected,
       listingBytes: MAX_LISTING, stderrBytes: MAX_STDERR, perUnpackSeconds: EXTRACT_TIMEOUT / 1000 } };
 }
 
-async function generatedScript(custody, api, state, sources) {
+export async function generatedScript(custody, api, state, sources) {
   requireSame(Object.keys(sources).sort(), Object.keys(state.sources).sort(), 'NSIS source member set differs');
   const path = join(state.cargo.releaseDirectory, 'nsis/x64/installer.nsi');
   const script = await readPinned(custody, file(path), { capture: true });
@@ -686,10 +686,14 @@ async function generatedScript(custody, api, state, sources) {
   const section = sections[0][1], mapped = Object.create(null);
   demand([...section.matchAll(/^\s*File "\$\{MAINBINARYSRCPATH\}"\s*$/gm)].length === 1, 'unique NSIS App File required');
   const rows = [...section.matchAll(/^\s*File \/a "\/oname=([^"\r\n]+)" "([^"\r\n]+)"\s*$/gm)];
-  for (const [, raw, source] of rows) {
+  const consumer = join(state.root, 'src-tauri');
+  for (const [, raw, renderedSource] of rows) {
     const name = posixName(raw);
     demand(!Object.hasOwn(mapped, name) && Object.hasOwn(sources, name), 'extra/duplicate NSIS File mapping: ' + name);
-    const [actual, expected] = await custody.inspect([file(source), file(sources[name])]);
+    const staged = sources[name];
+    // Tauri prepends its cwd to the known resource key without collapsing parent segments.
+    const source = renderedSource === consumer + sep + sourceKey(consumer, staged) ? staged : renderedSource;
+    const [actual, expected] = await custody.inspect([file(source), file(staged)]);
     requireSame(actual.slice(0, 2), expected.slice(0, 2), 'NSIS File source differs: ' + name);
     mapped[name] = (await readPinned(custody, file(source), { before: actual })).facts;
   }

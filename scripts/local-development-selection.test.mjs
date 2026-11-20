@@ -5,12 +5,12 @@ import {
   symlinkSync, truncateSync, writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join, toNamespacedPath } from 'node:path';
+import { dirname, join, relative, sep, toNamespacedPath } from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { crc32 } from 'node:zlib';
 import { buildPortableZip, inspectBoundNsis, inspectFormalArtifact, inspectPortableZip, nsisMembers, verifyFormalArtifactBytes } from './lib/formal-package-selection.mjs';
-import { expectedWindowsApp, forPackage, releaseArguments, selectTauriEntry } from './windows-package-integrity.mjs';
+import { expectedWindowsApp, forPackage, generatedScript, releaseArguments, selectTauriEntry } from './windows-package-integrity.mjs';
 import { now, parse, startCustody, streamChild, wire } from './lib/windows-package-custody.mjs';
 import { fixtureTar, fixtureZip, writeFormalAssets, writeLinuxFixture } from './lib/formal-package-fixtures.mjs';
 import {
@@ -770,6 +770,43 @@ test('Windows package child transport requires guarded primary exit and bounds p
       if (observed) pending.reject(new Error('late ' + stalled + ' failure'));
     }
   }
+}));
+
+test('Windows package generated NSIS paths bind the exact staged resource', () => fixture(async root => {
+  const workspace = join(root, 'workspace'), consumer = join(workspace, 'src-tauri');
+  const staged = join(root, 'stage', 'resource.bin');
+  const installer = join(root, 'nsis/x64/installer.nsi'), app = join(root, 'polaris.exe');
+  const bytes = Buffer.from('staged release resource'), sources = { 'resource.bin': staged };
+  const state = { root: workspace, version: '1.0.0', cargo: { releaseDirectory: root }, sources,
+    resources: { 'resource.bin': { bytes: bytes.length, sha256: hash(bytes) } } };
+  mkdirSync(consumer, { recursive: true });
+  mkdirSync(dirname(staged));
+  mkdirSync(dirname(installer), { recursive: true });
+  writeFileSync(staged, bytes);
+  const native = requiresWindowsCustody.skip ? null : startCustody(windowsCustody);
+  const custody = native ?? { inspect: async files => files.map(({ path }) => {
+    assert.ok(!path.split(sep).includes('..'), 'unsupported Windows filesystem namespace');
+    const row = statSync(path, { bigint: true });
+    return [row.dev, row.ino, row.mode, row.nlink, row.size, row.mtimeNs, row.ctimeNs];
+  }) };
+  const api = { cargoApp: async () => ({ path: app }) };
+  const verify = source => {
+    writeFileSync(installer, `!define VERSION "${state.version}"
+!define MAINBINARYNAME "polaris"
+!define MAINBINARYSRCPATH "${app}"
+Section Install
+  File "\${MAINBINARYSRCPATH}"
+  File /a "/oname=resource.bin" "${source}"
+SectionEnd
+`);
+    return generatedScript(custody, api, state, sources);
+  };
+  try {
+    const key = relative(consumer, staged);
+    await verify([consumer, key].join(sep));
+    await verify(staged);
+    await assert.rejects(verify([consumer, 'unowned', '..', key].join(sep)), /unsupported Windows filesystem namespace/);
+  } finally { await native?.close(); }
 }));
 
 test('Windows package native custody retains the exact App across capture exit', requiresWindowsCustody, () => fixture(async root => {
