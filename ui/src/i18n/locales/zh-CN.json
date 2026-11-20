@@ -414,7 +414,7 @@
     "networkProfileRulesPruned": "部分网络场景规则本次未生效（场景失效、探测源本机不可用或判据永不命中）· 请到「路由」页检查网络场景",
     "networkSettingsTip": "网络设置",
     "noActiveConnections": "暂无活动连接",
-    "noServerConfig": "暂无代理节点。选择直连或阻断即可连接。",
+    "noServerConfig": "可直接连接，也可选择阻断。如需代理出口，可添加订阅或服务器。",
     "others": "其他",
     "pageTitle": "主页",
     "nativeReconnectRequired": "连接更改需要重连。请在首页点击连接；若仍显示已连接，先断开再连接。",
