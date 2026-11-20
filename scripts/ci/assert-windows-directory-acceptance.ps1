@@ -41,17 +41,58 @@ if ($receipt.result -cne 'passed' -or $receipt.attemptId -cne $attempt.attemptId
     $receipt.validationMode -cne $ValidationMode -or $receipt.appSource -cne $ExpectedAppSource -or
     $receipt.kernelSource -cne $ExpectedKernelSource -or $receipt.repository -cne 'polaris-arch/sing-box-polaris' -or
     $receipt.scope -cne 'directory-protocol-tests-only' -or $null -ne $receipt.testFixture) { throw 'Current receipt source, mode, attempt or scope mismatch' }
+function Assert-ArtifactBinary($Artifact,[string]$Name) {
+    if ($Artifact.path -isnot [string] -or $Artifact.sha256 -isnot [string] -or
+        $Artifact.sha256 -cnotmatch '^[0-9a-f]{64}$' -or -not [IO.Path]::IsPathFullyQualified($Artifact.path)) { throw "Invalid current artifact: $Name" }
+    if ((Get-FileHash -LiteralPath $Artifact.path -Algorithm SHA256).Hash.ToLowerInvariant() -cne $Artifact.sha256) { throw "Current binary hash mismatch: $Name" }
+}
+function Assert-ActivationArtifacts($Manifest) {
+    $componentTests = @('TestWindowsDirectorySourceContract','TestWindowsDirectoryReservedNamespaceWholeConfig')
+    $bindingTest = 'TestWindowsDirectoryActivationAndOriginalBinding'
+    $bindingFile = 'directory-activation-tests.exe'
+    $evidenceRoot = (Resolve-Path -LiteralPath $EvidenceDirectory).ProviderPath
+    if ($null -eq $Manifest.artifacts) {
+        $artifacts = @($Manifest)
+        $expected = @(@{file=$bindingFile;tests=($componentTests + $bindingTest)})
+    } else {
+        $artifacts = $Manifest.artifacts
+        if ($artifacts -isnot [array] -or $artifacts.Count -ne 2 -or
+            $artifacts[0].package -isnot [string] -or $artifacts[1].package -isnot [string] -or
+            $artifacts[0].package -cnotin @('.', './internal/boxruntime') -or
+            $artifacts[1].package -cne './experimental/directorywindows') { throw 'Invalid activation package roster' }
+        $expected = @(
+            @{file=$bindingFile;tests=@($bindingTest)}
+            @{file='directory-activation-component-tests.exe';tests=$componentTests}
+        )
+    }
+    for ($i = 0; $i -lt $expected.Count; $i++) {
+        $artifact = $artifacts[$i]
+        $target = $expected[$i]
+        if ($artifact.path -isnot [string] -or $artifact.path -cne (Join-Path $evidenceRoot $target.file) -or
+            $artifact.tests -isnot [array] -or $artifact.tests.Count -ne $target.tests.Count -or
+            ($artifact.tests -join '|') -cne ($target.tests -join '|')) { throw "Invalid activation path or test roster: $($target.file)" }
+        $binary = Get-Item -LiteralPath $artifact.path
+        if ($binary.PSIsContainer -or $binary.LinkType) { throw "Invalid activation test binary: $($artifact.path)" }
+        Assert-ArtifactBinary $artifact $target.file
+    }
+}
 function Read-ManifestDigest([string]$Name,[string]$SourceField,[string]$Source,[string]$ExpectedDigest) {
     $path = Join-Path $EvidenceDirectory $Name
-    $hash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+    $bytes = [IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $path).ProviderPath)
+    $hash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
     if ($boundAttempt) {
         if ($ExpectedDigest -cnotmatch '^[0-9a-f]{64}$' -or $hash -cne $ExpectedDigest) { throw "Manifest changed since this job build: $Name" }
     }
-    $manifest = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
-    if ($manifest.$SourceField -cne $Source -or $manifest.validationMode -cne $ValidationMode -or
-        $manifest.sha256 -cnotmatch '^[0-9a-f]{64}$' -or -not [IO.Path]::IsPathFullyQualified($manifest.path)) { throw "Invalid current artifact: $Name" }
-    if ($SourceField -ceq 'kernelSource' -and $manifest.repository -cne 'polaris-arch/sing-box-polaris') { throw 'Wrong kernel artifact repository' }
-    if ((Get-FileHash -LiteralPath $manifest.path -Algorithm SHA256).Hash.ToLowerInvariant() -cne $manifest.sha256) { throw "Current binary hash mismatch: $Name" }
+    $manifest = [Text.Encoding]::UTF8.GetString($bytes) | ConvertFrom-Json
+    if ($manifest.$SourceField -isnot [string] -or $manifest.$SourceField -cne $Source -or
+        $manifest.validationMode -isnot [string] -or $manifest.validationMode -cne $ValidationMode) { throw "Invalid current artifact: $Name" }
+    if ($SourceField -ceq 'kernelSource' -and
+        ($manifest.repository -isnot [string] -or $manifest.repository -cne 'polaris-arch/sing-box-polaris')) { throw 'Wrong kernel artifact repository' }
+    if ($Name -ceq 'activation-artifact.json') {
+        Assert-ActivationArtifacts $manifest
+    } else {
+        Assert-ArtifactBinary $manifest $Name
+    }
     return $hash
 }
 $appHash = Read-ManifestDigest 'app-artifact.json' 'appSource' $ExpectedAppSource $ExpectedAppManifestSHA256

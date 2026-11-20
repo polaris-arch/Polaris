@@ -67,7 +67,32 @@ if ($ldflags.Contains($key)) {
     if ($matches.Count -ne 1 -or $matches[0].Groups[1].Value -cne $win.sourceCommit) { throw 'Conflicting formal SourceRevision flag' }
 } else { $ldflags += " -X ${key}${source}" }
 $kernelExe = Join-Path $outputRoot 'tailscale-tests.exe'
-$activationExe = Join-Path $outputRoot 'directory-activation-tests.exe'
+$componentTests = @('TestWindowsDirectorySourceContract','TestWindowsDirectoryReservedNamespaceWholeConfig')
+$bindingTest = 'TestWindowsDirectoryActivationAndOriginalBinding'
+# The historical checkout already has the component test file, with these cases still in the root package.
+$testOwners = @{
+    'directory_windows_test.go' = '.'
+    'internal/boxruntime/directory_windows_test.go' = './internal/boxruntime'
+    'experimental/directorywindows/prepared_activation_windows_test.go' = './experimental/directorywindows'
+}
+$testPackages = @{}
+foreach ($name in ($componentTests + $bindingTest)) {
+    $declarations = @(& git -C $kernelRoot grep -l -e "^func ${name}(" $source -- $testOwners.Keys)
+    if ($LASTEXITCODE -ne 0 -or $declarations.Count -ne 1) { throw "Expected one tracked owner for activation test: $name" }
+    $testPackages[$name] = $testOwners[$declarations[0].Substring($source.Length + 1)]
+}
+$bindingPackage = $testPackages[$bindingTest]
+$componentPackage = $testPackages[$componentTests[0]]
+if ($bindingPackage -cnotin @('.', './internal/boxruntime') -or
+    $componentPackage -cnotin @('.', './experimental/directorywindows') -or
+    $testPackages[$componentTests[1]] -cne $componentPackage -or
+    ($componentPackage -ceq '.' -and $bindingPackage -cne '.')) { throw 'Unexpected activation test ownership' }
+$activation = @(@{package=$bindingPackage;path=(Join-Path $outputRoot 'directory-activation-tests.exe');tests=@($bindingTest)})
+if ($componentPackage -ceq '.') {
+    $activation[0].tests = $componentTests + $bindingTest
+} else {
+    $activation += @{package=$componentPackage;path=(Join-Path $outputRoot 'directory-activation-component-tests.exe');tests=$componentTests}
+}
 Push-Location $kernelRoot
 try {
     # Read effective flags, including persisted GOENV settings; do not modify them.
@@ -81,8 +106,13 @@ try {
     $toolchainJson | Set-Content -LiteralPath (Join-Path $outputRoot 'toolchain-evidence.json') -Encoding utf8NoBOM
     & go test -c -buildvcs=true -mod=readonly -trimpath -tags $tags -ldflags $ldflags -o $kernelExe ./protocol/tailscale
     if ($LASTEXITCODE -ne 0) { throw 'Native kernel test producer build failed' }
-    & go test -c -buildvcs=true -mod=readonly -trimpath -tags $tags -ldflags $ldflags -o $activationExe .
-    if ($LASTEXITCODE -ne 0) { throw 'Native kernel activation test build failed' }
+    foreach ($target in $activation) {
+        & go test -c -buildvcs=true -mod=readonly -trimpath -tags $tags -ldflags $ldflags -o $target.path $target.package
+        if ($LASTEXITCODE -ne 0) { throw "Native kernel activation test build failed: $($target.package)" }
+        $binary = Get-Item -LiteralPath $target.path
+        if ($binary.PSIsContainer -or $binary.LinkType) { throw "Invalid activation test binary: $($target.path)" }
+        $target.sha256 = (Get-FileHash -LiteralPath $target.path -Algorithm SHA256).Hash.ToLowerInvariant()
+    }
 } finally { Pop-Location }
 $actual = & git -C $kernelRoot rev-parse HEAD
 if ($LASTEXITCODE -ne 0 -or $actual -cne $source) { throw 'Kernel HEAD changed during test build' }
@@ -105,13 +135,22 @@ $kernelManifest = Join-Path $outputRoot 'kernel-artifact.json'
 $appManifest = Join-Path $outputRoot 'app-artifact.json'
 @{path=$kernelExe;sha256=(Get-FileHash $kernelExe -Algorithm SHA256).Hash.ToLowerInvariant();kernelSource=$source;validationMode=$mode;repository='polaris-arch/sing-box-polaris'} | ConvertTo-Json | Set-Content -Encoding utf8NoBOM $kernelManifest
 @{path=$appExe;sha256=(Get-FileHash $appExe -Algorithm SHA256).Hash.ToLowerInvariant();appSource=$appSource;validationMode=$mode} | ConvertTo-Json | Set-Content -Encoding utf8NoBOM $appManifest
-$activationNames = @('TestWindowsDirectorySourceContract','TestWindowsDirectoryReservedNamespaceWholeConfig','TestWindowsDirectoryActivationAndOriginalBinding')
-$activationList = & $activationExe '-test.list=^TestWindowsDirectory'
-if ($LASTEXITCODE -ne 0) { throw 'Activation test discovery failed' }
-foreach ($name in $activationNames) { if (-not ($activationList -ccontains $name)) { throw "Missing exact activation regression: $name" } }
-& $activationExe ('-test.run=^(' + ($activationNames -join '|') + ')$') '-test.v' '-test.timeout=2m'
-if ($LASTEXITCODE -ne 0) { throw 'Production activation regressions failed' }
-@{path=$activationExe;sha256=(Get-FileHash $activationExe -Algorithm SHA256).Hash.ToLowerInvariant();kernelSource=$source;validationMode=$mode;repository='polaris-arch/sing-box-polaris';tests=$activationNames} | ConvertTo-Json | Set-Content -Encoding utf8NoBOM (Join-Path $outputRoot 'activation-artifact.json')
+foreach ($target in $activation) {
+    if ((Get-FileHash -LiteralPath $target.path -Algorithm SHA256).Hash.ToLowerInvariant() -cne $target.sha256) { throw "Activation test binary changed before execution: $($target.path)" }
+    $activationList = & $target.path '-test.list=^TestWindowsDirectory'
+    if ($LASTEXITCODE -ne 0) { throw "Activation test discovery failed: $($target.package)" }
+    foreach ($name in $target.tests) { if (-not ($activationList -ccontains $name)) { throw "Missing exact activation regression: $name" } }
+    & $target.path ('-test.run=^(' + ($target.tests -join '|') + ')$') '-test.v' '-test.timeout=2m'
+    if ($LASTEXITCODE -ne 0) { throw "Production activation regressions failed: $($target.package)" }
+    if ((Get-FileHash -LiteralPath $target.path -Algorithm SHA256).Hash.ToLowerInvariant() -cne $target.sha256) { throw "Activation test binary changed during execution: $($target.path)" }
+}
+$activationManifest = @{kernelSource=$source;validationMode=$mode;repository='polaris-arch/sing-box-polaris'}
+if ($activation.Count -eq 1) {
+    $activationManifest += @{path=$activation[0].path;sha256=$activation[0].sha256;tests=$activation[0].tests}
+} else {
+    $activationManifest.artifacts = $activation
+}
+$activationManifest | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8NoBOM (Join-Path $outputRoot 'activation-artifact.json')
 $listing = & $kernelExe '-test.list=^TestWindows'
 if ($LASTEXITCODE -ne 0) { throw 'Kernel test discovery failed' }
 $required = @(
