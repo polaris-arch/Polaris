@@ -89,7 +89,7 @@ export interface UseConfigResult {
    * 消费方（SettingsPage）用本字段决定「整屏塌成错误屏」，保存失败塌屏会把用户正在编辑的表单卸载掉。
    */
   error: string | null;
-  /** 局部 patch（顶层字段合并）；嵌套字段需先解构再传完整对象 */
+  /** 局部 patch（顶层字段合并）。`throwOnError` 在直写失败或暂存被拒绝时通知调用方。 */
   update: (
     patch: Partial<UserConfig>,
     options?: { throwOnError?: boolean },
@@ -222,8 +222,14 @@ export function useConfig(): UseConfigResult {
         label: t('home.stagedSetting', { key: labelKey ? t(labelKey) : key }),
         entityPath: [key], nextValue: value };
     });
-    if (first) await submitEdit(first, ...related);
-    if (Object.keys(direct).length === 0) return;
+    const stagedResult = first ? await submitEdit(first, ...related) : null;
+    const stagedError = options?.throwOnError && stagedResult === 'ignored'
+      ? new Error(tRef.current('common.saveFailed'))
+      : null;
+    if (Object.keys(direct).length === 0) {
+      if (stagedError) throw stagedError;
+      return;
+    }
     const id = ++operationId.current;
     const startSerial = edits.current.serial;
     const restartKeys = restartKeysStillPending(appRestartRequiredChanges(prev, direct), startupFlags.current, { ...prev, ...direct });
@@ -272,6 +278,7 @@ export function useConfig(): UseConfigResult {
       const keys = confirmedSerial === null ? pendingRestartKeys : claimRestartKeys(confirmedSerial, pendingRestartKeys);
       if (keys.length) promptAppRestart(keys, tRef.current);
     }
+    if (stagedError) throw stagedError;
   }, [apply, submitEdit, stagingEnabled, t]);
 
   return { config: effectiveConfigOf(config, stagedEntries), loading, error, update, reload };

@@ -23,7 +23,7 @@ let disk = { mixedPort: 7890, controlPort: 9090, logLevel: 'info', desktopNotifi
 let counter=0, app, ids=['a','b'], mounted=true;
 const handlers=new Map(), listeners=[], registrations=[], cleanupWaiters=new Map();
 const f=window.__config={hooks:{}, cleanups:{}, reads:[], writes:[], hotOnlyPorts:[], updates:[], toasts:[], prompts:0, cleanReads:0,
- holdReads:params.has('holdReads'), holdWrites:false, readFail:false, holdReady:params.has('holdReady'),
+ holdReads:params.has('holdReads'), holdWrites:false, readFail:false, holdReady:params.has('holdReady'), hotOnlyStatus:'needsManual',
  state:()=>useAppStore.getState().config, disk:()=>disk, staged:()=>useStagedConfigStore.getState().entries,
  listenerCount:()=>listeners.filter(l=>l.event===C.EVENT_CONFIG_CHANGED).length,
  registrationCount:0, loading:()=>useAppStore.getState().configLoading,
@@ -60,7 +60,7 @@ window.__TAURI_INTERNALS__={metadata:{currentWindow:{label:'main'},currentWebvie
    const port=args.config?.mixedPort;
    if(args.hotOnly!==true||typeof port!=='number'||port===disk.mixedPort)return Promise.reject(Error('unexpected config save'));
    f.hotOnlyPorts.push(port);
-   return Promise.resolve({success:true,data:{status:'needsManual'}});
+   return Promise.resolve({success:true,data:{status:f.hotOnlyStatus}});
   }
   if(cmd===C.CONFIG_PATCH){return new Promise((resolve,reject)=>{
    const index=f.writes.push({patch:args.patch,resolve,reject,done:false})-1;
@@ -195,9 +195,11 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('real mounted useConfi
 
   it('staged-only is zero writes; mixed failure retains staged intent and undo restores raw truth',async()=>{
     const page=await open('staged');try{await ready(page);
-      await page.evaluate(()=>(window as any).__config.update('a',{mixedPort:8000}));
+      await page.evaluate(()=>(window as any).__config.update('a',{mixedPort:8000},true));
+      await expect.poll(async()=>(await read(page)).updates[0].settled).toBe(true);
       await expect.poll(async()=>(await read(page)).hooks.a.config.mixedPort).toBe(8000);
       const staged=await read(page);
+      expect(staged.updates[0].error).toBeNull();
       expect(staged.hotOnlyPorts).toEqual([8000]);expect(staged.disk.mixedPort).toBe(7890);
       expect(staged.writes).toHaveLength(0);expect(staged.prompts).toBe(0);
       await page.evaluate(()=>(window as any).__config.undo('setting:mixedPort'));
@@ -211,6 +213,17 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('real mounted useConfi
       expect((await read(page)).hooks.a.config.mixedPort).toBe(8001);expect((await read(page)).disk.mixedPort).toBe(7890);
       await page.evaluate(()=>(window as any).__config.undo('setting:mixedPort'));
       await expect.poll(async()=>(await read(page)).hooks.a.config.mixedPort).toBe(7890);
+      await page.evaluate(()=>{const f=(window as any).__config;f.hotOnlyStatus='blockedByPending';f.holdWrites=false;
+        f.update('a',{mixedPort:8002},true);});
+      await expect.poll(async()=>(await read(page)).updates[2].settled).toBe(true);
+      const blocked=await read(page);
+      expect(blocked.updates[2].error).toBeTruthy();
+      expect(blocked.staged).toEqual([]);expect(blocked.writes).toHaveLength(1);
+      await page.evaluate(()=>(window as any).__config.update('a',{mixedPort:8003,controlPort:9003},true));
+      await expect.poll(async()=>(await read(page)).updates[3].settled).toBe(true);
+      const mixed=await read(page);
+      expect(mixed.updates[3].error).toBeTruthy();
+      expect(mixed.disk.mixedPort).toBe(7890);expect(mixed.disk.controlPort).toBe(9003);
     }finally{await page.close();}
   });
 
