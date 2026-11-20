@@ -40,8 +40,7 @@ function metadata(row) {
     + [...g.normalModules, ...g.prebuiltAcquisitionModules].map((d) => `\tdep\t${d.module}\t${d.version}\t${d.h1}\n`).join('')
     + Object.entries(g.settings).map(([k, v]) => `\tbuild\t${k}=${v}\n`).join('');
 }
-function fixture(options = {}) {
-  const root = fs.realpathSync(mkdtempSync(join(tmpdir(), 'polaris-release-fixture-')));
+function fixture(root, options = {}) {
   const transport = new Map(), calls = [], displays = {};
   const repository = 'polaris-arch/sing-box-polaris', goVersion = 'go1.26.8';
   const legal = (path, content) => ({ path, content, bytes: Buffer.byteLength(content), sha256: digest(content) });
@@ -135,7 +134,11 @@ function fixture(options = {}) {
   return { root, contract, manifest, transport, calls, read, run, base, publicRelease, inspections, displays,
     linuxVersionOutput, blobCacheDir: false };
 }
-async function withFixture(fn, options) { const f = fixture(options); try { await fn(f); } finally { rmSync(f.root, { recursive: true, force: true }); } }
+async function withFixture(fn, options) {
+  const root = mkdtempSync(join(tmpdir(), 'polaris-release-fixture-'));
+  try { await fn(fixture(fs.realpathSync(root), options)); }
+  finally { rmSync(root, { recursive: true, force: true }); }
+}
 function resources(f) {
   const dir = join(f.root, 'resources'), result = {};
   function walk(p, relative = '') { if (!existsSync(p)) return; for (const n of readdirSync(p, { withFileTypes: true })) {
@@ -1122,8 +1125,7 @@ test('default native consumer captures codesign stderr/status without exposing t
 // Same tag/version is intentionally insufficient: actual contract, archived
 // bytes and acquisition receipts must change together. Native payloads are inert.
 test('same-version repack rejects old receipts and stamps before admitting new core bytes', async () => withFixture(async old => {
-  const next = fixture({ coreMarker: 7 });
-  try {
+  await withFixture(async next => {
     await consumeRelease(old.root, old.manifest, ['linux'], old);
     const core = join(old.root, 'resources/linux/sing-box');
     const previousBytes = readFileSync(core);
@@ -1148,7 +1150,7 @@ test('same-version repack rejects old receipts and stamps before admitting new c
     assert.equal(readFileSync(join(old.root, 'resources/.fetch-stamp.json'), 'utf8'), stamp,
       'legacy version stamps are neither authority nor silently rewritten');
     verifyPackagedRelease(old.root, next.manifest, 'linux', core, next.run);
-  } finally { rmSync(next.root, { recursive: true, force: true }); }
+  }, { coreMarker: 7 });
 }));
 
 test('NA02 unchanged bytes reject setuid/setgid/sticky on final core, sidecar and notice', async () => {
@@ -1168,17 +1170,19 @@ test('NA02 unchanged bytes reject setuid/setgid/sticky on final core, sidecar an
 
 // Private raw-transport stores only; no new unit writes the host user's cache.
 async function withBlobCache(t, fn, options) {
-  const f = fixture(options), parent = mkdtempSync(join(tmpdir(), 'release-blob-cache-'));
-  t.after(() => { rmSync(f.root, { recursive: true, force: true }); rmSync(parent, { recursive: true, force: true }); });
-  f.blobCacheDir = join(fs.realpathSync(parent), 'store'); f.cacheReports = []; f.report = (line) => f.cacheReports.push(line);
-  // Ask the real consumer to initialize only, then deliberately stop at its
-  // first public read. No copied filesystem allowlist, payload or new trust API.
-  const admissionStop = Error('private cache admission observation only');
-  await assert.rejects(consumeRelease(f.root, f.manifest, ['linux'], { ...f, read: async () => { throw admissionStop; } }), error => error === admissionStop);
-  f.cacheSupported = f.cacheReports.includes('Release blob cache ready');
-  assert.equal(f.cacheReports.includes('Release blob cache unavailable'), !f.cacheSupported);
-  assert.equal(cacheBlobs(f).length, 0); f.cacheReports.length = 0;
-  await fn(f);
+  await withFixture(async f => {
+    const parent = mkdtempSync(join(tmpdir(), 'release-blob-cache-'));
+    t.after(() => rmSync(parent, { recursive: true, force: true }));
+    f.blobCacheDir = join(fs.realpathSync(parent), 'store'); f.cacheReports = []; f.report = (line) => f.cacheReports.push(line);
+    // Ask the real consumer to initialize only, then deliberately stop at its
+    // first public read. No copied filesystem allowlist, payload or new trust API.
+    const admissionStop = Error('private cache admission observation only');
+    await assert.rejects(consumeRelease(f.root, f.manifest, ['linux'], { ...f, read: async () => { throw admissionStop; } }), error => error === admissionStop);
+    f.cacheSupported = f.cacheReports.includes('Release blob cache ready');
+    assert.equal(f.cacheReports.includes('Release blob cache unavailable'), !f.cacheSupported);
+    assert.equal(cacheBlobs(f).length, 0); f.cacheReports.length = 0;
+    await fn(f);
+  }, options);
 }
 const cacheBlobs = (f) => existsSync(f.blobCacheDir) ? readdirSync(f.blobCacheDir).filter(name => name.endsWith('.blob')) : [];
 const blobPath = (f, key = 'linux') => join(f.blobCacheDir, f.contract.platforms[key].releaseAsset.sha256 + '.blob');

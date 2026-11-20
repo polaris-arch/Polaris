@@ -13,7 +13,9 @@ import { createHash } from 'node:crypto';
 import { loadReleaseContract, releasePayloadMembers } from './desktop-core/release-consumer.mjs';
 
 const repo = fileURLToPath(new URL('../', import.meta.url));
-const cleanRepo=mkdtempSync(join(tmpdir(),'polaris-formal-packaging-source-'));copyPackagingSource(repo,cleanRepo);after(()=>rmSync(cleanRepo,{recursive:true,force:true}));
+const cleanRepo = mkdtempSync(join(tmpdir(), 'polaris-formal-packaging-source-'));
+after(() => rmSync(cleanRepo, { recursive: true, force: true }));
+copyPackagingSource(repo, cleanRepo);
 const verifier = join(cleanRepo, 'scripts/verify-packaging.mjs');
 const count = Number(readFileSync(join(repo, 'src-tauri/build.rs'), 'utf8')
   .match(/^const EXPECTED_SRS_COUNT: usize = (\d+);$/m)?.[1]);
