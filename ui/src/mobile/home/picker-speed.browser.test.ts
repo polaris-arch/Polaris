@@ -476,7 +476,15 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile picker and mea
       const button=page.locator(surface==='desktop'?'#network-check-radar':'[data-write-control="network-check"]');
       await button.waitFor();
       await page.evaluate(()=>{const n=(window as any).__networkTest;n.hold=true;n.setStatus({running:true,mainGeneration:7,startTime:123});n.setUnlock({running:false,lastRunAt:Date.now()});});
-      await page.waitForFunction(()=>!!document.querySelector('[data-tip*="冷却"], [title*="冷却"]'));
+      if(surface==='desktop') {
+        await page.waitForFunction(()=>!!document.querySelector('[data-tip*="冷却"], [title*="冷却"]'));
+      } else {
+        await page.getByRole('button',{name:'查看网络检测说明',exact:true}).click();
+        const help=page.getByRole('dialog',{name:'网络检测',exact:true});
+        await help.getByText('服务检测冷却中，本次仅测延迟',{exact:true}).waitFor();
+        await page.keyboard.press('Escape');
+        await help.waitFor({state:'detached'});
+      }
       for(const background of [false,true]) {
         if(background)await page.evaluate(()=>(window as any).__networkTest.setUnlock({running:true,lastRunAt:null}));
         expect(await button.isDisabled()).toBe(false);
