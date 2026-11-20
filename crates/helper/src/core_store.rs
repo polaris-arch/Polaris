@@ -1493,6 +1493,8 @@ fn hash_reader(input: &mut File, expected_bytes: u64) -> io::Result<String> {
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests;
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) use tests::exact_fixture_scope;
 
 #[cfg(all(test, target_os = "macos"))]
 #[path = "core_store/macos_private_preparation_tests.rs"]

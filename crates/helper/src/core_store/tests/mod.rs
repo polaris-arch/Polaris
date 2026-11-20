@@ -331,7 +331,7 @@ struct ExactFixtureContext {
 // is declared before any fixture and completes only after its locals close.
 // This excludes incidental pre-exec inheritance by parallel libtest workers;
 // it does not identify the holder in any historical failure or change leases.
-pub(super) fn exact_fixture_scope(module: &str, name: &str) -> Option<impl Drop> {
+pub(crate) fn exact_fixture_scope(module: &str, name: &str) -> Option<impl Drop> {
     struct Completion(ExactFixtureContext);
     impl Drop for Completion {
         fn drop(&mut self) {

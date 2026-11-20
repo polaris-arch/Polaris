@@ -6,6 +6,12 @@ fn status_distinguishes_uninstalled_id_from_missing_installed_bytes() {
     use polaris_core_supervisor::admitted_payload::{
         AdmissionError, AdmissionErrorKind, ExecPurpose,
     };
+    let Some(_completion) = crate::core_store::exact_fixture_scope(
+        module_path!(),
+        "status_distinguishes_uninstalled_id_from_missing_installed_bytes",
+    ) else {
+        return;
+    };
     let root_dir = tempfile::tempdir().unwrap();
     let source_dir = tempfile::tempdir().unwrap();
     for dir in [root_dir.path(), source_dir.path()] {
