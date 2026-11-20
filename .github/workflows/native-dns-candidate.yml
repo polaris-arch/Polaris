@@ -100,13 +100,17 @@ jobs:
           go-version: ${{ steps.go-pin.outputs.version }}
           cache: false
       - name: Verify exact metadata-reader Go toolchain
+        timeout-minutes: 5
         env:
           EXPECTED_GO: ${{ steps.go-pin.outputs.version }}
           GOTOOLCHAIN: local
+          GOWORK: 'off'
         run: |
           set -euo pipefail
           [ "$(go env GOVERSION)" = "go$EXPECTED_GO" ]
           go version
+          # Go builds this tool on first use. Warm it before the per-file verification deadline.
+          go tool buildid "$(go env GOROOT)/bin/go$(go env GOEXE)" >/dev/null
       - name: Install Rust stable with existing rustup
         run: |
           set -euo pipefail
