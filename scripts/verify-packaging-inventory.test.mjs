@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, cpSync, re
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { test, after } from 'node:test';
+import { test, before, after } from 'node:test';
 import { copyPackagingSource, writeFormalAssets } from './lib/formal-package-fixtures.mjs';
 import { cronetFixture, fixtureContract, fixtureManifest } from './lib/cronet-payload.test.mjs';
 import { assetNames } from './release-assets.mjs';
@@ -13,10 +13,13 @@ import { createHash } from 'node:crypto';
 import { loadReleaseContract, releasePayloadMembers } from './desktop-core/release-consumer.mjs';
 
 const repo = fileURLToPath(new URL('../', import.meta.url));
-const cleanRepo = mkdtempSync(join(tmpdir(), 'polaris-formal-packaging-source-'));
-after(() => rmSync(cleanRepo, { recursive: true, force: true }));
-copyPackagingSource(repo, cleanRepo);
-const verifier = join(cleanRepo, 'scripts/verify-packaging.mjs');
+let cleanRepo, verifier;
+before(() => {
+  cleanRepo = mkdtempSync(join(tmpdir(), 'polaris-formal-packaging-source-'));
+  copyPackagingSource(repo, cleanRepo);
+  verifier = join(cleanRepo, 'scripts/verify-packaging.mjs');
+});
+after(() => { if (cleanRepo) rmSync(cleanRepo, { recursive: true, force: true }); });
 const count = Number(readFileSync(join(repo, 'src-tauri/build.rs'), 'utf8')
   .match(/^const EXPECTED_SRS_COUNT: usize = (\d+);$/m)?.[1]);
 assert.ok(count > 0, 'fixture count must come from the actual build source');
