@@ -1432,14 +1432,6 @@ impl ProxyRuntime {
             "selectedServerId".to_string(),
             Value::String(server_id.to_string()),
         );
-        if super::login_fallback::selected_tailscale_exit(&latest) == Some(server_id) {
-            if let Some(enabled) = latest
-                .get("meshLoginFallbackDirect")
-                .and_then(Value::as_bool)
-            {
-                object.insert("meshLoginFallbackDirect".into(), Value::Bool(enabled));
-            }
-        }
         object.remove(polaris_store::SELECTION_INTENT_KEY);
         let owner = StagedSaveOwner {
             generation,

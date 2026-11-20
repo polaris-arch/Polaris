@@ -256,21 +256,40 @@ async fn disabling_login_fallback_preserves_older_tun_debt() {
     let generation = rt.core_generation();
     let saved = rt.config.current().unwrap();
     let admission = rt.lock_config_patch().await;
-    rt.apply_saved_login_fallback_patch(&saved, generation.wrapping_add(1), &admission)
-        .await;
-    let mut stale = saved.clone();
-    stale["selectedServerId"] = Value::String("node-a".into());
-    rt.apply_saved_login_fallback_patch(&stale, generation, &admission)
-        .await;
+    assert!(
+        !rt.apply_saved_login_fallback_patch(&saved, generation.wrapping_add(1), &admission)
+            .await
+    );
+    let mut superseding = saved.clone();
+    superseding["meshLoginFallbackDirect"] = Value::Bool(true);
+    rt.config.save_full(&superseding).unwrap();
+    assert!(
+        !rt.apply_saved_login_fallback_patch(&saved, generation, &admission)
+            .await
+    );
     assert_eq!(sink.calls().len(), 1);
     assert_eq!(
         rt.current_config_snapshot().unwrap()["meshLoginFallbackDirect"],
         true
     );
 
+    rt.config.save_full(&saved).unwrap();
     sink.fail_first.store(1, Ordering::SeqCst);
-    rt.apply_saved_login_fallback_patch(&saved, generation, &admission)
-        .await;
+    let mut publication =
+        Box::pin(rt.apply_saved_login_fallback_patch(&saved, generation, &admission));
+    let mut newer = saved.clone();
+    {
+        let _hold = rt.gate.lock_generation_publication();
+        let mut poll = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(std::future::Future::poll(publication.as_mut(), &mut poll).is_pending());
+        let revision = rt.config.saved_revision();
+        // The pending D exit must not decide which live TS route we restore.
+        newer["selectedServerId"] = Value::String("node-a".into());
+        newer["uiTheme"] = Value::String("dark".into());
+        rt.config.save_full(&newer).unwrap();
+        assert!(rt.config.saved_revision() > revision);
+    }
+    assert!(publication.await);
     assert!(
         rt.login_fallback_engaged(),
         "failed PUT must preserve the actual fallback receipt"
@@ -280,8 +299,6 @@ async fn disabling_login_fallback_preserves_older_tun_debt() {
         &[(true, Some("组网出口".into()))]
     );
     drop(admission);
-    rt.reconcile_login_fallback().await;
-    rt.config.save_full(&stale).unwrap();
     rt.reconcile_login_fallback().await;
 
     assert_eq!(rt.core_generation(), generation);
@@ -302,8 +319,26 @@ async fn disabling_login_fallback_preserves_older_tun_debt() {
     let mut expected = running;
     expected["meshLoginFallbackDirect"] = Value::Bool(false);
     assert_eq!(rt.current_config_snapshot(), Some(expected));
+    assert_eq!(rt.config.current().unwrap()["selectedServerId"], "node-a");
     assert_eq!(rt.config.current().unwrap()["tunConfig"]["mtu"], 1400);
     assert!(rt.pending_changes().pending_apply);
+
+    let mut ordinary = rt.current_config_snapshot().unwrap();
+    ordinary["selectedServerId"] = Value::String("node-a".into());
+    ordinary["meshLoginFallbackDirect"] = Value::Bool(true);
+    *rt.current_config.write().unwrap() = Some(ordinary.clone());
+    let admission = rt.lock_config_patch().await;
+    assert!(
+        rt.apply_saved_login_fallback_patch(&newer, generation, &admission)
+            .await
+    );
+    ordinary["meshLoginFallbackDirect"] = Value::Bool(false);
+    assert_eq!(rt.current_config_snapshot(), Some(ordinary));
+    assert_eq!(
+        sink.calls().len(),
+        3,
+        "an ordinary live exit must not send a selector PUT"
+    );
 }
 
 /// 矩阵第 2 行（同一选中出口）：已让位 + `Running` → PUT 回该出口 tag、清 flag、emit(false, 出口名)。

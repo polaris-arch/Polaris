@@ -834,15 +834,25 @@ pub async fn config_patch(
         capture_previous.then_some(&mut previous),
     );
     if let Some(generation) = fallback_generation {
-        if let (Some(guard), Ok((_, saved, true))) = (&serial, &result) {
-            state
-                .proxy()
-                .apply_saved_login_fallback_patch(saved, generation, guard)
-                .await;
-        }
-        return Ok(config_edit_response_with(&app, &state, result, |_| {
-            emit_config_changed_signal(&app)
-        }));
+        let confirmed = match (&serial, &result) {
+            (Some(guard), Ok((_, saved, _))) => {
+                state
+                    .proxy()
+                    .apply_saved_login_fallback_patch(saved, generation, guard)
+                    .await
+            }
+            _ => true,
+        };
+        let response =
+            config_edit_response_with(&app, &state, result, |_| emit_config_changed_signal(&app));
+        return Ok(if confirmed {
+            response
+        } else {
+            ApiResponse::err_with_code(
+                "设置已保存，但尚未确认运行核更新，请重试",
+                "RUNTIME_PUBLICATION_UNCONFIRMED",
+            )
+        });
     }
     Ok(config_edit_response_with(&app, &state, result, |saved| {
         if app_only_config_patch(&previous, saved) {

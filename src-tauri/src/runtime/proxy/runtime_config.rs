@@ -1960,32 +1960,50 @@ impl ProxyRuntime {
         saved: &Value,
         generation: u64,
         switch_guard: &AsyncMutexGuard<'_, ()>,
-    ) {
-        if let Some(selected) = saved.get("selectedServerId").and_then(Value::as_str) {
-            let owner = StagedSaveOwner {
-                generation,
-                ..StagedSaveOwner::capture(self, self.config.saved_revision())
-            };
-            let projected = self
-                .try_runtime_saved_commit(Some(owner), None, |latest| {
-                    if !self.saved_revision_matches(Some(owner.revision)) {
+    ) -> bool {
+        let intent = self.selector_reconcile.intent_generation();
+        let selected = self.current_config.read().ok().and_then(|current| {
+            current.as_ref().map(|running| {
+                running
+                    .get("selectedServerId")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+        });
+        let mut projected = None;
+        if let (Some(selected), Some(enabled)) = (
+            selected,
+            saved
+                .get("meshLoginFallbackDirect")
+                .and_then(Value::as_bool),
+        ) {
+            projected = self
+                .try_owned_runtime_saved_commit(generation, intent, None, None, |latest| {
+                    // Other saves can advance D while this global setting retains
+                    // its authority. The live exit belongs exclusively to R.
+                    if latest
+                        .get("meshLoginFallbackDirect")
+                        .and_then(Value::as_bool)
+                        != Some(enabled)
+                    {
                         return Err(RuntimeClaimError::Rejected);
                     }
-                    self.with_runtime_candidate_claim(true, generation, owner.intent, || {
-                        self.project_saved_login_fallback(latest, selected)
-                    })
+                    self.with_runtime_candidate_claim(true, generation, intent, || {
+                        self.project_saved_login_fallback(selected.as_deref(), enabled)
+                    })?
+                    .ok_or(RuntimeClaimError::Rejected)
                 })
                 .await;
             if projected == Some(true) {
-                self.reconcile_login_fallback_for_generation(
-                    switch_guard,
-                    generation,
-                    owner.intent,
-                )
-                .await;
+                self.reconcile_login_fallback_for_generation(switch_guard, generation, intent)
+                    .await;
             }
         }
-        self.push_pending_changes();
+        if projected.is_some() {
+            self.push_pending_changes();
+            return self.selector_operation_is_current(generation, intent);
+        }
+        self.gate.generation() == generation && !self.core_running() && !self.gate.is_busy()
     }
 
     /// A Save can authorize only the freshly persisted candidate. An old saved
@@ -3495,20 +3513,38 @@ impl ProxyRuntime {
         &self,
         retry_owner: Option<StagedSaveOwner>,
         plan_expiry: Option<i64>,
-        mut commit: impl FnMut(&Value) -> Result<T, RuntimeClaimError>,
+        commit: impl FnMut(&Value) -> Result<T, RuntimeClaimError>,
     ) -> Option<T> {
         let Some(owner) = retry_owner else {
             return self.config.try_with_saved_commit(commit).ok()?.ok();
         };
+        self.try_owned_runtime_saved_commit(
+            owner.generation,
+            owner.intent,
+            Some(owner.revision),
+            plan_expiry,
+            commit,
+        )
+        .await
+    }
+
+    async fn try_owned_runtime_saved_commit<T>(
+        &self,
+        generation: u64,
+        intent: u64,
+        saved_revision: Option<u64>,
+        plan_expiry: Option<i64>,
+        mut commit: impl FnMut(&Value) -> Result<T, RuntimeClaimError>,
+    ) -> Option<T> {
         let deadline = tokio::time::Instant::now() + HOT_EDIT_WRITER_RETRY_LIMIT;
         loop {
-            if !self.saved_revision_matches(Some(owner.revision))
-                || !self.selector_intent_is_current(owner.intent)
+            if !self.saved_revision_matches(saved_revision)
+                || !self.selector_intent_is_current(intent)
                 || !self.core_running()
                 || self
                     .gate
                     .try_generation_activity()
-                    .is_some_and(|state| state != (owner.generation, false))
+                    .is_some_and(|state| state != (generation, false))
                 || plan_expiry.is_some_and(|expiry| !runtime_plan_ticket_is_live(expiry))
             {
                 return None;

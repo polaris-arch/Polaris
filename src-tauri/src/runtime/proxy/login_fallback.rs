@@ -9,11 +9,13 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use polaris_config_engine::builder::hotswitch::{HotSwitchKind, HotSwitchPlan, HotSwitchPut};
 use polaris_config_engine::builder::route::mesh_selected_exit_falls_back_to_direct;
 use polaris_config_engine::user_config::app_config::UserConfig;
 use polaris_config_engine::user_config::dns_constants::{DIRECT_TAG, PROXY_SELECTOR_TAG};
 use polaris_config_engine::user_config::proxy_mode::ProxyMode;
 use polaris_config_engine::user_config::server_config::Protocol;
+use polaris_switch_engine::HotSwitchOutcome;
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::MutexGuard as AsyncMutexGuard;
@@ -38,7 +40,7 @@ impl Drop for ReconcileGuard<'_> {
     }
 }
 
-pub(super) fn selected_tailscale_exit(raw: &Value) -> Option<&str> {
+fn selected_tailscale_exit(raw: &Value) -> Option<&str> {
     let selected = raw
         .get("selectedServerId")?
         .as_str()
@@ -102,25 +104,18 @@ impl ProxyRuntime {
         guard.as_ref().and_then(selected_tailscale_exit).is_some()
     }
 
-    pub(super) fn project_saved_login_fallback(&self, saved: &Value, server_id: &str) -> bool {
-        if saved.get("selectedServerId").and_then(Value::as_str) != Some(server_id) {
-            return false;
+    /// Returns whether the accepted policy needs a TS selector reconciliation.
+    pub(super) fn project_saved_login_fallback(
+        &self,
+        selected: Option<&str>,
+        enabled: bool,
+    ) -> Option<bool> {
+        let mut current = self.current_config.write().ok()?;
+        let running = current.as_ref()?;
+        if running.get("selectedServerId").and_then(Value::as_str) != selected {
+            return None;
         }
-        let Some(enabled) = saved
-            .get("meshLoginFallbackDirect")
-            .and_then(Value::as_bool)
-        else {
-            return false;
-        };
-        let Ok(mut current) = self.current_config.write() else {
-            return false;
-        };
-        let Some(running) = current
-            .as_ref()
-            .filter(|raw| selected_tailscale_exit(raw) == Some(server_id))
-        else {
-            return false;
-        };
+        let tailscale = selected_tailscale_exit(running).is_some();
         if running
             .get("meshLoginFallbackDirect")
             .and_then(Value::as_bool)
@@ -132,7 +127,7 @@ impl ProxyRuntime {
             projected["meshLoginFallbackDirect"] = Value::Bool(enabled);
             self.coex.commit_config(&mut current, projected);
         }
-        true
+        Some(tailscale)
     }
 
     /// 内存态写：置/清 `(engaged, server_id)`。
@@ -330,7 +325,12 @@ impl ProxyRuntime {
         // markEngaged 的 first 守卫保证 UI 只 emit 一次。
         if eligible && backend_state.as_deref() == Some("NeedsLogin") {
             if !self
-                .hot_switch_selector_locked(switch_guard, PROXY_SELECTOR_TAG, DIRECT_TAG)
+                .select_login_fallback_member(
+                    switch_guard,
+                    DIRECT_TAG,
+                    generation,
+                    intent_generation,
+                )
                 .await
             {
                 return; // PUT 失败：不改 flag，下次 tick 重试
@@ -368,7 +368,12 @@ impl ProxyRuntime {
                     .and_then(|g| g.as_ref().and_then(|s| s.id_to_tag.get(&eid).cloned()));
                 if let Some(tag) = tag {
                     if !self
-                        .hot_switch_selector_locked(switch_guard, PROXY_SELECTOR_TAG, &tag)
+                        .select_login_fallback_member(
+                            switch_guard,
+                            &tag,
+                            generation,
+                            intent_generation,
+                        )
                         .await
                     {
                         return; // PUT 失败：不改 flag，下次 tick 重试
@@ -398,6 +403,35 @@ impl ProxyRuntime {
                 self.set_login_fallback(false, None);
                 self.emit_mesh_login_fallback(false, None);
             }
+        }
+    }
+
+    async fn select_login_fallback_member(
+        &self,
+        _switch_guard: &AsyncMutexGuard<'_, ()>,
+        member: &str,
+        generation: u64,
+        intent: u64,
+    ) -> bool {
+        let plan = HotSwitchPlan {
+            kind: HotSwitchKind::Global,
+            puts: vec![HotSwitchPut {
+                selector_tag: PROXY_SELECTOR_TAG.into(),
+                member_tag: member.into(),
+                old_member_tag: None,
+            }],
+            must_restart: false,
+        };
+        match self
+            .execute_hot_switch_plan(&plan, false, generation, intent)
+            .await
+        {
+            HotSwitchOutcome::Applied { .. } => true,
+            HotSwitchOutcome::Failed { error, .. } => {
+                log::warn!("组网出口让位 selector 更新失败：{error}");
+                false
+            }
+            HotSwitchOutcome::ClientNotReady => false,
         }
     }
 }

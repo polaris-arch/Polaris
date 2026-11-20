@@ -626,7 +626,6 @@ async fn android_dual_mode_ts_switches_both_directions_without_core_generation_c
         running["proxyMode"] = serde_json::json!("smart");
         running["singboxDashboard"] = serde_json::json!(true);
         running["subscriptionProxyPolicy"] = serde_json::json!("follow");
-        running["meshLoginFallbackDirect"] = Value::Bool(true);
         rt.config.save_full(&running).unwrap();
         let running = rt.config.current().unwrap();
         mark_running_with_named_snapshot(&rt, &running);
@@ -655,7 +654,6 @@ async fn android_dual_mode_ts_switches_both_directions_without_core_generation_c
         let generation = rt.gate.generation();
         let mut saved = running;
         saved["selectedServerId"] = serde_json::json!(new);
-        saved["meshLoginFallbackDirect"] = Value::Bool(false);
         rt.config.save_full(&saved).unwrap();
         let intent = rt.register_selector_intent();
         assert_eq!(
@@ -671,11 +669,6 @@ async fn android_dual_mode_ts_switches_both_directions_without_core_generation_c
             "{old}->{new} restarted the core"
         );
         assert!(rt.pending_force_restart.read().unwrap().is_none());
-        assert_eq!(
-            rt.current_config_snapshot().unwrap()["meshLoginFallbackDirect"],
-            new != "ts-mesh",
-            "{old}->{new} must only project the saved setting onto the selected TS exit"
-        );
         assert_eq!(sink.mode.lock().unwrap().as_deref(), Some(new_mode));
         let ops = sink.operations.lock().unwrap().clone();
         let expected = if new_mode == "mesh-direct" {
