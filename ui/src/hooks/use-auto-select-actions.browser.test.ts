@@ -78,10 +78,11 @@ const f=window.__actions={calls:[],proxyCalls:[],reads:0,jobs,readJobs,messages:
    job.resolve({success:true,data:{status:'needsManual',config:structuredClone(disk),corrected:false}});
    return;
   }
+  const modeChanged=disk.proxyModeType!==job.mode;
   const result=applyFakeIpTunEntry({...disk,proxyModeType:job.mode});
   disk=result.config;
   f.nativeConfigSignal();
-  job.resolve({success:true,data:{status:'saved',config:structuredClone(disk),corrected:result.corrected,pendingApply:false}});
+  job.resolve({success:true,data:{status:'saved',config:structuredClone(disk),changed:modeChanged||result.corrected,corrected:result.corrected,pendingApply:false}});
  },
  proxySignal(running){proxyState={running,starting:false};for(const l of [...listeners])if(l.event===(running?C.EVENT_PROXY_STARTED:C.EVENT_PROXY_STOPPED))handlers.get(l.handler)?.({payload:{}});},
  stageOnly(){useStagedConfigStore.setState({enabled:true});useStagedConfigStore.getState().stage({id:'server:staged-only',kind:'server',label:'Local draft',entityPath:['servers','staged-only'],nextValue:{id:'staged-only',name:'Local draft',protocol:'socks',address:'draft.invalid',port:1}});},
@@ -234,10 +235,18 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS==='1')('five real mounted Auto 
    await takeover.getByRole('button', { name: '本地', exact: true }).click();
    const reversed = [{ mode: 'systemProxy', hotOnly: true }, { mode: 'manual', hotOnly: true }];
    await expect.poll(readTakeover).toEqual({ mode: 'manual', preview: [], dialog: null, requests: reversed });
+   await expect.poll(async () => (await state(page)).messages).toContainEqual(['success', '已保存 · 本地']);
+   await takeover.getByRole('button', { name: '本地', exact: true }).click();
+   const repeated = [...reversed, { mode: 'manual', hotOnly: true }];
+   await expect.poll(readTakeover).toEqual({ mode: 'manual', preview: [], dialog: null, requests: repeated });
+   await page.evaluate(() => (window as any).__actions.checkpoint());
+   expect((await state(page)).messages.filter(([kind]: string[]) => kind === 'success')).toEqual([
+    ['success', '已保存 · 系统'], ['success', '已保存 · 本地'],
+   ]);
    await page.evaluate(() => { (window as any).__actions.takeoverNeedsManual = true; });
    await takeover.getByRole('button', { name: 'TUN', exact: true }).click();
    await expect.poll(readTakeover).toEqual({ mode: 'manual', preview: ['tun'], dialog: 'confirm',
-    requests: [...reversed, { mode: 'tun', hotOnly: true }] });
+    requests: [...repeated, { mode: 'tun', hotOnly: true }] });
   } finally {
    await page.close();
   }

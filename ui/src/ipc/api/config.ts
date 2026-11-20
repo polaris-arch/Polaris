@@ -91,7 +91,7 @@ export const configApi = {
     return invoke(IPC_CHANNELS.CONFIG_SET_TAKEOVER, { mode, preview: true });
   },
 
-  async setTakeover(mode: NonNullable<UserConfig['proxyModeType']>, expectedOwner?: TakeoverApplyOwner, hotOnly?: boolean): Promise<{ config: UserConfig; corrected: boolean; owner?: TakeoverApplyOwner; pendingApply?: boolean; status?: 'saved' | 'needsManual' }> {
+  async setTakeover(mode: NonNullable<UserConfig['proxyModeType']>, expectedOwner?: TakeoverApplyOwner, hotOnly?: boolean): Promise<{ config: UserConfig; corrected: boolean; changed?: boolean; owner?: TakeoverApplyOwner; pendingApply?: boolean; status?: 'saved' | 'needsManual' }> {
     return invoke(IPC_CHANNELS.CONFIG_SET_TAKEOVER, { mode, expectedOwner, hotOnly });
   },
 

@@ -846,7 +846,7 @@ export function HomeScreen() {
           }
         });
         if (!result) return;
-        const { corrected, owner, status, pendingApply } = result;
+        const { corrected, changed, owner, status, pendingApply } = result;
         // 仅在真把 false 改回 true 时提示（罕见且有实际副作用需告知）；纯消费 flag 不打扰用户。
         // toast 在主窗可见时够用，但接管方式亦可从**托盘浮层**（独立窗口，FX-tray 已加入口）切换 →
         // 主窗 toast 此时看不到，故并发一条系统通知兜底（对齐 上游 notify-user；正文不含节点身份）。
@@ -860,7 +860,7 @@ export function HomeScreen() {
         }
         if (request !== takeoverPreviewRequest.current) return;
         if (owner) useAppStore.getState().setApplyRequested(owner);
-        if (!expectedOwner && status === 'saved' && !pendingApply) {
+        if (!expectedOwner && status === 'saved' && changed && !pendingApply) {
           const label = INTERCEPT_OPTS.find((option) => option.v === v)?.labelKey;
           if (label) toast.success(`${t('common.saved')} · ${t(label)}`);
         }

@@ -124,6 +124,7 @@ describe('接线：主窗里的配置事务必须都在闸门内', () => {
     expect((stagedStore.match(/withConfigWriteLock\((?:async )?\(\) =>/g) ?? []).length).toBe(3);
     expect((settings.match(/withConfigWriteLock\((?:async )?\(\) =>/g) ?? []).length).toBe(1);
     expect(filesWith('withConfigWriteLock(', ['config-write-lock.ts'])).toEqual([
+      'components/screens/home/HomeScreen.tsx',
       'components/screens/settings/use-config.ts',
       'lib/auto-select-actions.ts',
       'store/app-store.ts',

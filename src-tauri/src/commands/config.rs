@@ -1001,7 +1001,7 @@ pub(crate) async fn apply_takeover_edit(
     let mut config = edit.candidate;
     apply_frontend_view(&mut config);
     ApiResponse::ok(
-        json!({"status": "saved", "config": config, "corrected": corrected, "pendingApply": pending_apply}),
+        json!({"status": "saved", "config": config, "changed": changed, "corrected": corrected, "pendingApply": pending_apply}),
     )
 }
 
