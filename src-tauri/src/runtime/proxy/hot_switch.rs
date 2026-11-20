@@ -26,7 +26,7 @@ use polaris_config_engine::builder::hotswitch::{
     HotSwitchDeps, HotSwitchPut, RuleTargetEntry,
 };
 use polaris_config_engine::builder::mesh_mode::{
-    selected_mode, DASHBOARD_SELECTOR, MESH_DIRECT, NORMAL,
+    has_compiled_modes, selected_mode, DASHBOARD_SELECTOR, MESH_DIRECT, NORMAL,
 };
 use polaris_config_engine::builder::orchestration::{config_generation_norm, stable_stringify};
 use polaris_config_engine::builder::outbounds::{build_outbounds, OutboundsDeps};
@@ -34,7 +34,7 @@ use polaris_config_engine::builder::{build_id_to_tag_map, GenerateConfigDeps};
 use polaris_config_engine::singbox::{InboundUser, SingBoxConfig};
 use polaris_config_engine::user_config::app_config::UserConfig;
 use polaris_config_engine::user_config::dns_constants::{
-    is_block_selection, is_direct_selection, DIRECT_TAG, PROXY_SELECTOR_TAG,
+    is_block_selection, is_direct_selection, is_sentinel_selection, DIRECT_TAG, PROXY_SELECTOR_TAG,
 };
 use polaris_config_engine::user_config::rule::RuleAction;
 use polaris_config_engine::user_config::server_config::{
@@ -56,6 +56,7 @@ use crate::runtime::node_fingerprints;
 
 use super::network_settle::NetworkSettleGuard;
 use super::route_replan::runtime_binding_roots_covered;
+use super::runtime_config::StagedSaveOwner;
 use super::selector_reconcile::{SelectorReconcileOutcome, SelectorReconcileRequest};
 use super::{code, ProxyRuntime};
 // `TestPutSink` 的解锁失效记录句柄按 §A.3 归 `unlock_refresh.rs`（尚未搬），当前仍在 façade。
@@ -1139,11 +1140,7 @@ impl ProxyRuntime {
             &id_to_tag,
         );
         SwitchSnapshot {
-            mesh_mode_ready: singbox_config
-                .experimental
-                .as_ref()
-                .and_then(|x| x.clash_api.as_ref())
-                .is_some(),
+            mesh_mode_ready: has_compiled_modes(singbox_config),
             dashboard_mode_selector: singbox_config
                 .outbounds
                 .iter()
@@ -1381,6 +1378,7 @@ impl ProxyRuntime {
         if self.selector_reconcile.intent_generation() != intent_generation {
             return Ok(None);
         }
+        let saved_revision = self.config.saved_revision();
         let latest = self.config.current().map_err(|e| e.to_string())?;
         if latest.get("selectedServerId").and_then(Value::as_str) != Some(server_id) {
             return Ok(None);
@@ -1392,6 +1390,7 @@ impl ProxyRuntime {
         if !self.core_running() {
             return Ok(Some(SwitchOutcome::NotRunning));
         }
+        let generation = self.gate.generation();
         let runtime = self
             .current_config
             .read()
@@ -1421,6 +1420,9 @@ impl ProxyRuntime {
             self.defer_selected_switch("目标节点尚未在运行核中，或节点修改尚未应用");
             return Ok(Some(SwitchOutcome::Deferred));
         }
+        let block_change =
+            is_block_selection(runtime.get("selectedServerId").and_then(Value::as_str))
+                != is_block_selection(Some(server_id));
         let mut projected = runtime;
         let Some(object) = projected.as_object_mut() else {
             self.defer_selected_switch("运行态配置无法构造节点选择投影");
@@ -1431,9 +1433,16 @@ impl ProxyRuntime {
             Value::String(server_id.to_string()),
         );
         object.remove(polaris_store::SELECTION_INTENT_KEY);
+        let owner = StagedSaveOwner {
+            generation,
+            intent: intent_generation,
+            revision: saved_revision,
+        };
         if !clean_member {
             if let Some(node) = append_selected_outbound(&mut projected, &latest, server_id) {
-                let result = Box::pin(self.apply_runtime_candidate(projected, Some(&latest))).await;
+                let result =
+                    Box::pin(self.apply_selected_runtime_candidate(projected, &latest, owner))
+                        .await;
                 let outcome = Self::runtime_result_outcome(&result);
                 // Apply can first settle a retained receipt for another candidate.
                 if outcome == SwitchOutcome::HotSwitched
@@ -1450,6 +1459,25 @@ impl ProxyRuntime {
             }
             self.defer_selected_switch("目标节点尚未在运行核中，或节点修改尚未应用");
             return Ok(Some(SwitchOutcome::Deferred));
+        }
+        let recovers_mesh_modes = !is_sentinel_selection(Some(server_id))
+            && self.runtime_config_baseline.read().is_ok_and(|baseline| {
+                baseline.as_ref().is_some_and(|baseline| {
+                    baseline.generation == generation && baseline.dormant_mesh_modes()
+                })
+            });
+        if block_change || recovers_mesh_modes {
+            let result =
+                Box::pin(self.apply_selected_runtime_candidate(projected, &latest, owner)).await;
+            let outcome = Self::runtime_result_outcome(&result);
+            if outcome == SwitchOutcome::HotSwitched
+                && !self.current_config_snapshot().is_some_and(|running| {
+                    running.get("selectedServerId").and_then(Value::as_str) == Some(server_id)
+                })
+            {
+                return Ok(Some(SwitchOutcome::Pending));
+            }
+            return Ok(Some(outcome));
         }
         // Auto and a concrete node are distinct user exits, even at the same leaf.
         // Retain dormant native groups until the next authorized structural reload.

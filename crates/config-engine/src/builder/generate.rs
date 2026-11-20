@@ -38,10 +38,12 @@ use crate::builder::route::{
 };
 use crate::singbox::{
     ApiDashboard, ApiService, CacheFile, DnsConfig, DnsRule, Experimental, HttpClient, OneOrMany,
-    RouteConfig, SingBoxConfig,
+    RouteConfig, RouteRule, SingBoxConfig,
 };
 use crate::user_config::app_config::UserConfig;
-use crate::user_config::dns_constants::is_sentinel_selection;
+use crate::user_config::dns_constants::{
+    is_block_selection, is_direct_selection, is_sentinel_selection,
+};
 use crate::user_config::log_level::LogLevel;
 use crate::user_config::server_config::Protocol;
 
@@ -382,19 +384,75 @@ pub fn generate_running_candidate(
     let Some(candidates) = super::mesh_mode::mode_candidates_for_anchor(config, mesh_id) else {
         return Ok(outcome);
     };
-    if !compile_android_mesh_modes(
-        config,
-        &resolved_ips,
-        deps,
-        runtime_bind_interfaces,
-        candidates,
-        &mut outcome.config,
-    ) {
-        return Ok(outcome);
+    let selected = config.effective_selected_server_id();
+    let blocked = is_block_selection(selected);
+    if blocked
+        || !compile_android_mesh_modes(
+            config,
+            &resolved_ips,
+            deps,
+            runtime_bind_interfaces,
+            candidates,
+            &mut outcome.config,
+        )
+    {
+        let single_direct =
+            is_direct_selection(selected) && !super::mesh_mode::has_compiled_modes(running);
+        if !(blocked || single_direct) {
+            return Ok(outcome);
+        }
+        if outcome
+            .config
+            .dns
+            .as_ref()
+            .and_then(|dns| dns.rules.as_ref())
+            .is_some_and(|rules| rules.iter().any(|rule| rule.clash_mode.is_some()))
+        {
+            return Ok(outcome);
+        }
+        let Some(route) = outcome.config.route.as_mut() else {
+            return Ok(outcome);
+        };
+        if route.rules.iter().any(|rule| rule.clash_mode.is_some()) {
+            return Ok(outcome);
+        }
+        let (insert_at, fallback) = if blocked {
+            let reject = RouteRule {
+                action: Some("reject".into()),
+                ..Default::default()
+            };
+            if route.rules.last() != Some(&reject) {
+                return Ok(outcome);
+            }
+            (route.rules.len() - 1, reject)
+        } else {
+            let Some(outbound) = route.final_outbound.clone() else {
+                return Ok(outcome);
+            };
+            (
+                route.rules.len(),
+                RouteRule {
+                    action: Some("route".into()),
+                    outbound: Some(outbound),
+                    ..Default::default()
+                },
+            )
+        };
+        // Core derives its mode inventory from rules. Both modes must use the
+        // same single-policy fallback while the dual route and DNS are dormant.
+        route.rules.splice(
+            insert_at..insert_at,
+            [super::mesh_mode::NORMAL, super::mesh_mode::MESH_DIRECT]
+                .into_iter()
+                .map(|mode| RouteRule {
+                    clash_mode: Some(mode.into()),
+                    ..fallback.clone()
+                }),
+        );
     }
     if let Some(experimental) = outcome.config.experimental.as_mut() {
-        // The selected mode may have changed live; the cold boot default
-        // remains fixed for this generation.
+        // The existing Core still owns the Clash control and its immutable
+        // startup settings.
         experimental.clash_api = Some(clash_api.clone());
     }
     Ok(outcome)

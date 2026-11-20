@@ -17,6 +17,25 @@ pub const NORMAL: &str = "normal";
 pub const MESH_DIRECT: &str = "mesh-direct";
 pub const DASHBOARD_SELECTOR: &str = "polaris-dashboard-exit";
 
+/// The retained mode names alone do not prove both routing policies are active.
+pub fn has_compiled_modes(config: &SingBoxConfig) -> bool {
+    config
+        .experimental
+        .as_ref()
+        .is_some_and(|experimental| experimental.clash_api.is_some())
+        && config
+            .dns
+            .as_ref()
+            .and_then(|dns| dns.rules.as_ref())
+            .is_some_and(|rules| {
+                [NORMAL, MESH_DIRECT].into_iter().all(|mode| {
+                    rules
+                        .iter()
+                        .any(|rule| rule.clash_mode.as_deref() == Some(mode))
+                })
+            })
+}
+
 fn is_no_exit_ts(server: &ServerConfig) -> bool {
     server.protocol == Protocol::Tailscale && !mesh_node_carries_full_tunnel(server)
 }

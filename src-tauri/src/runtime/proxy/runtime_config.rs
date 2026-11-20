@@ -16,6 +16,9 @@ use crate::runtime::route_binding::{
 use polaris_config_engine::builder::custom_rule_files::build_custom_rule_files;
 use polaris_config_engine::builder::generate::generate_running_candidate;
 use polaris_config_engine::builder::helpers::MIXED_INBOUND_TAG;
+use polaris_config_engine::builder::mesh_mode::{
+    has_compiled_modes, selected_mode, MESH_DIRECT, NORMAL,
+};
 use polaris_config_engine::builder::GenerateConfigDeps;
 use polaris_config_engine::singbox::SingBoxConfig;
 use polaris_config_engine::user_config::dns_constants::is_sentinel_selection;
@@ -404,6 +407,16 @@ pub(super) struct RuntimeConfigBaseline {
 }
 
 impl RuntimeConfigBaseline {
+    pub(super) fn dormant_mesh_modes(&self) -> bool {
+        self.android_mesh_id.is_some()
+            && self
+                .generated
+                .experimental
+                .as_ref()
+                .is_some_and(|experimental| experimental.clash_api.is_some())
+            && !has_compiled_modes(&self.generated)
+    }
+
     pub(super) fn core_log_relay_enabled(&self, generation: u64) -> bool {
         self.generation == generation
             && !self.api_epoch.is_closed()
@@ -2328,6 +2341,21 @@ impl ProxyRuntime {
             .await
     }
 
+    pub(super) async fn apply_selected_runtime_candidate(
+        self: &Arc<Self>,
+        candidate: Value,
+        desired: &Value,
+        owner: StagedSaveOwner,
+    ) -> RuntimeApplyResult {
+        Box::pin(self.apply_runtime_candidate_with_policy(
+            candidate,
+            Some(desired),
+            Some(owner),
+            false,
+        ))
+        .await
+    }
+
     async fn apply_runtime_candidate_with_policy(
         self: &Arc<Self>,
         candidate: Value,
@@ -2605,7 +2633,7 @@ impl ProxyRuntime {
             }
         }
 
-        let capabilities = match paired_runtime_capabilities(&client, &baseline.pairing).await {
+        let mut capabilities = match paired_runtime_capabilities(&client, &baseline.pairing).await {
             Ok(value) => value,
             // Missing RPC/authentication/protocol/manifest/incarnation never grants
             // a same-core restart token. The old baseline must not adopt this peer.
@@ -2930,6 +2958,81 @@ impl ProxyRuntime {
             "热应用配置生成耗时：候选构建={candidate_ms}ms，运行配置及出站投影={}ms",
             t_previous.elapsed().as_millis()
         );
+        if baseline.dormant_mesh_modes() && has_compiled_modes(&generated) {
+            if !identity_equal(
+                capabilities.active.as_ref(),
+                baseline.observed_active.as_ref(),
+            ) {
+                return decline(RuntimeApplyResult::status("conflict"));
+            }
+            let mode = selected_mode(&typed);
+            let Ok(before) = client.get_clash_mode_status().await else {
+                return decline(RuntimeApplyResult::status("unconfirmed"));
+            };
+            if before.mode_list.len() != 2
+                || ![NORMAL, MESH_DIRECT]
+                    .iter()
+                    .all(|mode| before.mode_list.iter().any(|name| name == mode))
+            {
+                return decline(RuntimeApplyResult::status("unconfirmed"));
+            }
+            if before.current_mode != mode {
+                if prospective || !offer_confirmation {
+                    let mut result = RuntimeApplyResult::status("impactConfirmationRequired");
+                    result.reasons.push(RuntimeApplyReason {
+                        code: "impactConfirmationRequired",
+                        path: "runtime.clash_mode".into(),
+                    });
+                    return decline(result);
+                }
+                if !client.captured_transport_live() {
+                    return decline(RuntimeApplyResult::status("unconfirmed"));
+                }
+                let prior = match paired_runtime_capabilities(&client, &baseline.pairing).await {
+                    Ok(value) => value,
+                    Err(result) => return Err(result),
+                };
+                if !identity_equal(prior.active.as_ref(), capabilities.active.as_ref())
+                    || prior.control_revision != capabilities.control_revision
+                {
+                    return decline(RuntimeApplyResult::status("conflict"));
+                }
+                // The accepted single policy is independent of native mode.
+                // Align it before restoring mode-specific route/DNS. Core
+                // serializes the control write against graph publication.
+                let claim = self.with_runtime_candidate_claim(
+                    saved_revision.is_some(),
+                    generation,
+                    intent,
+                    || self.saved_revision_matches(saved_revision),
+                );
+                if !matches!(claim, Ok(true)) {
+                    return decline(RuntimeApplyResult::status("conflict"));
+                }
+                if client.set_clash_mode(mode).await.is_err() {
+                    return decline(RuntimeApplyResult::status("unconfirmed"));
+                }
+                let latest = match paired_runtime_capabilities(&client, &baseline.pairing).await {
+                    Ok(value) => value,
+                    Err(result) => return Err(result),
+                };
+                if !identity_equal(latest.active.as_ref(), capabilities.active.as_ref())
+                    || capabilities.control_revision.checked_add(1) != Some(latest.control_revision)
+                {
+                    return decline(RuntimeApplyResult::status("conflict"));
+                }
+                // The Plan and Apply both fence this exact graph and control
+                // revision, including any competing write after readback.
+                if !client
+                    .get_clash_mode_status()
+                    .await
+                    .is_ok_and(|status| status.current_mode == mode)
+                {
+                    return decline(RuntimeApplyResult::status("unconfirmed"));
+                }
+                capabilities = latest;
+            }
+        }
         let groups_started_at = Instant::now();
         let groups = match client.first_groups_snapshot().await {
             Ok(groups) => groups,

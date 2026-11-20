@@ -173,6 +173,89 @@ fn android_single_no_exit_ts_precompiles_both_policies_with_dashboard() {
 }
 
 #[test]
+fn android_warm_block_keeps_the_existing_clash_control_and_uses_block_policy() {
+    use crate::builder::mesh_mode::{has_compiled_modes, selected_mode, MESH_DIRECT, NORMAL};
+    use crate::user_config::dns_constants::{BLOCK_SERVER_ID, DIRECT_SERVER_ID};
+
+    let mut config = base_config();
+    config.servers.push(ServerConfig {
+        id: "ts".into(),
+        name: "Tailnet".into(),
+        protocol: Protocol::Tailscale,
+        tailscale_settings: Some(Box::default()),
+        ..Default::default()
+    });
+    let mut deps = deps_default();
+    deps.platform = "android".into();
+    deps.has_management_api = true;
+    deps.subscription_update_in_port = Some(15491);
+    let bindings = BTreeMap::new();
+
+    for starting_exit in ["s1", "ts"] {
+        config.selected_server_id = Some(starting_exit.into());
+        let running = generate_sing_box_config(&config, &BTreeMap::new(), &deps).unwrap();
+        assert!(has_compiled_modes(&running));
+
+        config.selected_server_id = Some(BLOCK_SERVER_ID.into());
+        let blocked = generate_running_candidate(&config, &deps, &bindings, &running, Some("ts"))
+            .unwrap()
+            .config;
+        let mut block_policy = generate_base_config(&config, &BTreeMap::new(), &deps, &bindings)
+            .unwrap()
+            .config;
+        assert_eq!(blocked.experimental, running.experimental);
+        let rules = &mut block_policy.route.as_mut().unwrap().rules;
+        let reject = rules.pop().unwrap();
+        assert_eq!(reject.action.as_deref(), Some("reject"));
+        rules.extend([NORMAL, MESH_DIRECT].into_iter().map(|mode| RouteRule {
+            clash_mode: Some(mode.into()),
+            ..reject.clone()
+        }));
+        rules.push(reject);
+        assert_eq!(blocked.route, block_policy.route);
+        assert_eq!(blocked.dns, block_policy.dns);
+        assert!(!has_compiled_modes(&blocked));
+
+        config.selected_server_id = Some(DIRECT_SERVER_ID.into());
+        let direct = generate_running_candidate(&config, &deps, &bindings, &blocked, Some("ts"))
+            .unwrap()
+            .config;
+        assert_eq!(direct.experimental, running.experimental);
+        assert!(!has_compiled_modes(&direct));
+        let route = direct.route.as_ref().unwrap();
+        for (rule, mode) in route
+            .rules
+            .iter()
+            .rev()
+            .take(2)
+            .rev()
+            .zip([NORMAL, MESH_DIRECT])
+        {
+            assert_eq!(rule.clash_mode.as_deref(), Some(mode));
+            assert_eq!(rule.outbound, route.final_outbound);
+        }
+
+        for (previous, next_exit) in [(&blocked, "s1"), (&blocked, "ts"), (&direct, "s1")] {
+            config.selected_server_id = Some(next_exit.into());
+            let resumed =
+                generate_running_candidate(&config, &deps, &bindings, previous, Some("ts"))
+                    .unwrap()
+                    .config;
+            assert_eq!(resumed.experimental, running.experimental);
+            assert!(has_compiled_modes(&resumed));
+            let base = generate_base_config(&config, &BTreeMap::new(), &deps, &bindings)
+                .unwrap()
+                .config;
+            assert!(compiled_projection_matches_base(
+                &resumed,
+                &base,
+                selected_mode(&config)
+            ));
+        }
+    }
+}
+
+#[test]
 fn android_warm_tailscale_add_preserves_admitted_dual_mode_and_dashboard() {
     let mut config = base_config();
     config.singbox_dashboard = Some(true);
