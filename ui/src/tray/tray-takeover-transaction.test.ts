@@ -57,7 +57,7 @@ describe('takeover tray transaction', () => {
     expect(fail).not.toHaveBeenCalled();
   });
 
-  it.each([false, true])('serializes a reversal and drops older hide or correction feedback (%s)', async corrected => {
+  it.each([false, true])('serializes a reversal and keeps only actual correction notifications (%s)', async corrected => {
     let finishFirst!: () => void;
     const firstReceipt = new Promise<void>(resolve => { finishFirst = resolve; });
     const setTakeover = vi.fn(async (mode: string) => {
@@ -78,7 +78,7 @@ describe('takeover tray transaction', () => {
     expect(setTakeover.mock.calls).toEqual([['tun'], ['manual']]);
     expect(notice.mock.calls).toEqual([['tray.manageInMain']]);
     expect(hide).not.toHaveBeenCalled();
-    expect(notify).not.toHaveBeenCalled();
+    expect(notify.mock.calls).toEqual(corrected ? [['tray.takeoverTun', 'tray.fakeIpAutoEnabled']] : []);
   });
 });
 

@@ -591,8 +591,9 @@ export default function TrayMenu() {
   const setTakeover = async (modeType: ProxyModeType) => {
     const life = trayLifecycle.current, operation = interactionEpoch.current;
     const intent = ++takeoverIntent.current;
-    const current = () => mounted.current && interactionActive.current && life === trayLifecycle.current
-      && operation === interactionEpoch.current && intent === takeoverIntent.current;
+    const sameInteraction = () => mounted.current && interactionActive.current && life === trayLifecycle.current
+      && operation === interactionEpoch.current;
+    const current = () => sameInteraction() && intent === takeoverIntent.current;
     if (!config) {
       hide();
       return;
@@ -602,13 +603,12 @@ export default function TrayMenu() {
       try {
         // 迁移中的 FakeIP 修正同时走桌面通知和当前浮层提示。
         const { corrected, pendingApply } = await api.config.setTakeover(modeType);
+        const correction = corrected && sameInteraction() ? t('tray.fakeIpAutoEnabled') : undefined;
+        if (correction) void notifyDesktop(t('tray.takeoverTun'), correction);
         if (!current()) return;
         const guidance = pendingApply ? t('tray.manageInMain') : undefined;
-        if (corrected) {
-          const title = t('tray.takeoverTun');
-          const body = t('tray.fakeIpAutoEnabled');
-          setNotice(guidance ? `${body} ${guidance}` : body);
-          void notifyDesktop(title, body);
+        if (correction) {
+          setNotice(guidance ? `${correction} ${guidance}` : correction);
           return;
         }
         if (guidance) {
