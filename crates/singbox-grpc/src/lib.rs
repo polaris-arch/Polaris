@@ -37,9 +37,11 @@ pub mod daemon {
     include!(concat!(env!("OUT_DIR"), "/daemon.rs"));
 }
 
+mod connection_events;
 mod h2c;
 mod reconnect;
 mod runtime_config;
+pub use connection_events::ConnectionEventStream;
 pub use runtime_config::{
     ApiHandoffMetadata, ExitIpProbeError, RuntimeConfigError, RuntimeStatusEnvelope,
     RUNTIME_CONFIG_MAX_MESSAGE_BYTES,
@@ -107,15 +109,7 @@ const SNAPSHOT_INTERVAL_NS: i64 = 1_000_000_000;
 const CONNECTION_SNAPSHOT_MAX_FRAME_BYTES: usize = 256 * 1024;
 const CONNECTION_SNAPSHOT_MAX_BYTES: usize = 4 * 1024 * 1024;
 
-/// 单会话 Connection 事件流的单帧解码上限：64 MiB（tonic 默认是 4 MiB）。
-///
-/// 这条流的首帧躲不开全量：内核的 `SubscribeConnections` 进循环前无条件发一帧「全部活动连接 +
-/// 保留的已关闭连接」，请求里只有一个 `interval` 字段，没有「只要新增」的选项
-/// （`daemon/started_service.go` 的 `SubscribeConnections` / `buildInitialConnectionState`）。
-/// 已关闭连接内核封顶 1000 条（`common/trafficcontrol/manager.go` 的 `closedConnectionsLimit`），
-/// 活动连接没有上限。单条记录的大头是规则描述、域名与进程路径，按 0.5 KiB 估，默认的 4 MiB 只够
-/// 约 8000 条，重度使用下首帧会被拒、整条流报错；64 MiB 够约 13 万条，同时仍是一个有界值，
-/// 回环上一个异常的对端不能让本进程无限分配。
+/// 接收旧核完整帧和暂存新核分批快照共用的字节上限。
 pub const CONNECTION_EVENTS_MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
 /// sing-box 管理 API 端点描述（host + port）。本地端点 → h2c（明文 HTTP/2）。
@@ -608,8 +602,10 @@ impl SingBoxApiClient {
             .max_decoding_message_size(CONNECTION_EVENTS_MAX_FRAME_BYTES);
         let req = self.with_auth(Request::new(daemon::SubscribeConnectionsRequest {
             interval: SNAPSHOT_INTERVAL_NS,
+            batch_frames: true,
         }));
-        let mut stream = c.subscribe_connections(req).await?.into_inner();
+        let mut stream =
+            ConnectionEventStream::new(c.subscribe_connections(req).await?.into_inner());
         Ok(stream.message().await?)
     }
 
@@ -638,19 +634,20 @@ impl SingBoxApiClient {
     pub async fn connection_events_once(
         &self,
         interval_ns: i64,
-    ) -> Result<tonic::Streaming<daemon::ConnectionEvents>, ClientError> {
+    ) -> Result<ConnectionEventStream, ClientError> {
         let mut c = self
             .client()
             .max_decoding_message_size(CONNECTION_EVENTS_MAX_FRAME_BYTES);
         let req = self.with_auth(Request::new(daemon::SubscribeConnectionsRequest {
             interval: interval_ns,
+            batch_frames: true,
         }));
         match in_api_lifetime(&self._retained_lifetime, async {
             Ok(tokio::time::timeout(SNAPSHOT_TIMEOUT, c.subscribe_connections(req)).await)
         })
         .await?
         {
-            Ok(stream) => Ok(stream?.into_inner()),
+            Ok(stream) => Ok(ConnectionEventStream::new(stream?.into_inner())),
             Err(_) => Err(ClientError::SnapshotTimeout),
         }
     }
@@ -662,7 +659,7 @@ impl SingBoxApiClient {
         endpoint: Endpoint,
         secret: impl Into<String>,
         interval_ns: i64,
-    ) -> Result<tonic::Streaming<daemon::ConnectionEvents>, ClientError> {
+    ) -> Result<ConnectionEventStream, ClientError> {
         Self::connect(endpoint, secret)
             .await?
             .connection_events_once(interval_ns)

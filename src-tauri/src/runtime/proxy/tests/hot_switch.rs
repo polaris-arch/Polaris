@@ -5,6 +5,36 @@ use polaris_config_engine::user_config::dns_constants::BLOCK_SERVER_ID;
 
 mod auto_select;
 
+#[test]
+fn saved_dashboard_preference_only_changes_the_desktop_runtime() {
+    for (platform, needs_restart) in [
+        (Platform::Linux, true),
+        (Platform::Android, false),
+        (Platform::Ios, false),
+    ] {
+        let (rt, _dir) = test_runtime_on(platform);
+        rt.config
+            .save_full(&two_node_config(7891, "node-a"))
+            .unwrap();
+        let running = rt.config.current().unwrap();
+        mark_running_with_snapshot(&rt, &running);
+        cover_running_binding_roots(&rt, &running);
+        *rt.startup_snapshot.write().unwrap() = Some(running.clone());
+
+        let mut saved = running;
+        saved["singboxDashboard"] = true.into();
+        let preview = rt.classify_staged(&saved);
+        assert_eq!(preview.restart_required, needs_restart, "{platform:?}");
+        assert_eq!(preview.pending_apply, needs_restart, "{platform:?}");
+
+        rt.config.save_full(&saved).unwrap();
+        assert_eq!(rt.config.current().unwrap()["singboxDashboard"], true);
+        let pending = rt.pending_changes();
+        assert_eq!(pending.restart_required, needs_restart, "{platform:?}");
+        assert_eq!(pending.pending_apply, needs_restart, "{platform:?}");
+    }
+}
+
 fn explicit_selection_fixture() -> (Arc<ProxyRuntime>, TestDir, Arc<TestPutSink>, Value) {
     let (rt, dir) = test_runtime();
     let running = two_node_config(7891, "node-a");
@@ -4978,8 +5008,7 @@ async fn real_core_hot_switch_keeps_pid() {
     // ── ① 起核（两节点，选中 Node A）────────────────────────────────────────
     // 生产时序：save_full 落盘 → broadcast_config_changed → switch_mode。测试逐条照做，
     // 否则去抖重启回落读磁盘时会拿到默认配置（restart 腿的载荷来自 config.current()）。
-    // Keep the production default enabled; only replace unrelated Internet ZIP
-    // download with this test's own inert static bundle via the real resolver.
+    // Opt in with an inert static bundle resolved by the production path.
     let dashboard = rt.config.dir().join("singbox-dashboard");
     std::fs::create_dir_all(&dashboard).unwrap();
     std::fs::write(
@@ -4991,11 +5020,8 @@ async fn real_core_hot_switch_keeps_pid() {
         super::super::core_binary::resolve_dashboard_serve_dir(rt.config.dir()),
         Some(dashboard.to_string_lossy().into_owned())
     );
-    let cfg_a = two_node_config_ports(mixed, "node-a", pa, pb);
-    assert_eq!(
-        cfg_a["singboxDashboard"], true,
-        "production default dashboard must stay enabled"
-    );
+    let mut cfg_a = two_node_config_ports(mixed, "node-a", pa, pb);
+    cfg_a["singboxDashboard"] = true.into();
     rt.config.save_full(&cfg_a).expect("落盘应成功");
     let started = rt.start(cfg_a.clone()).await;
     // These are the actual bytes written by the production generator for this
@@ -5012,7 +5038,7 @@ async fn real_core_hot_switch_keeps_pid() {
             "configJson":String::from_utf8(raw).expect("generator emits UTF-8 JSON"),
             "publicationEligible":false,
         });
-        println!("\nPOLARIS_DEFAULT_GRAPH {record}");
+        println!("\nPOLARIS_DASHBOARD_OPT_IN_GRAPH {record}");
     }
     let st = started.expect("起核应成功");
     let pid1 = st.pid;
@@ -5035,7 +5061,8 @@ async fn real_core_hot_switch_keeps_pid() {
     println!("[①] 热切换基准 id→tag = {snap_tags:?}");
 
     // ── ② 切节点 → 热切换，PID 不变（**核心判据**）───────────────────────────
-    let cfg_b = two_node_config_ports(mixed, "node-b", pa, pb);
+    let mut cfg_b = two_node_config_ports(mixed, "node-b", pa, pb);
+    cfg_b["singboxDashboard"] = true.into();
     rt.config.save_full(&cfg_b).expect("落盘应成功");
     let out = rt.switch_mode(cfg_b.clone()).await;
     println!("[②] switch_mode（node-a → node-b）→ {out:?}");
@@ -5126,7 +5153,8 @@ async fn real_core_hot_switch_keeps_pid() {
 
     // Structural edit is deferred first. Only explicit confirmation may change PID.
     let mixed2 = free_port();
-    let cfg_port = two_node_config_ports(mixed2, "node-b", pa, pb);
+    let mut cfg_port = two_node_config_ports(mixed2, "node-b", pa, pb);
+    cfg_port["singboxDashboard"] = true.into();
     rt.config.save_full(&cfg_port).expect("落盘应成功");
     let out = rt.switch_mode(cfg_port).await;
     println!("[④] switch_mode（改 mixedPort {mixed} → {mixed2}）→ {out:?}");

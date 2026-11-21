@@ -18,6 +18,7 @@ fn load_missing_file_returns_default_and_marks_was_missing() {
         serde_json::json!("systemProxy")
     );
     assert_eq!(res.config["mixedPort"], serde_json::json!(7890));
+    assert_eq!(res.config["singboxDashboard"], false);
     assert_eq!(
         res.config["dnsDefaults"]["realQueryFallbackAction"],
         serde_json::json!({"type":"server","serverId":"builtin-remote"})
@@ -187,6 +188,7 @@ fn load_valid_config_round_trips_through_save() {
         "logLevel": "warn",
         "mixedPort": 8080,
         "controlPort": 9091,
+        "singboxDashboard": true,
         "servers": [{"id":"s1","name":"HK","protocol":"trojan","address":"1.2.3.4","port":443,"password":"pw"}],
         "customRules": [{"id":"r1","type":"domain","values":["a.com"],"action":"direct","enabled":true}],
         "tunConfig": {"mtu":1400,"autoRoute":true,"strictRoute":false}
@@ -198,6 +200,7 @@ fn load_valid_config_round_trips_through_save() {
     assert_eq!(res.config["proxyMode"], serde_json::json!("smart"));
     assert_eq!(res.config["proxyModeType"], serde_json::json!("tun"));
     assert_eq!(res.config["mixedPort"], serde_json::json!(8080));
+    assert_eq!(res.config["singboxDashboard"], true);
     assert_eq!(res.config["servers"].as_array().unwrap().len(), 1);
     assert_eq!(res.config["customRules"].as_array().unwrap().len(), 1);
 }

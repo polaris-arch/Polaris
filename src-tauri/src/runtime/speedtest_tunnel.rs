@@ -90,6 +90,15 @@ pub enum TunnelError {
     NotReusable,
     /// 连不上本机代理口本身（被拒 / 句柄或临时端口耗尽）：故障在本机一侧，与被测节点无关。
     Local,
+    /// Core declined the CONNECT before allocating an outbound engine.
+    BudgetBusy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConnectProbe {
+    Standard,
+    Foreground,
+    Background,
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -161,10 +170,15 @@ impl SpeedTestTarget {
     /// `auth` 非空时带 `Proxy-Authorization`（Android 上 `probe-in-k` 要求本次起核的一次性凭据；
     /// 缺了内核回 407 ⇒ 该节点本轮记 -1，且全池一起 -1）。凭据**只**出现在这条 CONNECT 里：
     /// 隧道建成后我们面对的是 origin，逐跳头不得带过去（[`Self::get_request`] 一个字都不加）。
-    fn connect_request(&self, auth: Option<&InboundUser>) -> String {
+    fn connect_request(&self, auth: Option<&InboundUser>, probe: ConnectProbe) -> String {
         let a = self.authority();
         let proxy_auth = proxy_authorization_line(auth);
-        format!("CONNECT {a} HTTP/1.1\r\nHost: {a}\r\n{proxy_auth}\r\n")
+        let probe_header = match probe {
+            ConnectProbe::Standard => "",
+            ConnectProbe::Foreground => "X-Polaris-Probe: 1\r\n",
+            ConnectProbe::Background => "X-Polaris-Probe: background\r\n",
+        };
+        format!("CONNECT {a} HTTP/1.1\r\nHost: {a}\r\n{probe_header}{proxy_auth}\r\n")
     }
 
     /// 隧道上的 GET 报文 —— **origin-form**（`GET /path HTTP/1.1`），不是 absolute-form。
@@ -549,6 +563,26 @@ async fn read_response_status<S: AsyncRead + Unpin>(
     }
 }
 
+fn connect_error(code: u16, buf: &[u8]) -> TunnelError {
+    // Only the local proxy's final CONNECT response may defer a probe. A plain
+    // 503 or the same header on a tunneled origin response remains a failure.
+    if code == 503
+        && response_head_range(buf).is_some_and(|(start, end)| {
+            buf[start..end].split(|&b| b == b'\n').skip(1).any(|line| {
+                let Some(colon) = line.iter().position(|&b| b == b':') else {
+                    return false;
+                };
+                line[..colon].eq_ignore_ascii_case(b"x-polaris-probe-outcome")
+                    && line[colon + 1..].trim_ascii() == b"budget-busy"
+            })
+        })
+    {
+        TunnelError::BudgetBusy
+    } else {
+        TunnelError::ConnectStatus(code)
+    }
+}
+
 /// 建 CONNECT 隧道：TCP 连本机代理口 → 发 CONNECT → 读响应（**非 2xx 即失败**）→ https 目标再在
 /// 隧道上做一次 TLS 握手。
 ///
@@ -567,13 +601,14 @@ async fn read_response_status<S: AsyncRead + Unpin>(
 ///
 /// socket 一连上本机代理口、**还没写出任何字节**时，把它的本机源端口交给 `announce`。代理要读到
 /// CONNECT 才会为这条连接建记录，所以 `announce` 恒早于那条记录。
-pub async fn open_tunnel(
+pub(crate) async fn open_tunnel(
     proxy_port: u16,
     auth: Option<&InboundUser>,
     target: &SpeedTestTarget,
+    probe: ConnectProbe,
     announce: &(dyn Fn(u16) + Sync),
 ) -> Result<SpeedTestTunnel, TunnelError> {
-    open_tunnel_with_tls_config(proxy_port, auth, target, announce, tls_client_config).await
+    open_tunnel_with_tls_config(proxy_port, auth, target, probe, announce, tls_client_config).await
 }
 
 // The only production caller supplies the platform-verifying configuration.
@@ -582,6 +617,7 @@ async fn open_tunnel_with_tls_config(
     proxy_port: u16,
     auth: Option<&InboundUser>,
     target: &SpeedTestTarget,
+    probe: ConnectProbe,
     announce: &(dyn Fn(u16) + Sync),
     tls_config: impl FnOnce() -> Option<Arc<rustls::ClientConfig>> + Send,
 ) -> Result<SpeedTestTunnel, TunnelError> {
@@ -595,7 +631,7 @@ async fn open_tunnel_with_tls_config(
         announce(local.port());
     }
 
-    sock.write_all(target.connect_request(auth).as_bytes())
+    sock.write_all(target.connect_request(auth, probe).as_bytes())
         .await
         .map_err(io)?;
     sock.flush().await.map_err(io)?;
@@ -605,8 +641,11 @@ async fn open_tunnel_with_tls_config(
         .await
         .ok_or(TunnelError::Transport)?;
     if !is_acceptable_status(code) {
-        // 代理拒绝建隧道（典型 502 = 出站拨不通）→ 该节点本轮不可测，上层记 -1。
-        return Err(TunnelError::ConnectStatus(code));
+        return Err(if probe == ConnectProbe::Standard {
+            TunnelError::ConnectStatus(code)
+        } else {
+            connect_error(code, &buf)
+        });
     }
     // 200 之后缓冲里的任何残余都是代理抢发的非请求数据（sing 的 CONNECT 腿写完 200 就交棒，
     // 不会再写）→ 与 上游 一致地丢弃（node 的 'connect' 事件同样把 `head` 参数弃之不用）。

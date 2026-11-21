@@ -6,7 +6,6 @@ use crate::runtime::auto_switch::RuntimeCandidate;
 use crate::runtime::config::Decision;
 use crate::runtime::stats::relay::{build_aggregate, now_ms, signature_changed};
 use futures::{FutureExt, StreamExt};
-use polaris_config_engine::builder::mesh_mode::DASHBOARD_SELECTOR;
 use polaris_core_supervisor::Signal;
 use polaris_singbox_grpc::{Endpoint, SingBoxApiClient};
 use std::panic::AssertUnwindSafe;
@@ -564,8 +563,7 @@ async fn real_core_hot_switch_keeps_pid() {
     // ── ① 起核（两节点，选中 Node A）────────────────────────────────────────
     // 生产时序：ConfigManager::update 落盘 → broadcast_config_changed → switch_mode_with。逐条照做，
     // 否则去抖重启回落读磁盘时会拿到默认配置（restart 腿的载荷来自 config.current()）。
-    // Keep the production default enabled; only replace unrelated Internet ZIP
-    // download with this test's own inert static bundle via the real resolver.
+    // Opt in with an inert static bundle resolved by the production path.
     let dashboard = rt.config.dir().join("singbox-dashboard");
     std::fs::create_dir_all(&dashboard).unwrap();
     std::fs::write(
@@ -577,11 +575,8 @@ async fn real_core_hot_switch_keeps_pid() {
         super::core_binary::resolve_dashboard_serve_dir(rt.config.dir()),
         Some(dashboard.to_string_lossy().into_owned())
     );
-    let cfg_a = two_node_config_ports(mixed, "node-a", pa, pb);
-    assert_eq!(
-        cfg_a["singboxDashboard"], true,
-        "production default dashboard must stay enabled"
-    );
+    let mut cfg_a = two_node_config_ports(mixed, "node-a", pa, pb);
+    cfg_a["singboxDashboard"] = true.into();
     rt.config
         .update(|current| {
             *current = cfg_a.clone();
@@ -604,7 +599,7 @@ async fn real_core_hot_switch_keeps_pid() {
             "configJson":String::from_utf8(raw).expect("generator emits UTF-8 JSON"),
             "publicationEligible":false,
         });
-        println!("\nPOLARIS_DEFAULT_GRAPH {record}");
+        println!("\nPOLARIS_DASHBOARD_OPT_IN_GRAPH {record}");
     }
     let st = started.expect("起核应成功");
     let pid1 = st.pid;
@@ -627,7 +622,8 @@ async fn real_core_hot_switch_keeps_pid() {
     println!("[①] 热切换基准 id→tag = {snap_tags:?}");
 
     // ── ② 切节点 → 热切换，PID 不变（**核心判据**）───────────────────────────
-    let cfg_b = two_node_config_ports(mixed, "node-b", pa, pb);
+    let mut cfg_b = two_node_config_ports(mixed, "node-b", pa, pb);
+    cfg_b["singboxDashboard"] = true.into();
     rt.config
         .update(|current| {
             *current = cfg_b.clone();
@@ -730,7 +726,8 @@ async fn real_core_hot_switch_keeps_pid() {
 
     // Structural edit is deferred first. Only explicit confirmation may change PID.
     let mixed2 = free_port();
-    let cfg_port = two_node_config_ports(mixed2, "node-b", pa, pb);
+    let mut cfg_port = two_node_config_ports(mixed2, "node-b", pa, pb);
+    cfg_port["singboxDashboard"] = true.into();
     rt.config
         .update(|current| {
             *current = cfg_port.clone();

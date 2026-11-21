@@ -150,7 +150,7 @@ const RAW_JSON_REGISTRY: &[RawJsonSite] = &[
     ),
     (
         "src-tauri/src/runtime/proxy/runtime_config.rs",
-        "[ \"proxyModeType\", \"mixedPort\", \"httpPort\", \"allowLan\", \"singboxDashboard\", ] .iter() .any(|key| old.get(*key) != new.get(*key)) || structural_tun_change(old.get(\"tunConfig\"), new.get(\"tunConfig\")) || super::dns_takeover::host_dns_takeover_changed(platform, old, new)",
+        "[\"proxyModeType\", \"mixedPort\", \"httpPort\", \"allowLan\"] .iter() .any(|key| old.get(*key) != new.get(*key)) || dashboard_enabled(old) != dashboard_enabled(new) || structural_tun_change(old.get(\"tunConfig\"), new.get(\"tunConfig\")) || super::dns_takeover::host_dns_takeover_changed(platform, old, new)",
         1,
         "The array previews opaque D/R physical/service setting differences, not Android's effective takeover mode. The added host DNS projection returns false before raw reads on Android/iOS/Windows/Other; Mac/Linux normalize the typed mode with effective_on(platform).is_tun(). This preview is reachable on Android: Core changes still require the effective generated configuration's Plan, while host DNS changes require a separate explicit application-managed restart choice.",
     ),

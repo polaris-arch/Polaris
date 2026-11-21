@@ -59,12 +59,12 @@ fn rejects_non_http_schemes_and_hostless_urls() {
 fn connect_request_always_carries_an_explicit_port() {
     let t = SpeedTestTarget::parse("http://www.gstatic.com/generate_204").unwrap();
     assert_eq!(
-        t.connect_request(None),
+        t.connect_request(None, ConnectProbe::Standard),
         "CONNECT www.gstatic.com:80 HTTP/1.1\r\nHost: www.gstatic.com:80\r\n\r\n"
     );
     let t = SpeedTestTarget::parse("https://example.com/x").unwrap();
     assert!(t
-        .connect_request(None)
+        .connect_request(None, ConnectProbe::Foreground)
         .starts_with("CONNECT example.com:443 HTTP/1.1\r\n"));
 }
 
@@ -81,21 +81,61 @@ fn connect_request_presents_the_loopback_credential_only_on_connect() {
     };
     let t = SpeedTestTarget::parse("https://example.com/generate_204").unwrap();
     let expected = format!(
-        "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\nProxy-Authorization: Basic {}\r\n\r\n",
+        "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\nX-Polaris-Probe: 1\r\nProxy-Authorization: Basic {}\r\n\r\n",
         crate::runtime::mesh::base64_encode(b"polaris:0123456789abcdef0123456789abcdef")
     );
-    assert_eq!(t.connect_request(Some(&user)), expected);
+    assert_eq!(
+        t.connect_request(Some(&user), ConnectProbe::Foreground),
+        expected
+    );
+    assert_eq!(
+        t.connect_request(Some(&user), ConnectProbe::Background),
+        expected.replace("X-Polaris-Probe: 1", "X-Polaris-Probe: background")
+    );
     assert!(
         !t.get_request()
             .to_ascii_lowercase()
             .contains("proxy-authorization"),
         "凭据不得跟进隧道内的 GET"
     );
-    // 反向对照：无凭据 ⇒ 与改动前逐字节相同（桌面形态不变）。
+    assert!(!t.get_request().contains("X-Polaris-Probe"));
     assert_eq!(
-        t.connect_request(None),
-        "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n"
+        t.connect_request(None, ConnectProbe::Foreground),
+        "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\nX-Polaris-Probe: 1\r\n\r\n"
     );
+}
+
+#[tokio::test]
+async fn only_the_typed_connect_reply_defers_an_opted_in_probe() {
+    let tagged = "HTTP/1.1 503 Service Unavailable\r\nx-polaris-probe-outcome: budget-busy\r\n\r\n";
+    let untagged = "HTTP/1.1 503 Service Unavailable\r\n\r\nbudget-busy";
+    for (probe, reply, expected) in [
+        (ConnectProbe::Foreground, tagged, TunnelError::BudgetBusy),
+        (ConnectProbe::Background, tagged, TunnelError::BudgetBusy),
+        (
+            ConnectProbe::Background,
+            untagged,
+            TunnelError::ConnectStatus(503),
+        ),
+        (
+            ConnectProbe::Standard,
+            tagged,
+            TunnelError::ConnectStatus(503),
+        ),
+        (
+            ConnectProbe::Foreground,
+            "HTTP/1.1 502 Bad Gateway\r\nX-Polaris-Probe-Outcome: budget-busy\r\n\r\n",
+            TunnelError::ConnectStatus(502),
+        ),
+    ] {
+        let (port, _) = spawn_mock_proxy(Script {
+            connect_reply: Some(reply),
+            gets: Vec::new(),
+        })
+        .await;
+        let result = open_tunnel(port, None, &http_target(), probe, &|_| {}).await;
+        assert_eq!(result.err(), Some(expected));
+    }
 }
 
 /// 🔴 隧道上的 GET 必须是 **origin-form**（absolute-form 是改前那条错路的形态）。
@@ -195,7 +235,7 @@ async fn measure_detailed(
     crate::commands::speedtest::measure_warm_ttfb(
         budget,
         budget,
-        open_tunnel(port, None, target, &|_| {}),
+        open_tunnel(port, None, target, ConnectProbe::Standard, &|_| {}),
     )
     .await
 }
@@ -602,12 +642,18 @@ async fn the_source_port_is_announced_before_any_byte_is_sent() {
     })
     .await;
     let announced = std::sync::Mutex::new(Vec::new());
-    let _tunnel = open_tunnel(port, None, &http_target(), &|source_port| {
-        // 回环上给代理留足读到 CONNECT 的时间：字节若已发出，这里一定看得到请求行。
-        std::thread::sleep(Duration::from_millis(50));
-        let seen_requests = observed.lock().unwrap().request_lines.len();
-        announced.lock().unwrap().push((source_port, seen_requests));
-    })
+    let _tunnel = open_tunnel(
+        port,
+        None,
+        &http_target(),
+        ConnectProbe::Standard,
+        &|source_port| {
+            // 回环上给代理留足读到 CONNECT 的时间：字节若已发出，这里一定看得到请求行。
+            std::thread::sleep(Duration::from_millis(50));
+            let seen_requests = observed.lock().unwrap().request_lines.len();
+            announced.lock().unwrap().push((source_port, seen_requests));
+        },
+    )
     .await
     .expect("隧道建成");
     let peer_port = observed.lock().unwrap().peer_port.expect("代理接到了连接");

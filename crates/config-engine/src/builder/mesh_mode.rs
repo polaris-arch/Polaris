@@ -1,7 +1,7 @@
 //! Compile both selected-exit policies into one immutable core configuration.
 //!
 //! The old builder remains the oracle for each policy. We admit dynamic switching only when
-//! every non-route/DNS difference is the raw selector's default (or the dashboard's exit),
+//! every non-route/DNS difference is the raw selector's default,
 //! and every route/DNS difference can be guarded by `clash_mode`. Failure leaves the original
 //! configuration untouched, so the existing restart path remains authoritative.
 
@@ -10,12 +10,37 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::builder::endpoint_routes::mesh_node_carries_full_tunnel;
 use crate::singbox::{ClashApi, DnsRule, DnsServer, Outbound, RouteRule, SingBoxConfig};
 use crate::user_config::app_config::UserConfig;
-use crate::user_config::dns_constants::PROXY_SELECTOR_TAG;
+use crate::user_config::dns_constants::{DIRECT_TAG, PROXY_SELECTOR_TAG};
 use crate::user_config::server_config::{Protocol, ServerConfig};
 
 pub const NORMAL: &str = "normal";
 pub const MESH_DIRECT: &str = "mesh-direct";
 pub const DASHBOARD_SELECTOR: &str = "polaris-dashboard-exit";
+
+/// Recognize the Dashboard selector in older compiled graphs. Node names can share its tag.
+pub fn dashboard_mode_selector(config: &SingBoxConfig) -> Option<&Outbound> {
+    let dashboard_uses_selector = config.services.as_deref()?.iter().any(|service| {
+        service.type_field == "api"
+            && service.dashboard.as_ref().is_some_and(|dashboard| {
+                dashboard.enabled
+                    && dashboard
+                        .http_client
+                        .as_ref()
+                        .is_some_and(|client| client.detour == DASHBOARD_SELECTOR)
+            })
+    });
+    if !dashboard_uses_selector {
+        return None;
+    }
+    config.outbounds.iter().find(|outbound| {
+        outbound.tag == DASHBOARD_SELECTOR
+            && outbound.type_field == "selector"
+            && outbound
+                .outbounds
+                .as_deref()
+                .is_some_and(|members| members == [DIRECT_TAG, PROXY_SELECTOR_TAG])
+    })
+}
 
 /// The retained mode names alone do not prove both routing policies are active.
 pub fn has_compiled_modes(config: &SingBoxConfig) -> bool {
@@ -123,15 +148,6 @@ fn normalize_non_policy(config: &SingBoxConfig) -> SingBoxConfig {
         .find(|o| o.tag == PROXY_SELECTOR_TAG)
     {
         selector.default = None;
-    }
-    if let Some(services) = copy.services.as_mut() {
-        for service in services {
-            if let Some(dashboard) = service.dashboard.as_mut() {
-                if let Some(client) = dashboard.http_client.as_mut() {
-                    client.detour.clear();
-                }
-            }
-        }
     }
     copy
 }
@@ -483,31 +499,10 @@ pub fn try_compile(
         return false;
     }
 
-    let dashboard_present = actual
-        .services
-        .as_ref()
-        .is_some_and(|services| services.iter().any(|s| s.dashboard.is_some()));
-    if dashboard_present && actual.outbounds.iter().any(|o| o.tag == DASHBOARD_SELECTOR) {
-        return false;
-    }
     if actual.experimental.is_none() {
         return false;
     }
-    let dashboard_selector = if dashboard_present {
-        let selector = serde_json::from_value::<Outbound>(serde_json::json!({
-            "type": "selector", "tag": DASHBOARD_SELECTOR,
-            "outbounds": ["direct", PROXY_SELECTOR_TAG],
-            "default": if selected_mode == MESH_DIRECT { "direct" } else { PROXY_SELECTOR_TAG }
-        }))
-        .ok();
-        let Some(selector) = selector else {
-            return false;
-        };
-        Some(selector)
-    } else {
-        None
-    };
-    // No partial mutation: every fallible comparison and conversion above has completed.
+    // No partial mutation: every fallible comparison above has completed.
     let mut staged = actual.clone();
     let mut compiled_route = normal_route.clone();
     compiled_route.rules = route_rules;
@@ -523,18 +518,6 @@ pub fn try_compile(
         experimental.clash_api = Some(ClashApi {
             default_mode: mode.into(),
         });
-    }
-    if let Some(selector) = dashboard_selector {
-        staged.outbounds.push(selector);
-        if let Some(services) = staged.services.as_mut() {
-            for service in services {
-                if let Some(dashboard) = service.dashboard.as_mut() {
-                    if let Some(client) = dashboard.http_client.as_mut() {
-                        client.detour = DASHBOARD_SELECTOR.into();
-                    }
-                }
-            }
-        }
     }
     *actual = staged;
     true

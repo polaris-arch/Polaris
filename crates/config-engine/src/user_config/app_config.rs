@@ -211,7 +211,7 @@ pub struct UserConfig {
     /// clash_api/management api 鉴权 secret。上游 `clashApiSecret`。generateSingBoxConfig 注入 `services[0].secret`。
     #[serde(rename = "clashApiSecret", skip_serializing_if = "Option::is_none")]
     pub clash_api_secret: Option<String>,
-    /// sing-box 1.14 官方面板 opt-in 开关。上游 `singboxDashboard`。on 时注入 `services[0].dashboard`。
+    /// 桌面 sing-box Web Dashboard 的 opt-in 开关。启用时注入 `services[0].dashboard`。
     #[serde(rename = "singboxDashboard", skip_serializing_if = "Option::is_none")]
     pub singbox_dashboard: Option<bool>,
     // ── 日志两轴：只为 norm 可见性入列，值的解释权不在这里 ──────────────────────────────

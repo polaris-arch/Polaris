@@ -43,11 +43,12 @@ use polaris_config_engine::builder::custom_rule_files::is_custom_rule_orphan_fil
 use polaris_config_engine::builder::endpoint_routes::{
     mesh_system_supported_on_platform, mesh_uses_system_interface,
 };
+use polaris_config_engine::builder::generate::dashboard_enabled_on;
 use polaris_config_engine::builder::helpers::ServerLike;
 use polaris_config_engine::builder::inbounds::{
     emits_mixed_inbound, loopback_inbounds_require_auth,
 };
-use polaris_config_engine::builder::mesh_mode::DASHBOARD_SELECTOR;
+use polaris_config_engine::builder::mesh_mode::{dashboard_mode_selector, DASHBOARD_SELECTOR};
 use polaris_config_engine::builder::network_env::{
     builtin_dhcp_status, resolved_probe, BuiltinDhcpStatus, NetworkCanaryPlan, ProbeFacts,
     PrunedEnvRule, ResolvedProbe,
@@ -1142,11 +1143,7 @@ impl ProxyRuntime {
         {
             return Err("TS mode 启动校正读回不符".into());
         }
-        if let Some(dashboard) = generated
-            .outbounds
-            .iter()
-            .find(|o| o.tag == DASHBOARD_SELECTOR)
-        {
+        if let Some(dashboard) = dashboard_mode_selector(generated) {
             let Some(want) = dashboard.default.as_deref() else {
                 return Err("仪表盘出口 selector 缺少默认成员".into());
             };
@@ -1714,6 +1711,12 @@ impl ProxyRuntime {
                 &config,
                 takeover_active,
             );
+            if dashboard_enabled_on(
+                Platform::parse(&deps.platform),
+                user_config.singbox_dashboard,
+            ) {
+                deps.dashboard_serve_dir = resolve_dashboard_serve_dir(self.config.dir());
+            }
             #[cfg(target_os = "android")]
             {
                 deps.custom_rules_dir = android_rule_assets.custom.to_string_lossy().into_owned();
@@ -4272,9 +4275,7 @@ impl ProxyRuntime {
             privacy_mode: self.privacy_mode_active(),
             log_level,
             disable_log_file,
-            // dashboard #55 回归修复：此前硬编码 None → 面板开关 on 时核无 path → 联网下载兜底 → CWD 相对 mkdir 噪音。
-            // 改为解析「运行时下载覆盖 > 随包内置 resources/dashboard」（对齐 上游）→ 命中则核 serve 本地、零下载。
-            dashboard_serve_dir: resolve_dashboard_serve_dir(dir),
+            dashboard_serve_dir: None,
             tailscale_api_port: api_port,
             cache_path: dir.join("cache.db").to_string_lossy().into_owned(),
             // B3/W26：不再让 sing-box 自己持有固定 output fd。子进程不会响应外部轮转：Unix rename

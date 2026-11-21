@@ -19,6 +19,7 @@ use serde_json::Value;
 use crate::runtime::config::DeferredConfigDeletion;
 use crate::runtime::node_fingerprints;
 
+use super::runtime_config::user_config_for_runtime_comparison;
 use super::startup::server_ids;
 use super::ProxyRuntime;
 
@@ -111,8 +112,8 @@ fn non_node_runtime_debt(applied: &Value, disk: &Value, platform: Platform) -> O
     {
         return Some(true);
     }
-    let applied: UserConfig = serde_json::from_value(applied.clone()).ok()?;
-    let disk: UserConfig = serde_json::from_value(disk.clone()).ok()?;
+    let applied = user_config_for_runtime_comparison(applied.clone(), platform).ok()?;
+    let disk = user_config_for_runtime_comparison(disk.clone(), platform).ok()?;
     let no_servers = BTreeSet::new();
     Some(
         config_generation_norm(&applied, Some(&no_servers))

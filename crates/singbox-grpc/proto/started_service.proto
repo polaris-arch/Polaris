@@ -518,11 +518,16 @@ message Status {
 
 message SubscribeConnectionsRequest {
   int64 interval = 1;
+  // Opt in to bounded native frames and an explicit end to the initial reset.
+  bool batchFrames = 2;
 }
 
 message ConnectionEvents {
   repeated ConnectionEvent events = 1;
   bool reset = 2;
+  // In a batched snapshot, data frames carry false and only the first carries reset.
+  // An empty frame with true commits the snapshot. Deltas and legacy frames omit it.
+  optional bool snapshotComplete = 3;
 }
 
 message ConnectionSnapshotEntry {

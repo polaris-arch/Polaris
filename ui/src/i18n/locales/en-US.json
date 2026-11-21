@@ -2479,7 +2479,7 @@
     "speedTest": "Latency",
     "speedTestDone": "Speed test complete",
     "speedTestInterrupted": "Speed test interrupted",
-    "speedTestTooManyNaive": "Too many naive nodes selected for one speed-test core: each naive node needs its own network engine and the core starts them one by one. Test at most about {{max}} at a time — select fewer naive nodes and run the test in batches.",
+    "speedTestTooManyNaive": "The speed test exceeds the engine budget. Select fewer Naive nodes or lower concurrency on custom nodes.",
     "speedTestCoreExited": "Speed-test core exited",
     "speedTestCoreUnresponsive": "Speed-test core stopped responding",
     "speedTestCancelled": "Speed test cancelled",

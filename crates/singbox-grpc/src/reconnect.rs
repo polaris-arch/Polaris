@@ -3,26 +3,25 @@
 //! 对齐 上游 `subscribeStream`（singbox-api-client.ts L647）：server-streaming 订阅独立连接，
 //! 断开（stream `error`/`end`）后按固定间隔（2s）重建——重新建 client + 重新发 Subscribe 请求。
 //!
-//! [`ReconnectingStream<T>`] 实现 [`futures_core::Stream`]：内部持有一个 tonic `Streaming<T>`，
+//! [`ReconnectingStream<T>`] 实现 [`futures_core::Stream`]：内部持有一条 gRPC 订阅流，
 //! `poll_next` 时若底层流结束/出错，sleep `backoff` 后**重新调用连接器**重连，继续派发后续帧。
 //! 重连失败也只退避重试，不向消费方 yield 错误（对齐 Polaris：`error`/`end` → scheduleReconnect，不 throw）。
 //!
-//! 连接过程经 [`Reconnect`] trait 对象化——`Status` 与 `ConnectionEvents` 两条流各自具化一个实现，
-//! 规避「tonic `Streaming<Status>` 与 `Streaming<ConnectionEvents>` 是不同具体类型」的泛型分发难题。
+//! 连接器经 [`Reconnect`] 返回对应的订阅流。
 //!
 //! 边界：消费方 `drop` 该 stream → 重连 future 被 drop，后台自然停（对齐 Polaris 返回的 stop 句柄）。
 
 use crate::daemon;
 use crate::h2c;
+use crate::ConnectionEventStream;
 use core::future::Future;
 use daemon::started_service_client::StartedServiceClient;
 use futures_core::{ready, Stream};
-use futures_util::StreamExt;
+use futures_util::{stream::BoxStream, StreamExt};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::time::Sleep;
-use tonic::codec::Streaming;
 // **门面必须与本仓真实接了 sink 的那个一致**：`log` 由 `src-tauri/src/logging.rs` 用
 // `log::set_logger` 接到 stderr + 文件 + 内存环形缓冲。此前这里用的是 `tracing`，而全仓没有
 // 任何 `tracing-subscriber` / `set_global_default` ⇒ 下面这几行**恒为 no-op，输出去向为空**。
@@ -53,18 +52,16 @@ impl ReconnectConfig {
     }
 }
 
-/// 连接器：每次（重）连时建 channel + client + 发 Subscribe 请求，返回 tonic `Streaming<T>`。
-/// `Status` / `ConnectionEvents` 各自具化（避开 tonic 不同 Streaming 类型无法泛型分发）。
+type Subscription<T> = BoxStream<'static, Result<T, tonic::Status>>;
+type OpenSubscription<T> = Pin<Box<dyn Future<Output = Result<Subscription<T>, String>> + Send>>;
+
+/// 连接器：每次（重）连时建 channel + client + 发 Subscribe 请求。
 ///
 /// `open` 克隆 target/secret 进 future（owned 数据），返回 `'static` future——避免借用 lifetime 纠缠。
 trait Reconnect<T>: Send + Sync + 'static {
     /// 建连并返回流。interval_ns 不可变（构造时固定），重连只换底层连接。
-    fn open(
-        &self,
-        target: String,
-        secret: Option<String>,
-        interval_ns: i64,
-    ) -> Pin<Box<dyn Future<Output = Result<Streaming<T>, String>> + Send>>;
+    fn open(&self, target: String, secret: Option<String>, interval_ns: i64)
+        -> OpenSubscription<T>;
 }
 
 /// 注入 Bearer metadata（h2c per-call auth，对齐 Polaris authMetadata）。secret 空则免认证。
@@ -93,7 +90,7 @@ impl Reconnect<daemon::Status> for StatusReconnect {
         target: String,
         secret: Option<String>,
         interval_ns: i64,
-    ) -> Pin<Box<dyn Future<Output = Result<Streaming<daemon::Status>, String>> + Send>> {
+    ) -> OpenSubscription<daemon::Status> {
         Box::pin(async move {
             let channel = h2c::connect_h2c(&target)
                 .await
@@ -109,7 +106,7 @@ impl Reconnect<daemon::Status> for StatusReconnect {
                 .subscribe_status(req)
                 .await
                 .map_err(|e| format!("SubscribeStatus: {e}"))
-                .map(|r| r.into_inner())
+                .map(|r| r.into_inner().boxed())
         })
     }
 }
@@ -123,8 +120,7 @@ impl Reconnect<daemon::ConnectionEvents> for ConnectionsReconnect {
         target: String,
         secret: Option<String>,
         interval_ns: i64,
-    ) -> Pin<Box<dyn Future<Output = Result<Streaming<daemon::ConnectionEvents>, String>> + Send>>
-    {
+    ) -> OpenSubscription<daemon::ConnectionEvents> {
         Box::pin(async move {
             let channel = h2c::connect_h2c(&target)
                 .await
@@ -135,13 +131,14 @@ impl Reconnect<daemon::ConnectionEvents> for ConnectionsReconnect {
                 &secret,
                 daemon::SubscribeConnectionsRequest {
                     interval: interval_ns,
+                    batch_frames: true,
                 },
             )?;
             client
                 .subscribe_connections(req)
                 .await
                 .map_err(|e| format!("SubscribeConnections: {e}"))
-                .map(|r| r.into_inner())
+                .map(|r| ConnectionEventStream::new(r.into_inner()).boxed())
         })
     }
 }
@@ -159,9 +156,7 @@ impl Reconnect<daemon::TailscaleStatusUpdate> for TailscaleStatusReconnect {
         target: String,
         secret: Option<String>,
         _interval_ns: i64,
-    ) -> Pin<
-        Box<dyn Future<Output = Result<Streaming<daemon::TailscaleStatusUpdate>, String>> + Send>,
-    > {
+    ) -> OpenSubscription<daemon::TailscaleStatusUpdate> {
         Box::pin(async move {
             let channel = h2c::connect_h2c(&target)
                 .await
@@ -172,7 +167,7 @@ impl Reconnect<daemon::TailscaleStatusUpdate> for TailscaleStatusReconnect {
                 .subscribe_tailscale_status(req)
                 .await
                 .map_err(|e| format!("SubscribeTailscaleStatus: {e}"))
-                .map(|r| r.into_inner())
+                .map(|r| r.into_inner().boxed())
         })
     }
 }
@@ -186,9 +181,7 @@ impl Reconnect<daemon::OpenConnectStatusUpdate> for OpenConnectStatusReconnect {
         target: String,
         secret: Option<String>,
         _interval_ns: i64,
-    ) -> Pin<
-        Box<dyn Future<Output = Result<Streaming<daemon::OpenConnectStatusUpdate>, String>> + Send>,
-    > {
+    ) -> OpenSubscription<daemon::OpenConnectStatusUpdate> {
         Box::pin(async move {
             let channel = h2c::connect_h2c(&target)
                 .await
@@ -199,7 +192,7 @@ impl Reconnect<daemon::OpenConnectStatusUpdate> for OpenConnectStatusReconnect {
                 .subscribe_open_connect_status(req)
                 .await
                 .map_err(|e| format!("SubscribeOpenConnectStatus: {e}"))
-                .map(|r| r.into_inner())
+                .map(|r| r.into_inner().boxed())
         })
     }
 }
@@ -213,8 +206,7 @@ impl Reconnect<daemon::OpenVpnStatusUpdate> for OpenVpnStatusReconnect {
         target: String,
         secret: Option<String>,
         _interval_ns: i64,
-    ) -> Pin<Box<dyn Future<Output = Result<Streaming<daemon::OpenVpnStatusUpdate>, String>> + Send>>
-    {
+    ) -> OpenSubscription<daemon::OpenVpnStatusUpdate> {
         Box::pin(async move {
             let channel = h2c::connect_h2c(&target)
                 .await
@@ -225,7 +217,7 @@ impl Reconnect<daemon::OpenVpnStatusUpdate> for OpenVpnStatusReconnect {
                 .subscribe_open_vpn_status(req)
                 .await
                 .map_err(|e| format!("SubscribeOpenVPNStatus: {e}"))
-                .map(|r| r.into_inner())
+                .map(|r| r.into_inner().boxed())
         })
     }
 }
@@ -244,8 +236,7 @@ impl Reconnect<daemon::TaildropInbox> for TaildropInboxReconnect {
         target: String,
         secret: Option<String>,
         _interval_ns: i64,
-    ) -> Pin<Box<dyn Future<Output = Result<Streaming<daemon::TaildropInbox>, String>> + Send>>
-    {
+    ) -> OpenSubscription<daemon::TaildropInbox> {
         let endpoint_tag = self.endpoint_tag.clone();
         Box::pin(async move {
             let channel = h2c::connect_h2c(&target)
@@ -260,7 +251,7 @@ impl Reconnect<daemon::TaildropInbox> for TaildropInboxReconnect {
                 .subscribe_taildrop_inbox(req)
                 .await
                 .map_err(|e| format!("SubscribeTaildropInbox: {e}"))
-                .map(|r| r.into_inner())
+                .map(|r| r.into_inner().boxed())
         })
     }
 }
@@ -278,7 +269,7 @@ impl Reconnect<daemon::Log> for LogReconnect {
         target: String,
         secret: Option<String>,
         _interval_ns: i64,
-    ) -> Pin<Box<dyn Future<Output = Result<Streaming<daemon::Log>, String>> + Send>> {
+    ) -> OpenSubscription<daemon::Log> {
         Box::pin(async move {
             let channel = h2c::connect_h2c(&target)
                 .await
@@ -289,7 +280,7 @@ impl Reconnect<daemon::Log> for LogReconnect {
                 .subscribe_log(req)
                 .await
                 .map_err(|e| format!("SubscribeLog: {e}"))
-                .map(|r| r.into_inner())
+                .map(|r| r.into_inner().boxed())
         })
     }
 }
@@ -302,7 +293,7 @@ impl Reconnect<daemon::Groups> for GroupsReconnect {
         target: String,
         secret: Option<String>,
         _interval_ns: i64,
-    ) -> Pin<Box<dyn Future<Output = Result<Streaming<daemon::Groups>, String>> + Send>> {
+    ) -> OpenSubscription<daemon::Groups> {
         Box::pin(async move {
             let channel = h2c::connect_h2c(&target)
                 .await
@@ -311,7 +302,7 @@ impl Reconnect<daemon::Groups> for GroupsReconnect {
             client
                 .subscribe_groups(auth_request(&secret, daemon::Empty {})?)
                 .await
-                .map(|response| response.into_inner())
+                .map(|response| response.into_inner().boxed())
                 .map_err(|e| format!("SubscribeGroups: {e}"))
         })
     }
@@ -407,9 +398,9 @@ enum State<T> {
     /// 正在退避等待下次重连。
     Backoff(Pin<Box<Sleep>>),
     /// 重连 future 在途。
-    Connecting(Pin<Box<dyn Future<Output = Result<Streaming<T>, String>> + Send>>),
-    /// 正在派发底层 tonic Streaming 的帧。Box：tonic Streaming 较大（~232B），装箱避免 enum 膨胀。
-    Streaming(Box<Streaming<T>>),
+    Connecting(OpenSubscription<T>),
+    /// 正在派发订阅帧。
+    Streaming(Subscription<T>),
 }
 
 /// 自动重连的 tokio Stream。消费方如普通 Stream 般 `while let Some(msg) = stream.next().await`。
@@ -600,7 +591,7 @@ where
                     Poll::Ready(Ok(streaming)) => {
                         debug!("gRPC 流已连上：{}", this.target);
                         this.subscription_reset = true;
-                        this.state = State::Streaming(Box::new(streaming));
+                        this.state = State::Streaming(streaming);
                     }
                     Poll::Ready(Err(e)) => {
                         warn!("gRPC 流建连失败，退避后重连（{}）：{e}", this.target);
@@ -608,7 +599,7 @@ where
                     }
                     Poll::Pending => return Poll::Pending,
                 },
-                State::Streaming(s) => match s.as_mut().poll_next_unpin(cx) {
+                State::Streaming(s) => match s.as_mut().poll_next(cx) {
                     Poll::Ready(Some(Ok(msg))) => return Poll::Ready(Some(msg)),
                     // **这一格不只是「网络断了」**：prost 解码失败（proto 字段号/类型与真核不符）
                     // 与真实断线在这里长得一模一样——都只是一个 `Err`，而重连语义会把它变成

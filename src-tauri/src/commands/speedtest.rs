@@ -101,7 +101,7 @@ use crate::runtime::speedtest::{
     TempCoreSession,
 };
 use crate::runtime::speedtest_tunnel::{
-    is_acceptable_status, open_tunnel, SpeedTestTarget, TunnelError, WarmTunnel,
+    is_acceptable_status, open_tunnel, ConnectProbe, SpeedTestTarget, TunnelError, WarmTunnel,
 };
 use crate::runtime::tailscale_status::TailscaleStatusEvent;
 use crate::runtime::AppRuntime;
@@ -230,6 +230,8 @@ pub(crate) enum FailKind {
     /// 本机侧：连不上本机的探针入站口（被拒 / 句柄或临时端口耗尽）。不是节点的负面证据。
     /// 只在分波编排里被识别；对外仍报 `transport`，事件的取值集合不变。
     Local,
+    /// The Core could not start the dial within its native engine budget.
+    BudgetBusy,
 }
 
 impl FailKind {
@@ -239,6 +241,7 @@ impl FailKind {
             Self::Transport | Self::Local => "transport",
             Self::HttpStatus(_) => "http_status",
             Self::Rejected => "rejected",
+            Self::BudgetBusy => "budget_busy",
         }
     }
 }
@@ -263,6 +266,7 @@ impl MeasureFailure {
             TunnelError::ConnectStatus(code) => FailKind::HttpStatus(code),
             TunnelError::NotReusable => FailKind::Rejected,
             TunnelError::Local => FailKind::Local,
+            TunnelError::BudgetBusy => FailKind::BudgetBusy,
         };
         Self { phase, kind }
     }
@@ -2325,13 +2329,19 @@ async fn run_temp_core_speed_test(
             async move {
                 #[cfg(target_os = "android")]
                 {
-                    measure_via_local_proxy(port, Some(&auth), &url, &|_| {})
-                        .await
-                        .measured
+                    measure_via_local_proxy(
+                        port,
+                        Some(&auth),
+                        &url,
+                        ConnectProbe::Foreground,
+                        &|_| {},
+                    )
+                    .await
+                    .measured
                 }
                 #[cfg(not(target_os = "android"))]
                 {
-                    measure_via_local_proxy(port, None, &url, &|_| {})
+                    measure_via_local_proxy(port, None, &url, ConnectProbe::Foreground, &|_| {})
                         .await
                         .measured
                 }
@@ -2856,6 +2866,7 @@ pub async fn server_speed_test(
                         local_proxy.port,
                         local_proxy.auth.as_ref(),
                         &url,
+                        ConnectProbe::Standard,
                     )
                 },
             )
@@ -3264,7 +3275,16 @@ async fn run_pool_speed_test(
                         }
                     },
                     &invalid,
-                    || measure_slot(&readback, slot, port, auth.as_ref(), &url),
+                    || {
+                        measure_slot(
+                            &readback,
+                            slot,
+                            port,
+                            auth.as_ref(),
+                            &url,
+                            ConnectProbe::Foreground,
+                        )
+                    },
                 )
                 .await
                 .unwrap_or(BINDING_LOST.into())
@@ -3379,7 +3399,17 @@ pub(crate) async fn probe_runtime_candidates(
             // `probe-in-k` 的凭据与池端口同源同刻（`SpeedProbeTargets::auth`；桌面 `None`）。
             let auth = targets.auth.clone();
             let readback = readback.clone();
-            async move { measure_slot(&readback, slot, port, auth.as_ref(), &url).await }
+            async move {
+                measure_slot(
+                    &readback,
+                    slot,
+                    port,
+                    auth.as_ref(),
+                    &url,
+                    ConnectProbe::Background,
+                )
+                .await
+            }
         },
         &mut sink,
         targets.pool_ports.as_slice(),
@@ -3426,7 +3456,11 @@ where
     if reason.is_some() {
         return RuntimeProbeBatch::Interrupted;
     }
-    RuntimeProbeBatch::Completed(candidate_probes(candidates, &raw, &trace.mismatch_skipped))
+    let mut probes = candidate_probes(candidates, &raw, &trace.mismatch_skipped);
+    // An incomplete tier can still supply a verified winner, but cannot prove
+    // that every member failed or justify moving to the rescue tier.
+    probes.retain(|id, _| !trace.budget_deferred.contains(id));
+    RuntimeProbeBatch::Completed(probes)
 }
 
 /// 把一轮分波的结果折成逐候选的结局（纯函数）：出了值的是测得；记了 -1 的是真测了没通；
@@ -3867,10 +3901,27 @@ pub(crate) async fn run_scheduled_round(
             async move {
                 match readback {
                     Some(readback) => {
-                        measure_slot(&readback, slot, port, auth.as_ref(), &url).await
+                        measure_slot(
+                            &readback,
+                            slot,
+                            port,
+                            auth.as_ref(),
+                            &url,
+                            ConnectProbe::Background,
+                        )
+                        .await
                     }
                     // 测量只在准入之后发起，那时读回已开；取不到就照测，读回落成未验证。
-                    None => measure_via_local_proxy(port, auth.as_ref(), &url, &|_| {}).await,
+                    None => {
+                        measure_via_local_proxy(
+                            port,
+                            auth.as_ref(),
+                            &url,
+                            ConnectProbe::Background,
+                            &|_| {},
+                        )
+                        .await
+                    }
                 }
             }
         },
@@ -3949,6 +4000,7 @@ where
     Meas: Fn(usize, u16) -> MeasFut,
     MeasFut: Future<Output = Probed> + Send + 'static,
 {
+    let mut trace = WaveTrace::default();
     let (results, reason) = drive_pool_waves_traced(
         waves,
         total,
@@ -3959,11 +4011,11 @@ where
         measure,
         emit,
         pool_ports,
-        &mut WaveTrace::default(),
+        &mut trace,
         readback,
     )
     .await;
-    (results, outcome_of(reason))
+    (results, trace.outcome(reason))
 }
 
 /// 一轮分波里发生过、但不进结果的事。
@@ -3974,6 +4026,17 @@ pub(crate) struct WaveTrace {
     /// 因读回不符被「强制」档跳过的节点。它们缺席的原因是「量到的不是它」，与其余缺席
     /// （本机侧故障、测量任务异常、跨网络变化）不同。
     pub(crate) mismatch_skipped: BTreeSet<String>,
+    budget_deferred: BTreeSet<String>,
+}
+
+impl WaveTrace {
+    fn outcome(&self, reason: Option<InterruptReason>) -> &'static str {
+        if self.budget_deferred.is_empty() {
+            outcome_of(reason)
+        } else {
+            "interrupted"
+        }
+    }
 }
 
 /// [`drive_pool_waves`] 的本体：多带一个 [`WaveTrace`]，并把中断成因原样交回（而不是折成
@@ -4019,7 +4082,7 @@ where
     // 终态发出之前，读回用的连接事件流已经关闭。
     readback.close().await;
     let reason = reason.or_else(|| interrupted(cancel, superseded));
-    emit_speed_test_done(emit, outcome_of(reason), &results, &intended, reason);
+    emit_speed_test_done(emit, trace.outcome(reason), &results, &intended, reason);
     (results, reason)
 }
 
@@ -4065,7 +4128,7 @@ where
         .flatten()
         .map(|a| (a.node_id.clone(), a.tag.clone()))
         .collect();
-    // 因本机侧报错排回过队尾的节点：每个只重排一次，再撞就让它缺席。
+    // A probe can rejoin the queue once after a local refusal.
     let mut requeued: BTreeSet<String> = BTreeSet::new();
 
     while !queue.is_empty() {
@@ -4075,6 +4138,7 @@ where
             .map(|(slot, (node_id, tag))| SlotAssignment { slot, node_id, tag })
             .collect();
         let mut local_side_error = false;
+        let mut budget_busy = false;
         // ── 让位①（波首）：核跃迁/崩溃/已取消 → 停发新波 ──
         if let Some(reason) = interrupted(cancel, superseded) {
             return (results, Some(reason));
@@ -4165,13 +4229,16 @@ where
                 continue;
             }
             // 连不上本机探针口 ⇒ 故障在本机一侧，不是这个节点的负面证据：不落账，排回队尾。
-            if local_side_halving && measured.is_err_and(|failure| failure.kind == FailKind::Local)
-            {
-                local_side_error = true;
-                if requeued.insert(id.clone()) {
-                    if let Some(a) = wave.iter().find(|a| a.node_id == id) {
-                        queue.push_back((id, a.tag.clone()));
-                    }
+            let engine_busy = measured.is_err_and(|failure| failure.kind == FailKind::BudgetBusy);
+            let local_error = local_side_halving
+                && measured.is_err_and(|failure| failure.kind == FailKind::Local);
+            if engine_busy || local_error {
+                budget_busy |= engine_busy;
+                local_side_error |= local_error;
+                if (local_error || width > 1) && requeued.insert(id.clone()) {
+                    queue.push_back((id, assignment.tag));
+                } else if engine_busy {
+                    trace.budget_deferred.insert(id);
                 }
                 continue;
             }
@@ -4217,7 +4284,11 @@ where
         if let Some(reason) = reason.or_else(|| cancel.reason()) {
             return (results, Some(reason));
         }
-        if local_side_error {
+        if budget_busy {
+            let narrowed = (width / 2).max(1);
+            trace.halved |= narrowed < width;
+            width = narrowed;
+        } else if local_side_error {
             let narrowed = (width / 2).max(MIN_WAVE_WIDTH).min(width);
             log::warn!(
                 "测速：连接本机探针口失败，波宽由 {width} 减到 {narrowed}（本轮内不再回升，受影响节点不记失败）"
@@ -4422,6 +4493,7 @@ async fn measure_via_local_proxy(
     proxy_port: u16,
     auth: Option<&InboundUser>,
     url: &str,
+    probe: ConnectProbe,
     announce: &(dyn Fn(u16) + Sync),
 ) -> Probed {
     let Some(target) = SpeedTestTarget::parse(url) else {
@@ -4431,7 +4503,7 @@ async fn measure_via_local_proxy(
     let measured = measure_warm_ttfb(
         Duration::from_millis(SPEED_TEST_COLD_TIMEOUT_MS),
         Duration::from_millis(SPEED_TEST_REUSE_TIMEOUT_MS),
-        open_tunnel(proxy_port, auth, &target, &|source_port| {
+        open_tunnel(proxy_port, auth, &target, probe, &|source_port| {
             *announced.lock().unwrap_or_else(PoisonError::into_inner) = Some(source_port);
             announce(source_port);
         }),
@@ -4452,8 +4524,9 @@ async fn measure_inbound(
     proxy_port: u16,
     auth: Option<&InboundUser>,
     url: &str,
+    probe: ConnectProbe,
 ) -> Probed {
-    measure_via_local_proxy(proxy_port, auth, url, &|source_port| {
+    measure_via_local_proxy(proxy_port, auth, url, probe, &|source_port| {
         readback.expect(inbound, source_port);
     })
     .await
@@ -4466,8 +4539,17 @@ async fn measure_slot(
     port: u16,
     auth: Option<&InboundUser>,
     url: &str,
+    probe: ConnectProbe,
 ) -> Probed {
-    measure_inbound(readback, &probe_pool_inbound_tag(slot), port, auth, url).await
+    measure_inbound(
+        readback,
+        &probe_pool_inbound_tag(slot),
+        port,
+        auth,
+        url,
+        probe,
+    )
+    .await
 }
 
 /// 回退腿与出口伴测共用的一次测量：先限时等见证流建立，再测，出值之后读回。
@@ -4638,6 +4720,7 @@ pub(crate) fn spawn_warm_rtt_probe(
                 local_proxy.port,
                 local_proxy.auth.as_ref(),
                 &request.url,
+                ConnectProbe::Standard,
             )
         })
         .await;

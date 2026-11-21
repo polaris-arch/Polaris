@@ -486,8 +486,10 @@ fn config_binds_inbound_port_and_outbound_one_to_one() {
     assert_eq!(inbounds[0]["listen"], json!("127.0.0.1"), "只许监听回环");
     let rules = cfg["route"]["rules"].as_array().unwrap();
     for (i, node) in nodes.iter().enumerate() {
+        let tag = probe_pool_inbound_tag(i);
         assert_eq!(rules[i]["outbound"], json!(node.tag));
-        assert_eq!(rules[i]["inbound"][0], json!(format!("in-{}", node.tag)));
+        assert_eq!(inbounds[i]["tag"], json!(tag));
+        assert_eq!(rules[i]["inbound"][0], json!(tag));
     }
 }
 
@@ -789,7 +791,7 @@ fn config_wires_endpoint_nodes_with_tunneled_dns() {
     assert_eq!(cfg["endpoints"].as_array().unwrap().len(), 1);
     // endpoint 入站拒绝在最前，纯 v4 的 AAAA 抑制与 route 随后。
     let rule = &cfg["dns"]["rules"][2];
-    assert_eq!(rule["inbound"][0], json!("in-out-e1111111"));
+    assert_eq!(rule["inbound"][0], json!(probe_pool_inbound_tag(0)));
     assert_eq!(rule["server"], json!("dns-exit-out-e1111111"));
     assert_eq!(rule["disable_cache"], json!(true));
     // 穿隧道 DNS server 必须 detour 到本端点 tag（否则查询从本机发，等于没穿隧道）。
@@ -818,7 +820,7 @@ fn temporary_endpoint_refuses_unsolicited_ingress_but_keeps_outbound_test_path()
     assert_eq!(reject["action"], "reject");
     assert_eq!(reject["no_drop"], true);
     let outgoing = &cfg["route"]["rules"][1];
-    assert_eq!(outgoing["inbound"], json!(["in-out-e1111111"]));
+    assert_eq!(outgoing["inbound"], json!([probe_pool_inbound_tag(0)]));
     assert_eq!(outgoing["outbound"], "out-e1111111");
     let dns_reject = &cfg["dns"]["rules"][0];
     assert_eq!(dns_reject["inbound"], json!(["out-e1111111"]));
@@ -827,7 +829,7 @@ fn temporary_endpoint_refuses_unsolicited_ingress_but_keeps_outbound_test_path()
     assert_eq!(dns_reject["no_drop"], true);
     assert_eq!(
         cfg["dns"]["rules"][2]["inbound"],
-        json!(["in-out-e1111111"])
+        json!([probe_pool_inbound_tag(0)])
     );
 }
 
@@ -855,7 +857,7 @@ fn config_suppresses_aaaa_before_routing_for_v4_only_endpoints() {
     assert_eq!(
         rules[1],
         json!({
-            "inbound": ["in-out-e1111111"],
+            "inbound": [probe_pool_inbound_tag(0)],
             "query_type": ["AAAA"],
             "action": "predefined",
             "rcode": "NOERROR",
@@ -3128,7 +3130,7 @@ fn the_single_source_collapse_returns_the_same_values() {
         (512, 0, 143, Ok(10_000), "n 贴批上限、m=0"),
         (0, 119, 4_969, Ok(10_000), "下限仍主导的最后一格"),
         (0, 120, 5_010, Ok(10_020), "公式接管的第一格"),
-        (512, 142, 5_965, Ok(11_930), "两条批上限同时贴顶"),
+        (512, 142, 5_965, Ok(11_930), "起核时间模型允许的上边界"),
         (
             0,
             729,
@@ -3161,12 +3163,12 @@ fn the_single_source_collapse_returns_the_same_values() {
         "预算饱和面变了"
     );
 
-    // ② 越界报错里那个「本批节点数下单核最多带 N 个 naive」
+    // ② 越界报错里的引擎上限同时遵守 Core 和起核时间预算。
     for (n, want) in [
-        (0_usize, 144_usize),
-        (512, 142),
-        (900, 141),
-        (4_000, 133),
+        (0_usize, 10_usize),
+        (512, 10),
+        (900, 10),
+        (4_000, 10),
         (55_904, 1),
         (55_905, 0), // 已登记的纯理论 nit：n 大到 c_parse 项吃掉整个预算 ⇒ 报 0
         (usize::MAX, 0),
@@ -3283,27 +3285,31 @@ fn production_ready_gate_is_scale_derived_not_a_constant() {
 /// **变异锁**：把判据换成 `TempNode` 上另存的布尔标记 / 换成别的键名 → 转红。
 #[test]
 fn naive_count_reads_the_field_the_core_itself_dispatches_on() {
+    let custom = |id: &str, concurrency: usize| {
+        serde_json::from_value::<ServerConfig>(json!({
+            "id": id, "name": id, "protocol": "custom",
+            "customSettings": {"outbound": {
+                "type": "naive", "insecure_concurrency": concurrency
+            }}
+        }))
+        .unwrap()
+    };
     let plan = plan_temp_core(
         &[
             srv("n1111111", Protocol::Naive),
             srv("v1111111", Protocol::Vless),
+            custom("raw-large", 8),
+            custom("raw-small", 2),
         ],
         &env(),
     );
+    assert_eq!(plan.testable.len(), 4);
+    assert_eq!(temp_core_naive_count(&plan.testable[..1]), 1);
+    assert_eq!(temp_core_naive_count(&plan.testable[1..2]), 0);
+    assert_eq!(temp_core_naive_count(&plan.testable), 11);
     assert_eq!(
-        plan.testable.len(),
-        2,
-        "前提：两个节点都得建成，否则本条没测到东西"
-    );
-    assert_eq!(
-        temp_core_naive_count(&plan.testable),
-        1,
-        "生产产出的 naive 出站没被数到 ⇒ 预算恒按 0 个 engine 算 ⇒ 规模门整个失效"
-    );
-    assert_eq!(
-        temp_core_naive_count(&plan.testable[1..]),
-        0,
-        "反向对照：不含 naive 的一批必须数出 0"
+        plan_temp_core_batches(&plan.testable),
+        vec![&plan.testable[..3], &plan.testable[3..]]
     );
 }
 
@@ -3323,41 +3329,27 @@ fn naive_count_reads_the_field_the_core_itself_dispatches_on() {
 async fn oversized_batch_is_refused_before_spawning_and_says_why() {
     let mut h = harness(true, false, Vec::new());
     h.deps.ready_timeout_override_ms = None; // 走生产口径（覆写只为让别的用例免等真实超时）
-    let nodes = naive_nodes(900);
-    // 直接驱动**批级**入口：分批（T1-R1）之后 `run` 会把这 900 个先切开，规模门再也拦不到它
-    // ——那是本轮的目的，不是本门的失效。本门守的是「万一有一批真的越界，它必须被前置拒绝且
-    // 说清是规模问题」这条前置条件检查本身；「生产路径永远送不出越界的批」由
-    // `planned_batches_never_trip_the_oversize_refusal` 单独证明。
-    let mut progress = RoundProgress::new(nodes.len());
-    let out = TempCoreSession::run_batch(
-        &h.deps,
-        &nodes,
-        &|| false,
-        |_| async { Ok(50_u32) },
-        &mut |_: &str, _: Value| {},
-        &mut progress,
-    )
-    .await;
-    let msg = match out {
-        BatchOutcome::Failed {
-            detail,
-            oversized: true,
-        } => detail,
-        other => panic!(
-            "越界批必须打上 `oversized` 标（独立错误码的唯一来源），得到 {other:?} —— \
-             折成普通 `Failed` 会让前端把它显示成「测速中断」，与就绪超时逐字相同"
-        ),
-    };
-    assert!(msg.contains("规模超限"), "报错没说是规模问题：{msg}");
-    assert!(msg.contains("900"), "报错没带本批节点数：{msg}");
-    assert!(
-        msg.contains(&TEMP_CORE_READY_TIMEOUT_CAP_MS.to_string()),
-        "报错没带上限：{msg}"
-    );
-    assert!(
-        msg.contains(&temp_core_max_naive(900).to_string()),
-        "报错没给出可执行的 naive 上限：{msg}"
-    );
+    for requested in [11, 900] {
+        let mut nodes = naive_nodes(1);
+        nodes[0].node["insecure_concurrency"] = json!(requested);
+        let out = TempCoreSession::run(
+            &h.deps,
+            &nodes,
+            &|| false,
+            |_| async { Ok(50_u32) },
+            &mut |_: &str, _: Value| {},
+        )
+        .await;
+        let TempCoreOutcome::Oversized(msg) = out else {
+            panic!("单个自定义出站的引擎组超限应得到 Oversized，得到 {out:?}");
+        };
+        assert!(msg.contains("规模超限"));
+        assert!(msg.contains(&format!("1 个节点请求 {requested} 个 Cronet 引擎")));
+        assert!(msg.contains("最多带 10 个 Cronet 引擎"));
+        if requested == 900 {
+            assert!(msg.contains(&TEMP_CORE_READY_TIMEOUT_CAP_MS.to_string()));
+        }
+    }
     assert_eq!(
         h.spawns.load(Ordering::SeqCst),
         0,
@@ -3425,52 +3417,17 @@ fn the_oversize_refusal_logs_the_numbers_it_refused_on() {
     }
 }
 
-/// 🔴 **越界报错里那个「最多带 N 个」必须是「照它砍下去这一轮真的跑得通」的数**。
-///
-/// # 判据在 T1-R1 改过（旧判据更弱，输入对差如下）
-///
-/// 旧判据是「`m` 恰好不触发 60s 拒绝腿，`m + 1` 触发」。分批之后它**放行了一个有害的数**：
-/// 60s 对应 m ≈ 727，而单批真正的窗口是 12s（前端 20s 静默兜底减去批间固定开销）。用户照 727
-/// 砍完 ⇒ 单批预算 ≈30s ⇒ 拿到一条假的「测速中断」，而现场没有任何东西指向批太大。
-///
-/// | 输入 | 旧判据 | 新判据 |
-/// |---|---|---|
-/// | 分母 = `CAP(60s)/SAFETY`（改前的实现） | 绿 | **红**（m=727 的预算 ≈30s > 12s 批窗） |
-/// | 分母 = `BATCH_READY_BUDGET_CAP(12s)/SAFETY`（本批的实现） | **红**（m+1 仍不触发 60s ⇒ 第二条断言失败） | 绿 |
-/// | 分母被改成任意更大的值 | 视值而定 | 红 |
-///
-/// ⇒ 新判据**严格更强**：它同时钉住「不越 60s 拒绝腿」（第一条）与「不越 12s 批窗」（第二、三条），
-/// 旧判据只钉前者。
-///
-/// ⚠️ **射程登记**：本条与 `oversized_batch_is_refused_before_spawning_and_says_why`、
-/// `the_oversize_refusal_logs_the_numbers_it_refused_on`、命令层那条码分流门、前端那条文案分流门
-/// 一共 **5 条**，守的都是同一条**生产不可达**的链路（分批之后单批预算至多 ≈11.9s，碰不到 60s）。
-/// 它们不是假绿门（代码改坏照样红），但**不能被读成「这条路是活的」** —— 用户在正常运行的
-/// 应用里永远看不到这条腿。它们存在的理由只有一个：规划器被绕过或回归时，这是唯一会喊出来的地方。
-///
-/// **变异锁**：把 `temp_core_max_naive` 的分母改回 `TEMP_CORE_READY_TIMEOUT_CAP_MS` → 转红。
+/// 越界诊断应给出 Core 引擎上限，起核窗口更紧时应继续降到窗口允许的值。
 #[test]
 fn advertised_naive_ceiling_is_the_largest_batch_that_actually_runs() {
-    for n in [0_usize, 500, 1_500, 4_000] {
+    for (n, expected) in [(0, 10), (512, 10), (55_904, 1), (55_905, 0)] {
         let m = temp_core_max_naive(n);
-        // ① 报出去的数自己不许触发那条拒绝腿（否则用户砍到它仍被拒）。
-        assert!(
-            temp_core_ready_timeout_ms(n, m).is_ok(),
-            "n={n}：报出去的上限 {m} 自己就越了 60s 拒绝腿"
-        );
-        // ② 它必须装得进**批窗**——这才是「照它砍下去真的跑得通」的判据。
+        assert_eq!(m, expected, "n={n}");
         let budget = |m: usize| CORE_READY_SAFETY_FACTOR * temp_core_startup_estimate_ms(n, m);
+        assert!(budget(m) <= TEMP_CORE_BATCH_READY_BUDGET_CAP_MS);
         assert!(
-            budget(m) <= TEMP_CORE_BATCH_READY_BUDGET_CAP_MS,
-            "n={n}：报出去的上限 {m} 对应预算 {}ms 越过批窗 {TEMP_CORE_BATCH_READY_BUDGET_CAP_MS}ms \
-             ⇒ 用户照它砍完会拿到一条假的「测速中断」",
-            budget(m)
-        );
-        // ③ 而且是**恰好**那个（报小了等于让用户白砍）。
-        assert!(
-            budget(m + 1) > TEMP_CORE_BATCH_READY_BUDGET_CAP_MS,
-            "n={n}：上限 {m} 报小了，{} 其实也装得进批窗",
-            m + 1
+            m == TEMP_CORE_NATIVE_NAIVE_LIMIT
+                || budget(m + 1) > TEMP_CORE_BATCH_READY_BUDGET_CAP_MS
         );
     }
 }
@@ -3594,11 +3551,7 @@ fn mixed_nodes(n: usize, naive_every: usize) -> Vec<TempNode> {
 /// 造**两条上限都贴顶**的一批：n = [`TEMP_CORE_BATCH_MAX_NODES`]、m = [`temp_core_batch_max_naive`]，
 /// 且第 m+1 个 naive 不存在 ⇒ 规划器恰好把它当成一整批。
 ///
-/// # 为什么上限要取**现值**而不是写死 512 / 142
-///
-/// 本夹具服务的是「上限调大一点点就该转红」这条承诺。写死数字 ⇒ 把上限从 142 调到 143 时夹具还是
-/// 造 142 个 naive，最坏形态根本没被取到，门要到 +2 才红（复审 2026-09-03 实测正是这个洞）。
-/// 取现值 ⇒ 上限一涨，夹具跟着造出更坏的那一批，**+1 即红**。
+/// 使用生产上限，使时间与 RSS 测试覆盖当前允许的最大批次。
 fn topped_out_batch() -> Vec<TempNode> {
     let m = temp_core_batch_max_naive();
     (0..TEMP_CORE_BATCH_MAX_NODES)
@@ -3641,13 +3594,10 @@ fn topped_out_batch() -> Vec<TempNode> {
 fn batch_plan_keeps_peak_scale_flat_as_the_subscription_grows() {
     // (naive 每隔几个一个, 说明)
     for (naive_every, shape) in [(0_usize, "零 naive"), (2, "半数 naive"), (1, "全 naive")] {
-        // **空操作对照**：真机形态那一档（≈118 节点）必须仍然是**一批** —— 分批对今天跑得通的
-        // 订阅逐字无影响（一次起核、一份配置、同一条事件流），这是本改动的射程边界。
-        assert_eq!(
-            plan_temp_core_batches(&mixed_nodes(118, naive_every)).len(),
-            1,
-            "{shape}：118 节点的真机形态被切开了 ⇒ 本改动对今天能跑通的订阅不再是空操作"
-        );
+        // No Naive subscription keeps the existing port-limited batching.
+        if naive_every == 0 {
+            assert_eq!(plan_temp_core_batches(&mixed_nodes(118, 0)).len(), 1);
+        }
 
         let mut peak_nodes: Option<usize> = None;
         let mut peak_naive: Option<usize> = None;
@@ -3736,12 +3686,7 @@ fn batch_plan_keeps_peak_scale_flat_as_the_subscription_grows() {
 ///
 /// # 取样必须含**贴顶**形态
 ///
-/// [`topped_out_batch`] 是唯一能让「上限 +1 即红」成立的取样点：`mixed_nodes` 那几档要么 n 先满
-/// （m 远没到上限）、要么 m 先满（n 只有一两百），两条上限**同时**贴顶的那一批取不到，于是把
-/// naive 上限从 142 调到 143 时全部取样点都还绿，要到 +2 才红（复审 2026-09-03 实测）。
-///
-/// **变异锁**：把 [`TEMP_CORE_BATCH_MAX_NODES`] 或 [`temp_core_batch_max_naive`] 调大 **1**
-/// → 贴顶那一批的预算越过上限 → 转红并报出是哪一批。
+/// [`topped_out_batch`] 覆盖节点数和引擎数同时达到上限的形态。
 #[test]
 fn every_planned_batch_fits_the_frontend_idle_window() {
     let raw_budget = |n: usize, m: usize| {
@@ -3781,7 +3726,7 @@ fn every_planned_batch_fits_the_frontend_idle_window() {
     }
     assert!(
         saw_topped_out,
-        "取样里没有任何一批同时顶到两条上限 ⇒ 「上限 +1 即红」这条承诺落空（本门会到 +2 才红）"
+        "取样里没有任何一批同时达到节点数和引擎数上限"
     );
 }
 
@@ -3909,42 +3854,15 @@ fn the_batch_caps_are_derived_from_the_two_budgets() {
             "naive 上限失配（{why}）"
         );
     }
+    assert_eq!(temp_core_batch_max_naive(), 10);
+    let nodes = naive_nodes(11);
     assert_eq!(
-        temp_core_batch_max_naive(),
-        142,
-        "生产上限必须就是参数化内核在生产预算上的取值"
-    );
-
-    // **反向对照**：最坏批的估算确实贴着上限，而不是离得远到「随便填个数都能过」。
-    let worst =
-        temp_core_startup_estimate_ms(TEMP_CORE_BATCH_MAX_NODES, temp_core_batch_max_naive());
-    assert!(
-        worst <= TEMP_CORE_BATCH_ESTIMATE_CAP_MS
-            && worst + CORE_STARTUP_PER_NAIVE_MS > TEMP_CORE_BATCH_ESTIMATE_CAP_MS,
-        "最坏批估算 {worst}ms 应当是「再多一个 naive 就越界」的那个点（上限 \
-         {TEMP_CORE_BATCH_ESTIMATE_CAP_MS}ms）——离得太远说明上限根本没在绑"
+        plan_temp_core_batches(&nodes),
+        vec![&nodes[..10], &nodes[10..]]
     );
 }
 
-/// 🔴 **那条 60s 拒绝腿在生产上碰不到**（deliverable 8 的判据）—— 弱门，射程如实登记。
-///
-/// R0 的 [`TEMP_CORE_READY_TIMEOUT_CAP_MS`]（60s）在分批之后于生产路径上**不可达**。不可达这件事
-/// 必须是一条门，不能是一句注释 —— 注释拦不住有人把 [`TEMP_CORE_BATCH_MAX_NODES`] 调大。它同时
-/// 说明那条腿为什么可以留着：它是 [`TempCoreSession::run_batch`] 这个入口的前置条件检查，
-/// 规划器回归时是唯一会喊出来的地方。
-///
-/// # 弱在哪里（复审 2026-09-03 的判词，照录）
-///
-/// 规划器那一半**被 [`every_planned_batch_fits_the_frontend_idle_window`] 支配**：凡是能让本门红的
-/// 批（预算 > 60s）必然也 > 12s，那边先红且取样更宽。`m ∈ (142, 728]` 这一整段本门是**绿**的 ——
-/// 那一段确实越了批窗、却确实没越 60s。⇒ 本门不承担「批不许过大」这件事。
-///
-/// # 它今天唯一的独有覆盖
-///
-/// 1. **60s 那个常量本身被调小到规划器产出之下**（例如有人为了「保守一点」把它改成 10s）——
-///    那时姊妹门用的是原式、与该常量无关，只有本门红；
-/// 2. **生产入口是否真的经规划器**：下半段直接驱动 `TempCoreSession::run`（生产口径，
-///    不带就绪覆写），断言 900 个全 naive 的一轮不会得到 `Oversized`。规划器只测函数的门看不到这条接线。
+/// 常规单引擎出站经生产入口分批，每批均应通过实际就绪预算检查。
 #[tokio::test]
 async fn planned_batches_never_trip_the_oversize_refusal() {
     // ── 规划器一半（弱：被姊妹门支配，留作红报里的定位线索）──
@@ -4033,6 +3951,60 @@ async fn run_round(h: &Harness, nodes: &[TempNode]) -> (TempCoreOutcome, Vec<(St
     (out, events)
 }
 
+#[tokio::test]
+async fn native_budget_pressure_leaves_the_node_pending_without_retry_or_failure() {
+    let nodes = three_nodes();
+    let h = multi_batch_harness(nodes.len(), None);
+    let deferred_calls = Arc::new(AtomicUsize::new(0));
+    let mut events: Vec<(String, Value)> = Vec::new();
+    let out = TempCoreSession::run(
+        &h.deps,
+        &nodes,
+        &|| false,
+        |port| {
+            let deferred_calls = Arc::clone(&deferred_calls);
+            async move {
+                match port {
+                    20_001 => Ok(50),
+                    20_002 => {
+                        deferred_calls.fetch_add(1, Ordering::SeqCst);
+                        Err(MeasureFailure::new(
+                            FailPhase::Connect,
+                            FailKind::BudgetBusy,
+                        ))
+                    }
+                    20_003 => Err(TIMED_OUT),
+                    _ => panic!("unexpected measurement port {port}"),
+                }
+            }
+        },
+        &mut |ev: &str, payload: Value| events.push((ev.to_string(), payload)),
+    )
+    .await;
+    let TempCoreOutcome::Ran { results, outcome } = out else {
+        panic!("unexpected outcome: {out:?}");
+    };
+    assert_eq!(outcome, "interrupted");
+    assert_eq!(deferred_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(results.get(&nodes[0].id), Some(&Ok(50)));
+    assert!(!results.contains_key(&nodes[1].id));
+    assert_eq!(results.get(&nodes[2].id), Some(&Err(TIMED_OUT)));
+    let result_events: Vec<_> = events
+        .iter()
+        .filter(|(ev, _)| ev == EVENT_SPEED_TEST_RESULT)
+        .collect();
+    assert_eq!(result_events.len(), 2);
+    assert!(result_events
+        .iter()
+        .all(|(_, payload)| payload["serverId"] != nodes[1].id));
+    let done = &events.last().unwrap().1;
+    assert_eq!(done["outcome"], "interrupted");
+    assert_eq!(done["pending"], json!([nodes[1].id]));
+    assert_eq!(done["tested"], 2);
+    assert_eq!(done["total"], 3);
+    cleanup(&h.dir);
+}
+
 /// 🔴 **一轮 k 批只发一条终态事件，且载荷是轮级口径**（复用既有 `EVENT_SPEED_TEST_DONE`，不新起通道）。
 ///
 /// # 这条守的是分批最危险的那个失效面
@@ -4050,7 +4022,7 @@ async fn run_round(h: &Harness, nodes: &[TempNode]) -> (TempCoreOutcome, Vec<(St
 /// - `intended` 取成 `batch` 而不是 `nodes` → `total` / `serverIds` 断言转红。
 #[tokio::test]
 async fn a_round_emits_exactly_one_terminal_event_with_round_wide_scope() {
-    let nodes = naive_nodes(300); // > 142 ⇒ 必然多批
+    let nodes = naive_nodes(21);
     let h = multi_batch_harness(nodes.len(), None);
     let (out, events) = run_round(&h, &nodes).await;
     assert!(matches!(out, TempCoreOutcome::Ran { .. }), "得到 {out:?}");
@@ -4092,7 +4064,7 @@ async fn a_round_emits_exactly_one_terminal_event_with_round_wide_scope() {
 
 /// 🔴 **进度事件的口径是轮级的，不是批级的**（前端在 `tested >= total` 那一帧就收口）。
 ///
-/// 批级口径下，批 1 测完那一刻前端会收到 `142/142` ⇒ 当场弹一条「测速完成」并把 sticky 收掉，
+/// 批级口径下，首批测完时前端会提前弹出「测速完成」并把 sticky 收掉，
 /// 随后批 2 的事件又把它拉起来 —— 一轮里连弹 k 条「完成」。故 `total` 恒为全轮总数、`tested` 跨批
 /// 累加且严格单调。
 ///
@@ -4122,8 +4094,8 @@ async fn progress_is_reported_on_the_round_scale_across_batches() {
         );
         // 心跳与逐节点事件都进这个流；只要出现过「已超过**第一批**的规模」就说明账是跨批累加的。
         //
-        // 阈值取本轮**第一批的实际大小**，不取两条上限的 min：后者恰好等于本夹具（全 naive）第一批
-        // 的 142，纯属巧合 —— 换成零 naive 的夹具（第一批 512）阈值仍是 142，于是「第一批内部」就
+        // 阈值取本轮**第一批的实际大小**。若用了 Naive 的上限，零 Naive 的批（最多 512 节点）
+        // 会过早触发，于是「第一批内部」就
         // 满足了断言，本条当场变成假绿（复审 2026-09-03 指出）。判据必须跟着夹具走。
         if tested > plan_temp_core_batches(&nodes)[0].len() {
             saw_cross_batch = true;
@@ -4288,7 +4260,7 @@ async fn cache_eviction_does_not_hide_a_binary_replacement_during_check() {
 /// **变异锁**：删掉 `|| progress.tested() > 0` → 本门转红（且只有本门）。
 #[tokio::test]
 async fn a_failed_middle_batch_still_bridges_the_silent_window() {
-    let nodes = naive_nodes(300);
+    let nodes = naive_nodes(21);
     let batches = plan_temp_core_batches(&nodes);
     assert_eq!(
         batches.len(),
@@ -4415,7 +4387,7 @@ async fn no_progress_escapes_while_no_batch_has_measured_anything() {
 /// `pending` 断言同时转红。
 #[tokio::test]
 async fn a_batch_that_cannot_start_does_not_sink_the_round() {
-    let nodes = naive_nodes(300);
+    let nodes = naive_nodes(21);
     let batches = plan_temp_core_batches(&nodes);
     assert_eq!(
         batches.len(),

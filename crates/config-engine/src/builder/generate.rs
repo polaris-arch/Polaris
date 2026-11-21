@@ -101,6 +101,11 @@ fn is_node_usable(
     server.protocol != Protocol::Naive || has_cronet
 }
 
+/// The Web Dashboard is available only on desktop with an explicit opt-in.
+pub fn dashboard_enabled_on(platform: Platform, enabled: Option<bool>) -> bool {
+    enabled == Some(true) && matches!(platform, Platform::Mac | Platform::Win | Platform::Linux)
+}
+
 /// dashboard 的显式 HTTP client：`detour` 取 `route.final`。
 ///
 /// **为什么是 `route.final`（而非 direct，也非顶层 `http_clients` + `route.default_http_client`）**：
@@ -788,8 +793,7 @@ fn generate_base_config(
             secret,
             dashboard: None,
         };
-        // dashboard opt-in：仅 config.singboxDashboard==true 时注入。
-        if config.singbox_dashboard == Some(true) {
+        if dashboard_enabled_on(Platform::parse(&deps.platform), config.singbox_dashboard) {
             let http_client = Some(dashboard_http_client(&singbox));
             api_service.dashboard = Some(match &deps.dashboard_serve_dir {
                 Some(dir) => ApiDashboard {

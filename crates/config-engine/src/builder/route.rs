@@ -365,7 +365,18 @@ pub fn build_route_config_with_report(
         .unwrap_or("off")
         .to_string();
 
-    // A. 嗅探规则（必须在前，用于识别域名）。
+    // Dedicated CONNECT probes already carry their target. Routing them before
+    // sniff lets the Core report dial admission before the client sends TLS.
+    for k in 0..deps.probe_pool_ports.len() {
+        rules.push(RouteRule {
+            inbound: Some(OneOrMany::Many(vec![probe_pool_inbound_tag(k)])),
+            action: Some("route".to_string()),
+            outbound: Some(format!("probe-selector-{k}")),
+            ..empty_matcher()
+        });
+    }
+
+    // A. 嗅探规则（用于识别其余流量的域名）。
     rules.push(RouteRule {
         action: Some("sniff".to_string()),
         ..empty_matcher()
@@ -398,17 +409,6 @@ pub fn build_route_config_with_report(
             ])),
             action: Some("route".to_string()),
             outbound: Some(selected_server_tag.to_string()),
-            ..empty_matcher()
-        });
-    }
-
-    // A2b. 主核测速探测池钉死路由（§15）：probe-in-k → probe-selector-k。
-    // 上游 `inbound: ['probe-in-${k}']`（route-builder.ts:212）恒数组。
-    for k in 0..deps.probe_pool_ports.len() {
-        rules.push(RouteRule {
-            inbound: Some(OneOrMany::Many(vec![probe_pool_inbound_tag(k)])),
-            action: Some("route".to_string()),
-            outbound: Some(format!("probe-selector-{k}")),
             ..empty_matcher()
         });
     }

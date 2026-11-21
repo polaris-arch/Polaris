@@ -16,8 +16,8 @@
 
 use polaris_singbox_grpc::ClientError;
 use polaris_singbox_grpc::{
-    Endpoint, ReconnectConfig, SingBoxApiClient, TaildropOutgoingFile, TaildropSendUpdate,
-    UNARY_DEADLINE,
+    ConnectionEventStream, Endpoint, ReconnectConfig, SingBoxApiClient, TaildropOutgoingFile,
+    TaildropSendUpdate, UNARY_DEADLINE,
 };
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -90,6 +90,7 @@ struct MockState {
     /// `SubscribeConnections` 逐帧回放的脚本（`None` = 沿用下面按 interval 决定的单帧行为）。
     /// 脚本放完后流保持打开，直到客户端退订；脚本里的 `Err` 即流中途报错。
     connection_script: Arc<std::sync::Mutex<Option<FrameScript<ConnectionEvents>>>>,
+    connection_script_ends: std::sync::atomic::AtomicBool,
     /// `SubscribeConnections` 被订阅的次数。
     connection_calls: Arc<AtomicU64>,
     /// 为真时 `SubscribeConnections` 永不应答（核卡死）。
@@ -530,6 +531,17 @@ impl StartedService for MockService {
         }
         let (tx, rx) = tokio::sync::mpsc::channel(4);
         if let Some(script) = self.state.connection_script.lock().unwrap().clone() {
+            if script.iter().any(|frame| {
+                frame
+                    .as_ref()
+                    .is_ok_and(|frame| frame.snapshot_complete.is_some())
+            }) && !req.get_ref().batch_frames
+            {
+                return Err(Status::failed_precondition(
+                    "client did not opt in to framing",
+                ));
+            }
+            let ends = self.state.connection_script_ends.load(Ordering::Relaxed);
             tokio::spawn(async move {
                 for frame in script {
                     let failed = frame.is_err();
@@ -538,7 +550,9 @@ impl StartedService for MockService {
                     }
                 }
                 // 真核的流不会自己结束：等客户端退订。
-                tx.closed().await;
+                if !ends {
+                    tx.closed().await;
+                }
             });
             return Ok(Response::new(ReceiverStream::new(rx)));
         }
@@ -558,6 +572,7 @@ impl StartedService for MockService {
                             ..Default::default()
                         }],
                         reset: true,
+                        snapshot_complete: None,
                     }))
                     .await;
             }
@@ -1708,10 +1723,7 @@ fn scripted_conn(id: &str, inbound: &str, source: &str, closed_at: i64) -> Conne
     }
 }
 
-async fn events_at(
-    addr: SocketAddr,
-    secret: &str,
-) -> Result<tonic::Streaming<ConnectionEvents>, polaris_singbox_grpc::ClientError> {
+async fn events_at(addr: SocketAddr, secret: &str) -> Result<ConnectionEventStream, ClientError> {
     SingBoxApiClient::connection_events_at(
         Endpoint::new("127.0.0.1", addr.port()),
         secret,
@@ -1737,10 +1749,12 @@ async fn connection_events_at_delivers_first_frame_new_events_and_close_frames()
                 ),
             ],
             reset: true,
+            snapshot_complete: None,
         }),
         Ok(ConnectionEvents {
             events: vec![scripted_conn("fresh", "probe-in-1", "127.0.0.1:40003", 0)],
             reset: false,
+            snapshot_complete: None,
         }),
         // 真核的关闭事件带完整的连接体，且体上的 `closedAt` 与事件的相同
         // （`daemon/started_service.go` 的 `applyConnectionEvent`）。
@@ -1751,6 +1765,7 @@ async fn connection_events_at_delivers_first_frame_new_events_and_close_frames()
                 ..scripted_conn("live", "probe-in-0", "127.0.0.1:40001", 1_700_000_000_500)
             }],
             reset: false,
+            snapshot_complete: None,
         }),
     ]);
     let mut stream = events_at(addr, SECRET).await.expect("建流");
@@ -1807,6 +1822,7 @@ async fn connection_events_at_surfaces_a_mid_stream_error_and_never_reconnects()
         Ok(ConnectionEvents {
             events: vec![scripted_conn("live", "probe-in-0", "127.0.0.1:40001", 0)],
             reset: true,
+            snapshot_complete: None,
         }),
         Err(Status::unavailable("core is restarting")),
     ]);
@@ -1821,6 +1837,115 @@ async fn connection_events_at_surfaces_a_mid_stream_error_and_never_reconnects()
         1,
         "单会话流断了就是断了"
     );
+}
+
+#[tokio::test]
+async fn connection_events_commit_one_complete_reset_then_deliver_deltas_in_order() {
+    let (addr, state, _h) = spawn_server(SECRET, 0).await;
+    let mut expected_ids = Vec::new();
+    let rule = "r".repeat(64 * 1024);
+    let mut script = Vec::new();
+    for part in 0..8 {
+        let events = (0..10)
+            .map(|index| {
+                let id = format!("{part}-{index}");
+                let mut event = scripted_conn(&id, "mixed-in", "127.0.0.1:1", 0);
+                event.connection.as_mut().unwrap().rule = rule.clone();
+                expected_ids.push(id);
+                event
+            })
+            .collect();
+        script.push(Ok(ConnectionEvents {
+            events,
+            reset: part == 0,
+            snapshot_complete: Some(false),
+        }));
+    }
+    script.push(Ok(ConnectionEvents {
+        snapshot_complete: Some(true),
+        ..Default::default()
+    }));
+    script.push(Ok(ConnectionEvents {
+        events: vec![scripted_conn("delta", "mixed-in", "127.0.0.1:1", 0)],
+        ..Default::default()
+    }));
+    *state.connection_script.lock().unwrap() = Some(script);
+
+    let mut once = events_at(addr, SECRET).await.unwrap();
+    let reset = once.message().await.unwrap().unwrap();
+    assert!(reset.reset);
+    assert!(reset.snapshot_complete.is_none());
+    assert!(prost::Message::encoded_len(&reset) > 4 * 1024 * 1024);
+    assert_eq!(
+        reset
+            .events
+            .into_iter()
+            .map(|event| event.id)
+            .collect::<Vec<_>>(),
+        expected_ids
+    );
+    let delta = once.message().await.unwrap().unwrap();
+    assert!(!delta.reset);
+    assert_eq!(delta.events[0].id, "delta");
+
+    let client = SingBoxApiClient::connect(Endpoint::new("127.0.0.1", addr.port()), SECRET)
+        .await
+        .unwrap();
+    let snapshot = client.first_connection_snapshot().await.unwrap();
+    assert_eq!(
+        snapshot.into_iter().map(|conn| conn.id).collect::<Vec<_>>(),
+        expected_ids
+    );
+}
+
+#[tokio::test]
+async fn reconnecting_connection_events_discard_unfinished_snapshots() {
+    let (addr, state, _h) = spawn_server(SECRET, 0).await;
+    let incomplete = ConnectionEvents {
+        events: vec![scripted_conn("stale", "mixed-in", "127.0.0.1:1", 0)],
+        reset: true,
+        snapshot_complete: Some(false),
+    };
+    state.connection_script_ends.store(true, Ordering::Relaxed);
+    *state.connection_script.lock().unwrap() = Some(vec![Ok(incomplete)]);
+
+    let mut once = events_at(addr, SECRET).await.unwrap();
+    assert_eq!(
+        once.message().await.unwrap_err().code(),
+        tonic::Code::DataLoss
+    );
+    assert!(once.message().await.unwrap().is_none());
+
+    let client = SingBoxApiClient::connect(Endpoint::new("127.0.0.1", addr.port()), SECRET)
+        .await
+        .unwrap();
+    let mut continuous =
+        client.subscribe_connections(1, ReconnectConfig::with_backoff(Duration::from_millis(10)));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), continuous.recv())
+            .await
+            .is_err()
+    );
+    assert!(state.connection_calls.load(Ordering::Relaxed) >= 2);
+
+    // The replacement is an empty snapshot, which must still publish one reset.
+    *state.connection_script.lock().unwrap() = Some(vec![
+        Ok(ConnectionEvents {
+            reset: true,
+            snapshot_complete: Some(false),
+            ..Default::default()
+        }),
+        Ok(ConnectionEvents {
+            snapshot_complete: Some(true),
+            ..Default::default()
+        }),
+    ]);
+    let reset = tokio::time::timeout(Duration::from_secs(3), continuous.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(reset.reset);
+    assert!(reset.events.is_empty());
 }
 
 /// 订阅迟迟不应答（核卡死）：建流在兜底时限到期时报超时，不无限挂起。
@@ -1878,6 +2003,7 @@ async fn connection_events_at_decodes_a_first_frame_beyond_the_default_limit() {
     *state.connection_script.lock().unwrap() = Some(vec![Ok(ConnectionEvents {
         events,
         reset: true,
+        snapshot_complete: None,
     })]);
 
     let mut stream = events_at(addr, SECRET).await.expect("建流");
@@ -2049,6 +2175,7 @@ async fn connection_events_still_reject_frames_above_the_shared_bound() {
     *state.connection_script.lock().unwrap() = Some(vec![Ok(ConnectionEvents {
         events: vec![oversized],
         reset: true,
+        snapshot_complete: None,
     })]);
     let mut once = events_at(addr, SECRET).await.unwrap();
     assert!(tokio::time::timeout(Duration::from_secs(5), once.message())

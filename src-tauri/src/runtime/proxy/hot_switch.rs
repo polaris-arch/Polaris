@@ -26,7 +26,8 @@ use polaris_config_engine::builder::hotswitch::{
     HotSwitchDeps, HotSwitchPut, RuleTargetEntry,
 };
 use polaris_config_engine::builder::mesh_mode::{
-    has_compiled_modes, selected_mode, DASHBOARD_SELECTOR, MESH_DIRECT, NORMAL,
+    dashboard_mode_selector, has_compiled_modes, selected_mode, DASHBOARD_SELECTOR, MESH_DIRECT,
+    NORMAL,
 };
 use polaris_config_engine::builder::orchestration::{config_generation_norm, stable_stringify};
 use polaris_config_engine::builder::outbounds::{build_outbounds, OutboundsDeps};
@@ -1140,10 +1141,7 @@ impl ProxyRuntime {
         );
         SwitchSnapshot {
             mesh_mode_ready: has_compiled_modes(singbox_config),
-            dashboard_mode_selector: singbox_config
-                .outbounds
-                .iter()
-                .any(|outbound| outbound.tag == DASHBOARD_SELECTOR),
+            dashboard_mode_selector: dashboard_mode_selector(singbox_config).is_some(),
             id_to_tag,
             rule_target,
             named_rule_by_raw,
@@ -2529,9 +2527,11 @@ impl ProxyRuntime {
         // 腿 2：解析 + 规划。
         // 任一侧解析失败 → 保守重启（fail-closed）：热切换靠精确 diff，解析不出就无从判断，
         // 保持待应用并等待显式处理，不能把无法判定的变更当成无操作成功。
+        use super::runtime_config::user_config_for_runtime_comparison;
+        let platform = self.helper.platform();
         let (Ok(old_cfg), Ok(new_cfg)) = (
-            serde_json::from_value::<UserConfig>(old_value),
-            serde_json::from_value::<UserConfig>(new_config.clone()),
+            user_config_for_runtime_comparison(old_value, platform),
+            user_config_for_runtime_comparison(new_config.clone(), platform),
         ) else {
             return ClassifiedSwitch::Fallback("配置解析失败");
         };

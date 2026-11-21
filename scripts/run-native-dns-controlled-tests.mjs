@@ -201,7 +201,7 @@ function oneExecutedTest(result) {
 }
 
 function productionGraphRecord(result, name) {
-  const rows = records(result.stdout, 'POLARIS_DEFAULT_GRAPH ');
+  const rows = records(result.stdout, 'POLARIS_DASHBOARD_OPT_IN_GRAPH ');
   if (!rows.length) return null;
   demand(rows.length === 1, 'Duplicate controlled production graph record');
   const r = rows[0];
@@ -216,7 +216,7 @@ function productionGraphRecord(result, name) {
   'Controlled production graph bytes/hash mismatch');
   const graph = JSON.parse(r.configJson), apis = graph.services?.filter((s) => s.type === 'api');
   demand(apis?.length === 1 && typeof r.dashboardPath === 'string'
-    && apis[0].dashboard?.path === r.dashboardPath, 'Production default dashboard was not retained');
+    && apis[0].dashboard?.path === r.dashboardPath, 'Opt-in Dashboard path is missing from the production graph');
   demand(Array.isArray(graph.inbounds) && graph.inbounds.length > 0
     && graph.inbounds.every((i) => ['mixed', 'http', 'socks'].includes(i.type) && i.listen === '127.0.0.1'),
   'Controlled production graph must remain loopback/manual');

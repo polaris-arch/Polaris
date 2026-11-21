@@ -1941,7 +1941,7 @@ fn measurement_leg_goes_through_a_connect_tunnel() {
         "测量腿不得经 reqwest client 请求（同上）"
     );
     assert!(
-        body.contains("open_tunnel(proxy_port, auth, &target, &|source_port| {"),
+        body.contains("open_tunnel(proxy_port, auth, &target, probe, &|source_port| {"),
         "测量腿必须经 CONNECT 隧道（`open_tunnel`）建连"
     );
     assert!(
@@ -1972,9 +1972,15 @@ async fn production_measurement_entrypoint_speaks_connect_on_the_wire() {
     .await;
 
     let announced = std::sync::Mutex::new(Vec::new());
-    let out = measure_via_local_proxy(port, None, DEFAULT_SPEED_TEST_URL, &|source_port| {
-        announced.lock().unwrap().push(source_port);
-    })
+    let out = measure_via_local_proxy(
+        port,
+        None,
+        DEFAULT_SPEED_TEST_URL,
+        ConnectProbe::Standard,
+        &|source_port| {
+            announced.lock().unwrap().push(source_port);
+        },
+    )
     .await;
     assert!(
         out.measured.is_ok(),
@@ -2712,7 +2718,9 @@ fn temp_core_leg_reuses_the_shared_warm_ttfb_measurement() {
         "async fn run_temp_core_speed_test(",
     );
     assert!(
-        body.contains("measure_via_local_proxy(port, None, &url, &|_| {})"),
+        body.contains(
+            "measure_via_local_proxy(port, None, &url, ConnectProbe::Foreground, &|_| {})"
+        ),
         "临时核腿必须复用与主核路径同一个 warm-TTFB 测量（各写一份 ⇒ 同一个徽标里混着两种口径）"
     );
 }
@@ -4586,6 +4594,66 @@ async fn a_local_side_error_halves_the_wave_width_and_spares_the_node() {
     );
 }
 
+#[tokio::test]
+async fn engine_pressure_retries_at_lower_width_and_preserves_unmeasured_results() {
+    use std::sync::atomic::AtomicUsize;
+
+    let candidates = [
+        ("available".into(), "tag-a".into()),
+        ("deferred".into(), "tag-b".into()),
+    ];
+    for exhausted_after_narrowing in [false, true] {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let mut trace = WaveTrace::default();
+        let mut done = Value::Null;
+        let (results, reason) = drive_pool_waves_traced(
+            &plan_waves(&candidates, 2),
+            candidates.len(),
+            &|| false,
+            &SpeedTestCancel::default(),
+            &|| None,
+            |_, _| async { true },
+            plain(|port| {
+                let attempts = Arc::clone(&attempts);
+                async move {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    if port == 10_001 || exhausted_after_narrowing {
+                        Err(MeasureFailure::new(
+                            FailPhase::Connect,
+                            FailKind::BudgetBusy,
+                        ))
+                    } else {
+                        Ok(100)
+                    }
+                }
+            }),
+            &mut |event: &str, payload: Value| {
+                if event == EVENT_SPEED_TEST_DONE {
+                    done = payload;
+                }
+            },
+            &[10_000, 10_001],
+            &mut trace,
+            &Readback::off(),
+        )
+        .await;
+        assert_eq!(reason, None);
+        assert!(trace.halved);
+        assert_eq!(trace.budget_deferred.is_empty(), !exhausted_after_narrowing);
+        if exhausted_after_narrowing {
+            assert_eq!(attempts.load(Ordering::SeqCst), 4);
+            assert!(results.is_empty());
+            assert_eq!(done["outcome"], "interrupted");
+            assert_eq!(done["pending"], json!(["available", "deferred"]));
+        } else {
+            assert_eq!(attempts.load(Ordering::SeqCst), 3);
+            assert_eq!(results["available"], Ok(100));
+            assert_eq!(results["deferred"], Ok(100));
+            assert_eq!(done["outcome"], "completed");
+        }
+    }
+}
+
 /// 回退开关关掉：本机侧错误按传输错记账，波宽不变。
 #[tokio::test]
 async fn with_local_side_halving_off_the_error_is_a_transport_failure() {
@@ -5062,6 +5130,7 @@ fn connection_frames_fold_into_records() {
             event(None),
         ],
         reset: true,
+        ..daemon::ConnectionEvents::default()
     };
     let kept = |watched| -> Vec<(String, u16)> {
         records_of(frame(), watched)
@@ -5112,6 +5181,7 @@ async fn a_stream_error_ends_the_record_stream() {
         }],
         // 内核只在订阅那一刻的全量帧上置 `reset`。
         reset: port == 1,
+        ..daemon::ConnectionEvents::default()
     };
     let ports = |frames: Vec<Result<daemon::ConnectionEvents, Status>>| async move {
         record_stream(futures::stream::iter(frames), WatchedInbounds::ProbePool)
@@ -5401,6 +5471,7 @@ async fn backlog_records_are_told_apart_from_older_ones_with_a_clock_tolerance()
                 closed(40004, REGISTERED_AT - 30_000, "previous-use"),
             ],
             reset: true,
+            ..daemon::ConnectionEvents::default()
         },
         WatchedInbounds::One("mixed-in"),
     ));
@@ -6417,11 +6488,13 @@ fn production_entries_wire_the_readback() {
     assert_eq!(occurrences(&pool, "open_readback()"), 1);
     assert!(pool.contains(".with_readback(readback);"));
     assert!(pool.contains("targets.pool_ports.as_slice(),readback,)"));
-    assert!(pool.contains("||measure_slot(&readback,slot,port,auth.as_ref(),&url),"));
+    assert!(pool.contains(
+        "measure_slot(&readback,slot,port,auth.as_ref(),&url,ConnectProbe::Foreground,)"
+    ));
     assert!(manual.contains(".with_readback(&readback);"));
     assert!(manual.contains(
         "measure_inbound(&readback,local_proxy.inbound.tag(),local_proxy.port,\
-         local_proxy.auth.as_ref(),&url,)"
+         local_proxy.auth.as_ref(),&url,ConnectProbe::Standard,)"
     ));
     for (name, body) in [("回退腿", &manual), ("出口伴测", &companion)] {
         assert_eq!(
@@ -6451,7 +6524,7 @@ fn production_entries_wire_the_readback() {
     ));
     assert!(companion.contains(
         "companion_measure(&probe,||{measure_inbound(&readback,local_proxy.inbound.tag(),\
-         local_proxy.port,local_proxy.auth.as_ref(),&request.url,)}).await;"
+         local_proxy.port,local_proxy.auth.as_ref(),&request.url,ConnectProbe::Standard,)}).await;"
     ));
 
     for (name, body) in [("后台探测", &failover), ("周期一轮", &scheduled)] {
@@ -6467,7 +6540,7 @@ fn production_entries_wire_the_readback() {
         assert_eq!(
             occurrences(
                 body,
-                "measure_slot(&readback,slot,port,auth.as_ref(),&url).await"
+                "measure_slot(&readback,slot,port,auth.as_ref(),&url,ConnectProbe::Background,).await"
             ),
             1,
             "{name}"
@@ -6475,9 +6548,7 @@ fn production_entries_wire_the_readback() {
     }
     assert!(failover.contains(".with_readback(&readback);"));
     let core = compact_production_fn("async fn drive_runtime_probe<");
-    assert!(core.contains(
-        "RuntimeProbeBatch::Completed(candidate_probes(candidates,&raw,&trace.mismatch_skipped))"
-    ));
+    assert!(core.contains("candidate_probes(candidates,&raw,&trace.mismatch_skipped)"));
     // 周期一轮的编排核：没拿到闸、零可测、领不到运行号的三处早退都在开流之前。
     let round = compact_production_fn("pub(crate) async fn drive_scheduled_round<");
     let opened = round
@@ -6625,6 +6696,24 @@ async fn failover_tells_an_enforced_mismatch_apart_from_a_failed_node() {
     );
 }
 
+#[tokio::test]
+async fn failover_can_use_a_measured_candidate_when_other_probes_hit_the_budget() {
+    use crate::runtime::auto_switch::{judge_probes, ProbeVerdict};
+
+    let busy = MeasureFailure::new(FailPhase::Connect, FailKind::BudgetBusy);
+    let probes = runtime_probe(
+        &Readback::off(),
+        move |n| if n == 0 { Ok(120) } else { Err(busy) },
+    )
+    .await;
+    assert_eq!(
+        probes,
+        BTreeMap::from([("a".into(), CandidateProbe::Measured(120))])
+    );
+    let named = pairs(&[("a", "A"), ("b", "B"), ("c", "C")]);
+    assert!(matches!(judge_probes(&named, &probes), ProbeVerdict::Best(best) if best.id == "a"));
+}
+
 /// 「只观测」档下故障切换的裁定与引入读回之前**逐条相同**：读回不符的候选照常出值、照常参选；
 /// 因本机探针口连不上而没拿到值的候选（重排一次后仍连不上）按没通计 —— 于是「没有候选测出值」
 /// 落在「全部不可用」那一支（warn、`needs_restart > 0` 时认领锁存并上报），不落「不下结论」。
@@ -6756,7 +6845,15 @@ async fn a_pool_measurement_registers_under_its_slot_inbound() {
         witness.clone(),
         SpeedBindingContext::default(),
     );
-    let probed = measure_slot(&readback, 2, port, None, DEFAULT_SPEED_TEST_URL).await;
+    let probed = measure_slot(
+        &readback,
+        2,
+        port,
+        None,
+        DEFAULT_SPEED_TEST_URL,
+        ConnectProbe::Foreground,
+    )
+    .await;
     assert!(probed.measured.is_ok());
     let peer_port = observed.lock().unwrap().peer_port.expect("代理接到了连接");
     assert_eq!(probed.source_port, Some(peer_port));
@@ -6774,10 +6871,17 @@ async fn a_pool_measurement_registers_under_its_slot_inbound() {
         silent.clone(),
         SpeedBindingContext::default(),
     );
-    assert!(measure_slot(&off, 0, port, None, DEFAULT_SPEED_TEST_URL)
-        .await
-        .measured
-        .is_ok());
+    assert!(measure_slot(
+        &off,
+        0,
+        port,
+        None,
+        DEFAULT_SPEED_TEST_URL,
+        ConnectProbe::Foreground
+    )
+    .await
+    .measured
+    .is_ok());
     assert!(silent.calls().is_empty());
 }
 
@@ -6814,7 +6918,17 @@ async fn the_readback_wait_stays_outside_the_value_measured_by_the_production_pa
         |_, _| async { true },
         |slot, port| {
             let readback = readback.clone();
-            async move { measure_slot(&readback, slot, port, None, DEFAULT_SPEED_TEST_URL).await }
+            async move {
+                measure_slot(
+                    &readback,
+                    slot,
+                    port,
+                    None,
+                    DEFAULT_SPEED_TEST_URL,
+                    ConnectProbe::Foreground,
+                )
+                .await
+            }
         },
         &mut |ev: &str, payload: Value| collected.push((ev.to_string(), payload)),
         &pool_ports,
@@ -6937,7 +7051,15 @@ async fn a_failed_tunnel_still_withdraws_its_registration() {
         fake.clone(),
         SpeedBindingContext::default(),
     );
-    let probed = measure_slot(&readback, 0, port, None, DEFAULT_SPEED_TEST_URL).await;
+    let probed = measure_slot(
+        &readback,
+        0,
+        port,
+        None,
+        DEFAULT_SPEED_TEST_URL,
+        ConnectProbe::Foreground,
+    )
+    .await;
     let peer_port = observed.lock().unwrap().peer_port.expect("代理接到了连接");
     assert_eq!(
         probed.measured,
@@ -6973,8 +7095,15 @@ async fn a_failed_tunnel_still_withdraws_its_registration() {
             let witness = kernel.witness.clone();
             let seen = Arc::clone(&registered_mid_flight);
             async move {
-                let probed =
-                    measure_slot(&readback, slot, port, None, DEFAULT_SPEED_TEST_URL).await;
+                let probed = measure_slot(
+                    &readback,
+                    slot,
+                    port,
+                    None,
+                    DEFAULT_SPEED_TEST_URL,
+                    ConnectProbe::Foreground,
+                )
+                .await;
                 seen.store(witness.table_len().0, Ordering::SeqCst);
                 probed
             }

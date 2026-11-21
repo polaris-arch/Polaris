@@ -235,7 +235,14 @@ async fn trusted_origin_receives_the_complete_authenticated_query() {
     let result = crate::commands::speedtest::measure_warm_ttfb(
         Duration::from_secs(5),
         Duration::from_secs(5),
-        open_tunnel_with_tls_config(port, None, &target, &|_| {}, move || Some(config)),
+        open_tunnel_with_tls_config(
+            port,
+            None,
+            &target,
+            ConnectProbe::Standard,
+            &|_| {},
+            move || Some(config),
+        ),
     )
     .await;
     let origin = finish(task).await;
@@ -268,7 +275,14 @@ async fn wrong_hostname_self_signed_and_expired_certificates_receive_no_get() {
                 .unwrap();
         let result = tokio::time::timeout(
             Duration::from_secs(5),
-            open_tunnel_with_tls_config(port, None, &target, &|_| {}, move || Some(config)),
+            open_tunnel_with_tls_config(
+                port,
+                None,
+                &target,
+                ConnectProbe::Standard,
+                &|_| {},
+                move || Some(config),
+            ),
         )
         .await;
         let origin = finish(task).await;
@@ -314,7 +328,7 @@ async fn production_trust_store_rejects_the_uninstalled_test_ca_before_get() {
             .unwrap();
     let result = tokio::time::timeout(
         Duration::from_secs(5),
-        open_tunnel(port, None, &target, &|_| {}),
+        open_tunnel(port, None, &target, ConnectProbe::Standard, &|_| {}),
     )
     .await;
     let origin = finish(task).await;

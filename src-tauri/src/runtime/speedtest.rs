@@ -64,6 +64,7 @@ mod diagnostic;
 use polaris_config_engine::builder::endpoints::{
     build_masque_endpoint, build_vpn_client_endpoint, build_wireguard_endpoint,
 };
+use polaris_config_engine::builder::helpers::probe_pool_inbound_tag;
 use polaris_config_engine::builder::outbound::build_proxy_outbound;
 use polaris_config_engine::builder::outbounds::build_shadow_tls_outbound;
 use polaris_config_engine::builder::system_interfaces::{
@@ -82,7 +83,7 @@ use polaris_core_supervisor::{
 };
 
 use crate::commands::speedtest::{
-    Binding, Measured, MeasurementEvents, NodeResult, RoundResults, SpeedTestCancel,
+    Binding, FailKind, Measured, MeasurementEvents, NodeResult, RoundResults, SpeedTestCancel,
 };
 #[cfg(test)]
 use crate::events::channel::EVENT_SPEED_TEST_RESULT;
@@ -196,9 +197,7 @@ const TEMP_CORE_READY_TIMEOUT_FLOOR_MS: u64 = 10_000;
 /// # 60s 的判据
 ///
 /// 它不是启动耗时的物理上限，是「等一个**可能永远不会 bind** 的核」的耐心上限。
-/// · 下界：必须远高于本改动要拆掉的那堵墙（240 naive ⇒ 预算 19.9s），否则改了等于没改。
-///   60s 对应约 725 个 naive（见 [`temp_core_max_naive`]），是那堵墙的 3 倍；
-/// · 上界：一分钟是「这东西是不是死了」的普遍心理阈值，再往上等只是把无解的等待拉长。
+/// 60 秒给就绪等待设定上限。当前正常批次还受更紧的批间窗口和 Core 引擎预算约束。
 ///
 /// **真会吃满这 60s 的只有一种形态：核活着、但一直不 bind 的僵核。** 另外两条腿都提前返回，
 /// 不要把它们算进这个上限的依据里：核**崩掉**由 `CoreReadyDeps::observe_process` 接住
@@ -207,24 +206,8 @@ const TEMP_CORE_READY_TIMEOUT_FLOOR_MS: u64 = 10_000;
 /// （登记项 L2-e），且进程级单飞闸（`commands::speedtest::SPEED_TEST_GATE`）在此期间挡住
 /// 一切后续测速请求 ⇒ 上限必须有限，且不能定得太大。
 ///
-/// # ⚠️ T1-R1（分批）之后：这条腿**在生产路径上已经不可达**，但它不是死代码
-///
-/// 分批落地之后，进 [`TempCoreSession::run_batch`] 的每一批都由 [`plan_temp_core_batches`] 裁过，
-/// `(n, m)` 被 [`TEMP_CORE_BATCH_MAX_NODES`] / [`temp_core_batch_max_naive`] 封死 ⇒ 单批预算至多
-/// ≈11.9s，**永远不会**越过本值（60s）。门 `planned_batches_never_trip_the_oversize_refusal` 把这
-/// 件事钉成判据，而不是留成一句注释。
-///
-/// 那为什么不删掉整条腿：
-/// · 它是 [`TempCoreSession::run_batch`] 这个入口的**前置条件检查**。规划器绕过（未来新增第二个
-///   调用点）或规划器自身回归（有人把 `TEMP_CORE_BATCH_MAX_NODES` 调大而没跟着调预算）时，它是
-///   唯一会喊出来的地方 —— 而不喊的表现是「起核、白等一分多钟、超时、整批零结果、报错指向网络」；
-/// · 报错原文给的建议（「减少本轮 naive 节点数分次测」）在那种回归下**仍然可执行**，不是过期建议；
-/// · 删它不省任何运行成本（一次整型比较），却把一个已经写好、已有门、已接到用户可见文案的防御拆掉。
-///
-/// 判据本身**没有变**：60s 仍然是「等一个可能永远不 bind 的核」的耐心上限。变的是它的射程 ——
-/// 从「用户选太多 naive 时的拒绝腿」变成「规划器与门失配时的自曝腿」。
-/// **真正对用户生效的规模上限现在是 [`TEMP_CORE_BATCH_READY_BUDGET_CAP_MS`]（12s / 批），
-/// 而它不再拒绝任何人：越界的批被切开，不被打回。**
+/// 常规批次经 [`plan_temp_core_batches`] 切分。单个自定义出站请求的引擎组不能切分，若其估算
+/// 越过此上限，[`TempCoreSession::run_batch`] 会在分配端口和启动之前拒绝该批。
 const TEMP_CORE_READY_TIMEOUT_CAP_MS: u64 = 60_000;
 
 // ── 起核耗时的规模系数：单一真值在 `polaris_core_supervisor::readiness_gate` ──────────────────
@@ -341,7 +324,7 @@ const TEMP_CORE_BATCH_MAX_NODES: usize =
 ///
 /// 256 MB：一个**瞬态**测量核的峰值。宿主 app（Tauri + WebView）自身已在 200–400 MB 量级，再叠一个
 /// 常驻不了几分钟的子进程，这是「用户不会察觉」与「批不至于切得太碎」之间的取值。
-/// 它与 [`TEMP_CORE_BATCH_ESTIMATE_CAP_MS`] 两条**取严**，见 [`temp_core_batch_max_naive`]。
+/// 它与起核时间、原生引擎数量一并取严，见 [`temp_core_batch_max_naive`]。
 const TEMP_CORE_BATCH_RSS_BUDGET_KB: u64 = 256 * 1024;
 
 /// 临时核的**基线** RSS（KB，实测：`sing-box check` 0 节点 48 MB）。
@@ -354,52 +337,24 @@ const TEMP_CORE_PER_NODE_RSS_KB: u64 = 20;
 /// 131–135 MB 减去 `check(118)` 的 57 MB，除以 58）。
 const TEMP_CORE_PER_ENGINE_RSS_KB: u64 = 1_331;
 
-/// 单批 **naive 出站数**（= cronet engine 数）上限 —— 两条预算**取严**。
-///
-/// ```text
-/// ① 时间预算（前端 20s 静默兜底反解）：
-///    m ≤ (BATCH_ESTIMATE_CAP − T_fix − c_parse·n_max) / t_engine
-///      = (6000 − 90 − 0.105×512) / 41 = 142
-/// ② 内存预算：
-///    m ≤ (RSS_BUDGET − BASE − per_node·n_max) / per_engine
-///      = (262144 − 49152 − 20×512) / 1331 = 152
-/// ⇒ m_max = min(142, 152) = 142
-/// ```
-///
-/// 两处都按**最坏的 n**（[`TEMP_CORE_BATCH_MAX_NODES`]）折算 ⇒ 任何 (n ≤ n_max, m ≤ m_max) 的批都
-/// 同时满足两条预算（估算与 RSS 对 n、m 都单调）。这条「取严」由门
-/// `every_planned_batch_fits_the_frontend_idle_window` 与
-/// `every_planned_batch_fits_the_core_memory_budget` 各守一条。
-///
-/// # 为什么不写成一个字面常量
-///
-/// 写死一个数 ⇒ 五个输入系数（`T_fix` / `c_parse` / `t_engine` / 安全系数 / 前端 20s）里任何一个被
-/// 改，这个数都会静默失配，而失配的表现是「批间空窗超过前端兜底 ⇒ 假的测速中断」——一个不会有人
-/// 把它联想到批大小的现象。算出来则系数一改它就跟着走，且门会当场指出是哪一条预算在绑。
+/// Core 的非 iOS 进程预算（`protocol/naive/outbound_runtime.go::probeClientLimit`）。
+/// 临时核的固定路由持有每个已初始化的出站，直到本批核关闭才释放引擎。iOS 不运行临时核。
+const TEMP_CORE_NATIVE_NAIVE_LIMIT: usize = 10;
+
+/// 单批 Cronet 引擎上限，同时受 Core、起核时间和 RSS 约束。
 const fn temp_core_batch_max_naive() -> usize {
-    temp_core_batch_naive_cap(
+    let resource_cap = temp_core_batch_naive_cap(
         TEMP_CORE_BATCH_ESTIMATE_CAP_MS,
         TEMP_CORE_BATCH_RSS_BUDGET_KB,
-    )
+    );
+    if resource_cap < TEMP_CORE_NATIVE_NAIVE_LIMIT {
+        resource_cap
+    } else {
+        TEMP_CORE_NATIVE_NAIVE_LIMIT
+    }
 }
 
-/// [`temp_core_batch_max_naive`] 的**可参数化**内核：两条预算给定时的 naive 上限。
-///
-/// # 为什么把两条预算提成参数（而不是直接读那两个常量）
-///
-/// 今天 ① 时间预算（142）比 ② 内存预算（152）紧 ⇒ `min` 恒取 ①，**② 那条腿对最终取值毫无影响**。
-/// 直接读常量的写法下，把整条 ② 删掉、结果一字不变 —— 于是「内存预算也在把关」这句话在门上
-/// **无法证伪**（复审 2026-09-03 实测：删掉 ② 之后本模块与 UI 两侧的门全绿）。
-///
-/// 提成参数之后，门可以喂一个「① 被放宽到大于 ②」的输入，断言此刻上限被 ② **钉在 152** ——
-/// 删掉 ② 那条腿，这条断言当场红。守的就是
-/// `every_planned_batch_fits_the_core_memory_budget` 里那条参数化断言。
-///
-/// # 这不是为测试而造的形状 —— ② 很快就会变成绑定的那一条
-///
-/// `t_engine = 41ms` 是**两点回归的推导值**（真值区间 30–45ms，多点实测已排进验收 runbook 的 F 组）。
-/// 一旦实测把它下修到 30ms，① 放宽到 `(6000 − 90 − 53) / 30 = 195` > 152 ⇒ **② 立刻接管**。
-/// 那时若 ② 已经被人当成「反正没用」删掉，单批峰值 RSS 会从 247 MB 涨到 ~308 MB 而没有任何门会喊。
+/// 起核时间和 RSS 分别按单批最大节点数折算，取允许引擎数较小的预算。
 const fn temp_core_batch_naive_cap(estimate_cap_ms: u64, rss_budget_kb: u64) -> usize {
     let n = TEMP_CORE_BATCH_MAX_NODES as u64;
     // ① 时间预算（前端静默兜底反解）
@@ -427,25 +382,18 @@ const fn temp_core_batch_naive_cap(estimate_cap_ms: u64, rss_budget_kb: u64) -> 
 ///
 /// # 这个函数是「资源 O(1)」的本体
 ///
-/// 分批之前，一轮测速的峰值资源（核 RSS / 线程 / fd / 回环端口 / 配置体积）**全部**随订阅节点数
-/// 线性增长 —— 因为一份配置里塞了全部 N 个入站与 N 个出站，其中每个 naive 出站还是一个独立的
-/// Chromium Cronet Engine（≈1.3 MB + 2 线程 + 6 fd，且由内核**串行**启动）。分批之后每一批的
-/// `(n, m)` 都被两个上限封死 ⇒ **峰值与 N 无关，只有批数与总耗时随 N 线性**。
+/// 每批的入站、出站与 Cronet 引擎有独立上限。订阅节点数增长时，只有批数和总耗时随之增长。
 ///
 /// # 为什么是贪心装箱而不是定长 `chunks(k)`
 ///
-/// 绑定约束是 **m**（naive 数），不是 n。定长切分要想保住 m 的上界，只能按「每个节点都是 naive」
-/// 的最坏情况取 k = m_max ⇒ 一个 2000 节点 0 naive 的订阅会被切成 15 批（真实需要 4 批），白白多
-/// 起 11 次核。贪心装箱同时看 n 与 m，两个上限谁先满谁切，零 naive 的订阅按 n_max 切、全 naive 的
-/// 按 m_max 切，两头都不浪费。代价是 12 行 stdlib 循环，无新抽象。
+/// 同时限制节点数和 Cronet 引擎数，零 Naive 的订阅仍按端口容量分批。
 ///
 /// **不复用** `commands::speedtest::plan_waves`：那是主核池的「槽位指派」（把节点分配到 k 个固定
 /// 槽上按波热切），与本函数的「切成若干批、每批起一个自己的核」语义不同，强行复用会语义错配。
 ///
 /// # 边界
 ///
-/// 单个节点即便自己就超过某条预算也**照样成批**（`start < i` 的守卫保证批非空）——绝不因为装不下
-/// 而丢节点。今天不可能发生（m_max ≥ 1），但这条不变量必须由结构保证，不是由取值保证。
+/// 单个自定义 Naive 出站请求的引擎数若超限，单独成批并由批次准入拒绝。
 #[must_use]
 pub fn plan_temp_core_batches(nodes: &[TempNode]) -> Vec<&[TempNode]> {
     let max_naive = temp_core_batch_max_naive();
@@ -453,15 +401,15 @@ pub fn plan_temp_core_batches(nodes: &[TempNode]) -> Vec<&[TempNode]> {
     let mut start = 0usize;
     let mut naive = 0usize;
     for (i, node) in nodes.iter().enumerate() {
-        let is_naive = temp_core_is_naive(node);
+        let engines = temp_core_node_naive_slots(node);
         let would_nodes = i - start + 1;
-        let would_naive = naive + usize::from(is_naive);
+        let would_naive = naive.saturating_add(engines);
         if start < i && (would_nodes > TEMP_CORE_BATCH_MAX_NODES || would_naive > max_naive) {
             batches.push(&nodes[start..i]);
             start = i;
             naive = 0;
         }
-        naive += usize::from(is_naive);
+        naive = naive.saturating_add(engines);
     }
     if start < nodes.len() {
         batches.push(&nodes[start..]);
@@ -475,16 +423,10 @@ pub fn plan_temp_core_batches(nodes: &[TempNode]) -> Vec<&[TempNode]> {
 /// ```text
 /// T_ready(n, m) ≈ 90ms + 0.105ms·n + 41ms·m
 ///     n = 本批节点数（临时核给每个节点配一个 http inbound）
-///     m = 其中 naive 出站数（每个 = 一个独立 Chromium Cronet Engine）
+///     m = 本批请求的 Cronet 引擎数
 /// ```
 ///
-/// # 系数、分级与「m 主导」的机制都在单一真值那边 —— 改公式前先读那里
-///
-/// 三个系数的出处与分级（`T_fix` 单点实测 / `t_engine` **两点回归的推导值**、真值区间 30–45ms、多点
-/// 实测的测法 / `c_parse` 开发机实测）、以及「sing-box 在入站 bind 之前串行 eager 启动全部出站，naive
-/// 出站在这一步同步建 Cronet Engine」这条机制，写在 [`CORE_STARTUP_PER_NAIVE_MS`] /
-/// [`CORE_STARTUP_PER_NODE_US`] / [`core_startup_estimate_ms`] 上。多点实测拿到真斜率后改的是**那边**的
-/// 常量，本函数与本文件的批上限都跟着走，不必动。
+/// 继续使用 [`core_startup_estimate_ms`] 的早期启动实测作保守预算。当前 Core 按需初始化 Naive 引擎。
 ///
 /// # 固定项为什么可以直接取 [`CORE_STARTUP_BASELINE_FIXED_MS`]（90ms）
 ///
@@ -526,39 +468,13 @@ fn temp_core_ready_timeout_ms(node_count: usize, naive_count: usize) -> Result<u
     Ok(budget.max(TEMP_CORE_READY_TIMEOUT_FLOOR_MS))
 }
 
-/// 给定本批节点数，单核**最多**能带多少个 naive 出站 —— 即越界报错里那个**可执行的数**。
-///
-/// 只服务一件事：「本批规模超限」不带这个数，用户唯一能做的就是二分猜；带上它，他知道要砍到多少。
-///
-/// # ⚠️ 分母是**批预算**（12s），不是那条 60s 的拒绝上限 —— 这一条 T1-R1 改过，理由在此
-///
-/// 改前分母取 `TEMP_CORE_READY_TIMEOUT_CAP_MS / SAFETY` = 30s ⇒ 报出去的数是 **≈727**，
-/// 即「恰好还不触发拒绝」的那个 m。分批之后那个数是**有害的**：用户照它把 naive 砍到 727，
-/// 单批预算约 30s，**远超前端 20s 的静默兜底**（[`TEMP_CORE_UI_IDLE_TIMEOUT_MS`]）⇒ 他会拿到一条
-/// 假的「测速中断」，而现场没有任何东西指向「批太大」。**自曝腿把用户引向了第二个坑。**
-///
-/// 换成 [`TEMP_CORE_BATCH_READY_BUDGET_CAP_MS`] / SAFETY = 6s 之后，报出去的数与
-/// [`temp_core_batch_max_naive`] 同源（同一条时间预算），照它砍下去**这一轮真的能跑通**。
-///
-/// # 那这条建议在分批之后还算不算「可执行」——算，判据如下
-///
-/// 越界腿本身在生产上已不可达（见 [`TEMP_CORE_READY_TIMEOUT_CAP_MS`] 的射程说明），能看到它
-/// 只有一种情形：**规划器被绕过或回归**。那种情形下用户仍然完全控制得了「本轮选哪些节点」
-/// （`server_speed_test` 的 `serverIds`），把本轮 naive 砍到本函数报的数 ⇒ 单批预算落回 12s 内
-/// ⇒ 这一轮跑得通。⇒ 建议是**真的可执行**，不是安慰话。
-///
-/// # 已登记的纯理论 nit（不修）
-///
-/// `n` 大到 `c_parse` 项自己就吃掉整个预算时（阈值随分母变小而下降到 `n ≥ 56_285`），本函数返回
-/// **0**，报错会写「最多带 0 个 naive」—— 一条不可执行的建议。不修的判据不变：那是一个 5.6 万节点
-/// 的订阅，比本模块任何一个取样点都高两个数量级，且到达该区间之前 `Err` 腿早已把整批拒掉，
-/// 用户看到的仍是「规模超限」这个正确结论，只有末尾那句建议退化。加一条 `max(1)` 会让
-/// 「最多带 1 个」同样不可执行，纯属把一个触发不到的分支换个说法。
+/// 规模超限诊断使用单批引擎上限，同时考虑给定节点数下更紧的起核时间预算。
 fn temp_core_max_naive(node_count: usize) -> usize {
     let per_core = TEMP_CORE_BATCH_READY_BUDGET_CAP_MS / CORE_READY_SAFETY_FACTOR;
     let non_engine = temp_core_startup_estimate_ms(node_count, 0);
     usize::try_from(per_core.saturating_sub(non_engine) / CORE_STARTUP_PER_NAIVE_MS)
         .unwrap_or(usize::MAX)
+        .min(temp_core_batch_max_naive())
 }
 
 /// 越过 [`TEMP_CORE_READY_TIMEOUT_CAP_MS`] 那一批的报错原文。
@@ -573,16 +489,15 @@ fn temp_core_max_naive(node_count: usize) -> usize {
 /// 两种排布之间反复横跳，`cargo fmt --check` 因此永不稳定。
 fn temp_core_oversize_message(node_count: usize, naive_count: usize, budget_ms: u64) -> String {
     format!(
-        "测速临时核本批规模超限：{node_count} 个节点含 {naive_count} 个 naive，估算起核 {}ms、\
+        "测速临时核本批规模超限：{node_count} 个节点请求 {naive_count} 个 Cronet 引擎，估算起核 {}ms、\
          就绪预算 {budget_ms}ms 超过上限 {TEMP_CORE_READY_TIMEOUT_CAP_MS}ms，不起核。\
-         每个 naive 出站都是一个独立 Cronet Engine 且由内核串行启动，\
-         本批节点数下单核最多带 {} 个 naive。请减少本轮 naive 节点数分次测。",
+         本批节点数下单核最多带 {} 个 Cronet 引擎。请减少本批 Naive 节点数或调低自定义出站的引擎数。",
         temp_core_startup_estimate_ms(node_count, naive_count),
         temp_core_max_naive(node_count),
     )
 }
 
-/// 本批里的 naive 出站数（= cronet engine 数，[`temp_core_startup_estimate_ms`] 的 `m`）。
+/// 本批请求的 Cronet 引擎数（[`temp_core_startup_estimate_ms`] 的 `m`）。
 ///
 /// # 为什么从出站 JSON 的 `type` 读，而不是在 [`TempNode`] 上另存一个 `is_naive`
 ///
@@ -611,17 +526,23 @@ fn temp_core_oversize_message(node_count: usize, naive_count: usize, budget_ms: 
 ///
 /// 附属出站（ShadowTLS 外层）同理不进计数，且它们也不建 engine。
 fn temp_core_naive_count(nodes: &[TempNode]) -> usize {
-    nodes.iter().filter(|n| temp_core_is_naive(n)).count()
+    nodes
+        .iter()
+        .map(temp_core_node_naive_slots)
+        .fold(0, usize::saturating_add)
 }
 
-/// 单个节点是不是 naive 出站（[`temp_core_naive_count`] 与 [`plan_temp_core_batches`] **共用**的判据）。
-///
-/// 抽成一个函数而不是在两处各写一遍那个 `get("type")`：预算的输入与分批的输入必须是**同一个**判据，
-/// 各写一遍就会在「协议映射改了、只改了一处」时静默分叉 —— 而分叉的表现是「批算得太大 ⇒ 就绪门
-/// 算得太小 ⇒ 整批零结果 ⇒ 报错指向网络」，本模块最难归因的那一种。判据本身的出处见
-/// [`temp_core_naive_count`]。
+/// Config Engine 生成的 Naive 使用单引擎。自定义出站可能指定更大的引擎组。
+fn temp_core_node_naive_slots(node: &TempNode) -> usize {
+    if !temp_core_is_naive(node) {
+        return 0;
+    }
+    let concurrency = node.node["insecure_concurrency"].as_u64().unwrap_or(1);
+    usize::try_from(concurrency.max(1)).unwrap_or(usize::MAX)
+}
+
 fn temp_core_is_naive(node: &TempNode) -> bool {
-    node.node.get("type").and_then(Value::as_str) == Some("naive")
+    !node.is_endpoint && node.node.get("type").and_then(Value::as_str) == Some("naive")
 }
 
 /// 端口列表 → **定长**日志摘要（`128 个 [20001, 20002, 20003 … 20126, 20127, 20128]`）。
@@ -1702,8 +1623,9 @@ pub fn build_temp_core_config(nodes: &[TempNode], ports: &[u16], log_level: &str
     })];
     let mut dns_rules: Vec<Value> = Vec::new();
 
-    for (node, port) in nodes.iter().zip(ports.iter()) {
-        let inbound_tag = format!("in-{}", node.tag);
+    for (index, (node, port)) in nodes.iter().zip(ports.iter()).enumerate() {
+        // The Core recognizes probe CONNECT framing on loopback HTTP probe tags.
+        let inbound_tag = probe_pool_inbound_tag(index);
         inbounds.push(json!({
             "type": "http", "tag": inbound_tag, "listen": "127.0.0.1", "listen_port": port,
         }));
@@ -1712,7 +1634,7 @@ pub fn build_temp_core_config(nodes: &[TempNode], ports: &[u16], log_level: &str
         }));
         if node.is_endpoint {
             // 测速临时核不是本机服务入口。内核对新建 endpoint ingress 用自身 tag；
-            // 测速 HTTP in-<tag> 仍只负责出站，不能拿它代替这道拒绝。
+            // 测速 HTTP 入站仍只负责出站，不能拿它代替这道拒绝。
             endpoint_route_rejects.push(json!({
                 "inbound": [node.tag], "action": "reject", "no_drop": true,
             }));
@@ -1982,6 +1904,8 @@ pub struct RoundProgress {
     ok: usize,
     /// 本轮第一个中断成因（[`Self::note_interrupt`] 的取舍规则见其文档）。
     reason: Option<InterruptReason>,
+    /// 至少一个节点因 Core 引擎准入被延后。
+    budget_deferred: bool,
 }
 
 impl RoundProgress {
@@ -1993,6 +1917,7 @@ impl RoundProgress {
             tested: 0,
             ok: 0,
             reason: None,
+            budget_deferred: false,
         }
     }
 
@@ -2192,6 +2117,13 @@ where
                 if superseded() {
                     set.shutdown().await;
                     return Some(InterruptReason::Superseded);
+                }
+                if measured.is_err_and(|failure| failure.kind == FailKind::BudgetBusy) {
+                    // The live batch retains its engine reservations. Leave this node
+                    // pending for a later round and keep measuring the other nodes.
+                    progress.budget_deferred = true;
+                    failure_streak = 0;
+                    continue;
                 }
                 if measured.is_ok() {
                     failure_streak = 0;
@@ -2595,8 +2527,7 @@ enum BatchOutcome {
     Ran(RoundResults),
     /// 起核前/就绪前失败 ⇒ **本批一个数值都不产出**，节点缺席（绝不写假 `-1`），后续批照跑。
     ///
-    /// `oversized` = 本批规模越过 [`TEMP_CORE_READY_TIMEOUT_CAP_MS`]。分批之后它在生产上不可达
-    /// （见该常量的射程说明），但仍要与「核起不来」分开：两者在用户侧不是一句话，修法也南辕北辙。
+    /// `oversized` 表示本批超出引擎数或就绪时间预算。
     Failed {
         detail: String,
         oversized: bool,
@@ -2641,10 +2572,8 @@ impl TempCoreSession {
     ///
     /// # 为什么要分批（T1-R1 的本体）
     ///
-    /// 一份配置塞下全部 N 个节点时，峰值资源（核 RSS / 线程 / fd / 回环端口 / 配置体积 / 起核耗时）
-    /// **全部**随 N 线性 —— 其中每个 naive 出站是一个独立的 Chromium Cronet Engine，由内核在入站
-    /// bind **之前**串行 eager 启动。分批把 `(n, m)` 封在常数上 ⇒ **峰值与 N 无关，只有批数与总耗时
-    /// 随 N 线性**。切法与两条预算见 [`plan_temp_core_batches`]。
+    /// 回环端口受节点数约束。固定路由持有已初始化的 Naive 引擎，单核引擎预算受它们的总数约束。
+    /// [`plan_temp_core_batches`] 限制两者，每批关闭后释放临时核的引擎。
     ///
     /// # 批间的两条心跳：为什么两条都必要
     ///
@@ -2799,6 +2728,11 @@ impl TempCoreSession {
         }
         // 一批都没起成功时不发终态（同分批之前）；只要测过就必须发，且载荷是**轮**级口径。
         let (outcome, reason) = round_exit(progress.reason(), deps.cancel.reason(), failed_batches);
+        let outcome = if progress.budget_deferred {
+            "interrupted"
+        } else {
+            outcome
+        };
         emit_speed_test_done(emit, outcome, &results, &intended, reason);
         TempCoreOutcome::Ran { results, outcome }
     }
@@ -2924,6 +2858,20 @@ impl TempCoreSession {
                 }
             },
         };
+
+        let max_naive = temp_core_batch_max_naive();
+        if naive_count > max_naive {
+            let detail = format!(
+                "测速临时核本批规模超限：{} 个节点请求 {naive_count} 个 Cronet 引擎，\
+                 单核最多带 {max_naive} 个 Cronet 引擎。请调低自定义出站的引擎数。",
+                nodes.len()
+            );
+            log::warn!("{detail}");
+            return BatchOutcome::Failed {
+                detail,
+                oversized: true,
+            };
+        }
 
         let binary = match (deps.resolve_binary)() {
             Ok(b) => b,

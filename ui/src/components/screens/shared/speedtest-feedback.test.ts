@@ -12,13 +12,7 @@ import {
   notInPoolMessage,
   speedTestErrorMessage,
   speedTestBlockedMessage,
-  TEMP_CORE_NAIVE_CEILING_HINT,
 } from './speedtest-feedback';
-import {
-  maskRustCommentsAndStrings,
-  moduleSource,
-  rustConstU64,
-} from '@/contracts/rust-source.test-support';
 import type { ServerConfig } from '@/contracts/types';
 import { speedTestBlockReason, type SpeedTestBlockReason } from '../nodes/nodes-logic';
 
@@ -58,21 +52,6 @@ describe('speedTestErrorMessage', () => {
     expect(speedTestErrorMessage(err, t)).toBe('nodes.speedTestOnlyActive');
   });
 
-  /**
-   * 🔴 **规模超限必须与就绪超时分流** —— 这是后端新增独立错误码的**全部理由**。
-   *
-   * 合并回 `SPEEDTEST_TEMP_CORE_FAILED` 那组，用户看到的就是「测速中断」，与「核起不来 / 未就绪
-   * 超时」逐字相同 ⇒ 朝网络/端口方向排查，而真因是本轮 naive 节点太多、少选一些当场就能测。
-   *
-   * 第二条断言（`not.toBe` 就绪超时那句）是牙：只断言「等于新键」的话，把 `speedTestInterrupted`
-   * 改名成新键同样能骗过去。
-   *
-   * ⚠️ **射程登记（T1-R1 分批之后）**：`SPEEDTEST_TEMP_CORE_OVERSIZED` 这条码在生产路径上
-   * **已不可达** —— 后端规划器保证每一批的就绪预算至多 ≈11.9s，永远碰不到那条 60s 的拒绝上限
-   * （Rust 侧门 `planned_batches_never_trip_the_oversize_refusal`）。本条守的是
-   * 「万一规划器被绕过或回归，那条自曝腿仍然有自己的文案」，**不是一条活路径**。
-   * 读到这里不要以为用户还会看到这句话，也不要据此推断「测速会因为 naive 太多而拒绝用户」。
-   */
   it('临时核规模超限 → 专属文案，且与「测速中断」不是同一句', () => {
     const oversized = new IpcError('server_speed_test', '后端诊断原文', 'SPEEDTEST_TEMP_CORE_OVERSIZED');
     const failed = new IpcError('server_speed_test', '后端诊断原文', 'SPEEDTEST_TEMP_CORE_FAILED');
@@ -202,98 +181,5 @@ describe('speedTestBlockedMessage', () => {
         `原因码 ${reason} 没有专属文案`
       ).not.toBe('nodes.speedTestNotApplicable');
     }
-  });
-});
-
-/**
- * 🔴 **超限文案里那个「最多带 N 个」不许比后端的真实上限大** —— 报大了，用户照着砍完仍被拒。
- *
- * # 为什么这个数不能只写在译文里
- *
- * 后端 `temp_core_max_naive(n)` 现算的精确值只到得了诊断串（失败信封没有数据面，见
- * `TEMP_CORE_NAIVE_CEILING_HINT` 的文档），所以用户可见的那个数是前端一个保守常量 + 五份译文里的
- * `{{max}}`。它与后端四个系数之间**没有任何编译期联系**：多点实测之后 `t_engine` 必然要改
- * （`core-supervisor/src/readiness_gate.rs` 的系数出处表里写着它是两点回归的推导值），改完这五处
- * 译文会静默过期。
- * 本门就是那条联系：直接读 Rust 常量把上限现算出来对拍。
- *
- * 取材同 `speedtest-progress-toast.test.ts`：`moduleSource` 入口 + 剥注释 + 命中数自检
- * （裸 `readFileSync` + 不剥注释的正则会被文档注释里的同形常量替真常量作证，复审已实测打穿过一次）。
- */
-describe('超限文案里那个「最多带 N 个」', () => {
-  /*
-   * 取材面走 `contracts/rust-source.test-support.ts` 的共享净化器（`crates/source-probe` 那个字节
-   * 状态机的逐条移植），**不再**用本地那份正则版：正则剥得掉注释，却保护不了字符串 ——
-   * 一条 `const _X: &str = "const CORE_STARTUP_PER_NAIVE_MS: u64 = 1;";` 就能在真常量改名之后
-   * 让本门读到假值并全绿（复审 2026-09-03 构造实测，本仓同族第三次）。
-   * should-throw 的对照用例在 `lib/speedtest-progress-toast.test.ts`（同一份实现，不重复写两遍）。
-   */
-  const RUNTIME_SPEEDTEST = maskRustCommentsAndStrings(
-    moduleSource('src-tauri/src/runtime/speedtest')
-  );
-
-  /*
-   * 起核耗时的三个系数与安全系数**不在** `speedtest.rs`：它们是主核与测速临时核共用的规模模型，
-   * 单一真值在 `crates/core-supervisor/src/readiness_gate.rs`。那边曾在 `speedtest.rs` 里有一份逐值
-   * 相同的 `TEMP_CORE_*` 副本（由一道双向防漂移门顶着），2026-09-03 收口删掉 ⇒ 本门的取材面跟着搬到
-   * 单一真值那边。**这不是取材面放宽**：两处都是 `moduleSource` 入口 + 剥注释与字符串 + 命中数恰好 1，
-   * 且现在读的就是生产代码真正在用的那一份，中间再没有一层可以悄悄漂移的副本。
-   */
-  const READINESS_GATE = maskRustCommentsAndStrings(
-    moduleSource('crates/core-supervisor/src/readiness_gate')
-  );
-
-  const rustConst = (name: string): number =>
-    rustConstU64(RUNTIME_SPEEDTEST, name, 'speedtest-naive-ceiling');
-
-  const supervisorConst = (name: string): number =>
-    rustConstU64(READINESS_GATE, name, 'speedtest-naive-ceiling');
-
-  /**
-   * 与 `runtime/speedtest.rs::temp_core_max_naive` 同一条算式（含它那两处整数截断）。
-   *
-   * ⚠️ **分母是批预算（12s），不是 60s 那条拒绝上限** —— T1-R1 改过。分批之后单批真正的窗口是
-   * 「前端静默兜底 20s − 批间固定开销 8s」，照 60s 那条算出来的 ≈727 会把用户引向第二个坑
-   * （砍到 727 ⇒ 单批预算 ≈30s ⇒ 假的「测速中断」）。判据见该函数的文档。
-   */
-  function backendCeiling(nodeCount: number): number {
-    const batchBudgetCap =
-      rustConst('TEMP_CORE_UI_IDLE_TIMEOUT_MS') - rustConst('TEMP_CORE_BATCH_WINDOW_OVERHEAD_MS');
-    const perCore = Math.floor(batchBudgetCap / supervisorConst('CORE_READY_SAFETY_FACTOR'));
-    const nonEngine =
-      supervisorConst('CORE_STARTUP_BASELINE_FIXED_MS') +
-      Math.floor((nodeCount * supervisorConst('CORE_STARTUP_PER_NODE_US')) / 1000);
-    return Math.floor(
-      Math.max(perCore - nonEngine, 0) / supervisorConst('CORE_STARTUP_PER_NAIVE_MS')
-    );
-  }
-
-  it('取材自检：注释里的假常量不算数，且两个真取材面都非空', () => {
-    expect(
-      maskRustCommentsAndStrings('/// const CORE_STARTUP_PER_NAIVE_MS: u64 = 1;\nx;')
-    ).not.toMatch(/CORE_STARTUP_PER_NAIVE_MS/);
-    // 两个面各读一半：系数在单一真值那边，批窗那两个常量仍在 `speedtest.rs`。任一面读空/读错，
-    // `rustConstU64` 的命中数自检会当场抛 —— 但那要等到用它的那条断言，故此处先各钉一次。
-    expect(READINESS_GATE).toMatch(/const CORE_STARTUP_PER_NAIVE_MS\s*:\s*u64/);
-    expect(RUNTIME_SPEEDTEST).toMatch(/const TEMP_CORE_UI_IDLE_TIMEOUT_MS\s*:\s*u64/);
-  });
-
-  /**
-   * 覆盖到 n=10 000（本仓见过的最大订阅量级还低一个数量级）。`n` 项让上限随节点数缓慢下滑，
-   * 取整段的**最小值**对拍 —— 只拿 n=0 那个点比，n 大时报出去的数就偏乐观了。
-   */
-  it('🔴 不大于后端真实上限（否则用户砍到这个数仍会被拒）', () => {
-    const worst = Math.min(...[0, 1_000, 5_000, 10_000].map(backendCeiling));
-    expect(worst, '前提校验：算出来的上限得是个正数，否则本条无对象可守').toBeGreaterThan(0);
-    expect(
-      TEMP_CORE_NAIVE_CEILING_HINT,
-      `文案里报的 ${TEMP_CORE_NAIVE_CEILING_HINT} 已超过后端上限 ${worst} —— ` +
-        '后端系数改过了？同步本常量与五份译文里的 {{max}}'
-    ).toBeLessThanOrEqual(worst);
-  });
-
-  it('也不许保守到没信息量（报 1 个同样不可执行）', () => {
-    const worst = Math.min(...[0, 1_000, 5_000, 10_000].map(backendCeiling));
-    expect(TEMP_CORE_NAIVE_CEILING_HINT).toBeGreaterThanOrEqual(Math.floor(worst * 0.9));
   });
 });

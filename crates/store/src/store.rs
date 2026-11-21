@@ -419,7 +419,7 @@ pub fn default_config() -> Value {
         "ruleResourceUpdateIntervalHours": 12,
         "fakeIpFilter": true,
         "blockQuic": true,
-        "singboxDashboard": true,
+        "singboxDashboard": false,
         "mixedPort": 7890,
         "controlPort": 9090,
         "logLevel": "info",

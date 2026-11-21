@@ -251,9 +251,17 @@ fn legacy_explicit_destination_resolution_survives_non_smart_mode() {
 #[test]
 fn sniff_is_first_rule() {
     let config = UserConfig::default();
-    let deps = deps_default(&[]);
+    let mut deps = deps_default(&[]);
     let rc = build_route_config(&config, &empty_id_map(), &deps);
     assert_eq!(rc.rules[0].action.as_deref(), Some("sniff"));
+    deps.probe_pool_ports = vec![7892];
+    let rc = build_route_config(&config, &empty_id_map(), &deps);
+    assert!(matches!(
+        rc.rules[0].inbound.as_ref(),
+        Some(OneOrMany::Many(tags)) if tags == &["probe-in-0"]
+    ));
+    assert_eq!(rc.rules[0].outbound.as_deref(), Some("probe-selector-0"));
+    assert_eq!(rc.rules[1].action.as_deref(), Some("sniff"));
 }
 
 #[test]

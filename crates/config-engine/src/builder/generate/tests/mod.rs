@@ -73,7 +73,11 @@ fn base_config() -> UserConfig {
 }
 
 #[test]
-fn android_single_no_exit_ts_precompiles_both_policies_with_dashboard() {
+fn android_single_no_exit_ts_precompiles_both_policies_without_web_dashboard() {
+    use crate::builder::mesh_mode::{
+        dashboard_mode_selector, has_compiled_modes, DASHBOARD_SELECTOR,
+    };
+
     let mut config = base_config();
     config.singbox_dashboard = Some(true);
     let mut deps = deps_default();
@@ -89,6 +93,7 @@ fn android_single_no_exit_ts_precompiles_both_policies_with_dashboard() {
         ..Default::default()
     });
     let ordinary = generate_sing_box_config(&config, &BTreeMap::new(), &deps).unwrap();
+    assert!(ordinary.services.as_ref().unwrap()[0].dashboard.is_none());
     let ordinary_base = generate_base_config(&config, &BTreeMap::new(), &deps, &BTreeMap::new())
         .unwrap()
         .config;
@@ -121,7 +126,7 @@ fn android_single_no_exit_ts_precompiles_both_policies_with_dashboard() {
     assert!(ordinary
         .outbounds
         .iter()
-        .any(|o| o.tag == super::super::mesh_mode::DASHBOARD_SELECTOR));
+        .all(|o| o.tag != DASHBOARD_SELECTOR));
     let mut mesh_config = config;
     mesh_config.selected_server_id = Some("ts".into());
     let mesh = generate_sing_box_config(&mesh_config, &BTreeMap::new(), &deps).unwrap();
@@ -170,6 +175,34 @@ fn android_single_no_exit_ts_precompiles_both_policies_with_dashboard() {
     if let Ok(path) = std::env::var("POLARIS_MESH_MODE_TEST_OUTPUT") {
         std::fs::write(path, serde_json::to_vec_pretty(&ordinary).unwrap()).unwrap();
     }
+
+    mesh_config.selected_server_id = Some("s1".into());
+    mesh_config.servers[0].name = DASHBOARD_SELECTOR.into();
+    let collision = generate_sing_box_config(&mesh_config, &BTreeMap::new(), &deps).unwrap();
+    assert!(has_compiled_modes(&collision));
+    assert!(collision
+        .outbounds
+        .iter()
+        .any(|outbound| outbound.tag == DASHBOARD_SELECTOR && outbound.type_field == "vless"));
+    assert!(dashboard_mode_selector(&collision).is_none());
+
+    let mut legacy = ordinary;
+    legacy.outbounds.push(
+        serde_json::from_value(serde_json::json!({
+            "type": "selector", "tag": DASHBOARD_SELECTOR,
+            "outbounds": ["direct", "proxy-selector"], "default": "proxy-selector",
+        }))
+        .unwrap(),
+    );
+    assert!(dashboard_mode_selector(&legacy).is_none());
+    legacy.services.as_mut().unwrap()[0].dashboard = Some(ApiDashboard {
+        enabled: true,
+        path: None,
+        http_client: Some(HttpClient {
+            detour: DASHBOARD_SELECTOR.into(),
+        }),
+    });
+    assert!(dashboard_mode_selector(&legacy).is_some());
 }
 
 #[test]
@@ -256,7 +289,7 @@ fn android_warm_block_keeps_the_existing_clash_control_and_uses_block_policy() {
 }
 
 #[test]
-fn android_warm_tailscale_add_preserves_admitted_dual_mode_and_dashboard() {
+fn android_warm_tailscale_add_preserves_admitted_dual_mode_without_web_dashboard() {
     let mut config = base_config();
     config.singbox_dashboard = Some(true);
     config.servers.push(ServerConfig {
@@ -287,7 +320,8 @@ fn android_warm_tailscale_add_preserves_admitted_dual_mode_and_dashboard() {
         cold_wire["experimental"]["clash_api"],
         running_wire["experimental"]["clash_api"]
     );
-    assert_ne!(cold_wire["services"], running_wire["services"]);
+    assert_eq!(cold_wire["services"], running_wire["services"]);
+    assert!(running.services.as_ref().unwrap()[0].dashboard.is_none());
 
     for active in ["s1", "original"] {
         config.selected_server_id = Some(active.into());
@@ -305,7 +339,7 @@ fn android_warm_tailscale_add_preserves_admitted_dual_mode_and_dashboard() {
         assert!(candidate
             .outbounds
             .iter()
-            .any(|outbound| outbound.tag == super::super::mesh_mode::DASHBOARD_SELECTOR));
+            .all(|outbound| outbound.tag != super::super::mesh_mode::DASHBOARD_SELECTOR));
         let base = generate_base_config(&config, &BTreeMap::new(), &deps, &bindings)
             .unwrap()
             .config;
@@ -320,7 +354,7 @@ fn android_warm_tailscale_add_preserves_admitted_dual_mode_and_dashboard() {
     let disabled = generate_running_candidate(&config, &deps, &bindings, &running, Some(&anchor))
         .unwrap()
         .config;
-    assert!(disabled.services.unwrap()[0].dashboard.is_none());
+    assert_eq!(disabled.services, running.services);
 
     config.singbox_dashboard = Some(true);
     config.selected_server_id = Some("fresh".into());
@@ -2130,6 +2164,34 @@ fn dashboard_not_injected_when_off() {
         result.services.as_ref().unwrap()[0].dashboard.is_none(),
         "singboxDashboard=false 不注入 dashboard"
     );
+}
+
+#[test]
+fn mobile_dashboard_opt_in_is_ignored_while_management_api_is_available() {
+    let mut cfg = base_config();
+    cfg.singbox_dashboard = Some(true);
+    cfg.clash_api_secret = Some("test-secret".into());
+    let mut deps = deps_default();
+    deps.has_management_api = true;
+    deps.dashboard_serve_dir = Some("/fake/dashboard".into());
+
+    for platform in ["android", "ios"] {
+        deps.platform = platform.into();
+        let result = generate_sing_box_config(&cfg, &BTreeMap::new(), &deps).unwrap();
+        let wire = serde_json::to_value(result).unwrap();
+        let service = &wire["services"][0];
+        assert_eq!(
+            service,
+            &serde_json::json!({
+                "type": "api",
+                "listen": "127.0.0.1",
+                "listen_port": 15490,
+                "secret": "test-secret"
+            }),
+            "{platform}"
+        );
+        assert!(wire.get("http_clients").is_none(), "{platform}");
+    }
 }
 
 #[test]

@@ -14,7 +14,7 @@ use crate::runtime::route_binding::{
     ProtectedPhysicalRoot,
 };
 use polaris_config_engine::builder::custom_rule_files::build_custom_rule_files;
-use polaris_config_engine::builder::generate::generate_running_candidate;
+use polaris_config_engine::builder::generate::{dashboard_enabled_on, generate_running_candidate};
 use polaris_config_engine::builder::helpers::MIXED_INBOUND_TAG;
 use polaris_config_engine::builder::mesh_mode::{
     has_compiled_modes, selected_mode, MESH_DIRECT, NORMAL,
@@ -5799,18 +5799,29 @@ fn saved_settings_receipt(
     polaris_updater::sha256_hex(input.as_bytes())
 }
 
+pub(super) fn user_config_for_runtime_comparison(
+    value: Value,
+    platform: Platform,
+) -> serde_json::Result<UserConfig> {
+    let mut config: UserConfig = serde_json::from_value(value)?;
+    config.singbox_dashboard =
+        dashboard_enabled_on(platform, config.singbox_dashboard).then_some(true);
+    Ok(config)
+}
+
 /// Preview of changed host/service controls, not mere TUN/cache presence.
 /// Core changes still use Kernel Plan; host DNS needs application-managed restart.
 pub(super) fn structural_runtime_change(old: &Value, new: &Value, platform: Platform) -> bool {
-    [
-        "proxyModeType",
-        "mixedPort",
-        "httpPort",
-        "allowLan",
-        "singboxDashboard",
-    ]
-    .iter()
-    .any(|key| old.get(*key) != new.get(*key))
+    let dashboard_enabled = |config: &Value| {
+        dashboard_enabled_on(
+            platform,
+            config.get("singboxDashboard").and_then(Value::as_bool),
+        )
+    };
+    ["proxyModeType", "mixedPort", "httpPort", "allowLan"]
+        .iter()
+        .any(|key| old.get(*key) != new.get(*key))
+        || dashboard_enabled(old) != dashboard_enabled(new)
         || structural_tun_change(old.get("tunConfig"), new.get("tunConfig"))
         || super::dns_takeover::host_dns_takeover_changed(platform, old, new)
 }
