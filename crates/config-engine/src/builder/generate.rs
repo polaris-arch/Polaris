@@ -103,7 +103,10 @@ fn is_node_usable(
 
 /// The Web Dashboard is available only on desktop with an explicit opt-in.
 pub fn dashboard_enabled_on(platform: Platform, enabled: Option<bool>) -> bool {
-    enabled == Some(true) && matches!(platform, Platform::Mac | Platform::Win | Platform::Linux)
+    match platform {
+        Platform::Mac | Platform::Win | Platform::Linux => enabled == Some(true),
+        Platform::Android | Platform::Ios | Platform::Other => false,
+    }
 }
 
 /// dashboard 的显式 HTTP client：`detour` 取 `route.final`。
