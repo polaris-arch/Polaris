@@ -271,7 +271,7 @@ const PRIMITIVE_REGISTRY: &[(&str, &str, Option<&str>, &str)] = &[
     (
         "src-tauri/src/runtime/speedtest_tunnel.rs",
         "open_tunnel_with_tls_config",
-        Some("connect_request(auth)"),
+        Some("connect_request(auth, probe)"),
         "测速 CONNECT 隧道（probe-in-k / probe-proxy-in / mixed / 临时核入站）",
     ),
     (
@@ -430,9 +430,8 @@ const CREDENTIALED_CALLEES: &[(&str, usize)] = &[
 #[cfg(target_os = "linux")]
 const NONE_AUTH_ALLOWED: &[(&str, &str, &str)] = &[(
     "src-tauri/src/commands/speedtest.rs",
-    "measure_via_local_proxy(port, None, &url, &|_| {})",
-    "临时核腿：临时核自建的 `in-<tag>` 入站零认证（`build_temp_core_config`），且临时核只在桌面跑\
-     （Android 核在进程内，没有可 spawn 的临时核二进制）。",
+    "measure_via_local_proxy(port, None, &url, ConnectProbe::Foreground, &|_| {})",
+    "桌面临时核的专用回环探针入站无需认证。Android 临时核调用携带本轮凭据，iOS 无临时核。",
 )];
 
 #[cfg(target_os = "linux")]
