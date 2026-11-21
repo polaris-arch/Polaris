@@ -116,7 +116,7 @@ async fn prerequisite_speed_binding_change_after_actual_io_discards_result() {
 }
 
 #[test]
-fn pool_selector_uses_ticket_transport_and_keeps_legacy_path_without_ticket() {
+fn pool_selector_uses_ticket_transport_when_measuring_a_bound_node() {
     let body = crate::commands::guard_scan::top_level_fn_body(
         &crate_code("commands/speedtest.rs"),
         "async fn run_pool_speed_test(",
@@ -124,7 +124,7 @@ fn pool_selector_uses_ticket_transport_and_keeps_legacy_path_without_ticket() {
     assert!(
         body.contains("Some(ticket) => proxy.probe_select_slot_bound(ticket, slot, &tag).await")
     );
-    assert!(body.contains("None => proxy.probe_select_slot(slot, &tag).await"));
+    assert!(body.contains("None => proxy.probe_select_slot(gen0, slot, &tag).await"));
     assert!(body.contains("proxy.validate_ready_main(ticket).await.is_ok()"));
     assert!(body.contains("bound_speed_io("));
     let bound = crate::commands::guard_scan::impl_method_body(
@@ -1179,13 +1179,17 @@ async fn drive_waves_records_genuine_select_failure_as_minus_one() {
 /// 让位①（波首）：第 1 次调用即超代 → 一个节点都不测，`interrupted`。
 #[tokio::test]
 async fn drive_waves_interrupts_at_wave_head() {
+    let calls = std::sync::atomic::AtomicUsize::new(0);
     let (results, outcome) = drive_pool_waves(
         &two_waves(),
         3,
         &superseded_at(1),
         &SpeedTestCancel::default(),
         &|| None,
-        |_, _| async { true },
+        |_, _| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async { true }
+        },
         plain(|_| async { Ok(120_u32) }),
         &mut |_: &str, _: Value| {},
         &[10000, 10001],
@@ -1195,19 +1199,26 @@ async fn drive_waves_interrupts_at_wave_head() {
 
     assert_eq!(outcome, "interrupted");
     assert!(results.is_empty(), "超代下未测节点必须缺席，绝不写假 -1");
+    assert_eq!(calls.into_inner(), 0, "未开始的波不会操作任何槽");
 }
 
 /// 让位②（热切后）：第 2 次调用超代（= 第一波热切完那一刻）→ 本波作废。
 /// **关键**：此时热切结果可能全是 false（stale tag），没有这道检查它们会被记成 `-1`。
 #[tokio::test]
 async fn drive_waves_interrupts_after_select_without_faking_minus_one() {
+    let released = Mutex::new(Vec::new());
     let (results, outcome) = drive_pool_waves(
         &two_waves(),
         3,
         &superseded_at(2),
         &SpeedTestCancel::default(),
         &|| None,
-        |_, _| async { false }, // 超代导致的热切失败
+        |slot, tag| {
+            if tag == DIRECT_TAG {
+                released.lock().unwrap().push(slot);
+            }
+            async { false } // 超代导致的热切失败，仍请求归还已尝试的槽
+        },
         plain(|_| async { Ok(120_u32) }),
         &mut |_: &str, _: Value| {},
         &[10000, 10001],
@@ -1220,6 +1231,7 @@ async fn drive_waves_interrupts_after_select_without_faking_minus_one() {
         results.is_empty(),
         "超代所致的热切失败不是「真实不可测」，不得记 -1"
     );
+    assert_eq!(released.into_inner().unwrap(), vec![0, 1]);
 }
 
 /// 让位③（每节点测完）：第 3 次调用超代（= 第一波**第一个节点**量完那一刻）→ 丢弃在飞值。
@@ -1242,6 +1254,34 @@ async fn drive_waves_discards_in_flight_measurements_after_transition() {
 
     assert_eq!(outcome, "interrupted");
     assert!(results.is_empty(), "跨代在飞值必须丢弃，不得写入结果集");
+}
+
+#[tokio::test]
+async fn drive_waves_reports_superseded_when_core_changes_during_final_release() {
+    let generation = AtomicU64::new(1);
+    let mut collected = Vec::new();
+    let (results, outcome) = drive_pool_waves(
+        &two_waves()[..1],
+        2,
+        &|| generation.load(Ordering::SeqCst) != 1,
+        &SpeedTestCancel::default(),
+        &|| None,
+        |_, tag| {
+            if tag == DIRECT_TAG {
+                generation.store(2, Ordering::SeqCst);
+            }
+            async { true }
+        },
+        plain(|_| async { Ok(120_u32) }),
+        &mut |ev: &str, payload: Value| collected.push((ev.to_string(), payload)),
+        &[10000, 10001],
+        &Readback::off(),
+    )
+    .await;
+
+    assert_eq!(outcome, "interrupted");
+    assert_eq!(results.len(), 2, "归还前已经完成的测量仍有效");
+    assert_eq!(sole_done_payload(&collected)["reason"], json!("superseded"));
 }
 
 /// 第一波正常、第二波波首超代 → 已测部分**保留**，未测部分缺席，outcome=interrupted。
@@ -1557,10 +1597,10 @@ async fn drive_waves_never_repoints_a_slot_while_that_wave_is_still_measuring() 
         &superseded_at(0),
         &SpeedTestCancel::default(),
         &|| None,
-        move |_, tag: String| {
+        move |slot, tag: String| {
             let slog = std::sync::Arc::clone(&slog);
             async move {
-                slog.lock().unwrap().push(format!("sel:{tag}"));
+                slog.lock().unwrap().push(format!("sel:{slot}:{tag}"));
                 true
             }
         },
@@ -1574,7 +1614,11 @@ async fn drive_waves_never_repoints_a_slot_while_that_wave_is_still_measuring() 
                 Ok(120_u32)
             }
         }),
-        &mut |_: &str, _: Value| {},
+        &mut |event: &str, _: Value| {
+            if event == EVENT_SPEED_TEST_DONE {
+                log.lock().unwrap().push("done".into());
+            }
+        },
         &[10000, 10001],
         &Readback::off(),
     )
@@ -1582,20 +1626,20 @@ async fn drive_waves_never_repoints_a_slot_while_that_wave_is_still_measuring() 
 
     assert_eq!(outcome, "completed");
     let log = log.lock().unwrap();
-    let sel_c = log
-        .iter()
-        .position(|l| l == "sel:tag-c")
-        .expect("第二波必须热切");
-    for port in [10000, 10001] {
-        let end = log
-            .iter()
-            .position(|l| *l == format!("m-end:{port}"))
-            .unwrap_or_else(|| panic!("端口 {port} 必须测完"));
-        assert!(
-            end < sel_c,
-            "第一波端口 {port} 的测量必须在第二波热切之前结束（实际顺序：{log:?}）"
-        );
-    }
+    assert_eq!(&log[..2], ["sel:0:tag-a", "sel:1:tag-b"]);
+    assert!(log[2..4].iter().any(|event| event == "m-end:10000"));
+    assert!(log[2..4].iter().any(|event| event == "m-end:10001"));
+    assert_eq!(
+        &log[4..],
+        [
+            "sel:0:direct",
+            "sel:1:direct",
+            "sel:0:tag-c",
+            "m-end:10000",
+            "sel:0:direct",
+            "done"
+        ],
+    );
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -3404,6 +3448,7 @@ async fn cancel_ends_the_round_promptly_with_no_fake_failures() {
     let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let dropped_at_done = Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX));
+    let released = Mutex::new(Vec::new());
     let published = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut events = pool_events(SpeedTestOrigin::Manual);
     let mut collected: Vec<(String, Value)> = Vec::new();
@@ -3417,7 +3462,17 @@ async fn cancel_ends_the_round_promptly_with_no_fake_failures() {
             &superseded_at(0),
             &cancel,
             &|| None,
-            |_, _| async { true },
+            |slot, tag| {
+                let released = &released;
+                let dropped = &dropped;
+                async move {
+                    if tag == DIRECT_TAG {
+                        assert_eq!(dropped.load(Ordering::SeqCst), 2);
+                        released.lock().unwrap().push(slot);
+                    }
+                    true
+                }
+            },
             plain(|port| {
                 let guard = CountsDrop(Arc::clone(&dropped));
                 let started = Arc::clone(&started);
@@ -3433,6 +3488,7 @@ async fn cancel_ends_the_round_promptly_with_no_fake_failures() {
             &mut events.sink(|ev: &str, payload: Value| {
                 if ev == EVENT_SPEED_TEST_DONE {
                     dropped_at_done.store(dropped.load(Ordering::SeqCst), Ordering::SeqCst);
+                    assert_eq!(*released.lock().unwrap(), vec![0, 1]);
                 }
                 if ev == EVENT_SPEED_TEST_RESULT {
                     published.fetch_add(1, Ordering::SeqCst);
@@ -3547,7 +3603,16 @@ async fn a_manual_request_preempts_a_lower_priority_run_and_waits_for_it() {
             &superseded_at(0),
             low.cancel(),
             &|| None,
-            |_, _| async { true },
+            |_, tag| {
+                let order = &order;
+                async move {
+                    if tag == DIRECT_TAG {
+                        tokio::task::yield_now().await;
+                        order.lock().unwrap().push("slot released");
+                    }
+                    true
+                }
+            },
             plain(|_| std::future::pending::<Measured>()),
             &mut |ev: &str, payload: Value| collected.push((ev.to_string(), payload)),
             &[10000, 10001],
@@ -3572,7 +3637,12 @@ async fn a_manual_request_preempts_a_lower_priority_run_and_waits_for_it() {
         .all(|(ev, _)| ev != EVENT_SPEED_TEST_RESULT));
     assert_eq!(
         *order.lock().unwrap(),
-        ["low finished", "high admitted"],
+        [
+            "slot released",
+            "slot released",
+            "low finished",
+            "high admitted"
+        ],
         "请求方必须等被抢占的一轮收口之后才开始"
     );
     let high_guard = high_guard.expect("被抢占的一轮释放后，手动请求必须拿到闸");
@@ -4466,12 +4536,14 @@ async fn waves_with_one_local_refusal(
         &superseded_at(0),
         &SpeedTestCancel::default(),
         &|| None,
-        |slot, _| {
+        |slot, tag| {
             let mut widest = widest.lock().unwrap();
-            if slot == 0 {
-                widest.push(0);
-            } else if let Some(last) = widest.last_mut() {
-                *last = (*last).max(slot);
+            if tag != DIRECT_TAG {
+                if slot == 0 {
+                    widest.push(0);
+                } else if let Some(last) = widest.last_mut() {
+                    *last = (*last).max(slot);
+                }
             }
             async { true }
         },
@@ -4555,12 +4627,14 @@ async fn halving_stops_at_the_floor_and_a_node_is_requeued_once() {
             &superseded_at(0),
             &SpeedTestCancel::default(),
             &|| None,
-            |slot, _| {
-                let mut widest = widest.lock().unwrap();
-                if slot == 0 {
-                    widest.push(0);
-                } else if let Some(last) = widest.last_mut() {
-                    *last = (*last).max(slot);
+            |slot, tag| {
+                if tag != DIRECT_TAG {
+                    let mut widest = widest.lock().unwrap();
+                    if slot == 0 {
+                        widest.push(0);
+                    } else if let Some(last) = widest.last_mut() {
+                        *last = (*last).max(slot);
+                    }
                 }
                 async { true }
             },
@@ -6224,7 +6298,7 @@ fn selectability_with_binding_and_policy() {
     assert_eq!(keys.len(), 4);
 }
 
-/// 🔵 **源门**：测速模块只经探针槽的两个入口换选，槽的 selector tag 恒以 `probe-selector-` 开头；
+/// 🔵 **源门**：测速模块只经探针槽入口换选，槽的 selector tag 恒以 `probe-selector-` 开头；
 /// 不出现带锁的 selector 写入口、通用的换选入口与内核的 `URLTest`。
 #[test]
 fn speed_test_modules_only_repoint_probe_slots() {
@@ -6269,13 +6343,17 @@ fn speed_test_modules_only_repoint_probe_slots() {
         "对照：测速模块确实在换选探针槽（{slot_calls} 处）"
     );
 
-    // 两个入口写的 selector 都是探针槽的。
+    // 换选和归还都只写探针槽。
     let proxy = crate_code("runtime/proxy.rs");
     let slot = crate::commands::guard_scan::impl_method_body(
         &proxy,
         "    pub async fn probe_select_slot(",
     );
-    assert!(slot.contains(r#"&format!("probe-selector-{k}")"#), "{slot}");
+    assert_eq!(occurrences(&slot, "select_outbound("), 1);
+    assert!(
+        slot.contains(r#".select_outbound(&format!("probe-selector-{slot}"), member_tag)"#),
+        "{slot}"
+    );
     let bound = crate_code("runtime/proxy/prerequisite.rs");
     let ticket = crate::commands::guard_scan::top_level_fn_body(
         &bound,

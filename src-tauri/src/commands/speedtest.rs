@@ -3089,7 +3089,8 @@ impl SystemProbe<'_> {
 /// 编排：请求集经 [`partition_pool`] 波前预筛分「可测 / notInPool / tsNotReady」→ 可测节点经 [`plan_waves`]
 /// 按 K 分波 → 逐波：①各槽 [`ProxyRuntime::probe_select_slot`] 热切 `probe-selector-k` → 本波节点；②波内
 /// **并发**经 `probe-in-k` 端口量 warm-TTFB（K 槽各测各出口不串味）；③逐节点推 `event:speedTestResult` /
-/// `event:speedTestProgress` + 收集。波间串行（同槽跨波复用，selector `interrupt_exist_connections` 断残留防串味）。
+/// `event:speedTestProgress` + 收集；④归还本波的槽。波间串行（同槽跨波复用，selector
+/// `interrupt_exist_connections` 断残留防串味）。
 ///
 /// **诚实性**：两条波前缺席列表如实回报（不 select / 不 measure / 不 report、绝不伪造）；热切失败/超时的槽记
 /// -1（真实不可测，非缺席）；`total` = 波前预筛**后**的可测数（把缺席节点算进 total 等于谎报测过）。零可测 →
@@ -3179,7 +3180,7 @@ async fn run_pool_speed_test(
     );
 
     // §15.11 让位（超代）基准：本轮归属的核世代。三检查点均以它比对（见 [`drive_pool_waves`]）。
-    let gen0 = proxy.core_generation();
+    let gen0 = ticket.map_or_else(|| proxy.core_generation(), ReadyMainTicket::generation);
     let invalid = Arc::new(AtomicBool::new(false));
     let superseded = || {
         invalid.load(Ordering::SeqCst)
@@ -3224,6 +3225,9 @@ async fn run_pool_speed_test(
         |slot, tag: String| {
             let invalid = Arc::clone(&invalid);
             async move {
+                if tag == DIRECT_TAG {
+                    return proxy.probe_select_slot(gen0, slot, &tag).await;
+                }
                 bound_speed_io(
                     || async {
                         match ticket {
@@ -3235,7 +3239,7 @@ async fn run_pool_speed_test(
                     || async {
                         match ticket {
                             Some(ticket) => proxy.probe_select_slot_bound(ticket, slot, &tag).await,
-                            None => proxy.probe_select_slot(slot, &tag).await,
+                            None => proxy.probe_select_slot(gen0, slot, &tag).await,
                         }
                     },
                 )
@@ -3369,7 +3373,7 @@ pub(crate) async fn probe_runtime_candidates(
         &waves,
         &superseded,
         guard.cancel(),
-        |slot, tag: String| async move { proxy.probe_select_slot(slot, &tag).await },
+        |slot, tag: String| async move { proxy.probe_select_slot(gen0, slot, &tag).await },
         |slot, port| {
             let url = url.to_string();
             // `probe-in-k` 的凭据与池端口同源同刻（`SpeedProbeTargets::auth`；桌面 `None`）。
@@ -3853,7 +3857,7 @@ pub(crate) async fn run_scheduled_round(
         &|| proxy.network_epoch(),
         |slot, tag: String| {
             let proxy = Arc::clone(&proxy);
-            async move { proxy.probe_select_slot(slot, &tag).await }
+            async move { proxy.probe_select_slot(gen0, slot, &tag).await }
         },
         |slot, port| {
             let url = url.clone();
@@ -3923,8 +3927,7 @@ const fn is_superseded(gen_now: u64, gen0: u64, running: bool) -> bool {
 ///
 /// # 终态事件的唯一出口
 ///
-/// 内核 [`drive_pool_waves_inner`] 有 4 个 `return`（让位三检查点 + 正常收尾），薄壳
-/// [`drive_pool_waves_traced`] 把它们收成一个出口再发 [`EVENT_SPEED_TEST_DONE`] ⇒ 「中断了却没发
+/// 薄壳 [`drive_pool_waves_traced`] 在归还本波的槽后收成一个出口再发 [`EVENT_SPEED_TEST_DONE`] ⇒ 「中断了却没发
 /// 终态」在结构上写不出来。载荷含未测集合（续测输入），判据见 [`emit_speed_test_done`]。
 /// 本函数是它面向手动与故障切换两条腿的入口：中断成因折成 `outcome` 字符串。
 #[allow(clippy::too_many_arguments)]
@@ -4015,12 +4018,8 @@ where
     .await;
     // 终态发出之前，读回用的连接事件流已经关闭。
     readback.close().await;
+    let reason = reason.or_else(|| interrupted(cancel, superseded));
     emit_speed_test_done(emit, outcome_of(reason), &results, &intended, reason);
-    // 槽交回 direct：按需连接的端点只在被选中时保持会话，槽停在被测节点上会让它一直连着
-    // （不可达的还一直重试），直到下一轮或内核重启。失败无害：槽本就只在测速时被换选。
-    let slots = waves.iter().map(Vec::len).max().unwrap_or(0);
-    futures::future::join_all((0..slots).map(|slot| select_slot(slot, DIRECT_TAG.to_owned())))
-        .await;
     (results, reason)
 }
 
@@ -4093,64 +4092,56 @@ where
                 .await;
 
         // ── 让位②（热切后）：热切期间跃迁 ⇒ 本波 select 结果作废，不得把超代的热切失败记成真实 -1 ──
-        // 取消不与在飞的热切竞速：一次热切 RPC 自带 2s deadline，取消到终态的时延以它为上界。
-        if let Some(reason) = interrupted(cancel, superseded) {
-            return (results, Some(reason));
-        }
+        // 取消后先等在飞的热切结束，再归还槽；每次 RPC 自带 deadline。
+        let mut reason = interrupted(cancel, superseded);
 
         // 2. 热切失败的槽本波不测 → 立刻记 -1 回填（**真实**不可测：让位②刚放行，说明核没跃迁，
         //    这次 select 失败是 stale tag / 节点不可用，不是超代所致）。对齐 上游 `:739-744`。
-        for (i, a) in wave.iter().enumerate() {
-            if !selected[i] {
-                record_measured(
-                    &mut results,
-                    &mut tested,
-                    &mut ok,
-                    emit,
-                    &a.node_id,
-                    &Err(MeasureFailure::new(FailPhase::Select, FailKind::Rejected)),
-                    network_epoch(),
-                    total,
-                    // 换选没成功，没有测量连接可读回。
-                    Some(&readback.bind(RoutePolicy::SlotPin, Some(&a.tag), None)),
-                );
-            }
-        }
-
-        // 3. 波内并发量 warm-TTFB（各槽经其 probe-in-k 回环端口测各自出口，互不污染）。热切失败的槽不 spawn。
-        //    **每回来一个就回填一个**（不等整波）—— 首个数字几百毫秒内上屏，而不是等本波最慢的那个。
         let mut set = tokio::task::JoinSet::new();
-        for (i, a) in wave.iter().enumerate() {
-            if !selected[i] {
-                continue;
+        if reason.is_none() {
+            for (a, selected) in wave.iter().zip(selected) {
+                if !selected {
+                    record_measured(
+                        &mut results,
+                        &mut tested,
+                        &mut ok,
+                        emit,
+                        &a.node_id,
+                        &Err(MeasureFailure::new(FailPhase::Select, FailKind::Rejected)),
+                        network_epoch(),
+                        total,
+                        // 换选没成功，没有测量连接可读回。
+                        Some(&readback.bind(RoutePolicy::SlotPin, Some(&a.tag), None)),
+                    );
+                    continue;
+                }
+                // 3. 波内并发量 warm-TTFB，每个节点测完就回填。
+                let port = pool_ports[a.slot]; // slot < k = pool_ports.len()（plan_waves 保证）
+                let assignment = a.clone();
+                let fut = measure(a.slot, port);
+                // 起测那一刻的网络代次：测完再取一次，两刻不同即这个值跨了一次网络变化。
+                let epoch0 = network_epoch();
+                let readback = readback.clone();
+                set.spawn(async move {
+                    let Probed {
+                        measured,
+                        source_port,
+                    } = fut.await;
+                    // 等待读回不计入测量值，各节点在自己的任务里等。
+                    let record = readback
+                        .lookup(&probe_pool_inbound_tag(assignment.slot), source_port)
+                        .await;
+                    (assignment, epoch0, measured, record)
+                });
             }
-            let port = pool_ports[a.slot]; // slot < k = pool_ports.len()（plan_waves 保证）
-            let assignment = a.clone();
-            let fut = measure(a.slot, port);
-            // 起测那一刻的网络代次：测完再取一次，两刻不同即这个值跨了一次网络变化。
-            let epoch0 = network_epoch();
-            let readback = readback.clone();
-            set.spawn(async move {
-                let Probed {
-                    measured,
-                    source_port,
-                } = fut.await;
-                // 读回在出值之后：等待不计入测量值；各节点在自己的任务里等，不拖住同波的其他节点。
-                let record = readback
-                    .lookup(&probe_pool_inbound_tag(assignment.slot), source_port)
-                    .await;
-                (assignment, epoch0, measured, record)
-            });
         }
-        loop {
-            // 与取消竞速：窗口里的节点全挂死时，取消也不必等它们各自走完 6s / 10s。
-            // 中断时**等在飞任务真正结束**（`shutdown` = 中止 + 逐个收回）再返回 ⇒ 终态发出时
-            // 本轮已没有在飞的测量、它们的 socket 已全部关闭。
+        while reason.is_none() {
+            // 即使所有测量都在等 socket，取消也会立即开始收回任务。
             let joined = tokio::select! {
                 biased;
-                reason = cancel.cancelled() => {
-                    set.shutdown().await;
-                    return (results, Some(reason));
+                cancelled = cancel.cancelled() => {
+                    reason = Some(cancelled);
+                    break;
                 }
                 joined = set.join_next() => joined,
             };
@@ -4162,9 +4153,9 @@ where
             let id = assignment.node_id;
             // ── 让位③（**每节点**测完即查）：在飞期间跃迁 ⇒ 丢弃这一个及其后的在飞值
             //    （量的是新核/已死核，非本轮出口）。已回填的节点是跃迁前量到的真值，保留。
-            if let Some(reason) = interrupted(cancel, superseded) {
-                set.shutdown().await;
-                return (results, Some(reason));
+            reason = interrupted(cancel, superseded);
+            if reason.is_some() {
+                break;
             }
             // 测量跨了一次网络变化 ⇒ 只作废这一个节点（缺席，不是失败），整轮继续；
             // 其后的节点在新代次下起测，身份块带新代次。
@@ -4212,6 +4203,19 @@ where
                 total,
                 Some(&binding),
             );
+        }
+        if reason.is_some() {
+            set.shutdown().await;
+        }
+        // 失败的选择也可能已经在 Core 生效。等本波全部任务退出，再归还尝试过的槽；
+        // 单飞租约跨过此处，下一波或下一轮要等归还完成才能开始。
+        futures::future::join_all(
+            wave.iter()
+                .map(|a| select_slot(a.slot, DIRECT_TAG.to_owned())),
+        )
+        .await;
+        if let Some(reason) = reason.or_else(|| cancel.reason()) {
+            return (results, Some(reason));
         }
         if local_side_error {
             let narrowed = (width / 2).max(MIN_WAVE_WIDTH).min(width);

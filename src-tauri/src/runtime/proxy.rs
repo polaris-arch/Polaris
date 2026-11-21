@@ -2176,13 +2176,36 @@ impl ProxyRuntime {
         }
     }
 
-    /// **§15**：把第 `k` 槽 `probe-selector-k` 热切到被测节点出站 `member_tag`（gRPC `select_outbound`，live 生效）。
-    ///
-    /// = 上游 `MainCoreProbe.selectSlot`。复用 [`hot_switch_selector`](Self::hot_switch_selector)（同 PUT 原语，
-    /// 核未就绪 → false）。`interrupt_exist_connections:true` 由 config-engine 挂在 selector 上 → 同槽跨波重指前断残留、防串味。
-    pub async fn probe_select_slot(&self, k: usize, member_tag: &str) -> bool {
-        self.hot_switch_selector(&format!("probe-selector-{k}"), member_tag)
+    /// Select a node or release the probe slot to `direct` on the round's Core.
+    pub async fn probe_select_slot(&self, generation: u64, slot: usize, member_tag: &str) -> bool {
+        let status = self.status();
+        if !status.running || self.core_generation() != generation {
+            return false;
+        }
+        // Only use the captured carrier. A lazy connection could reach a replacement
+        // Core that reuses the local port after the generation check.
+        let Ok(Some((client, lease))) = self.managed_api_call(status.clash_api_port) else {
+            log::warn!("换选测速槽 {slot} → {member_tag} 失败：管理连接不可用");
+            return false;
+        };
+        if self.core_generation() != generation || lease.is_closed() {
+            return false;
+        }
+        match client
+            .select_outbound(&format!("probe-selector-{slot}"), member_tag)
             .await
+        {
+            Ok(()) => {
+                if member_tag != DIRECT_TAG {
+                    log::info!("已热切换 probe-selector-{slot} → {member_tag}（管理 API，无重启）");
+                }
+                true
+            }
+            Err(error) => {
+                log::warn!("换选测速槽 {slot} → {member_tag} 失败：{error}");
+                false
+            }
+        }
     }
 
     /// A prerequisite action writes only to its ticket's management endpoint. Current
