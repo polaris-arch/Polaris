@@ -173,8 +173,9 @@ use polaris_config_engine::singbox::InboundUser;
 use polaris_config_engine::singbox::SingBoxConfig;
 #[cfg(test)]
 use polaris_config_engine::user_config::app_config::UserConfig;
+use polaris_config_engine::user_config::dns_constants::DIRECT_TAG;
 #[cfg(test)]
-use polaris_config_engine::user_config::dns_constants::{DIRECT_TAG, PROXY_SELECTOR_TAG};
+use polaris_config_engine::user_config::dns_constants::PROXY_SELECTOR_TAG;
 #[cfg(test)]
 use polaris_config_engine::user_config::proxy_mode::ProxyMode;
 #[cfg(test)]
