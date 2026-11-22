@@ -4378,7 +4378,7 @@ fn replay_leg_feeds_the_defer_restart_intent_back_into_the_decision() {
     );
 }
 
-/// 清账点的**接线**守卫：`restart_deferred` 必须在 `startup_snapshot` 被写/被清的**同一个方法体**里复位。
+/// 清账点的**接线**守卫：起核就绪提交同时发布 `startup_snapshot` 和复位 `restart_deferred`。
 ///
 /// 单测够不着这两处（`start_inner` 要真起核、`stop_inner` 会碰系统 DNS 与路由，本机禁跑触网测试），
 /// 故用源码型守卫兜底。它证不了行为，只证「接线没掉」——behavior 那一半由上面两条测试覆盖。
@@ -4387,9 +4387,14 @@ fn replay_leg_feeds_the_defer_restart_intent_back_into_the_decision() {
 fn deferred_debt_is_cleared_where_the_startup_snapshot_is_written_and_cleared() {
     let src = module_code("runtime/proxy");
     let started = method_body(&src, "    pub(super) async fn start_inner(");
+    let prepare = crate::test_support::method_body(
+        &started,
+        "let ready = self.publish_startup_running(&new_status, ||",
+    );
+    let commit = crate::test_support::method_body(&prepare, "move ||");
     assert!(
-        started.contains("*snap = Some(config.clone());")
-            && started.contains("restart_deferred.store(false"),
+        commit.contains("*startup = Some(startup_config);")
+            && commit.contains("restart_deferred.store(false"),
         "起核就绪腿必须与写 startup_snapshot 同刻清账 —— 否则核已按新配置起来了，条上还挂着「待应用」"
     );
     let stopped = method_body(&src, "    async fn stop_inner_attributed(");
