@@ -652,7 +652,7 @@ async fn flush_reaches_management_api_when_both_guards_pass() {
 /// [`start_inner_spawns_reassert_and_defers_unlock_invalidation`] 两侧夹住
 /// （续延里恰一次 + 主链上零次）。此处再抄一遍只会在下次搬家时留下第三处要改的地方。
 ///
-/// **变异锁**：把 `spawn_reassert_selector_selection(...)` 挪到 `*g = new_status.clone();` 之前 → 转红。
+/// **变异锁**：把 `spawn_reassert_selector_selection(...)` 挪到 `publish_startup_running(...)` 之前 → 转红。
 #[test]
 fn connection_flush_is_reachable_only_after_status_commit() {
     let body = method_body(
@@ -660,8 +660,8 @@ fn connection_flush_is_reachable_only_after_status_commit() {
         "    pub(super) async fn start_inner(",
     );
     let commit = body
-        .find("*g = new_status.clone();")
-        .expect("锚点 `*g = new_status.clone();` 消失，顺序守卫已失去判据");
+        .find("self.publish_startup_running(")
+        .expect("找不到发布运行状态的入口");
     let spawn = body
         .find("self.spawn_reassert_selector_selection(")
         .expect("校正腿的 spawn 点消失 —— flush 已随它挪进续延，没有 spawn 就没有 flush");

@@ -230,6 +230,21 @@ impl ApiRelayBorrow {
     pub(crate) fn is_closed(&self) -> bool {
         self.epoch.state.lock().unwrap_or_else(|p| p.into_inner()).0
     }
+    pub(in crate::runtime::proxy) fn publish_startup_if_live(
+        &self,
+        control: &SingBoxApiClient,
+        publish: impl FnOnce(),
+    ) -> Result<(), &'static str> {
+        let state = self.epoch.state.lock().unwrap_or_else(|p| p.into_inner());
+        if !control.captured_transport_live() {
+            return Err("captured transport closed");
+        }
+        if state.0 {
+            return Err("epoch closed");
+        }
+        publish();
+        Ok(())
+    }
     pub(crate) async fn cancelled(&self) {
         loop {
             let mut wait = std::pin::pin!(self.epoch.changed.notified());
@@ -685,6 +700,13 @@ impl ProxyRuntime {
             }
         }));
     }
+    pub(in crate::runtime::proxy) fn invalidate_runtime_api_epoch(&self, generation: u64) {
+        if let Ok(baseline) = self.runtime_config_baseline.read() {
+            if let Some(b) = baseline.as_ref().filter(|b| b.generation == generation) {
+                b.api_epoch.invalidate();
+            }
+        }
+    }
     pub(in crate::runtime::proxy) fn runtime_api_baseline_present(&self) -> bool {
         self.runtime_config_baseline
             .read()
@@ -766,30 +788,32 @@ impl ProxyRuntime {
     pub(in crate::runtime::proxy) fn managed_api_call(
         &self,
         expected_port: u16,
-    ) -> Result<Option<(Arc<SingBoxApiClient>, ApiRelayBorrow)>, ()> {
+    ) -> Result<Option<(Arc<SingBoxApiClient>, ApiRelayBorrow)>, &'static str> {
         let generation = self.core_generation();
-        let baseline = self.runtime_config_baseline.read().map_err(|_| ())?;
+        let baseline = self
+            .runtime_config_baseline
+            .read()
+            .map_err(|_| "runtime baseline unavailable")?;
         let Some(b) = baseline.as_ref() else {
             return Ok(None);
         };
-        if b.generation != generation || b.api_epoch.is_closed() {
-            return Err(());
+        if b.generation != generation {
+            return Err("runtime generation mismatch");
         }
-        let e = b.management.as_ref().ok_or(())?;
-        if e.port != expected_port {
-            return Err(());
-        }
-        let lease = b.api_epoch.borrow();
-        if lease.is_closed() {
-            return Err(());
+        let endpoint = b.management.as_ref().ok_or("endpoint unavailable")?;
+        if endpoint.port != expected_port {
+            return Err("endpoint port mismatch");
         }
         // Ordinary calls share this already captured carrier. A buffered or
         // cancelled request can never redial a later occupant of the old tuple.
-        let control = b
-            .control
-            .as_ref()
-            .filter(|c| c.captured_transport_live())
-            .ok_or(())?;
+        let control = b.control.as_ref().ok_or("captured transport unbound")?;
+        let lease = b.api_epoch.borrow();
+        if !control.captured_transport_live() {
+            return Err("captured transport closed");
+        }
+        if lease.is_closed() {
+            return Err("epoch closed");
+        }
         Ok(Some((control.clone(), lease)))
     }
     pub(in crate::runtime::proxy) fn managed_readback_binding(

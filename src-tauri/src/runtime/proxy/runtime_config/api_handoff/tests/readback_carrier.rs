@@ -262,6 +262,78 @@ async fn bound_runtime(
 }
 
 #[tokio::test]
+async fn startup_does_not_publish_running_after_authenticated_carrier_closes() {
+    let peer = RunningPeer::start(0).await;
+    let (rt, epoch, _directory) = bound_runtime(&peer, true).await;
+    let new_status = rt.status();
+    assert!(new_status.running);
+    *rt.status.write().unwrap() = Default::default();
+
+    let mut wrong_port = new_status.clone();
+    wrong_port.clash_api_port = 0;
+    assert_eq!(
+        rt.publish_startup_running(&wrong_port, || || panic!(
+            "published with a mismatched port"
+        )),
+        Err("endpoint port mismatch")
+    );
+    assert!(!rt.status().running);
+    let mut snapshots_published = false;
+    rt.publish_startup_running(&new_status, || || snapshots_published = true)
+        .unwrap();
+    assert!(rt.status().running && snapshots_published);
+    *rt.status.write().unwrap() = Default::default();
+    peer.join().await;
+    tokio::time::timeout(Duration::from_secs(5), epoch.cancelled())
+        .await
+        .unwrap();
+
+    let result =
+        rt.publish_startup_running(&new_status, || || panic!("published with a closed carrier"));
+    assert!(!rt.status().running, "the authenticated carrier has closed");
+    assert_eq!(result, Err("captured transport closed"));
+    let error = rt
+        .current_management_client(new_status.clash_api_port)
+        .await
+        .err()
+        .expect("ordinary callers must fail closed too");
+    let polaris_singbox_grpc::ClientError::Status(status) = error else {
+        panic!("expected a local admission error: {error}");
+    };
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(
+        status.message(),
+        "management endpoint/epoch changed: captured transport closed"
+    );
+}
+
+#[tokio::test]
+async fn startup_does_not_publish_running_after_epoch_invalidates_during_preparation() {
+    let peer = RunningPeer::start(0).await;
+    let (rt, epoch, _directory) = bound_runtime(&peer, true).await;
+    let new_status = rt.status();
+    *rt.status.write().unwrap() = Default::default();
+
+    rt.restart_deferred.store(true, Ordering::SeqCst);
+    let mut snapshots_published = false;
+    let result = rt.publish_startup_running(&new_status, || {
+        epoch.invalidate();
+        || {
+            snapshots_published = true;
+            rt.restart_deferred.store(false, Ordering::SeqCst);
+        }
+    });
+    assert!(
+        !rt.status().running,
+        "the bound epoch closed during publication preparation"
+    );
+    assert_eq!(result, Err("epoch closed"));
+    assert!(!snapshots_published);
+    assert!(rt.restart_deferred.load(Ordering::SeqCst));
+    peer.join().await;
+}
+
+#[tokio::test]
 async fn readback_joins_real_captured_opening_and_stream_without_a_cached_borrow_cycle() {
     for opening in [true, false] {
         let peer = RunningPeer::start(0).await;

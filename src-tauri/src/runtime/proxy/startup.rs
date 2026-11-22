@@ -793,6 +793,26 @@ struct StartupRuntimePairing {
 }
 
 impl ProxyRuntime {
+    pub(super) fn publish_startup_running<Commit: FnOnce()>(
+        &self,
+        new_status: &ProxyStatus,
+        prepare_snapshots: impl FnOnce() -> Commit,
+    ) -> Result<(), &'static str> {
+        // The caller holds the generation publication lock. Capture the exact
+        // binding before waiting on snapshot and status writers.
+        let (control, lease) = self
+            .managed_api_call(new_status.clash_api_port)?
+            .ok_or("runtime baseline unavailable")?;
+        let publish_snapshots = prepare_snapshots();
+        let new_status = new_status.clone();
+        let mut status = self.status.write().map_err(|_| "status unavailable")?;
+        // This is the readiness commit point. Keep the status writer until
+        // the prepared snapshot assignments are complete.
+        lease.publish_startup_if_live(&control, || *status = new_status)?;
+        publish_snapshots();
+        Ok(())
+    }
+
     async fn confirm_startup_runtime_pairing(
         &self,
         generated: &SingBoxConfig,
@@ -2657,20 +2677,15 @@ impl ProxyRuntime {
         if self.gate.generation() != my_gen {
             return Ok(self.status());
         }
-        if let Ok(mut identity) = self.captured_core_sha256.lock() {
-            *identity = ready_tls.binary_sha256.map(|digest| (my_gen, digest));
-        }
+        let captured_core_sha256 = ready_tls.binary_sha256.map(|digest| (my_gen, digest));
         // Build the selector baseline outside the publication fence, then
         // publish it with the matching running config and startup node set.
         let switch_snapshot = Self::build_switch_snapshot(&user_config, &singbox_config, &deps);
-        {
+        let management_ready = {
             let tailnet_bindings = self.tailnet_bindings(&config, &singbox_config);
             let _publication = self.gate.lock_generation_publication();
             if self.gate.generation() != my_gen {
                 return Ok(self.status());
-            }
-            if let Ok(mut snapshot) = self.switch_snapshot.write() {
-                *snapshot = Some(switch_snapshot);
             }
             self.capture_runtime_config_baseline(
                 my_gen,
@@ -2691,22 +2706,68 @@ impl ProxyRuntime {
                 baseline.observed_control_revision = runtime_control_revision;
             }
             self.bind_runtime_api_control(my_gen, runtime_api_control);
-            self.commit_coex_current_config(config.clone());
-            // The final endpoint set was claimed before native/libbox startup. Keep that claim
-            // continuously through readiness; releasing and re-reserving here opens a takeover gap.
-            if let Ok(mut snap) = self.startup_snapshot.write() {
-                *snap = Some(config.clone());
+            let current_config = config.clone();
+            let startup_config = config.clone();
+            let mut current = None;
+            let ready = self.publish_startup_running(&new_status, || {
+                // Native exit-status readers acquire the selector before current config.
+                let switch = self.switch_snapshot.write().ok();
+                current = self.current_config.write().ok();
+                let startup = self.startup_snapshot.write().ok();
+                let identity = self.captured_core_sha256.lock().ok();
+                move || {
+                    if let Some(mut switch) = switch {
+                        *switch = Some(switch_snapshot);
+                    }
+                    if let Some(mut startup) = startup {
+                        *startup = Some(startup_config);
+                    }
+                    if let Some(mut identity) = identity {
+                        *identity = captured_core_sha256;
+                    }
+                    if !restore_applied {
+                        self.restart_deferred.store(false, Ordering::SeqCst);
+                    }
+                }
+            });
+            if ready.is_ok() {
+                // Current-config readers wait for the accepted value. Dispatch
+                // COEX with the short readiness locks released.
+                match current {
+                    Some(mut current) => self.coex.commit_config(&mut current, current_config),
+                    None => self.coex.config_unavailable(),
+                }
+                // Keep the pre-start endpoint claim continuously through readiness.
+                self.activate_tailnet_context(my_gen, tailnet_bindings);
+                if let Some(ready_at_ms) = new_status.start_time {
+                    self.publish_mesh_route_run(mesh_route_prepared, ready_at_ms);
+                }
+            } else {
+                drop(current);
+                // Reject new control calls even if native cleanup cannot settle.
+                // Full baseline retirement still requires the original Stop ACK.
+                self.invalidate_runtime_api_epoch(my_gen);
             }
-            if !restore_applied {
-                self.restart_deferred.store(false, Ordering::SeqCst);
+            ready
+        };
+        if let Err(reason) = management_ready {
+            if self.gate.generation() != my_gen {
+                return Ok(self.status());
             }
-            if let Ok(mut g) = self.status.write() {
-                *g = new_status.clone();
+            let msg = format!("启动管理接口未就绪：{reason}");
+            if let Err(error) = self.kill_core_and_release_main(ts_gate).await {
+                log::warn!("{msg}");
+                return Err(error.into());
             }
-            self.activate_tailnet_context(my_gen, tailnet_bindings);
-            if let Some(ready_at_ms) = new_status.start_time {
-                self.publish_mesh_route_run(mesh_route_prepared, ready_at_ms);
+            {
+                let _publication = self.gate.lock_generation_publication();
+                if self.gate.generation() != my_gen {
+                    return Ok(self.status());
+                }
+                self.clear_runtime_config_baseline();
             }
+            self.set_error_if_current(my_gen, &msg, code::STARTUP_FAILED);
+            return Err(StartError::coded(msg, code::STARTUP_FAILED));
         }
         #[cfg(target_os = "android")]
         if self.gate.generation() == my_gen && super::android_bridge::core_started() {

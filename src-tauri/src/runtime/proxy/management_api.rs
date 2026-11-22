@@ -149,7 +149,10 @@ impl ProxyRuntime {
         }
         match self.current_management_client(status.clash_api_port).await {
             Ok(client) => GrpcManagementApi::new(client),
-            Err(_) => GrpcManagementApi::not_ready(),
+            Err(error) => {
+                log::debug!("管理 API 客户端未就绪：{error}");
+                GrpcManagementApi::not_ready()
+            }
         }
     }
 
@@ -159,19 +162,16 @@ impl ProxyRuntime {
         &self,
         expected_port: u16,
     ) -> Result<SingBoxApiClient, ClientError> {
-        let invalid = || {
+        let invalid = |reason| {
             ClientError::Status(polaris_singbox_grpc::tonic::Status::failed_precondition(
-                "management endpoint/epoch changed",
+                format!("management endpoint/epoch changed: {reason}"),
             ))
         };
-        match self
-            .managed_api_call(expected_port)
-            .map_err(|_| invalid())?
-        {
+        match self.managed_api_call(expected_port).map_err(invalid)? {
             Some((control, lease)) => Ok(control.as_ref().clone().retain_lifetime(lease)),
             None => {
                 if expected_port == 0 {
-                    return Err(invalid());
+                    return Err(invalid("endpoint unavailable"));
                 }
                 SingBoxApiClient::connect(
                     Endpoint::new("127.0.0.1", expected_port),

@@ -6844,7 +6844,7 @@ fn clash_api_secret_projects_instead_of_deep_copying_the_config() {
     let client = code_getter(&source, client_head);
     let keeps_captured_client = |body: &str| {
         body.contains(".managed_api_call(expected_port)")
-            && body.contains(".map_err(|_| invalid())?")
+            && body.contains(".map_err(invalid)?")
             && body.contains(
                 "Some((control, lease)) => Ok(control.as_ref().clone().retain_lifetime(lease))",
             )
