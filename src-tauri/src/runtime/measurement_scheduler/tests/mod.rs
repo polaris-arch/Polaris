@@ -1452,7 +1452,12 @@ fn a_new_generation_or_network_forgives_failures_so_the_retest_covers_backed_off
             })
             .start?;
         let view = LedgerView::new(&Value::Null, Some(generation), Some(epoch), Platform::Linux);
-        Some(planner.round_targets(&start, None, &|id| view.entry(ledger, id), &BTreeSet::new()))
+        Some(planner.round_targets(
+            &start,
+            None,
+            &|id| view.entry(ledger, id, None),
+            &BTreeSet::new(),
+        ))
     };
     // 首轮跑完后，`bad` 已连续失败 3 轮（进了退避），`good` 是通的。
     let backed_off = || {
@@ -1650,6 +1655,10 @@ fn rounds_that_measured_nothing_are_recorded_with_a_reason() {
         planner.status(at(t0), true, &plan)["subscriptions"]["s1"]["lastSkip"]["reason"],
         "poolUnavailable"
     );
+    assert!(planner
+        .tick(&input(at(t0 + 30 * MINUTE + 1), Some(1), &plan))
+        .start
+        .is_none());
 }
 
 /// 完整轮次要有成员真被测到：成员全被预筛跳过的订阅、以及没有目标的空轮，都不刷新完整轮次时间，
@@ -1838,7 +1847,7 @@ fn sample_between_rounds(
             &members,
             None,
             &[],
-            &|id| view.entry(&ledger, id),
+            &|id| view.entry(&ledger, id, None),
             None,
             &mut skips,
         );
@@ -1875,6 +1884,7 @@ fn sample_between_rounds(
             let read = ledger.candidates(
                 &members,
                 &ReadContext {
+                    pool_graph: None,
                     core_binary_sha256: None,
                     main_generation: Some(1),
                     fingerprints: &fingerprints,
@@ -2122,6 +2132,7 @@ fn selectable_at(
         .candidates(
             &ids(&["a"]),
             &ReadContext {
+                pool_graph: None,
                 core_binary_sha256: None,
                 main_generation: Some(1),
                 fingerprints: &fingerprints,

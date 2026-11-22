@@ -150,6 +150,80 @@ async fn only_the_typed_connect_reply_defers_an_opted_in_probe() {
 }
 
 #[tokio::test]
+async fn graph_bound_connect_requires_one_exact_final_head_before_origin_io() {
+    const GRAPH: &str = "1111111111111111111111111111111111111111111111111111111111111111/1";
+    let echo = format!("X-Polaris-Probe-Graph: {GRAPH}\r\n");
+    for (status, headers, error, proven) in [
+        ("200 Connection established", echo.clone(), None, true),
+        (
+            "502 Bad Gateway",
+            echo.clone(),
+            Some(TunnelError::ConnectStatus(502)),
+            true,
+        ),
+        (
+            "200 Connection established",
+            String::new(),
+            Some(TunnelError::BindingMismatch),
+            false,
+        ),
+        (
+            "502 Bad Gateway",
+            String::new(),
+            Some(TunnelError::BindingMismatch),
+            false,
+        ),
+        (
+            "200 Connection established",
+            echo.replace("/1", "/2"),
+            Some(TunnelError::BindingMismatch),
+            false,
+        ),
+        (
+            "200 Connection established",
+            echo.repeat(2),
+            Some(TunnelError::BindingMismatch),
+            false,
+        ),
+        (
+            "200 Connection established",
+            format!("\r\n{echo}"),
+            Some(TunnelError::BindingMismatch),
+            false,
+        ),
+        (
+            "502 Bad Gateway",
+            format!("X-Polaris-Probe-Outcome: binding-mismatch\r\n{echo}"),
+            Some(TunnelError::BindingMismatch),
+            false,
+        ),
+        (
+            "503 Service Unavailable",
+            "X-Polaris-Probe-Outcome: budget-busy\r\n".to_string(),
+            Some(TunnelError::BudgetBusy),
+            false,
+        ),
+    ] {
+        let reply = Box::leak(format!("HTTP/1.1 {status}\r\n{headers}\r\n").into_boxed_str());
+        let (port, observed) = spawn_mock_proxy(Script {
+            connect_reply: Some(reply),
+            gets: Vec::new(),
+        })
+        .await;
+        let probe = ConnectProbe::pool_foreground("member").with_graph(Arc::from(GRAPH));
+        let receipt = probe.graph_receipt().unwrap();
+        let target = http_target();
+        let request = target.connect_request(None, &probe);
+        assert!(request.contains(&echo));
+        assert!(!target.get_request().contains("X-Polaris-Probe-Graph"));
+        let result = open_tunnel(port, None, &target, probe, &|_| {}).await;
+        assert_eq!(result.err(), error);
+        assert_eq!(receipt.load(Ordering::Acquire), proven);
+        assert!(observed.lock().unwrap().first_tunnel_bytes.is_empty());
+    }
+}
+
+#[tokio::test]
 async fn only_a_member_bound_connect_accepts_binding_mismatch_before_tls() {
     const REFUSED: &str =
         "HTTP/1.1 502 Bad Gateway\r\nX-Polaris-Probe-Outcome: binding-mismatch\r\n\r\n";

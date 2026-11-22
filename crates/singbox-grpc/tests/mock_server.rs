@@ -50,6 +50,7 @@ struct MockState {
     clash_mode: Arc<std::sync::Mutex<String>>,
     url_test_calls: Arc<std::sync::Mutex<Vec<String>>>,
     select_calls: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    select_graphs: std::sync::Mutex<Vec<String>>,
     close_calls: Arc<std::sync::Mutex<Vec<String>>>,
     close_all_count: Arc<AtomicU64>,
     set_exit_node_calls: Arc<std::sync::Mutex<Vec<(String, String)>>>,
@@ -639,6 +640,23 @@ impl StartedService for MockService {
         req: Request<SelectOutboundRequest>,
     ) -> Result<Response<Empty>, Status> {
         check_auth(&req, &self.secret)?;
+        let graphs = req.metadata().get_all("x-polaris-probe-graph");
+        let mut graphs = graphs.iter();
+        if let Some(graph) = graphs.next() {
+            assert!(graphs.next().is_none());
+            let graph = graph.to_str().unwrap();
+            self.state
+                .select_graphs
+                .lock()
+                .unwrap()
+                .push(graph.to_owned());
+            if graph != format!("{}/2", "a".repeat(64)) {
+                return Err(Status::failed_precondition("active graph changed"));
+            }
+            if req.get_ref().outbound_tag == "unavailable" {
+                return Err(Status::unavailable("selector response uncertain"));
+            }
+        }
         let r = req.into_inner();
         self.state
             .select_calls
@@ -837,6 +855,36 @@ async fn select_outbound_succeeds_with_bearer_auth() {
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].0, "🇯🇵-selector");
     assert_eq!(calls[0].1, "jp-tokyo-01");
+    assert!(state.select_graphs.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn select_outbound_on_probe_graph_distinguishes_stale_and_unavailable() {
+    let (addr, state, _h) = spawn_server(SECRET, 0).await;
+    let client = SingBoxApiClient::connect(Endpoint::new("127.0.0.1", addr.port()), SECRET)
+        .await
+        .unwrap();
+    let stale = format!("{}/1", "a".repeat(64));
+    let active = format!("{}/2", "a".repeat(64));
+    assert!(!client
+        .select_outbound_on_probe_graph("proxy-selector", "old-graph-target", &stale)
+        .await
+        .unwrap());
+    assert!(matches!(client
+        .select_outbound_on_probe_graph("proxy-selector", "unavailable", &active)
+        .await, Err(ClientError::Status(status)) if status.code() == tonic::Code::Unavailable));
+    assert!(client
+        .select_outbound_on_probe_graph("proxy-selector", "target", &active)
+        .await
+        .unwrap());
+    assert_eq!(
+        *state.select_graphs.lock().unwrap(),
+        [stale, active.clone(), active]
+    );
+    assert_eq!(
+        *state.select_calls.lock().unwrap(),
+        [("proxy-selector".to_string(), "target".to_string())]
+    );
 }
 
 #[tokio::test]

@@ -161,14 +161,26 @@ impl SwitchExecutor {
             }
         }
 
-        // 腿 2：精准断连（Polaris L1810 closeOldNodeConnectionsAfterHotSwitch）。
-        let disconnect = if interrupt_connections_on_switch {
+        let disconnect = self
+            .after_selection(api, plan, interrupt_connections_on_switch)
+            .await;
+
+        HotSwitchOutcome::Applied { disconnect }
+    }
+
+    /// Apply the usual disconnect policy after the caller has successfully
+    /// selected all members through a conditional selector RPC.
+    pub async fn after_selection(
+        &self,
+        api: &dyn ManagementApi,
+        plan: &HotSwitchPlan,
+        interrupt_connections_on_switch: bool,
+    ) -> Option<PrecisionDisconnectOutcome> {
+        if interrupt_connections_on_switch {
             Some(self.precision_disconnect(api, &plan.puts).await)
         } else {
             None
-        };
-
-        HotSwitchOutcome::Applied { disconnect }
+        }
     }
 
     /// 精准断连：取连接首帧 → 筛命中 pair 的活连接 → 有界并发逐条关。

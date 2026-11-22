@@ -443,6 +443,30 @@ fn a_switch_needs_two_wins_from_distinct_runs_far_enough_apart() {
     assert_eq!(memory.streak().map(|streak| streak.wins), Some(1));
 }
 
+#[test]
+fn a_new_pool_graph_cannot_resume_the_previous_measurement_streak() {
+    let intent = auto();
+    let (mut memory, second) = two_wins(&intent);
+    assert_eq!(
+        round(&intent, &mut memory, &second, T0),
+        switch("ch", 100, Cause::Better)
+    );
+    assert_eq!(memory.streak().unwrap().wins, 2);
+
+    memory.reset_measurement_scope(2);
+    let third = [candidate("ch", 100, 3, T0 + 5 * MINUTE)];
+    assert_eq!(
+        round(&intent, &mut memory, &third, T0 + 5 * MINUTE),
+        Decision::Hold(Hold::Pending(Lacking::Streak))
+    );
+    assert_eq!(memory.streak().unwrap().wins, 1);
+    let fourth = [candidate("ch", 100, 4, T0 + 10 * MINUTE)];
+    assert_eq!(
+        round(&intent, &mut memory, &fourth, T0 + 10 * MINUTE),
+        switch("ch", 100, Cause::Better)
+    );
+}
+
 /// 连胜记的是当前出口被胜过的轮数，不是某个挑战者：两轮里领先的是不同的节点，照样凑满，
 /// 目标取最近一轮里延迟最小的那个。中途有一轮没有候选明显胜过当前出口，连胜清零。
 #[test]

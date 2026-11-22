@@ -3319,6 +3319,7 @@ fn companion_result_has_identity_but_no_top_level_run_id() {
     assert_eq!(identity["coreBinarySha256"], digest);
     assert_eq!(identity["nodeFingerprint"], "running-node");
     let context = crate::runtime::measurement_ledger::ReadContext {
+        pool_graph: None,
         core_binary_sha256: Some(Some(&digest)),
         main_generation: Some(7),
         fingerprints: &fingerprints,
@@ -4069,7 +4070,7 @@ fn production_entries_wire_origin_instance_cancel_and_terminal() {
     assert!(failover.contains("origin:SpeedTestOrigin::Failover,"));
     assert!(failover.contains("drive_runtime_probe(candidates,&waves,&superseded,guard.cancel(),"));
     assert!(failover.contains("letmutsink=events.sink(|_,_|{});"));
-    assert!(failover.contains("&mutsink,targets.pool_ports.as_slice(),&readback,)"));
+    assert!(failover.contains("&mutsink,targets.pool_ports.as_slice(),&readback,true,)"));
     assert_eq!(occurrences(&failover, "app.emit("), 0);
 
     // 整份生产源码：取消句柄只在准入处新建一次，终态事件只有命令入口那一处直接发。
@@ -4090,7 +4091,7 @@ fn production_entries_wire_origin_instance_cancel_and_terminal() {
 use crate::events::channel::EVENT_SPEED_TEST_RESULT;
 
 /// 周期一轮的测试台：独立的闸、运行号序列与账本，墙钟由测试拨。
-struct ScheduleBench {
+struct ScheduleBench<'a> {
     gate: &'static SpeedTestGate,
     sequence: AtomicU64,
     ledger: &'static MeasurementLedger,
@@ -4101,9 +4102,11 @@ struct ScheduleBench {
     ports: Vec<u16>,
     /// 读回上下文被开过几次。
     readbacks_opened: std::sync::atomic::AtomicUsize,
+    pool_runtime: Option<&'a ProxyRuntime>,
+    superseded: bool,
 }
 
-impl ScheduleBench {
+impl ScheduleBench<'_> {
     /// `nodes` 个在池节点（`n0`、`n1`…），`ports` 个池端口（从 10000 起）。
     fn new(nodes: usize, ports: u16) -> Self {
         Self {
@@ -4118,6 +4121,8 @@ impl ScheduleBench {
             none: BTreeSet::new(),
             ports: (0..ports).map(|k| 10_000 + k).collect(),
             readbacks_opened: std::sync::atomic::AtomicUsize::new(0),
+            pool_runtime: None,
+            superseded: false,
         }
     }
 
@@ -4141,6 +4146,7 @@ impl ScheduleBench {
         MeasFut: Future<Output = Measured> + Send + 'static,
     {
         let clock = Arc::clone(&self.clock);
+        let measure = plain(measure);
         drive_scheduled_round(
             ScheduledRoundInput {
                 core_binary_sha256: None,
@@ -4169,11 +4175,14 @@ impl ScheduleBench {
                     self.readbacks_opened.fetch_add(1, Ordering::SeqCst);
                     Readback::off()
                 },
+                pool_runtime: self
+                    .pool_runtime
+                    .map(|proxy| (proxy, proxy.core_generation(), None)),
             },
-            &superseded_at(0),
+            &|| self.superseded,
             &|| None,
             select,
-            plain(measure),
+            |slot, port, member, _| measure(slot, port, member),
             &mut |event, payload| collected.push((event.to_string(), payload)),
         )
         .await
@@ -4181,6 +4190,33 @@ impl ScheduleBench {
 
     fn url_digest() -> String {
         polaris_updater::sha256_hex(DEFAULT_SPEED_TEST_URL.as_bytes())
+    }
+}
+
+#[tokio::test]
+async fn scheduled_missing_pool_graph_retires_without_opening_readback() {
+    let (proxy, _dir, _) = crate::runtime::proxy::tests::test_runtime_recording();
+    for superseded in [false, true] {
+        let mut bench = ScheduleBench::new(1, 1);
+        bench.pool_runtime = Some(&proxy);
+        bench.superseded = superseded;
+        let mut events = Vec::new();
+        let round = bench
+            .run(
+                &bench.targets(1),
+                1,
+                |_, _| async { panic!("must not select a slot") },
+                |_| async { panic!("must not measure") },
+                &mut events,
+            )
+            .await;
+        if superseded {
+            assert_eq!(ran(round).interrupted, Some(InterruptReason::Superseded));
+        } else {
+            assert!(matches!(round, ScheduledRound::PoolUnavailable));
+        }
+        assert_eq!(bench.readbacks_opened.load(Ordering::SeqCst), 0);
+        assert!(events.is_empty());
     }
 }
 
@@ -4420,23 +4456,26 @@ async fn a_gap_between_results_over_the_threshold_discards_the_rest_as_frozen() 
                 wall_clock: &move || wall.load(Ordering::SeqCst),
                 freeze_gap_ms,
                 open_readback: &Readback::off,
+                pool_runtime: None,
             },
             &superseded_at(0),
             &|| None,
             |_, _| async { true },
-            plain(|_| {
-                // 第一个节点耗时 14 秒出值；第二个 16 秒后才回来，而且是超时（解冻后的典型表现）。
-                let (elapsed, measured) = match step.fetch_add(1, Ordering::SeqCst) {
-                    0 => (14_000, Ok(120_u32)),
-                    1 => (16_000, Err(TIMED_OUT)),
-                    _ => (1_000, Ok(90_u32)),
-                };
-                let clock = Arc::clone(&clock);
-                async move {
-                    clock.fetch_add(elapsed, Ordering::SeqCst);
-                    measured
-                }
-            }),
+            |slot, port, member, _| {
+                plain(|_| {
+                    // 第一个节点耗时 14 秒出值；第二个 16 秒后才回来，而且是超时（解冻后的典型表现）。
+                    let (elapsed, measured) = match step.fetch_add(1, Ordering::SeqCst) {
+                        0 => (14_000, Ok(120_u32)),
+                        1 => (16_000, Err(TIMED_OUT)),
+                        _ => (1_000, Ok(90_u32)),
+                    };
+                    let clock = Arc::clone(&clock);
+                    async move {
+                        clock.fetch_add(elapsed, Ordering::SeqCst);
+                        measured
+                    }
+                })(slot, port, member)
+            },
             &mut |event, payload| collected.push((event.to_string(), payload)),
         )
         .await;
@@ -5008,6 +5047,7 @@ fn binding_of<'a>(collected: &'a [(String, Value)], id: &str) -> &'a Value {
 
 fn ledger_view<'a>(fps: &'a BTreeMap<String, String>) -> measurement_ledger::ReadContext<'a> {
     measurement_ledger::ReadContext {
+        pool_graph: None,
         core_binary_sha256: None,
         main_generation: Some(7),
         fingerprints: fps,
@@ -6535,8 +6575,8 @@ fn production_entries_wire_the_readback() {
     assert!(zero < opened, "零可测时不建读回流");
     assert_eq!(occurrences(&pool, "open_readback()"), 1);
     assert!(pool.contains(".with_readback(readback);"));
-    assert!(pool.contains("targets.pool_ports.as_slice(),readback,)"));
-    assert!(pool.contains("letprobe=ConnectProbe::pool_foreground(member);"));
+    assert!(pool.contains("targets.pool_ports.as_slice(),&muttrace,readback,)"));
+    assert!(pool.contains("ConnectProbe::pool_foreground(member).with_graph("));
     assert!(pool.contains("measure_slot(&readback,slot,port,auth.as_ref(),&url,probe)"));
     assert!(manual.contains(".with_readback(&readback);"));
     assert!(manual.contains(
@@ -6576,7 +6616,7 @@ fn production_entries_wire_the_readback() {
 
     for (name, body) in [("后台探测", &failover), ("周期一轮", &scheduled)] {
         assert!(
-            body.contains("letprobe=ConnectProbe::pool_background(member);"),
+            body.contains("ConnectProbe::pool_background(member)"),
             "{name}"
         );
         assert_eq!(
@@ -6695,6 +6735,7 @@ async fn runtime_probe(
         &mut sink,
         &[10000, 10001],
         readback,
+        false,
     )
     .await;
     match batch {

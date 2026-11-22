@@ -3312,14 +3312,166 @@ async fn native_unknown_survives_same_generation_baseline_recapture_until_teardo
     );
 }
 
+type ProbeGraphCalls = Arc<std::sync::Mutex<Vec<(String, Option<String>)>>>;
+type ProbeSelectCallback = Arc<std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>>;
+type ProbeSelectHold = Arc<
+    std::sync::Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
+>;
+
 #[derive(Clone)]
 struct NativeRetirementRpcFixture {
     capabilities: Arc<std::sync::Mutex<daemon::RuntimeCapabilities>>,
     status: Arc<std::sync::Mutex<daemon::RuntimeConfigStatus>>,
     requests: Arc<std::sync::Mutex<Vec<daemon::RuntimeConfigStatusRequest>>>,
+    probe_selection: Arc<std::sync::atomic::AtomicBool>,
+    probe_select_first_unavailable: Arc<std::sync::atomic::AtomicBool>,
+    probe_select_calls: ProbeGraphCalls,
+    on_probe_select: ProbeSelectCallback,
+    probe_select_hold: ProbeSelectHold,
+    selected_group_member: Arc<std::sync::Mutex<Option<String>>>,
+    capability_reads: Arc<std::sync::atomic::AtomicUsize>,
     mutations: Arc<std::sync::atomic::AtomicUsize>,
     acknowledgement_response: Arc<std::sync::Mutex<Option<daemon::RuntimeConfigOperation>>>,
     acknowledgements: Arc<std::sync::Mutex<Vec<daemon::RuntimePersistenceAcknowledgementRequest>>>,
+}
+
+#[derive(Clone)]
+struct ProbeSelectorPeer {
+    runtime: daemon::runtime_config_service_server::RuntimeConfigServiceServer<
+        NativeRetirementRpcFixture,
+    >,
+    fixture: NativeRetirementRpcFixture,
+}
+
+struct ProbeGroupReadback(String);
+
+impl polaris_singbox_grpc::tonic::server::ServerStreamingService<()> for ProbeGroupReadback {
+    type Response = daemon::Groups;
+    type ResponseStream = futures::stream::Iter<
+        std::array::IntoIter<Result<Self::Response, polaris_singbox_grpc::tonic::Status>, 1>,
+    >;
+    type Future = std::future::Ready<
+        Result<
+            polaris_singbox_grpc::tonic::Response<Self::ResponseStream>,
+            polaris_singbox_grpc::tonic::Status,
+        >,
+    >;
+
+    fn call(&mut self, _: polaris_singbox_grpc::tonic::Request<()>) -> Self::Future {
+        let groups = daemon::Groups {
+            group: vec![daemon::Group {
+                tag: "proxy-selector".into(),
+                selected: self.0.clone(),
+                ..Default::default()
+            }],
+        };
+        std::future::ready(Ok(polaris_singbox_grpc::tonic::Response::new(
+            futures::stream::iter([Ok(groups)]),
+        )))
+    }
+}
+
+impl
+    polaris_singbox_grpc::tonic::codegen::Service<
+        polaris_singbox_grpc::tonic::codegen::http::Request<
+            polaris_singbox_grpc::tonic::body::Body,
+        >,
+    > for ProbeSelectorPeer
+{
+    type Response = polaris_singbox_grpc::tonic::codegen::http::Response<
+        polaris_singbox_grpc::tonic::body::Body,
+    >;
+    type Error = std::convert::Infallible;
+    type Future = polaris_singbox_grpc::tonic::codegen::BoxFuture<Self::Response, Self::Error>;
+
+    fn poll_ready(
+        &mut self,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(
+        &mut self,
+        request: polaris_singbox_grpc::tonic::codegen::http::Request<
+            polaris_singbox_grpc::tonic::body::Body,
+        >,
+    ) -> Self::Future {
+        use polaris_singbox_grpc::tonic::{self, Status};
+        if request
+            .uri()
+            .path()
+            .starts_with("/daemon.RuntimeConfigService/")
+        {
+            return self.runtime.call(request);
+        }
+        assert_eq!(
+            request.headers().get("authorization").unwrap(),
+            "Bearer native-retirement-test"
+        );
+        let path = request.uri().path();
+        let graph = request
+            .headers()
+            .get("x-polaris-probe-graph")
+            .map(|value| value.to_str().unwrap().to_owned());
+        self.fixture
+            .probe_select_calls
+            .lock()
+            .unwrap()
+            .push((path.into(), graph));
+        let selected = self.fixture.selected_group_member.lock().unwrap().clone();
+        if let Some(selected) = selected {
+            if path == "/daemon.StartedService/SubscribeGroups" {
+                return Box::pin(async move {
+                    let mut grpc = tonic::server::Grpc::new(tonic_prost::ProstCodec::default());
+                    Ok(grpc
+                        .server_streaming(ProbeGroupReadback(selected), request)
+                        .await)
+                });
+            }
+            if path == "/daemon.StartedService/SelectOutbound" {
+                return Box::pin(async {
+                    let mut response = Status::new(tonic::Code::Ok, "").into_http();
+                    *response.body_mut() =
+                        tonic::body::Body::new(reqwest::Body::from(vec![0u8; 5]));
+                    Ok(response)
+                });
+            }
+        }
+        let (status, hold) = if path == "/daemon.StartedService/SelectOutbound" {
+            let callback = self.fixture.on_probe_select.lock().unwrap().take();
+            if let Some(callback) = callback {
+                callback();
+            }
+            let status = if self
+                .fixture
+                .probe_select_first_unavailable
+                .swap(false, Ordering::SeqCst)
+            {
+                Status::unavailable("selector result unknown")
+            } else {
+                Status::failed_precondition("active graph changed before write")
+            };
+            (
+                status,
+                self.fixture.probe_select_hold.lock().unwrap().take(),
+            )
+        } else {
+            (Status::unimplemented("no readback"), None)
+        };
+        Box::pin(async move {
+            if let Some((entered, release)) = hold {
+                entered.send(()).unwrap();
+                release.await.unwrap();
+            }
+            Ok(status.into_http())
+        })
+    }
 }
 
 impl NativeRetirementRpcFixture {
@@ -3352,6 +3504,7 @@ impl daemon::runtime_config_service_server::RuntimeConfigService for NativeRetir
         polaris_singbox_grpc::tonic::Response<daemon::RuntimeCapabilities>,
         polaris_singbox_grpc::tonic::Status,
     > {
+        self.capability_reads.fetch_add(1, Ordering::SeqCst);
         Ok(polaris_singbox_grpc::tonic::Response::new(
             self.capabilities.lock().unwrap().clone(),
         ))
@@ -3382,9 +3535,14 @@ impl daemon::runtime_config_service_server::RuntimeConfigService for NativeRetir
         polaris_singbox_grpc::tonic::Status,
     > {
         self.requests.lock().unwrap().push(request.into_inner());
-        Ok(polaris_singbox_grpc::tonic::Response::new(
-            self.status.lock().unwrap().clone(),
-        ))
+        let mut reply =
+            polaris_singbox_grpc::tonic::Response::new(self.status.lock().unwrap().clone());
+        if self.probe_selection.load(Ordering::SeqCst) {
+            reply
+                .metadata_mut()
+                .insert("x-polaris-probe-select-condition", "1".parse().unwrap());
+        }
+        Ok(reply)
     }
     async fn retry_runtime_persistence(
         &self,
@@ -3437,6 +3595,13 @@ async fn native_retirement_rpc_peer(
         capabilities: Arc::new(std::sync::Mutex::new(capabilities)),
         status: Arc::new(std::sync::Mutex::new(native_retirement_status(operation))),
         requests: Arc::default(),
+        probe_selection: Arc::default(),
+        probe_select_first_unavailable: Arc::default(),
+        probe_select_calls: Arc::default(),
+        on_probe_select: Arc::default(),
+        probe_select_hold: Arc::default(),
+        selected_group_member: Arc::default(),
+        capability_reads: Arc::default(),
         mutations: Arc::default(),
         acknowledgement_response: Arc::default(),
         acknowledgements: Arc::default(),
@@ -3445,13 +3610,15 @@ async fn native_retirement_rpc_peer(
         let next = listener.accept().await.map(|(stream, _)| stream);
         Some((next, listener))
     });
-    let service = fixture.clone();
+    let service = ProbeSelectorPeer {
+        runtime: daemon::runtime_config_service_server::RuntimeConfigServiceServer::new(
+            fixture.clone(),
+        ),
+        fixture: fixture.clone(),
+    };
     let server = tokio::spawn(async move {
         polaris_singbox_grpc::tonic::transport::Server::builder()
-            .serve_with_incoming(
-                daemon::runtime_config_service_server::RuntimeConfigServiceServer::new(service),
-                incoming,
-            )
+            .serve_with_incoming(service, incoming)
             .await
     });
     runtime.capture_runtime_config_baseline(
@@ -3483,6 +3650,331 @@ async fn native_retirement_rpc_peer(
     assert!(control.captured_transport_live());
     runtime.bind_runtime_api_control(pending.generation, Arc::new(control));
     (fixture, server)
+}
+
+#[tokio::test]
+async fn pool_graph_capture_pins_the_paired_startup_and_observes_only_active_status() {
+    use crate::commands::speedtest::{capture_pool_graph, read_pool_graph};
+
+    let (runtime, _dir, _) = crate::runtime::proxy::tests::test_runtime_recording();
+    let mut pending = ts_pending_raw_fixture(&runtime, runnable_config_fixture());
+    let incarnation = "a".repeat(64);
+    pending.pairing.incarnation = Some(incarnation.clone());
+    pending.plan.expected.as_mut().unwrap().incarnation = incarnation.clone();
+    let mut operation = listener_retirement_receipt(&pending, "PENDING");
+    let active = operation.active.as_mut().unwrap();
+    active.incarnation = incarnation.clone();
+    active.applied_revision = 1;
+    let active = active.clone();
+    let (rpc, server) = native_retirement_rpc_peer(&runtime, &pending, operation).await;
+    let port = runtime
+        .runtime_config_baseline
+        .read()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .management
+        .as_ref()
+        .unwrap()
+        .port;
+    runtime.status.write().unwrap().clash_api_port = port;
+    let generation = pending.generation;
+    let graph = format!("{incarnation}/1");
+    let next = format!("{incarnation}/2");
+    assert!(runtime.published_pool_graph(generation).is_none());
+    runtime
+        .runtime_config_baseline
+        .write()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .observed_active = Some(active.clone());
+    assert_eq!(
+        runtime.published_pool_graph(generation).as_deref(),
+        Some(graph.as_str())
+    );
+    *rpc.status.lock().unwrap() = daemon::RuntimeConfigStatus {
+        contract_version: 1,
+        active: Some(active.clone()),
+        lookup_state: daemon::RuntimeLookupState::ActiveOnly as i32,
+        ..Default::default()
+    };
+    let scope = capture_pool_graph(&runtime, generation, &graph)
+        .await
+        .unwrap();
+    assert_eq!(scope.graph.as_ref(), graph);
+    assert!(
+        !scope.can_select,
+        "status from an older Core has no selector capability"
+    );
+    let requested = rpc.requests.lock().unwrap().clone();
+    assert_eq!(
+        requested,
+        [daemon::RuntimeConfigStatusRequest {
+            contract_version: 1,
+            ..Default::default()
+        }]
+    );
+    assert_eq!(
+        rpc.capability_reads.load(Ordering::SeqCst),
+        1,
+        "only peer setup reads inventory"
+    );
+    let legacy = SingBoxApiClient::connect(Endpoint::new("127.0.0.1", port), "legacy")
+        .await
+        .unwrap();
+    assert!(read_pool_graph(&legacy).await.is_none());
+    assert_eq!(rpc.requests.lock().unwrap().len(), 1);
+    rpc.probe_selection.store(true, Ordering::SeqCst);
+    assert!(
+        capture_pool_graph(&runtime, generation, &graph)
+            .await
+            .unwrap()
+            .can_select
+    );
+
+    let set_active = |identity| rpc.status.lock().unwrap().active = Some(identity);
+    let publish = |identity| {
+        runtime
+            .runtime_config_baseline
+            .write()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .observed_active = Some(identity);
+    };
+    set_active(daemon::RuntimeIdentity {
+        incarnation: "b".repeat(64),
+        ..active.clone()
+    });
+    assert!(capture_pool_graph(&runtime, generation, &graph)
+        .await
+        .is_none());
+    publish(active.clone());
+    let native = daemon::RuntimeIdentity {
+        applied_revision: 2,
+        ..active.clone()
+    };
+    set_active(native.clone());
+    assert_eq!(
+        capture_pool_graph(&runtime, generation, &graph)
+            .await
+            .unwrap()
+            .graph
+            .as_ref(),
+        next
+    );
+    assert_eq!(
+        runtime.published_pool_graph(generation).as_deref(),
+        Some(graph.as_str())
+    );
+    assert_eq!(
+        runtime.current_pool_graph(generation).as_deref(),
+        Some(next.as_str())
+    );
+    assert!(runtime.pool_graph_is_current(generation, &next));
+    assert!(!runtime.pool_graph_is_current(generation, &graph));
+
+    set_active(active);
+    assert!(capture_pool_graph(&runtime, generation, &graph)
+        .await
+        .is_none());
+    let replacement = daemon::RuntimeIdentity {
+        applied_revision: 3,
+        effective_digest: "b".repeat(64),
+        ..native.clone()
+    };
+    set_active(replacement.clone());
+    assert!(capture_pool_graph(&runtime, generation, &graph)
+        .await
+        .is_none());
+    runtime.runtime_config_apply.lock().unwrap().pending = Some(pending);
+    assert!(runtime.published_pool_graph(generation).is_none());
+    set_active(native);
+    assert!(capture_pool_graph(&runtime, generation, &graph)
+        .await
+        .is_none());
+    runtime
+        .runtime_config_apply
+        .lock()
+        .unwrap()
+        .pending
+        .as_mut()
+        .unwrap()
+        .published = true;
+    publish(replacement.clone());
+    set_active(replacement);
+    assert!(capture_pool_graph(&runtime, generation, &graph)
+        .await
+        .is_none());
+    let replacement = format!("{incarnation}/3");
+    assert!(capture_pool_graph(&runtime, generation, &replacement)
+        .await
+        .is_some());
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn pool_graph_guarded_selection_never_restores_against_a_new_graph() {
+    use crate::runtime::auto_switch::RuntimeCandidate;
+    use crate::runtime::config::Decision;
+    use crate::runtime::management_api::GrpcManagementApi;
+    use crate::runtime::proxy::auto_switch::AutoHotSwitchOutcome;
+
+    let select = "/daemon.StartedService/SelectOutbound";
+    let groups = "/daemon.StartedService/SubscribeGroups";
+    for (can_select, unavailable, newer_intent, held_stop, attested) in [
+        (false, false, false, false, false),
+        (true, false, false, false, false),
+        (true, false, true, false, false),
+        (true, true, false, false, false),
+        (true, true, false, true, false),
+        (true, false, false, false, true),
+    ] {
+        let (runtime, _dir, _) = crate::runtime::proxy::tests::test_runtime_recording();
+        let mut raw = runnable_config_fixture();
+        raw["servers"] = json!([{
+            "id": "candidate", "name": "measured", "protocol": "shadowsocks",
+            "address": "127.0.0.1", "port": 9,
+            "shadowsocksSettings": { "method": "aes-128-gcm", "password": "fixture" }
+        }]);
+        raw["proxyMode"] = json!("global");
+        raw["proxyModeType"] = json!("manual");
+        raw["interruptConnectionsOnSwitch"] = json!(false);
+        runtime.config.save_full(&raw).unwrap();
+        let mut pending = ts_pending_raw_fixture(&runtime, raw.clone());
+        let incarnation = "a".repeat(64);
+        pending.pairing.incarnation = Some(incarnation.clone());
+        pending.plan.expected.as_mut().unwrap().incarnation = incarnation.clone();
+        let mut operation = listener_retirement_receipt(&pending, "PENDING");
+        let active = operation.active.as_mut().unwrap();
+        active.incarnation = incarnation.clone();
+        active.applied_revision = 1;
+        let active = active.clone();
+        let (rpc, server) = native_retirement_rpc_peer(&runtime, &pending, operation).await;
+        let snapshot =
+            ProxyRuntime::build_switch_snapshot(&pending.typed, &pending.generated, &pending.deps);
+        let candidate = RuntimeCandidate {
+            id: "candidate".into(),
+            name: "measured".into(),
+            tag: snapshot.id_to_tag["candidate"].clone(),
+        };
+        *runtime.switch_snapshot.write().unwrap() = Some(snapshot);
+        *runtime.current_config.write().unwrap() = Some(raw);
+        let generation = pending.generation;
+        {
+            let mut baseline = runtime.runtime_config_baseline.write().unwrap();
+            let baseline = baseline.as_mut().unwrap();
+            runtime.status.write().unwrap().clash_api_port =
+                baseline.management.as_ref().unwrap().port;
+            baseline.observed_active = Some(active.clone());
+        }
+        *rpc.status.lock().unwrap() = daemon::RuntimeConfigStatus {
+            contract_version: 1,
+            active: Some(active),
+            lookup_state: daemon::RuntimeLookupState::ActiveOnly as i32,
+            ..Default::default()
+        };
+        rpc.probe_selection.store(can_select, Ordering::SeqCst);
+        rpc.probe_select_first_unavailable
+            .store(unavailable, Ordering::SeqCst);
+        if attested {
+            *rpc.selected_group_member.lock().unwrap() = Some(candidate.tag.clone());
+        }
+        if newer_intent {
+            let runtime = Arc::clone(&runtime);
+            *rpc.on_probe_select.lock().unwrap() = Some(Box::new(move || {
+                runtime
+                    .config
+                    .update(|raw| {
+                        runtime.register_selector_intent();
+                        raw["selectedServerId"] = json!("candidate");
+                        Decision::Write(())
+                    })
+                    .unwrap();
+            }));
+        }
+        let fingerprint = &runtime.speed_measurement_fingerprints()["candidate"];
+        let graph = format!("{incarnation}/1");
+        let wait_for_stop = async {
+            if held_stop {
+                let (enter, entered) = tokio::sync::oneshot::channel();
+                let (release, waiting) = tokio::sync::oneshot::channel();
+                *rpc.probe_select_hold.lock().unwrap() = Some((enter, waiting));
+                tokio::time::timeout(Duration::from_secs(2), entered)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                // Ordinary Start reads saved config before claiming its lifecycle.
+                assert_eq!(
+                    runtime.config.current().unwrap()["selectedServerId"],
+                    DIRECT_SERVER_ID
+                );
+                assert!(runtime
+                    .claim_generation(Some(generation), crate::runtime::proxy::LifecycleKind::Stop)
+                    .is_some());
+                release.send(()).unwrap();
+            }
+        };
+        let legacy_api = GrpcManagementApi::not_ready();
+        let ((), outcome) = tokio::join!(
+            wait_for_stop,
+            runtime.auto_hot_switch_transaction_for_graph(
+                generation,
+                DIRECT_SERVER_ID,
+                &candidate,
+                fingerprint,
+                None,
+                &legacy_api,
+                Some(&graph),
+            ),
+        );
+        assert_eq!(
+            outcome,
+            if attested {
+                AutoHotSwitchOutcome::Applied
+            } else if unavailable && !held_stop {
+                AutoHotSwitchOutcome::Failed
+            } else {
+                AutoHotSwitchOutcome::Superseded
+            }
+        );
+        assert_eq!(
+            runtime.selector_reconcile.is_required(),
+            unavailable && !held_stop
+        );
+        assert_eq!(
+            runtime.config.current().unwrap()["selectedServerId"],
+            if newer_intent || attested {
+                "candidate"
+            } else {
+                DIRECT_SERVER_ID
+            }
+        );
+        assert_eq!(
+            runtime.current_config.read().unwrap().as_ref().unwrap()["selectedServerId"],
+            if attested {
+                "candidate"
+            } else {
+                DIRECT_SERVER_ID
+            }
+        );
+        let guarded_put = (select.to_string(), Some(graph));
+        let expected = if attested {
+            vec![guarded_put, (groups.to_string(), None)]
+        } else if unavailable && !held_stop {
+            vec![guarded_put.clone(), guarded_put, (groups.to_string(), None)]
+        } else if can_select {
+            vec![guarded_put]
+        } else {
+            vec![]
+        };
+        assert_eq!(*rpc.probe_select_calls.lock().unwrap(), expected);
+        assert_eq!(rpc.requests.lock().unwrap().len(), 1);
+        server.abort();
+        let _ = server.await;
+    }
 }
 
 #[tokio::test]

@@ -674,6 +674,10 @@ impl Memory {
 
     fn enter(&mut self, epoch: &Epoch, round_serial: u64) {
         self.epoch = Some(epoch.clone());
+        self.reset_measurement_scope(round_serial);
+    }
+
+    pub(crate) fn reset_measurement_scope(&mut self, round_serial: u64) {
         self.first_round_done = false;
         self.round_baseline = round_serial;
         self.streak = None;

@@ -313,11 +313,49 @@ impl SingBoxApiClient {
         selector_tag: impl Into<String>,
         member_tag: impl Into<String>,
     ) -> Result<(), ClientError> {
+        self.select_outbound_request(selector_tag.into(), member_tag.into(), None)
+            .await
+    }
+
+    /// Returns false for Core's precondition rejection, which guarantees zero selector mutation.
+    /// Use after this Core has advertised support on a trusted status response.
+    pub async fn select_outbound_on_probe_graph(
+        &self,
+        selector_tag: &str,
+        member_tag: &str,
+        graph: &str,
+    ) -> Result<bool, ClientError> {
+        let result = self
+            .select_outbound_request(selector_tag.into(), member_tag.into(), Some(graph))
+            .await;
+        match result {
+            Ok(()) => Ok(true),
+            Err(ClientError::Status(status))
+                if status.code() == tonic::Code::FailedPrecondition =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn select_outbound_request(
+        &self,
+        group_tag: String,
+        outbound_tag: String,
+        graph: Option<&str>,
+    ) -> Result<(), ClientError> {
         let mut c = self.client();
         let mut req = self.with_auth(Request::new(daemon::SelectOutboundRequest {
-            group_tag: selector_tag.into(),
-            outbound_tag: member_tag.into(),
+            group_tag,
+            outbound_tag,
         }));
+        if let Some(graph) = graph {
+            let graph = graph.parse().map_err(|_| {
+                tonic::Status::invalid_argument("invalid expected probe graph metadata")
+            })?;
+            req.metadata_mut().insert("x-polaris-probe-graph", graph);
+        }
         req.set_timeout(UNARY_DEADLINE);
         self.unary(c.select_outbound(req)).await?;
         Ok(())

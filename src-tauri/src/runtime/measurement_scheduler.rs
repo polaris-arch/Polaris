@@ -1823,15 +1823,19 @@ impl MeasurementScheduler {
                     }
                 }
                 let targets = output.start.as_ref().map(|start| {
+                    let state = app.state::<AppRuntime>();
+                    let proxy = state.proxy();
                     let context = LedgerView::new(&config, generation, network_epoch, platform)
-                        .with_core_binary_sha256(
-                            app.state::<AppRuntime>().proxy().measurement_core_sha256(),
-                        );
+                        .with_core_binary_sha256(proxy.measurement_core_sha256());
                     let Shared { planner, plan, .. } = &mut *shared;
                     let periods = freshness_period_index(plan);
                     let cap = |id: &str, entry: &LedgerEntry| {
                         indexed_entry_freshness_cap_ms(&periods, id, entry)
                     };
+                    let graph =
+                        generation.and_then(|generation| proxy.current_pool_graph(generation));
+                    let mut read = context.read(&cap, ledger, now.wall);
+                    read.pool_graph = graph.as_deref();
                     let current = ledger.current_results(
                         &start
                             .subs
@@ -1839,12 +1843,12 @@ impl MeasurementScheduler {
                             .filter_map(|id| plan.get(id))
                             .flat_map(|sub| sub.members.iter().cloned())
                             .collect::<Vec<_>>(),
-                        &context.read(&cap, ledger, now.wall),
+                        &read,
                     );
                     let targets = planner.round_targets(
                         start,
                         config.get("selectedServerId").and_then(Value::as_str),
-                        &|id| context.entry(ledger, id),
+                        &|id| context.entry(ledger, id, graph.as_deref()),
                         &current,
                     );
                     let abort = Arc::new(RoundAbort::default());
@@ -1988,6 +1992,7 @@ impl LedgerView {
         now_ms: u64,
     ) -> ReadContext<'a> {
         ReadContext {
+            pool_graph: None,
             core_binary_sha256: self.core_binary_sha256.as_ref().map(|v| v.as_deref()),
             main_generation: self.generation,
             fingerprints: &self.fingerprints,
@@ -2000,8 +2005,20 @@ impl LedgerView {
         }
     }
 
-    pub(crate) fn entry(&self, ledger: &MeasurementLedger, node_id: &str) -> Option<EntryView> {
+    pub(crate) fn entry(
+        &self,
+        ledger: &MeasurementLedger,
+        node_id: &str,
+        graph_current: Option<&str>,
+    ) -> Option<EntryView> {
         let entry = ledger.candidate_entry(node_id, &self.url_digest)?;
+        if entry
+            .pool_graph
+            .as_deref()
+            .is_some_and(|graph| graph_current != Some(graph))
+        {
+            return None;
+        }
         Some(EntryView {
             this_generation: matches!(
                 entry.identity.instance,

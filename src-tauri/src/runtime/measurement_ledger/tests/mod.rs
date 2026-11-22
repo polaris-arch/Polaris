@@ -44,6 +44,7 @@ fn context<'a>(
     foreground_epoch: Option<u64>,
 ) -> ReadContext<'a> {
     ReadContext {
+        pool_graph: None,
         core_binary_sha256: None,
         main_generation: Some(7),
         fingerprints,
@@ -63,6 +64,48 @@ fn exclusion_of(candidates: &Candidates, id: &str) -> Exclusion {
         .find(|(node, _)| node == id)
         .map(|(_, exclusion)| exclusion.clone())
         .unwrap_or_else(|| panic!("{id} 不在被排除的列表里：{candidates:?}"))
+}
+
+#[test]
+fn same_node_receipts_cannot_drive_selection_or_backoff_across_core_graphs() {
+    let ledger = MeasurementLedger::new();
+    let fps = fingerprints(&["a", "b"]);
+    let record = |id: &str, measured: Measured, run, graph| {
+        assert!(ledger.record_connection_in_epoch_at(
+            id,
+            measured,
+            identity(run, 1, 100),
+            fps.get(id).cloned(),
+            100,
+            None,
+            graph
+        ));
+    };
+    record("a", Ok(20), 1, Some(Arc::from("old/1")));
+    record("b", Ok(30), 1, None);
+    let mut read = context(&fps, 101, None);
+    read.pool_graph = Some("new/2");
+    let all = ids(&["a", "b"]);
+    let candidates = ledger.candidates(&all, &read);
+    assert_eq!(
+        exclusion_of(&candidates, "a"),
+        Exclusion::Stale(LedgerStale::Identity(StaleReason::Instance))
+    );
+    assert_eq!(candidates.selectable[0].node_id, "b");
+
+    let failure = Err(MeasureFailure::new(FailPhase::Connect, FailKind::Transport));
+    record("a", failure, 2, Some(Arc::from("old/1")));
+    record("a", failure, 3, Some(Arc::from("new/2")));
+    let candidates = ledger.candidates(&all, &read);
+    assert!(matches!(
+        exclusion_of(&candidates, "a"),
+        Exclusion::Failed { consecutive: 1, .. }
+    ));
+    assert!(ledger
+        .candidate_entry("a", URL)
+        .unwrap()
+        .last_ok_at
+        .is_none());
 }
 
 #[test]

@@ -53,6 +53,7 @@
 //! 真延迟数值走真核真出站 = 真机门。
 
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
 
@@ -96,21 +97,49 @@ pub enum TunnelError {
     BindingMismatch,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) enum ConnectProbe {
     Standard,
     Foreground,
-    PoolForeground(String),
-    PoolBackground(String),
+    Pool {
+        member: String,
+        background: bool,
+        graph: Option<(Arc<str>, Arc<AtomicBool>)>,
+    },
 }
 
 impl ConnectProbe {
     pub(crate) fn pool_foreground(member: &str) -> Self {
-        Self::PoolForeground(polaris_updater::sha256_hex(member.as_bytes()))
+        Self::pool(member, false)
     }
 
     pub(crate) fn pool_background(member: &str) -> Self {
-        Self::PoolBackground(polaris_updater::sha256_hex(member.as_bytes()))
+        Self::pool(member, true)
+    }
+
+    fn pool(member: &str, background: bool) -> Self {
+        Self::Pool {
+            member: polaris_updater::sha256_hex(member.as_bytes()),
+            background,
+            graph: None,
+        }
+    }
+
+    pub(crate) fn with_graph(mut self, expected: Arc<str>) -> Self {
+        if let Self::Pool { graph, .. } = &mut self {
+            *graph = Some((expected, Arc::new(AtomicBool::new(false))));
+        }
+        self
+    }
+
+    pub(crate) fn graph_receipt(&self) -> Option<Arc<AtomicBool>> {
+        match self {
+            Self::Pool {
+                graph: Some((_, receipt)),
+                ..
+            } => Some(Arc::clone(receipt)),
+            _ => None,
+        }
     }
 }
 
@@ -186,20 +215,23 @@ impl SpeedTestTarget {
     fn connect_request(&self, auth: Option<&InboundUser>, probe: &ConnectProbe) -> String {
         let a = self.authority();
         let proxy_auth = proxy_authorization_line(auth);
-        let (probe_header, member) = match probe {
-            ConnectProbe::Standard => ("", None),
-            ConnectProbe::Foreground => ("X-Polaris-Probe: 1\r\n", None),
-            ConnectProbe::PoolForeground(member) => ("X-Polaris-Probe: 1\r\n", Some(member)),
-            ConnectProbe::PoolBackground(member) => {
-                ("X-Polaris-Probe: background\r\n", Some(member))
-            }
+        let mode = match probe {
+            ConnectProbe::Standard => "",
+            ConnectProbe::Pool {
+                background: true, ..
+            } => "X-Polaris-Probe: background\r\n",
+            _ => "X-Polaris-Probe: 1\r\n",
         };
-        match member {
-            Some(member) => format!(
-                "CONNECT {a} HTTP/1.1\r\nHost: {a}\r\n{probe_header}{proxy_auth}X-Polaris-Probe-Member: {member}\r\n\r\n"
-            ),
-            None => format!("CONNECT {a} HTTP/1.1\r\nHost: {a}\r\n{probe_header}{proxy_auth}\r\n"),
+        let mut request = format!("CONNECT {a} HTTP/1.1\r\nHost: {a}\r\n{mode}{proxy_auth}");
+        if let ConnectProbe::Pool { member, graph, .. } = probe {
+            use std::fmt::Write as _;
+            let _ = write!(request, "X-Polaris-Probe-Member: {member}\r\n");
+            if let Some((expected, _)) = graph {
+                let _ = write!(request, "X-Polaris-Probe-Graph: {expected}\r\n");
+            }
         }
+        request.push_str("\r\n");
+        request
     }
 
     /// 隧道上的 GET 报文 —— **origin-form**（`GET /path HTTP/1.1`），不是 absolute-form。
@@ -590,9 +622,7 @@ fn connect_error(probe: &ConnectProbe, code: u16, buf: &[u8]) -> TunnelError {
     let (outcome, error): (&[u8], _) = match (probe, code) {
         (ConnectProbe::Standard, _) => return TunnelError::ConnectStatus(code),
         (_, 503) => (b"budget-busy", TunnelError::BudgetBusy),
-        (ConnectProbe::PoolForeground(_) | ConnectProbe::PoolBackground(_), 502) => {
-            (b"binding-mismatch", TunnelError::BindingMismatch)
-        }
+        (ConnectProbe::Pool { .. }, 502) => (b"binding-mismatch", TunnelError::BindingMismatch),
         _ => return TunnelError::ConnectStatus(code),
     };
     if response_head_range(buf).is_some_and(|(start, end)| {
@@ -608,6 +638,22 @@ fn connect_error(probe: &ConnectProbe, code: u16, buf: &[u8]) -> TunnelError {
     } else {
         TunnelError::ConnectStatus(code)
     }
+}
+
+fn matches_connect_graph(buf: &[u8], expected: &str) -> bool {
+    let Some((start, end)) = response_head_range(buf) else {
+        return false;
+    };
+    let mut graphs = buf[start..end]
+        .split(|&b| b == b'\n')
+        .skip(1)
+        .filter_map(|line| {
+            let colon = line.iter().position(|&b| b == b':')?;
+            line[..colon]
+                .eq_ignore_ascii_case(b"x-polaris-probe-graph")
+                .then(|| line[colon + 1..].trim_ascii())
+        });
+    graphs.next() == Some(expected.as_bytes()) && graphs.next().is_none()
 }
 
 /// 建 CONNECT 隧道：TCP 连本机代理口 → 发 CONNECT → 读响应（**非 2xx 即失败**）→ https 目标再在
@@ -668,8 +714,22 @@ async fn open_tunnel_with_tls_config(
     let code = read_response_status(&mut sock, &mut buf)
         .await
         .ok_or(TunnelError::Transport)?;
-    if !is_acceptable_status(code) {
-        return Err(connect_error(probe, code, &buf));
+    let error = (!is_acceptable_status(code)).then(|| connect_error(probe, code, &buf));
+    if let Some(error @ (TunnelError::BindingMismatch | TunnelError::BudgetBusy)) = error {
+        return Err(error);
+    }
+    if let ConnectProbe::Pool {
+        graph: Some((expected, receipt)),
+        ..
+    } = probe
+    {
+        if !matches_connect_graph(&buf, expected) {
+            return Err(TunnelError::BindingMismatch);
+        }
+        receipt.store(true, Ordering::Release);
+    }
+    if let Some(error) = error {
+        return Err(error);
     }
     // 200 之后缓冲里的任何残余都是代理抢发的非请求数据（sing 的 CONNECT 腿写完 200 就交棒，
     // 不会再写）→ 与 上游 一致地丢弃（node 的 'connect' 事件同样把 `head` 参数弃之不用）。

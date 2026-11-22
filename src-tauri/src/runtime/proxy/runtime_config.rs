@@ -396,6 +396,7 @@ pub(super) struct RuntimeConfigBaseline {
     pub(super) generation: u64,
     committed_transaction: Option<String>,
     pub(super) observed_active: Option<daemon::RuntimeIdentity>,
+    pool_observed_revision: u64,
     pub(super) observed_control_revision: u64,
     pub(super) pairing: RuntimePairing,
     physical_route_config: UserConfig,
@@ -427,6 +428,15 @@ impl RuntimeConfigBaseline {
     pub(super) fn core_log_relay_initial_history(&self, generation: u64) -> bool {
         self.generation == generation && !self.api_epoch.is_closed() && !self.api_handed_off
     }
+}
+
+fn pool_graph_matches(graph: &str, incarnation: &str, revision: u64) -> bool {
+    graph.split_once('/').is_some_and(|(observed, number)| {
+        observed == incarnation
+            && !number.starts_with('0')
+            && number.bytes().all(|byte| byte.is_ascii_digit())
+            && number.parse::<u64>() == Ok(revision)
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -660,6 +670,96 @@ impl ProxyRuntime {
                 .as_ref()
                 .is_none_or(|pending| pending.generation != generation || pending.published)
         })
+    }
+
+    fn pool_baseline_ready(&self, generation: u64) -> bool {
+        self.gate.generation() == generation
+            && self.core_running()
+            && self.exit_ip_graph_is_published(generation)
+    }
+
+    fn with_pool_baseline<T>(
+        &self,
+        generation: u64,
+        read: impl FnOnce(&RuntimeConfigBaseline, &str, u64) -> Option<T>,
+    ) -> Option<T> {
+        if !self.pool_baseline_ready(generation) {
+            return None;
+        }
+        let baseline = self.runtime_config_baseline.try_read().ok()?;
+        let baseline = baseline
+            .as_ref()
+            .filter(|baseline| baseline.generation == generation)?;
+        let active = baseline.observed_active.as_ref()?;
+        read(baseline, &active.incarnation, active.applied_revision)
+    }
+
+    /// The App graph identity must be captured before taking the slot membership
+    /// and fingerprints from the published snapshot.
+    pub(crate) fn published_pool_graph(&self, generation: u64) -> Option<Arc<str>> {
+        self.with_pool_baseline(generation, |_, incarnation, revision| {
+            crate::commands::speedtest::pool_graph(incarnation, revision)
+        })
+    }
+
+    pub(crate) fn current_pool_graph(&self, generation: u64) -> Option<Arc<str>> {
+        self.with_pool_baseline(generation, |baseline, incarnation, revision| {
+            crate::commands::speedtest::pool_graph(
+                incarnation,
+                revision.max(baseline.pool_observed_revision),
+            )
+        })
+    }
+
+    pub(crate) fn pool_graph_is_current(&self, generation: u64, graph: &str) -> bool {
+        self.with_pool_baseline(generation, |baseline, incarnation, revision| {
+            Some(pool_graph_matches(
+                graph,
+                incarnation,
+                revision.max(baseline.pool_observed_revision),
+            ))
+        })
+        .unwrap_or(false)
+    }
+
+    /// A native rule/root source refresh may advance Core's revision without
+    /// changing the App's canonical configuration or its probe target snapshot.
+    pub(crate) fn admit_pool_graph(
+        &self,
+        generation: u64,
+        publication: &str,
+        active: &daemon::RuntimeIdentity,
+    ) -> bool {
+        if !self.pool_baseline_ready(generation) {
+            return false;
+        }
+        let Ok(mut baseline) = self.runtime_config_baseline.try_write() else {
+            return false;
+        };
+        let Some(baseline) = baseline
+            .as_mut()
+            .filter(|baseline| baseline.generation == generation)
+        else {
+            return false;
+        };
+        let Some(published) = baseline.observed_active.as_ref() else {
+            return false;
+        };
+        if !pool_graph_matches(
+            publication,
+            &published.incarnation,
+            published.applied_revision,
+        ) || active.incarnation != published.incarnation
+            || active.applied_revision
+                < published
+                    .applied_revision
+                    .max(baseline.pool_observed_revision)
+            || active.effective_digest != published.effective_digest
+        {
+            return false;
+        }
+        baseline.pool_observed_revision = active.applied_revision;
+        true
     }
 
     pub(crate) fn pinned_exit_ip_route(&self) -> Option<RuntimeExitIpRoute> {
@@ -1696,6 +1796,7 @@ impl ProxyRuntime {
                 generation,
                 committed_transaction: None,
                 observed_active: None,
+                pool_observed_revision: 0,
                 observed_control_revision: 0,
                 pairing,
                 physical_route_config,
@@ -4043,6 +4144,17 @@ impl ProxyRuntime {
                     .map(str::to_owned)
                     .or_else(|| previous.committed_transaction.clone()),
                 observed_active: active.clone(),
+                pool_observed_revision: if active
+                    .as_ref()
+                    .zip(previous.observed_active.as_ref())
+                    .is_some_and(|(next, old)| {
+                        next.incarnation == old.incarnation
+                            && next.effective_digest == old.effective_digest
+                    }) {
+                    previous.pool_observed_revision
+                } else {
+                    0
+                },
                 observed_control_revision: control_revision,
                 pairing: pending.pairing.clone(),
                 physical_route_config: pending.physical_route_config.clone(),

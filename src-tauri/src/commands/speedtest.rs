@@ -85,6 +85,7 @@ use polaris_config_engine::user_config::LogLevel;
 use polaris_core_supervisor::PortExclusions;
 use polaris_helper_proto::Platform;
 use polaris_net_stack::subscription::server_fingerprint;
+use polaris_singbox_grpc::{daemon, SingBoxApiClient};
 
 use crate::events::channel::{
     EVENT_SPEED_TEST_DONE, EVENT_SPEED_TEST_PROGRESS, EVENT_SPEED_TEST_RESULT,
@@ -297,6 +298,67 @@ impl MeasureFailure {
 
 /// 单节点测量结果：毫秒数，或带阶段与成因的失败。失败不带任何毫秒数。
 pub(crate) type Measured = Result<u32, MeasureFailure>;
+
+pub(crate) fn pool_graph(incarnation: &str, revision: u64) -> Option<Arc<str>> {
+    (revision != 0
+        && incarnation.len() == 64
+        && incarnation
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+    .then(|| Arc::from(format!("{incarnation}/{revision}")))
+}
+
+pub(crate) async fn read_pool_graph(
+    client: &SingBoxApiClient,
+) -> Option<(daemon::RuntimeIdentity, Arc<str>, bool)> {
+    if !client.captured_transport_live() {
+        return None;
+    }
+    let (status, can_select) = client
+        .get_runtime_config_status_with_probe_selection(daemon::RuntimeConfigStatusRequest {
+            contract_version: 1,
+            ..Default::default()
+        })
+        .await
+        .ok()?;
+    if status.contract_version != 1
+        || status.lookup_state != daemon::RuntimeLookupState::ActiveOnly as i32
+    {
+        return None;
+    }
+    let active = status.active?;
+    let graph = pool_graph(&active.incarnation, active.applied_revision)?;
+    Some((active, graph, can_select))
+}
+
+pub(crate) struct CapturedPoolGraph {
+    pub(crate) client: SingBoxApiClient,
+    pub(crate) graph: Arc<str>,
+    pub(crate) can_select: bool,
+}
+
+pub(crate) async fn capture_pool_graph(
+    proxy: &ProxyRuntime,
+    generation: u64,
+    expected: &str,
+) -> Option<CapturedPoolGraph> {
+    let status = proxy.status();
+    if !status.running || proxy.core_generation() != generation {
+        return None;
+    }
+    let client = proxy
+        .current_management_client(status.clash_api_port)
+        .await
+        .ok()?;
+    let (active, graph, can_select) = read_pool_graph(&client).await?;
+    proxy
+        .admit_pool_graph(generation, expected, &active)
+        .then_some(CapturedPoolGraph {
+            client,
+            graph,
+            can_select,
+        })
+}
 
 /// Producer-owned result. JSON is only a projection at the event/API boundary.
 #[derive(Debug, Clone)]
@@ -999,6 +1061,7 @@ pub(crate) struct RunEvents {
     failed_samples: Vec<String>,
     /// 逐节点结果盖章后入的那本账。
     ledger: &'static MeasurementLedger,
+    pool_graph: Option<Arc<str>>,
     /// Scheduled admission epoch, captured before measurement; never serialized.
     foreground_epoch: Option<u64>,
     /// 本轮的读回上下文（汇总行取它的计数与流状态）。
@@ -1047,6 +1110,7 @@ impl RunEvents {
             failures: BTreeMap::new(),
             failed_samples: Vec::new(),
             ledger: measurement_ledger::global(),
+            pool_graph: None,
             foreground_epoch: None,
             readback: None,
             static_bound: 0,
@@ -1094,6 +1158,11 @@ impl RunEvents {
         self
     }
 
+    fn with_pool_graph(mut self, graph: Option<Arc<str>>) -> Self {
+        self.pool_graph = graph;
+        self
+    }
+
     fn with_foreground_epoch(mut self, epoch: u64) -> Self {
         self.foreground_epoch = Some(epoch);
         self
@@ -1137,23 +1206,15 @@ impl RunEvents {
             // Record before projection, even when the external outlet is a no-op.
             let measured = result.measured.map_err(MeasureFailure::for_ledger);
             let connection_digest = self.connection_fingerprints.get(&result.node_id).cloned();
-            let recorded = match self.foreground_epoch {
-                Some(epoch) => self.ledger.record_connection_in_epoch_at(
-                    &result.node_id,
-                    measured,
-                    identity.clone(),
-                    connection_digest,
-                    measurement_ledger::mono_now_ms(),
-                    Some(epoch),
-                ),
-                None => self.ledger.record_connection_at(
-                    &result.node_id,
-                    measured,
-                    identity.clone(),
-                    connection_digest,
-                    measurement_ledger::mono_now_ms(),
-                ),
-            };
+            let recorded = self.ledger.record_connection_in_epoch_at(
+                &result.node_id,
+                measured,
+                identity.clone(),
+                connection_digest,
+                measurement_ledger::mono_now_ms(),
+                self.foreground_epoch,
+                self.pool_graph.clone(),
+            );
             // A lifecycle transition can race the outer gate. The ledger checks
             // again under its epoch lock; rejected old-epoch results stay private.
             if !recorded && self.foreground_epoch.is_some() {
@@ -1652,6 +1713,7 @@ struct PoolPrefilter<'a> {
     /// 不参与分区判定 —— 分区只问「就不就绪」，文案才需要问「为什么」。
     ts_reasons: &'a BTreeMap<String, TsNotReady>,
     connection_fingerprints: &'a BTreeMap<String, String>,
+    pool_graph: Option<&'a str>,
 }
 
 /// 请求集波前预筛分区（纯逻辑，对齐 上游 `SpeedTestService.ts:674-700` 的 `poolTestable` 循环）。
@@ -2620,6 +2682,10 @@ pub async fn server_speed_test(
 
     // §15 主核探测池分波测速（池就绪 → 「批量比较多节点延迟选优」核心路径）：把请求的 N 个节点按 K 分波，
     // 逐波经 gRPC select_outbound 热切各槽到本波节点、经 probe-in-k 端口量 warm-TTFB。详见模块文档路径①。
+    let generation = ticket
+        .as_ref()
+        .map_or_else(|| proxy.core_generation(), ReadyMainTicket::generation);
+    let pool_graph = proxy.published_pool_graph(generation);
     if let Some(targets) = proxy.speed_probe_targets() {
         let requested = manual_requested.clone();
         // 波前预筛第三腿（dirty）的入参：起核快照指纹 vs **ConfigManager 最新** config 的当前指纹。
@@ -2651,6 +2717,7 @@ pub async fn server_speed_test(
             ts_pending: &ts_pending,
             ts_reasons: &ts_reasons,
             connection_fingerprints: &connection_fingerprints,
+            pool_graph: pool_graph.as_deref(),
         };
         let open_readback = || {
             Readback::open(
@@ -3196,10 +3263,18 @@ async fn run_pool_speed_test(
 
     // §15.11 让位（超代）基准：本轮归属的核世代。三检查点均以它比对（见 [`drive_pool_waves`]）。
     let gen0 = ticket.map_or_else(|| proxy.core_generation(), ReadyMainTicket::generation);
+    let graph = match prefilter.pool_graph {
+        Some(expected) => capture_pool_graph(proxy, gen0, expected)
+            .await
+            .map(|scope| scope.graph),
+        None => None,
+    };
     let invalid = Arc::new(AtomicBool::new(false));
     let superseded = || {
-        invalid.load(Ordering::SeqCst)
-            || is_superseded(proxy.core_generation(), gen0, proxy.status().running)
+        graph
+            .as_deref()
+            .is_none_or(|graph| !proxy.pool_graph_is_current(gen0, graph))
+            || invalid.load(Ordering::SeqCst)
             || proxy.native_owns_any(requested)
             || ticket.is_some_and(|ticket| proxy.check_ready_main(ticket).is_err())
     };
@@ -3223,6 +3298,7 @@ async fn run_pool_speed_test(
         context.cloned(),
     )
     .with_core_binary_sha256(proxy.measurement_core_sha256())
+    .with_pool_graph(graph.clone())
     .with_connection_fingerprints(proxy.speed_measurement_fingerprints())
     .with_skipped(vec![
         ("notInPool", not_in_pool.len()),
@@ -3231,7 +3307,11 @@ async fn run_pool_speed_test(
     ])
     .with_readback(readback);
 
-    let (results, outcome) = drive_pool_waves(
+    let mut trace = WaveTrace {
+        graph_required: true,
+        ..WaveTrace::default()
+    };
+    let (results, reason) = drive_pool_waves_traced(
         &waves,
         total,
         &superseded,
@@ -3263,7 +3343,9 @@ async fn run_pool_speed_test(
             }
         },
         |slot, port, member| {
-            let probe = ConnectProbe::pool_foreground(member);
+            let probe = graph
+                .as_ref()
+                .map(|graph| ConnectProbe::pool_foreground(member).with_graph(Arc::clone(graph)));
             let url = url.to_string();
             // `probe-in-k` 的凭据与池端口同源同刻（`SpeedProbeTargets::auth`；桌面 `None`）。
             let auth = targets.auth.clone();
@@ -3272,6 +3354,13 @@ async fn run_pool_speed_test(
             let invalid = Arc::clone(&invalid);
             let readback = readback.clone();
             async move {
+                let Some(probe) = probe else {
+                    return Err(MeasureFailure::new(
+                        FailPhase::Connect,
+                        FailKind::BindingMismatch,
+                    ))
+                    .into();
+                };
                 bound_speed_io(
                     || async {
                         match ticket.as_ref() {
@@ -3288,9 +3377,11 @@ async fn run_pool_speed_test(
         },
         &mut events.sink(hold_terminal(app, done)),
         targets.pool_ports.as_slice(),
+        &mut trace,
         readback,
     )
     .await;
+    let outcome = trace.outcome(reason);
 
     ApiResponse::ok(json!({
         "runId": run_id,
@@ -3333,6 +3424,8 @@ pub(crate) async fn probe_runtime_candidates(
     targets: &SpeedProbeTargets,
     candidates: &[(String, String)],
     url: &str,
+    expected_graph: &str,
+    graph_scope: &tokio::sync::OnceCell<Option<CapturedPoolGraph>>,
 ) -> RuntimeProbeBatch {
     if polaris_config_engine::user_config::auto_select::validate_test_url(Some(url)).is_err() {
         return RuntimeProbeBatch::Interrupted;
@@ -3353,7 +3446,14 @@ pub(crate) async fn probe_runtime_candidates(
         return RuntimeProbeBatch::Completed(BTreeMap::new());
     }
     let gen0 = proxy.core_generation();
-    let superseded = || is_superseded(proxy.core_generation(), gen0, proxy.status().running);
+    let Some(scope) = graph_scope
+        .get_or_init(|| capture_pool_graph(proxy, gen0, expected_graph))
+        .await
+    else {
+        return RuntimeProbeBatch::Interrupted;
+    };
+    let graph = &scope.graph;
+    let superseded = || !proxy.pool_graph_is_current(gen0, graph);
     // 本腿不向外发任何事件；仍经发布口走一遍，是为了让它与手动运行出同一行汇总。
     let request = SpeedTestRequest {
         origin: SpeedTestOrigin::Failover,
@@ -3381,6 +3481,7 @@ pub(crate) async fn probe_runtime_candidates(
         None,
     )
     .with_core_binary_sha256(proxy.measurement_core_sha256())
+    .with_pool_graph(Some(Arc::clone(graph)))
     .with_connection_fingerprints(proxy.speed_measurement_fingerprints())
     .with_readback(&readback);
     let mut sink = events.sink(|_, _| {});
@@ -3391,7 +3492,7 @@ pub(crate) async fn probe_runtime_candidates(
         guard.cancel(),
         |slot, tag: String| async move { proxy.probe_select_slot(gen0, slot, &tag).await },
         |slot, port, member| {
-            let probe = ConnectProbe::pool_background(member);
+            let probe = ConnectProbe::pool_background(member).with_graph(Arc::clone(graph));
             let url = url.to_string();
             // `probe-in-k` 的凭据与池端口同源同刻（`SpeedProbeTargets::auth`；桌面 `None`）。
             let auth = targets.auth.clone();
@@ -3401,6 +3502,7 @@ pub(crate) async fn probe_runtime_candidates(
         &mut sink,
         targets.pool_ports.as_slice(),
         &readback,
+        true,
     )
     .await
 }
@@ -3417,6 +3519,7 @@ async fn drive_runtime_probe<Sel, SelFut, Meas, MeasFut>(
     emit: &mut dyn MeasurementEvents,
     pool_ports: &[u16],
     readback: &Readback,
+    graph_required: bool,
 ) -> RuntimeProbeBatch
 where
     Sel: Fn(usize, String) -> SelFut,
@@ -3424,7 +3527,10 @@ where
     Meas: Fn(usize, u16, &str) -> MeasFut,
     MeasFut: Future<Output = Probed> + Send + 'static,
 {
-    let mut trace = WaveTrace::default();
+    let mut trace = WaveTrace {
+        graph_required,
+        ..WaveTrace::default()
+    };
     let (raw, reason) = drive_pool_waves_traced(
         waves,
         candidates.len(),
@@ -3446,7 +3552,10 @@ where
     let mut probes = candidate_probes(candidates, &raw, &trace.mismatch_skipped);
     // An incomplete tier can still supply a verified winner, but cannot prove
     // that every member failed or justify moving to the rescue tier.
-    probes.retain(|id, _| !trace.budget_deferred.contains(id));
+    probes.retain(|id, _| {
+        !trace.budget_deferred.contains(id)
+            && (!graph_required || raw.contains_key(id) || trace.mismatch_skipped.contains(id))
+    });
     RuntimeProbeBatch::Completed(probes)
 }
 
@@ -3543,7 +3652,7 @@ pub(crate) enum ScheduledRound {
     /// 闸被同级或更高优先级的来源占着（附占用方；查的那一刻已释放则为 `None`）。
     /// 没有任何节点被测，也没有任何节点被记成失败。
     Busy(Option<SpeedTestOrigin>),
-    /// 探针池不可用（起核时端口没分到）。
+    /// 探针池或它所属的运行图暂不可用。
     PoolUnavailable,
     Ran(RoundReport),
 }
@@ -3601,6 +3710,7 @@ pub(crate) struct ScheduledRoundDeps<'a> {
     pub(crate) freeze_gap_ms: u64,
     /// 开本轮的读回上下文。确认有可测目标、领到运行号之后才调：没拿到闸或零可测的一轮不建流。
     pub(crate) open_readback: &'a (dyn Fn() -> Readback + Sync),
+    pool_runtime: Option<(&'a ProxyRuntime, u64, Option<&'a str>)>,
 }
 
 /// **周期一轮的编排核**（热切 / 测量 / 事件出口全部注入，不碰宿主网络）。
@@ -3622,7 +3732,7 @@ pub(crate) async fn drive_scheduled_round<Sel, SelFut, Meas, MeasFut>(
 where
     Sel: Fn(usize, String) -> SelFut,
     SelFut: Future<Output = bool>,
-    Meas: Fn(usize, u16, &str) -> MeasFut,
+    Meas: Fn(usize, u16, &str, Option<Arc<str>>) -> MeasFut,
     MeasFut: Future<Output = Probed> + Send + 'static,
 {
     let Some(guard) = deps.gate.acquire(SpeedTestOrigin::Schedule).await else {
@@ -3699,12 +3809,44 @@ where
     if waves.is_empty() {
         return ScheduledRound::Ran(report);
     }
+    let graph_required = deps.pool_runtime.is_some();
+    let graph = match deps.pool_runtime {
+        Some((proxy, generation, Some(expected))) => {
+            capture_pool_graph(proxy, generation, expected)
+                .await
+                .map(|scope| scope.graph)
+        }
+        _ => None,
+    };
+    let graph_unavailable = || {
+        deps.pool_runtime.is_some_and(|(proxy, generation, _)| {
+            graph
+                .as_deref()
+                .is_none_or(|graph| !proxy.pool_graph_is_current(generation, graph))
+        })
+    };
+    if graph_unavailable() {
+        report.interrupted = interrupted(guard.cancel(), superseded);
+        if report.interrupted.is_none() {
+            return ScheduledRound::PoolUnavailable;
+        }
+        report.run = run_id;
+        report.ended_at = (deps.wall_clock)();
+        report.unmeasured = partition.testable.into_iter().map(|(id, _)| id).collect();
+        return ScheduledRound::Ran(report);
+    }
     let readback = (deps.open_readback)();
-    events = events.with_readback(&readback);
+    events = events
+        .with_readback(&readback)
+        .with_pool_graph(graph.clone());
 
-    let mut trace = WaveTrace::default();
+    let mut trace = WaveTrace {
+        graph_required,
+        ..WaveTrace::default()
+    };
     let mut admitted: BTreeMap<String, bool> = BTreeMap::new();
     let mut frozen = false;
+    let lost_graph = AtomicBool::new(false);
     let (_, reason) = {
         let mut last_event = started_at;
         // 冻结判据：只看逐节点结果之间的墙钟间隔（首条与准入时刻比）。进程被系统冻结后，在飞的
@@ -3745,11 +3887,18 @@ where
         drive_pool_waves_traced(
             &waves,
             partition.testable.len(),
-            superseded,
+            &|| {
+                if graph_unavailable() {
+                    lost_graph.store(true, Ordering::Relaxed);
+                    true
+                } else {
+                    superseded()
+                }
+            },
             guard.cancel(),
             network_epoch,
             select_slot,
-            measure,
+            |slot, port, member| measure(slot, port, member, graph.clone()),
             &mut gated,
             input.pool_ports,
             &mut trace,
@@ -3757,6 +3906,12 @@ where
         )
         .await
     };
+    if reason == Some(InterruptReason::Superseded)
+        && lost_graph.load(Ordering::Relaxed)
+        && !superseded()
+    {
+        return ScheduledRound::PoolUnavailable;
+    }
     report.run = run_id;
     report.ended_at = (deps.wall_clock)();
     report.unmeasured = partition
@@ -3785,6 +3940,8 @@ pub(crate) async fn run_scheduled_round(
     freeze_gap_ms: u64,
 ) -> ScheduledRound {
     let proxy = Arc::clone(&app.state::<AppRuntime>().proxy);
+    let gen0 = proxy.core_generation();
+    let expected_graph = proxy.published_pool_graph(gen0);
     // 取值都在 await 之前：`State` 不跨 await 持有。
     let (probe, config, dirty, ts_pending) = {
         let state = app.state::<AppRuntime>();
@@ -3815,7 +3972,6 @@ pub(crate) async fn run_scheduled_round(
         });
     }
     let url = resolve_speed_test_url(&config);
-    let gen0 = proxy.core_generation();
     let superseded = || {
         is_superseded(proxy.core_generation(), gen0, proxy.status().running)
             || app
@@ -3869,6 +4025,7 @@ pub(crate) async fn run_scheduled_round(
         wall_clock: &crate::runtime::subscription_scheduler::now_ms,
         freeze_gap_ms,
         open_readback: &open_readback,
+        pool_runtime: Some((&proxy, gen0, expected_graph.as_deref())),
     };
     drive_scheduled_round(
         input,
@@ -3879,12 +4036,15 @@ pub(crate) async fn run_scheduled_round(
             let proxy = Arc::clone(&proxy);
             async move { proxy.probe_select_slot(gen0, slot, &tag).await }
         },
-        |slot, port, member| {
+        |slot, port, member, graph| {
             let url = url.clone();
             // `probe-in-k` 的凭据与池端口同源同刻（`SpeedProbeTargets::auth`；桌面 `None`）。
             let auth = probe.auth.clone();
             let readback = round_readback.get().cloned();
-            let probe = ConnectProbe::pool_background(member);
+            let mut probe = ConnectProbe::pool_background(member);
+            if let Some(graph) = graph {
+                probe = probe.with_graph(graph);
+            }
             async move {
                 match readback {
                     Some(readback) => {
@@ -3954,6 +4114,7 @@ const fn is_superseded(gen_now: u64, gen0: u64, running: bool) -> bool {
 /// 终态」在结构上写不出来。载荷含未测集合（续测输入），判据见 [`emit_speed_test_done`]。
 /// 本函数是它面向手动与故障切换两条腿的入口：中断成因折成 `outcome` 字符串。
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 async fn drive_pool_waves<Sel, SelFut, Meas, MeasFut>(
     waves: &[Vec<SlotAssignment>],
     total: usize,
@@ -3993,6 +4154,7 @@ where
 /// 一轮分波里发生过、但不进结果的事。
 #[derive(Debug, Default)]
 pub(crate) struct WaveTrace {
+    graph_required: bool,
     /// 本轮内波宽是否因本机侧报错减半过。
     pub(crate) halved: bool,
     /// 因读回不符被「强制」档跳过的节点。它们缺席的原因是「量到的不是它」，与其余缺席
@@ -4137,6 +4299,11 @@ where
         if reason.is_none() {
             for (a, selected) in wave.iter().zip(selected) {
                 if !selected {
+                    // A graph-bound result needs a receipt from the same CONNECT.
+                    if trace.graph_required {
+                        trace.mismatch_skipped.insert(a.node_id.clone());
+                        continue;
+                    }
                     record_measured(
                         &mut results,
                         &mut tested,
@@ -4477,6 +4644,7 @@ async fn measure_via_local_proxy(
         return Err(MeasureFailure::new(FailPhase::Connect, FailKind::Rejected)).into();
     };
     let announced = Mutex::new(None);
+    let receipt = probe.graph_receipt();
     let measured = measure_warm_ttfb(
         Duration::from_millis(SPEED_TEST_COLD_TIMEOUT_MS),
         Duration::from_millis(SPEED_TEST_REUSE_TIMEOUT_MS),
@@ -4486,6 +4654,17 @@ async fn measure_via_local_proxy(
         }),
     )
     .await;
+    let measured = if receipt.is_some_and(|receipt| !receipt.load(Ordering::Acquire))
+        && !measured
+            .is_err_and(|failure| matches!(failure.kind, FailKind::Local | FailKind::BudgetBusy))
+    {
+        Err(MeasureFailure::new(
+            FailPhase::Connect,
+            FailKind::BindingMismatch,
+        ))
+    } else {
+        measured
+    };
     Probed {
         measured,
         source_port: announced

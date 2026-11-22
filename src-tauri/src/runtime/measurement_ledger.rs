@@ -11,7 +11,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use tokio::sync::Notify;
 
@@ -39,6 +39,7 @@ pub(crate) struct LedgerEntry {
     pub(crate) measured: Measured,
     pub(crate) identity: ResultIdentity,
     pub(crate) connection_digest: Option<String>,
+    pub(crate) pool_graph: Option<Arc<str>>,
     /// 入账那一刻的前台代次。
     pub(crate) foreground_epoch: u64,
     /// 到这一条为止的连续失败次数（成功即归零；手动测过即从头数；换核世代或切网时清零）。
@@ -109,6 +110,8 @@ pub(crate) struct Candidates {
 
 /// 读取时的对照面，由读取方在读的那一刻取。账本不缓存任何判定结果。
 pub(crate) struct ReadContext<'a> {
+    /// A graph-bound pool result requires the current runtime's publication.
+    pub(crate) pool_graph: Option<&'a str>,
     /// Outer None is an unbound pure-logic fixture; production supplies Some.
     /// Some(None) is unknown and cannot make a measurement current.
     pub(crate) core_binary_sha256: Option<Option<&'a str>>,
@@ -272,6 +275,7 @@ impl MeasurementLedger {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn record_connection_at(
         &self,
         node_id: &str,
@@ -286,6 +290,7 @@ impl MeasurementLedger {
             identity,
             connection_digest,
             recorded_mono,
+            None,
             None,
         )
     }
@@ -302,6 +307,7 @@ impl MeasurementLedger {
         connection_digest: Option<String>,
         recorded_mono: u64,
         captured_foreground_epoch: Option<u64>,
+        pool_graph: Option<Arc<str>>,
     ) -> bool {
         let key = result_key(node_id, &identity);
         let mut inner = self.lock();
@@ -316,7 +322,7 @@ impl MeasurementLedger {
         }
         let manual = identity.origin == SpeedTestOrigin::Manual;
         let previous_failures = stored
-            .filter(|_| !manual)
+            .filter(|entry| !manual && entry.pool_graph == pool_graph)
             .map_or(0, |entry| entry.consecutive_failures);
         let entry = LedgerEntry {
             consecutive_failures: if measured.is_ok() {
@@ -327,13 +333,16 @@ impl MeasurementLedger {
             last_ok_at: if measured.is_ok() {
                 Some(identity.measured_at)
             } else {
-                stored.and_then(|entry| entry.last_ok_at)
+                stored
+                    .filter(|entry| entry.pool_graph == pool_graph)
+                    .and_then(|entry| entry.last_ok_at)
             },
             foreground_epoch,
             recorded_mono,
             period_factor: self.period_factor.load(Ordering::Acquire),
             measured,
             connection_digest,
+            pool_graph,
             identity,
         };
         if entry.identity.path == crate::commands::speedtest::MeasurePath::Candidate
@@ -553,6 +562,15 @@ fn classify(
     };
     if entry.identity.instance == CoreInstance::Temp {
         return Err(Exclusion::Disconnected);
+    }
+    if entry
+        .pool_graph
+        .as_deref()
+        .is_some_and(|graph| context.pool_graph != Some(graph))
+    {
+        return Err(Exclusion::Stale(LedgerStale::Identity(
+            StaleReason::Instance,
+        )));
     }
     if let Some(stale) = ledger_stale(entry, node_id, context) {
         return Err(Exclusion::Stale(stale));

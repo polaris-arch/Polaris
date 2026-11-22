@@ -20,11 +20,13 @@ use polaris_config_engine::singbox::InboundUser;
 use polaris_config_engine::user_config::app_config::UserConfig;
 use polaris_config_engine::user_config::server_config::is_mesh_node;
 use polaris_helper_proto::Platform;
-use polaris_switch_engine::{HotSwitchOutcome, SwitchDecision, SwitchExecutor};
+use polaris_switch_engine::{
+    HotSwitchOutcome, PrecisionDisconnectOutcome, SwitchDecision, SwitchExecutor,
+};
 
 use crate::commands::speedtest::{
-    probe_runtime_candidates, resolve_speed_test_url, speed_test_data_settled,
-    speed_test_in_flight, RuntimeProbeBatch,
+    capture_pool_graph, probe_runtime_candidates, read_pool_graph, resolve_speed_test_url,
+    speed_test_data_settled, speed_test_in_flight, RuntimeProbeBatch,
 };
 use crate::runtime::auto_select::{
     self, Cause, CommitFailure, Decision as SelectDecision, Epoch, Evaluation, Facts, Intent, Leg,
@@ -37,6 +39,7 @@ use crate::runtime::auto_switch::{
     HEARTBEAT_INTERVAL_MS,
 };
 use crate::runtime::config::Decision;
+use crate::runtime::management_api::GrpcManagementApi;
 use crate::runtime::measurement_ledger::{
     self, Candidate, Candidates, LedgerEntry, MeasurementLedger,
 };
@@ -62,6 +65,18 @@ use super::{code, ProxyRuntime};
 /// 同配置重启只会世代 +1、锁存复位、同情形再报一次 —— 用户照做就进循环。
 const RESTART_BLOCKED_MESSAGE: &str =
     "自动切换已触发，但本轮未能换成节点：有候选节点需要重启内核才能切换过去";
+
+fn log_auto_switch_disconnect(disconnect: Option<PrecisionDisconnectOutcome>) -> usize {
+    disconnect.map_or(0, |result| {
+        if let Some(error) = &result.snapshot_error {
+            log::warn!("自动故障切换：断连快照失败：{error}");
+        }
+        if !result.failed_ids.is_empty() {
+            log::warn!("自动故障切换：{} 条断连请求未确认", result.failed_ids.len());
+        }
+        result.closed_ids.len()
+    })
+}
 
 pub(super) fn heartbeat_mode_blocked(
     startup_blocked: bool,
@@ -285,6 +300,10 @@ impl ProxyRuntime {
     /// 与普通 `switch_mode` 的关键差异是**禁止失败回退整核重启**。普通用户 Apply 的目标就是把完整 D
     /// 入核，失败回退重启正确；后台 failover 只获授权切出口，若沿用同一回退会把 DNS/TUN/规则等
     /// 已保存未 Apply 的修改一起带入核，破坏 Save/Apply 边界。
+    #[cfg(any(
+        test,
+        all(desktop, feature = "native-production-verification", debug_assertions)
+    ))]
     pub(super) async fn auto_hot_switch_transaction(
         self: &Arc<Self>,
         generation: u64,
@@ -311,6 +330,10 @@ impl ProxyRuntime {
     /// `required_auto`：这次换点是凭「自动选择意图指向该订阅」发起的（择优腿，或自动意图下收窄了
     /// 候选的故障腿）。落盘那一刻意图已不是它即让位：用户在评估与提交之间点了节点（哪怕点的就是
     /// 当前出口，实际出口没变、只有意图变了），这次换点已无授权。手动意图下的故障腿传 `None`。
+    #[cfg(any(
+        test,
+        all(desktop, feature = "native-production-verification", debug_assertions)
+    ))]
     pub(super) async fn auto_hot_switch_transaction_with_api(
         self: &Arc<Self>,
         generation: u64,
@@ -319,6 +342,29 @@ impl ProxyRuntime {
         expected_candidate_fingerprint: &str,
         required_auto: Option<&str>,
         api: &dyn RuntimeSelectionApi,
+    ) -> AutoHotSwitchOutcome {
+        self.auto_hot_switch_transaction_for_graph(
+            generation,
+            expected_current_id,
+            candidate,
+            expected_candidate_fingerprint,
+            required_auto,
+            api,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn auto_hot_switch_transaction_for_graph(
+        self: &Arc<Self>,
+        generation: u64,
+        expected_current_id: &str,
+        candidate: &RuntimeCandidate,
+        expected_candidate_fingerprint: &str,
+        required_auto: Option<&str>,
+        api: &dyn RuntimeSelectionApi,
+        pool_graph: Option<&str>,
     ) -> AutoHotSwitchOutcome {
         let switch_guard = self.switch_serial.lock().await;
         if self.gate.generation() != generation || !self.core_running() {
@@ -341,10 +387,12 @@ impl ProxyRuntime {
         {
             return AutoHotSwitchOutcome::NotEligible;
         }
-        let staged = self.config.staged_node_mask();
-        if staged.pending
-            && (!staged.scope_known || staged.node_ids.contains(candidate.id.as_str()))
-        {
+        let target_staged = || {
+            let staged = self.config.staged_node_mask();
+            staged.pending
+                && (!staged.scope_known || staged.node_ids.contains(candidate.id.as_str()))
+        };
+        if target_staged() {
             return AutoHotSwitchOutcome::Superseded;
         }
 
@@ -403,19 +451,42 @@ impl ProxyRuntime {
             return AutoHotSwitchOutcome::NotEligible;
         };
         let new_cfg = *new_cfg;
+        let guarded = if let Some(expected) = pool_graph {
+            if !matches!(hot_plan.puts.as_slice(), [put]
+                if put.selector_tag == "proxy-selector" && put.member_tag == candidate.tag)
+            {
+                return AutoHotSwitchOutcome::NotEligible;
+            }
+            let Some(publication) = self.published_pool_graph(generation) else {
+                return AutoHotSwitchOutcome::Superseded;
+            };
+            let Some(scope) = capture_pool_graph(self, generation, &publication).await else {
+                return AutoHotSwitchOutcome::Superseded;
+            };
+            if !scope.can_select || scope.graph.as_ref() != expected {
+                return AutoHotSwitchOutcome::Superseded;
+            }
+            Some(scope)
+        } else {
+            None
+        };
+        let guarded_api = guarded
+            .as_ref()
+            .map(|scope| GrpcManagementApi::new(scope.client.clone()));
+        let api = guarded_api
+            .as_ref()
+            .map_or(api, |api| api as &dyn RuntimeSelectionApi);
 
-        // 在持有 switch_serial 时原子复核并只写 selectedServerId。其它 writer 仍可先写盘，但其广播会
-        // 排在本事务之后；闭包再次核对当前选择、候选仍存在且连接指纹未变，任何一项漂移即让位。
-        let target_id = candidate.id.clone();
-        let expected_fingerprint = expected_candidate_fingerprint.to_string();
-        let persisted = self.config.update(|latest| {
+        let target_id = &candidate.id;
+        let expected_fingerprint = expected_candidate_fingerprint;
+        let desired_is_current = |latest: &Value| {
             if polaris_store::auto_select::target(latest).is_some() {
-                return Decision::Skip(None);
+                return false;
             }
             // 显式用户选择也在同一个 ConfigManager 写事务内 bump；因此本检查到 claim 之间没有
             // “同目标但更新意图”可穿过。只比较 selectedServerId 无法分辨这种所有权交接。
             if self.selector_reconcile.intent_generation() != starting_intent_generation {
-                return Decision::Skip(None);
+                return false;
             }
             if required_auto.is_some_and(|subscription| {
                 auto_select::effective_subscription(
@@ -424,72 +495,113 @@ impl ProxyRuntime {
                     self.helper.platform(),
                 ) != Some(subscription)
             }) {
-                return Decision::Skip(None);
+                return false;
             }
-            if self.gate.generation() != generation
-                || !self.core_running()
-                || self.speed_measurement_fingerprints().get(&target_id)
-                    != Some(&expected_fingerprint)
-                || latest.get("selectedServerId").and_then(Value::as_str)
-                    != Some(expected_current_id)
-                || measurement_table_json(latest).get(&target_id) != Some(&expected_fingerprint)
-            {
-                return Decision::Skip(None);
-            }
-            let Some(object) = latest.as_object_mut() else {
-                return Decision::Skip(None);
-            };
-            let intent_generation = self.register_selector_intent();
-            object.insert(
-                "selectedServerId".to_string(),
-                Value::String(target_id.clone()),
-            );
-            Decision::Write(Some(intent_generation))
-        });
-        let intent_generation = match persisted {
-            Ok((Some(intent_generation), Some(_))) => intent_generation,
-            Ok((None, None)) => return AutoHotSwitchOutcome::Superseded,
-            Ok(_) => unreachable!("auto failover persistence decision must agree"),
-            Err(error) => {
-                log::warn!("自动故障切换：保存目标出口失败：{error}");
-                return AutoHotSwitchOutcome::Failed;
-            }
+            self.gate.generation() == generation
+                && self.core_running()
+                && self
+                    .speed_measurement_fingerprints()
+                    .get(target_id)
+                    .map(String::as_str)
+                    == Some(expected_fingerprint)
+                && latest.get("selectedServerId").and_then(Value::as_str)
+                    == Some(expected_current_id)
+                && measurement_table_json(latest)
+                    .get(target_id)
+                    .map(String::as_str)
+                    == Some(expected_fingerprint)
         };
-
-        let interrupt = new_cfg.interrupt_connections_on_switch == Some(true);
-        let applied_disconnects = match SwitchExecutor.execute(api, &hot_plan, interrupt).await {
-            HotSwitchOutcome::Applied { disconnect } => {
-                if let Some(result) = disconnect.as_ref() {
-                    if let Some(error) = result.snapshot_error.as_ref() {
-                        log::warn!("自动故障切换：断连快照失败：{error}");
-                    }
-                    if !result.failed_ids.is_empty() {
-                        log::warn!("自动故障切换：{} 条断连请求未确认", result.failed_ids.len());
-                    }
+        let persist_desired = || {
+            let mut claim = None;
+            let result = self.config.update(|latest| {
+                if !desired_is_current(latest)
+                    || (guarded.is_some() && (self.gate.is_busy() || target_staged()))
+                {
+                    return Decision::Skip(());
                 }
-                Some(disconnect.map_or(0, |result| result.closed_ids.len()))
+                let Some(object) = latest.as_object_mut() else {
+                    return Decision::Skip(());
+                };
+                claim = Some(self.register_selector_intent());
+                object.insert(
+                    "selectedServerId".to_string(),
+                    Value::String(target_id.clone()),
+                );
+                Decision::Write(())
+            });
+            (claim, result.map(|(_, saved)| saved.is_some()))
+        };
+        let mut intent_generation = starting_intent_generation;
+        if guarded.is_some() {
+            // Ordinary Start can read desired config while the target RPC is in
+            // flight. Persist a guarded target only after server selection and readback.
+            if !self
+                .config
+                .with_current(desired_is_current)
+                .unwrap_or(false)
+            {
+                return AutoHotSwitchOutcome::Superseded;
             }
-            other => {
-                log::warn!("自动故障切换：selector 热切失败（{other:?}），禁止回退整核重启");
-                None
+        } else {
+            match persist_desired() {
+                (Some(claim), Ok(true)) => intent_generation = claim,
+                (None, Ok(false)) => return AutoHotSwitchOutcome::Superseded,
+                (_, Ok(_)) => unreachable!("auto failover persistence decision must agree"),
+                (_, Err(error)) => {
+                    log::warn!("自动故障切换：保存目标出口失败：{error}");
+                    return AutoHotSwitchOutcome::Failed;
+                }
+            }
+        }
+
+        let lose_ownership = || {
+            if guarded.is_none() || (self.gate.generation() == generation && self.core_running()) {
+                self.selector_reconcile.mark_required();
+            }
+            AutoHotSwitchOutcome::Superseded
+        };
+        let interrupt = new_cfg.interrupt_connections_on_switch == Some(true);
+        let mut applied_disconnects = 0;
+        let target_acknowledged = if let Some(scope) = &guarded {
+            if !self.selector_operation_is_current(generation, intent_generation) {
+                return AutoHotSwitchOutcome::Superseded;
+            }
+            match scope
+                .client
+                .select_outbound_on_probe_graph("proxy-selector", &candidate.tag, &scope.graph)
+                .await
+            {
+                Ok(true) => true,
+                Ok(false) => return AutoHotSwitchOutcome::Superseded,
+                Err(error) => {
+                    log::warn!("自动故障切换：selector 条件选择失败：{error}");
+                    false
+                }
+            }
+        } else {
+            match SwitchExecutor.execute(api, &hot_plan, interrupt).await {
+                HotSwitchOutcome::Applied { disconnect } => {
+                    applied_disconnects = log_auto_switch_disconnect(disconnect);
+                    true
+                }
+                other => {
+                    log::warn!("自动故障切换：selector 热切失败（{other:?}），禁止回退整核重启");
+                    false
+                }
             }
         };
         if !self.selector_operation_is_current(generation, intent_generation) {
-            self.selector_reconcile.mark_required();
-            log::info!("自动故障切换：target PUT 后 selector 所有权已交接 → 不恢复、不回滚 D");
-            return AutoHotSwitchOutcome::Superseded;
+            return lose_ownership();
         }
 
         // PUT 回执不是最终真值：读回 sing-box 当前 group，只有实际指向目标成员才提交成功事件。
-        let groups_after_target = if applied_disconnects.is_some() {
+        let groups_after_target = if target_acknowledged {
             api.groups_snapshot().await.ok()
         } else {
             None
         };
         if !self.selector_operation_is_current(generation, intent_generation) {
-            self.selector_reconcile.mark_required();
-            log::info!("自动故障切换：target 自证后 selector 所有权已交接 → 不恢复、不回滚 D");
-            return AutoHotSwitchOutcome::Superseded;
+            return lose_ownership();
         }
         let attested = groups_after_target.is_some_and(|groups| {
             groups
@@ -499,25 +611,67 @@ impl ProxyRuntime {
         // PUT 在 await 期间配置 writer 仍可前进；因此自证不只读 selector，还要再次核对目标指纹与
         // staged 遮罩。候选若恰被订阅替换/用户编辑，哪怕 PUT 已成功也必须恢复旧出口，不能把运行核
         // 里的旧参数成员冒充成磁盘里的新节点。
-        let staged_after = self.config.staged_node_mask();
-        let target_still_clean = !(staged_after.pending
-            && (!staged_after.scope_known
-                || staged_after.node_ids.contains(candidate.id.as_str())))
-            && self
-                .config
-                .with_current(|latest| {
-                    latest.get("selectedServerId").and_then(Value::as_str)
-                        == Some(candidate.id.as_str())
-                        && measurement_table_json(latest).get(&candidate.id)
-                            == Some(&expected_fingerprint)
-                })
-                .unwrap_or(false);
-        let loaded_still_matches =
-            self.speed_measurement_fingerprints().get(&candidate.id) == Some(&expected_fingerprint);
-        if attested && target_still_clean && loaded_still_matches {
+        let target_still_clean = !target_staged()
+            && (guarded.is_some()
+                || self
+                    .config
+                    .with_current(|latest| {
+                        latest.get("selectedServerId").and_then(Value::as_str)
+                            == Some(candidate.id.as_str())
+                            && measurement_table_json(latest)
+                                .get(target_id)
+                                .map(String::as_str)
+                                == Some(expected_fingerprint)
+                    })
+                    .unwrap_or(false));
+        let loaded_still_matches = self
+            .speed_measurement_fingerprints()
+            .get(target_id)
+            .map(String::as_str)
+            == Some(expected_fingerprint);
+        let mut ready_to_commit = attested && target_still_clean && loaded_still_matches;
+        let mut desired_superseded = false;
+        if ready_to_commit && guarded.is_some() {
+            match persist_desired() {
+                (Some(claim), Ok(true)) => intent_generation = claim,
+                (None, Ok(false)) => {
+                    ready_to_commit = false;
+                    desired_superseded = true;
+                }
+                (_, Ok(_)) => unreachable!("auto failover persistence decision must agree"),
+                (claim, Err(error)) => {
+                    intent_generation = claim.unwrap_or(intent_generation);
+                    log::warn!("自动故障切换：保存目标出口失败：{error}");
+                    ready_to_commit = false;
+                }
+            }
+        }
+        if ready_to_commit {
             // 只有管理面回读与配置 CAS 双重自证后，才把候选提交为 R 的真实选择并刷新依赖出口的
             // 派生状态。PUT 成功但随后回滚的瞬态不应污染 current_config / 解锁 / 出口 IP 缓存。
-            self.commit_applied(&new_runtime);
+            if guarded.is_some() {
+                let committed = self.selector_reconcile.with_intent_claim(|current| {
+                    current == intent_generation
+                        && self
+                            .with_idle_core_generation(generation, || {
+                                self.commit_applied(&new_runtime)
+                            })
+                            .is_some()
+                });
+                if !committed {
+                    return lose_ownership();
+                }
+                applied_disconnects = log_auto_switch_disconnect(
+                    SwitchExecutor
+                        .after_selection(api, &hot_plan, interrupt)
+                        .await,
+                );
+                if !self.selector_operation_is_current(generation, intent_generation) {
+                    return AutoHotSwitchOutcome::Superseded;
+                }
+            } else {
+                self.commit_applied(&new_runtime);
+            }
             self.reconcile_emitted_exit_route(generation).await;
             if !self.selector_operation_is_current(generation, intent_generation) {
                 log::info!("自动故障切换：出口路由对账期间 selector 所有权已交接 → 抑制旧成功通知");
@@ -532,39 +686,51 @@ impl ProxyRuntime {
             self.push_pending_changes();
             log::info!(
                 "自动故障切换：selector 已热切并通过运行态回读，精准断连 {} 条",
-                applied_disconnects.unwrap_or_default()
+                applied_disconnects
             );
             return AutoHotSwitchOutcome::Applied;
         }
 
-        // 未自证成功则 best-effort 恢复旧 selector。恢复也只走管理 API，不以重启“兜底”。只有运行态
-        // 确认回到旧成员后才把 D 的 selectedServerId 回滚，避免盘面声称旧节点而核仍实际指向新节点。
-        log::warn!("自动故障切换：目标 selector 未通过运行态回读，尝试恢复原出口");
-        let restore_put_ok = api
-            .select_outbound("proxy-selector", &old_tag)
-            .await
-            .is_ok();
+        // The guarded path has not published its candidate. It can restore R
+        // only in the original graph, under the same lifecycle and intent.
         if !self.selector_operation_is_current(generation, intent_generation) {
-            self.selector_reconcile.mark_required();
-            log::info!("自动故障切换：restore PUT 后 selector 所有权已交接 → 禁止回滚 D");
-            return AutoHotSwitchOutcome::Superseded;
+            return lose_ownership();
         }
-        let groups_after_restore = if restore_put_ok {
+        log::warn!("自动故障切换：目标 selector 未通过运行态回读，尝试恢复原出口");
+        let restore_put_ok = if let Some(scope) = &guarded {
+            scope
+                .client
+                .select_outbound_on_probe_graph("proxy-selector", &old_tag, &scope.graph)
+                .await
+                .is_ok_and(|applied| applied)
+        } else {
+            api.select_outbound("proxy-selector", &old_tag)
+                .await
+                .is_ok()
+        };
+        if !self.selector_operation_is_current(generation, intent_generation) {
+            return lose_ownership();
+        }
+        let groups_after_restore = if restore_put_ok || guarded.is_some() {
             api.groups_snapshot().await.ok()
         } else {
             None
         };
         if !self.selector_operation_is_current(generation, intent_generation) {
-            self.selector_reconcile.mark_required();
-            log::info!("自动故障切换：restore 自证后 selector 所有权已交接 → 禁止回滚 D");
-            return AutoHotSwitchOutcome::Superseded;
+            return lose_ownership();
         }
         let restored = groups_after_restore.is_some_and(|groups| {
             groups
                 .iter()
                 .any(|group| group.tag == "proxy-selector" && group.selected == old_tag)
         });
-        if restored {
+        if guarded.is_some() {
+            if !restored {
+                self.selector_reconcile.mark_required();
+                self.set_nonfatal_error("无法确认自动切换后的运行出口", code::EXIT_MISMATCH);
+            }
+            self.push_pending_changes();
+        } else if restored {
             let rollback_target = candidate.id.clone();
             let old_id = expected_current_id.to_string();
             let rollback = self.config.update(|latest| {
@@ -609,7 +775,8 @@ impl ProxyRuntime {
             log::error!("{message}");
             return AutoHotSwitchOutcome::ReconcilePending { intent_generation };
         }
-        if !self.selector_operation_is_current(generation, intent_generation) {
+        if desired_superseded || !self.selector_operation_is_current(generation, intent_generation)
+        {
             AutoHotSwitchOutcome::Superseded
         } else {
             AutoHotSwitchOutcome::Failed
@@ -851,6 +1018,9 @@ impl ProxyRuntime {
             return false;
         }
         let generation = self.core_generation();
+        let Some(expected_graph) = self.published_pool_graph(generation) else {
+            return false;
+        };
         let config = match self.config.current() {
             Ok(c) => c,
             Err(e) => {
@@ -988,6 +1158,7 @@ impl ProxyRuntime {
         let barred =
             self.auto_select_failover_barred_from(&config, generation, &SelectReadings::live());
         let url = resolve_speed_test_url(&config);
+        let graph_scope = tokio::sync::OnceCell::new();
         let Some(verdict) = self
             .probe_failover_candidates_from(
                 generation,
@@ -996,13 +1167,42 @@ impl ProxyRuntime {
                 |probe_input| {
                     let targets = &targets;
                     let url = &url;
-                    async move { probe_runtime_candidates(self, targets, &probe_input, url).await }
+                    let graph_scope = &graph_scope;
+                    let expected_graph = expected_graph.as_ref();
+                    async move {
+                        probe_runtime_candidates(
+                            self,
+                            targets,
+                            &probe_input,
+                            url,
+                            expected_graph,
+                            graph_scope,
+                        )
+                        .await
+                    }
                 },
             )
             .await
         else {
             return false;
         };
+        let Some(Some(scope)) = graph_scope.get() else {
+            return false;
+        };
+        let graph = &scope.graph;
+        if !self.pool_graph_is_current(generation, graph) {
+            return false;
+        }
+        // Recheck the graph before publishing a no-candidate conclusion.
+        // The switch transaction independently rechecks a winner before selecting it.
+        if !matches!(verdict, ProbeVerdict::Best(_)) {
+            let Some((active, receipt, _)) = read_pool_graph(&scope.client).await else {
+                return false;
+            };
+            if !self.admit_pool_graph(generation, &expected_graph, &active) || receipt != *graph {
+                return false;
+            }
+        }
         let best = match verdict {
             ProbeVerdict::Best(best) => best,
             // 有候选因读回不符被跳过（只在读回的「强制」档下出现）：量到的不是它，不能据此说它
@@ -1046,13 +1246,16 @@ impl ProxyRuntime {
         let Some(expected_fingerprint) = current_fingerprints.get(&candidate.id) else {
             return false;
         };
+        let api = self.management_api().await;
         match self
-            .auto_hot_switch_transaction(
+            .auto_hot_switch_transaction_for_graph(
                 generation,
                 &current_id,
                 candidate,
                 expected_fingerprint,
                 auto_subscription,
+                &api,
+                Some(graph),
             )
             .await
         {
@@ -1234,9 +1437,24 @@ enum Eligibility {
 pub(super) struct SelectCache {
     key: Option<(u64, String)>,
     verdicts: BTreeMap<String, Eligibility>,
+    pool_graph: Option<Arc<str>>,
 }
 
 impl SelectCache {
+    fn align_pool_graph(&mut self, graph: Option<&Arc<str>>) -> bool {
+        let Some(graph) = graph else {
+            return false;
+        };
+        if self.pool_graph.as_ref() == Some(graph) {
+            return false;
+        }
+        let changed = self.pool_graph.replace(Arc::clone(graph)).is_some();
+        if changed {
+            self.verdicts.clear();
+        }
+        changed
+    }
+
     fn align(&mut self, generation: u64, current_id: &str) {
         if self
             .key
@@ -1262,6 +1480,7 @@ pub(super) struct SelectPlan {
     from_name: Option<String>,
     from_latency_ms: Option<u32>,
     unverified: bool,
+    pool_graph: Option<Arc<str>>,
 }
 
 /// 自动选点从进程级设施取的读数与两个时钟。生产取活的那一份（[`SelectReadings::live`]）；单测
@@ -1338,12 +1557,16 @@ impl AutoView {
 
     /// 给定节点在账本里的分布（可选点与各类排除）。新鲜度判据与调度器共用 [`LedgerView`]；
     /// 新鲜期上限取自每条记录入账时的降频倍数。
-    fn read(&self, node_ids: &[String], readings: &SelectReadings<'_>) -> Candidates {
+    fn read(
+        &self,
+        node_ids: &[String],
+        readings: &SelectReadings<'_>,
+        pool_graph: Option<&str>,
+    ) -> Candidates {
         let cap = |id: &str, entry: &LedgerEntry| entry_freshness_cap_ms(&self.plan, id, entry);
-        readings.ledger.candidates(
-            node_ids,
-            &self.view.read(&cap, readings.ledger, readings.now_wall),
-        )
+        let mut context = self.view.read(&cap, readings.ledger, readings.now_wall);
+        context.pool_graph = pool_graph;
+        readings.ledger.candidates(node_ids, &context)
     }
 }
 
@@ -1525,7 +1748,8 @@ impl ProxyRuntime {
             platform,
             self.measurement_core_sha256(),
         );
-        let read = auto.read(&auto.members, readings);
+        let graph = self.current_pool_graph(generation);
+        let read = auto.read(&auto.members, readings, graph.as_deref());
         let ranked = auto_select::rank(&read.selectable);
         let mut slot = self.auto_select_slot();
         slot.memory.observe_native_context(
@@ -1733,7 +1957,8 @@ impl ProxyRuntime {
                 if let Some(id) = view.selected.as_ref().filter(|_| !in_subscription) {
                     node_ids.push(id.clone());
                 }
-                let read = auto.read(&node_ids, readings);
+                let graph = self.current_pool_graph(self.core_generation());
+                let read = auto.read(&node_ids, readings, graph.as_deref());
                 (
                     view.selected
                         .as_deref()
@@ -2000,7 +2225,13 @@ impl ProxyRuntime {
             }
             return None;
         };
-        let read = auto.read(&auto.members, readings);
+        let graph = self.current_pool_graph(generation);
+        if cache.align_pool_graph(graph.as_ref()) {
+            self.auto_select_slot()
+                .memory
+                .reset_measurement_scope(readings.signals.round_serial);
+        }
+        let read = auto.read(&auto.members, readings, graph.as_deref());
         let mut facts = self.auto_select_facts(
             &view.intent,
             auto,
@@ -2099,6 +2330,15 @@ impl ProxyRuntime {
             .into_iter()
             .find(|(candidate, _)| candidate.node_id == target)
             .and_then(|(candidate, runtime_candidate)| {
+                let entry = readings
+                    .ledger
+                    .candidate_entry(&target, &auto.view.url_digest)?;
+                if entry.identity.run != candidate.run
+                    || entry.identity.measured_at != candidate.measured_at
+                    || entry.measured != Ok(candidate.latency_ms)
+                {
+                    return None;
+                }
                 Some(SelectPlan {
                     subscription: auto.subscription.clone(),
                     current_id: view.selected.clone()?,
@@ -2109,6 +2349,7 @@ impl ProxyRuntime {
                     from_name: view.selected_name.clone(),
                     from_latency_ms,
                     unverified: read.unverified.contains(&candidate.node_id),
+                    pool_graph: entry.pool_graph,
                 })
             });
         if plan.is_none() {
@@ -2140,13 +2381,14 @@ impl ProxyRuntime {
     ) -> bool {
         machine.begin_switch(readings.now);
         let outcome = self
-            .auto_hot_switch_transaction_with_api(
+            .auto_hot_switch_transaction_for_graph(
                 generation,
                 &plan.current_id,
                 &plan.candidate,
                 &plan.fingerprint,
                 Some(&plan.subscription),
                 api,
+                plan.pool_graph.as_deref(),
             )
             .await;
         machine.end_switch();

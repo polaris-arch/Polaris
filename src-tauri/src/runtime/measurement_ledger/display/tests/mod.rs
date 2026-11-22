@@ -46,6 +46,7 @@ fn identity(run: u64, path: MeasurePath) -> ResultIdentity {
 
 fn context(fingerprints: &BTreeMap<String, String>) -> ReadContext<'_> {
     ReadContext {
+        pool_graph: None,
         core_binary_sha256: None,
         main_generation: Some(7),
         fingerprints,

@@ -174,16 +174,38 @@ impl SingBoxApiClient {
         &self,
         request: daemon::RuntimeConfigStatusRequest,
     ) -> Result<daemon::RuntimeConfigStatus, RuntimeConfigError> {
-        let mut client = self.runtime_config_client();
         Ok(self
-            .unary(
-                client.get_runtime_config_status(
-                    self.runtime_config_request(request, UNARY_DEADLINE),
-                ),
-            )
-            .await
-            .map_err(classify)?
+            .runtime_config_status_response(request)
+            .await?
             .into_inner())
+    }
+
+    /// Read the graph-selection capability on the same channel and status response
+    /// as the active graph identity.
+    pub async fn get_runtime_config_status_with_probe_selection(
+        &self,
+        request: daemon::RuntimeConfigStatusRequest,
+    ) -> Result<(daemon::RuntimeConfigStatus, bool), RuntimeConfigError> {
+        let response = self.runtime_config_status_response(request).await?;
+        let values = response
+            .metadata()
+            .get_all("x-polaris-probe-select-condition");
+        let mut values = values.iter();
+        let can_select =
+            values.next().is_some_and(|value| value.as_bytes() == b"1") && values.next().is_none();
+        Ok((response.into_inner(), can_select))
+    }
+
+    async fn runtime_config_status_response(
+        &self,
+        request: daemon::RuntimeConfigStatusRequest,
+    ) -> Result<tonic::Response<daemon::RuntimeConfigStatus>, RuntimeConfigError> {
+        let mut client = self.runtime_config_client();
+        self.unary(
+            client.get_runtime_config_status(self.runtime_config_request(request, UNARY_DEADLINE)),
+        )
+        .await
+        .map_err(classify)
     }
 }
 

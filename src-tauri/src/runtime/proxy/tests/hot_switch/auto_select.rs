@@ -811,10 +811,11 @@ fn failover_fallback_production_uses_layered_coordinator_after_candidate_qualifi
     let bars = body.find("self.auto_select_failover_barred_from(").unwrap();
     let layered = body.find(".probe_failover_candidates_from(").unwrap();
     let probe = body.find("probe_runtime_candidates(").unwrap();
-    let commit = body.find(".auto_hot_switch_transaction(").unwrap();
+    let commit = body
+        .find(".auto_hot_switch_transaction_for_graph(")
+        .unwrap();
     assert!(qualify < bars && bars < layered && layered < probe && probe < commit);
     assert!(body.contains("&candidate_plan.candidates,"));
-    assert!(body.contains("probe_runtime_candidates(self, targets, &probe_input, url)"));
     assert!(
         !body.contains("judge_probes("),
         "the caller must not re-judge mixed tiers"
