@@ -59,12 +59,12 @@ fn rejects_non_http_schemes_and_hostless_urls() {
 fn connect_request_always_carries_an_explicit_port() {
     let t = SpeedTestTarget::parse("http://www.gstatic.com/generate_204").unwrap();
     assert_eq!(
-        t.connect_request(None, ConnectProbe::Standard),
+        t.connect_request(None, &ConnectProbe::Standard),
         "CONNECT www.gstatic.com:80 HTTP/1.1\r\nHost: www.gstatic.com:80\r\n\r\n"
     );
     let t = SpeedTestTarget::parse("https://example.com/x").unwrap();
     assert!(t
-        .connect_request(None, ConnectProbe::Foreground)
+        .connect_request(None, &ConnectProbe::Foreground)
         .starts_with("CONNECT example.com:443 HTTP/1.1\r\n"));
 }
 
@@ -85,13 +85,20 @@ fn connect_request_presents_the_loopback_credential_only_on_connect() {
         crate::runtime::mesh::base64_encode(b"polaris:0123456789abcdef0123456789abcdef")
     );
     assert_eq!(
-        t.connect_request(Some(&user), ConnectProbe::Foreground),
+        t.connect_request(Some(&user), &ConnectProbe::Foreground),
         expected
     );
-    assert_eq!(
-        t.connect_request(Some(&user), ConnectProbe::Background),
-        expected.replace("X-Polaris-Probe: 1", "X-Polaris-Probe: background")
-    );
+    const MEMBER_HEADER: &str = "X-Polaris-Probe-Member: 929a6cf94854e26690bcb5bdc14c44ea7a0d93d31bcb70b3218c0e690fbac524\r\n";
+    for (probe, mode) in [
+        (ConnectProbe::pool_foreground("节点-β"), "1"),
+        (ConnectProbe::pool_background("节点-β"), "background"),
+    ] {
+        let expected = expected.replace("X-Polaris-Probe: 1", &format!("X-Polaris-Probe: {mode}"));
+        assert_eq!(
+            t.connect_request(Some(&user), &probe),
+            format!("{}{MEMBER_HEADER}\r\n", &expected[..expected.len() - 2]),
+        );
+    }
     assert!(
         !t.get_request()
             .to_ascii_lowercase()
@@ -100,7 +107,7 @@ fn connect_request_presents_the_loopback_credential_only_on_connect() {
     );
     assert!(!t.get_request().contains("X-Polaris-Probe"));
     assert_eq!(
-        t.connect_request(None, ConnectProbe::Foreground),
+        t.connect_request(None, &ConnectProbe::Foreground),
         "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\nX-Polaris-Probe: 1\r\n\r\n"
     );
 }
@@ -111,9 +118,13 @@ async fn only_the_typed_connect_reply_defers_an_opted_in_probe() {
     let untagged = "HTTP/1.1 503 Service Unavailable\r\n\r\nbudget-busy";
     for (probe, reply, expected) in [
         (ConnectProbe::Foreground, tagged, TunnelError::BudgetBusy),
-        (ConnectProbe::Background, tagged, TunnelError::BudgetBusy),
         (
-            ConnectProbe::Background,
+            ConnectProbe::pool_background("member"),
+            tagged,
+            TunnelError::BudgetBusy,
+        ),
+        (
+            ConnectProbe::pool_background("member"),
             untagged,
             TunnelError::ConnectStatus(503),
         ),
@@ -135,6 +146,63 @@ async fn only_the_typed_connect_reply_defers_an_opted_in_probe() {
         .await;
         let result = open_tunnel(port, None, &http_target(), probe, &|_| {}).await;
         assert_eq!(result.err(), Some(expected));
+    }
+}
+
+#[tokio::test]
+async fn only_a_member_bound_connect_accepts_binding_mismatch_before_tls() {
+    const REFUSED: &str =
+        "HTTP/1.1 502 Bad Gateway\r\nX-Polaris-Probe-Outcome: binding-mismatch\r\n\r\n";
+    let target = SpeedTestTarget::parse("https://example.com/x").unwrap();
+    for (probe, reply, expected) in [
+        (
+            ConnectProbe::pool_foreground("member"),
+            REFUSED,
+            TunnelError::BindingMismatch,
+        ),
+        (
+            ConnectProbe::pool_background("member"),
+            REFUSED,
+            TunnelError::BindingMismatch,
+        ),
+        (ConnectProbe::Foreground, REFUSED, TunnelError::ConnectStatus(502)),
+        (ConnectProbe::Standard, REFUSED, TunnelError::ConnectStatus(502)),
+        (
+            ConnectProbe::pool_foreground("member"),
+            "HTTP/1.1 502 Bad Gateway\r\n\r\nbinding-mismatch",
+            TunnelError::ConnectStatus(502),
+        ),
+        (
+            ConnectProbe::pool_foreground("member"),
+            "HTTP/1.1 103 Early Hints\r\nX-Polaris-Probe-Outcome: binding-mismatch\r\n\r\nHTTP/1.1 502 Bad Gateway\r\n\r\n",
+            TunnelError::ConnectStatus(502),
+        ),
+        (
+            ConnectProbe::pool_foreground("member"),
+            "HTTP/1.1 407 Proxy Authentication Required\r\nX-Polaris-Probe-Outcome: binding-mismatch\r\n\r\n",
+            TunnelError::ConnectStatus(407),
+        ),
+    ] {
+        let (port, observed) = spawn_mock_proxy(Script {
+            connect_reply: Some(reply),
+            gets: vec![GetReply::ok()],
+        })
+        .await;
+        let result = open_tunnel_with_tls_config(port, None, &target, probe, &|_| {}, || {
+            panic!("a refused CONNECT must never start TLS")
+        })
+        .await;
+        assert_eq!(result.err(), Some(expected));
+        for _ in 0..50 {
+            if observed.lock().unwrap().saw_client_close {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let seen = observed.lock().unwrap();
+        assert!(seen.saw_client_close);
+        assert_eq!(seen.request_lines.len(), 1);
+        assert!(seen.first_tunnel_bytes.is_empty());
     }
 }
 

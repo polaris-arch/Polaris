@@ -92,13 +92,26 @@ pub enum TunnelError {
     Local,
     /// Core declined the CONNECT before allocating an outbound engine.
     BudgetBusy,
+    /// The Core resolved this CONNECT to a different probe pool member.
+    BindingMismatch,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ConnectProbe {
     Standard,
     Foreground,
-    Background,
+    PoolForeground(String),
+    PoolBackground(String),
+}
+
+impl ConnectProbe {
+    pub(crate) fn pool_foreground(member: &str) -> Self {
+        Self::PoolForeground(polaris_updater::sha256_hex(member.as_bytes()))
+    }
+
+    pub(crate) fn pool_background(member: &str) -> Self {
+        Self::PoolBackground(polaris_updater::sha256_hex(member.as_bytes()))
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -170,15 +183,23 @@ impl SpeedTestTarget {
     /// `auth` 非空时带 `Proxy-Authorization`（Android 上 `probe-in-k` 要求本次起核的一次性凭据；
     /// 缺了内核回 407 ⇒ 该节点本轮记 -1，且全池一起 -1）。凭据**只**出现在这条 CONNECT 里：
     /// 隧道建成后我们面对的是 origin，逐跳头不得带过去（[`Self::get_request`] 一个字都不加）。
-    fn connect_request(&self, auth: Option<&InboundUser>, probe: ConnectProbe) -> String {
+    fn connect_request(&self, auth: Option<&InboundUser>, probe: &ConnectProbe) -> String {
         let a = self.authority();
         let proxy_auth = proxy_authorization_line(auth);
-        let probe_header = match probe {
-            ConnectProbe::Standard => "",
-            ConnectProbe::Foreground => "X-Polaris-Probe: 1\r\n",
-            ConnectProbe::Background => "X-Polaris-Probe: background\r\n",
+        let (probe_header, member) = match probe {
+            ConnectProbe::Standard => ("", None),
+            ConnectProbe::Foreground => ("X-Polaris-Probe: 1\r\n", None),
+            ConnectProbe::PoolForeground(member) => ("X-Polaris-Probe: 1\r\n", Some(member)),
+            ConnectProbe::PoolBackground(member) => {
+                ("X-Polaris-Probe: background\r\n", Some(member))
+            }
         };
-        format!("CONNECT {a} HTTP/1.1\r\nHost: {a}\r\n{probe_header}{proxy_auth}\r\n")
+        match member {
+            Some(member) => format!(
+                "CONNECT {a} HTTP/1.1\r\nHost: {a}\r\n{probe_header}{proxy_auth}X-Polaris-Probe-Member: {member}\r\n\r\n"
+            ),
+            None => format!("CONNECT {a} HTTP/1.1\r\nHost: {a}\r\n{probe_header}{proxy_auth}\r\n"),
+        }
     }
 
     /// 隧道上的 GET 报文 —— **origin-form**（`GET /path HTTP/1.1`），不是 absolute-form。
@@ -563,21 +584,27 @@ async fn read_response_status<S: AsyncRead + Unpin>(
     }
 }
 
-fn connect_error(code: u16, buf: &[u8]) -> TunnelError {
+fn connect_error(probe: &ConnectProbe, code: u16, buf: &[u8]) -> TunnelError {
     // Only the local proxy's final CONNECT response may defer a probe. A plain
-    // 503 or the same header on a tunneled origin response remains a failure.
-    if code == 503
-        && response_head_range(buf).is_some_and(|(start, end)| {
-            buf[start..end].split(|&b| b == b'\n').skip(1).any(|line| {
-                let Some(colon) = line.iter().position(|&b| b == b':') else {
-                    return false;
-                };
-                line[..colon].eq_ignore_ascii_case(b"x-polaris-probe-outcome")
-                    && line[colon + 1..].trim_ascii() == b"budget-busy"
-            })
+    // status or the same header on a tunneled origin response remains a failure.
+    let (outcome, error): (&[u8], _) = match (probe, code) {
+        (ConnectProbe::Standard, _) => return TunnelError::ConnectStatus(code),
+        (_, 503) => (b"budget-busy", TunnelError::BudgetBusy),
+        (ConnectProbe::PoolForeground(_) | ConnectProbe::PoolBackground(_), 502) => {
+            (b"binding-mismatch", TunnelError::BindingMismatch)
+        }
+        _ => return TunnelError::ConnectStatus(code),
+    };
+    if response_head_range(buf).is_some_and(|(start, end)| {
+        buf[start..end].split(|&b| b == b'\n').skip(1).any(|line| {
+            let Some(colon) = line.iter().position(|&b| b == b':') else {
+                return false;
+            };
+            line[..colon].eq_ignore_ascii_case(b"x-polaris-probe-outcome")
+                && line[colon + 1..].trim_ascii() == outcome
         })
-    {
-        TunnelError::BudgetBusy
+    }) {
+        error
     } else {
         TunnelError::ConnectStatus(code)
     }
@@ -631,6 +658,7 @@ async fn open_tunnel_with_tls_config(
         announce(local.port());
     }
 
+    let probe = &probe;
     sock.write_all(target.connect_request(auth, probe).as_bytes())
         .await
         .map_err(io)?;
@@ -641,11 +669,7 @@ async fn open_tunnel_with_tls_config(
         .await
         .ok_or(TunnelError::Transport)?;
     if !is_acceptable_status(code) {
-        return Err(if probe == ConnectProbe::Standard {
-            TunnelError::ConnectStatus(code)
-        } else {
-            connect_error(code, &buf)
-        });
+        return Err(connect_error(probe, code, &buf));
     }
     // 200 之后缓冲里的任何残余都是代理抢发的非请求数据（sing 的 CONNECT 腿写完 200 就交棒，
     // 不会再写）→ 与 上游 一致地丢弃（node 的 'connect' 事件同样把 `head` 参数弃之不用）。

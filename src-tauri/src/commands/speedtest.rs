@@ -232,6 +232,8 @@ pub(crate) enum FailKind {
     Local,
     /// The Core could not start the dial within its native engine budget.
     BudgetBusy,
+    /// The dedicated CONNECT resolved to a different probe pool member.
+    BindingMismatch,
 }
 
 impl FailKind {
@@ -242,6 +244,7 @@ impl FailKind {
             Self::HttpStatus(_) => "http_status",
             Self::Rejected => "rejected",
             Self::BudgetBusy => "budget_busy",
+            Self::BindingMismatch => "binding_mismatch",
         }
     }
 }
@@ -267,6 +270,7 @@ impl MeasureFailure {
             TunnelError::NotReusable => FailKind::Rejected,
             TunnelError::Local => FailKind::Local,
             TunnelError::BudgetBusy => FailKind::BudgetBusy,
+            TunnelError::BindingMismatch => FailKind::BindingMismatch,
         };
         Self { phase, kind }
     }
@@ -3258,7 +3262,8 @@ async fn run_pool_speed_test(
                 .unwrap_or(false)
             }
         },
-        |slot, port| {
+        |slot, port, member| {
+            let probe = ConnectProbe::pool_foreground(member);
             let url = url.to_string();
             // `probe-in-k` 的凭据与池端口同源同刻（`SpeedProbeTargets::auth`；桌面 `None`）。
             let auth = targets.auth.clone();
@@ -3275,16 +3280,7 @@ async fn run_pool_speed_test(
                         }
                     },
                     &invalid,
-                    || {
-                        measure_slot(
-                            &readback,
-                            slot,
-                            port,
-                            auth.as_ref(),
-                            &url,
-                            ConnectProbe::Foreground,
-                        )
-                    },
+                    || measure_slot(&readback, slot, port, auth.as_ref(), &url, probe),
                 )
                 .await
                 .unwrap_or(BINDING_LOST.into())
@@ -3394,22 +3390,13 @@ pub(crate) async fn probe_runtime_candidates(
         &superseded,
         guard.cancel(),
         |slot, tag: String| async move { proxy.probe_select_slot(gen0, slot, &tag).await },
-        |slot, port| {
+        |slot, port, member| {
+            let probe = ConnectProbe::pool_background(member);
             let url = url.to_string();
             // `probe-in-k` 的凭据与池端口同源同刻（`SpeedProbeTargets::auth`；桌面 `None`）。
             let auth = targets.auth.clone();
             let readback = readback.clone();
-            async move {
-                measure_slot(
-                    &readback,
-                    slot,
-                    port,
-                    auth.as_ref(),
-                    &url,
-                    ConnectProbe::Background,
-                )
-                .await
-            }
+            async move { measure_slot(&readback, slot, port, auth.as_ref(), &url, probe).await }
         },
         &mut sink,
         targets.pool_ports.as_slice(),
@@ -3434,7 +3421,7 @@ async fn drive_runtime_probe<Sel, SelFut, Meas, MeasFut>(
 where
     Sel: Fn(usize, String) -> SelFut,
     SelFut: Future<Output = bool>,
-    Meas: Fn(usize, u16) -> MeasFut,
+    Meas: Fn(usize, u16, &str) -> MeasFut,
     MeasFut: Future<Output = Probed> + Send + 'static,
 {
     let mut trace = WaveTrace::default();
@@ -3463,9 +3450,8 @@ where
     RuntimeProbeBatch::Completed(probes)
 }
 
-/// 把一轮分波的结果折成逐候选的结局（纯函数）：出了值的是测得；记了 -1 的是真测了没通；
-/// 不在结果里的，**只有因读回不符被跳过的才算「没测」**，其余缺席（本机探针口连不上、测量任务
-/// 异常）与引入读回之前一样按没通计 —— 故障切换的后续判定因此在「只观测」档下与之前逐条相同。
+/// 把一轮分波的结果折成逐候选的结局。确认错载的候选记为「没测」；本机探针口连接失败、
+/// 测量任务异常等缺席沿用原来的失败判定。预算延期由调用方另行裁定。
 pub(crate) fn candidate_probes(
     candidates: &[(String, String)],
     raw: &RoundResults,
@@ -3636,7 +3622,7 @@ pub(crate) async fn drive_scheduled_round<Sel, SelFut, Meas, MeasFut>(
 where
     Sel: Fn(usize, String) -> SelFut,
     SelFut: Future<Output = bool>,
-    Meas: Fn(usize, u16) -> MeasFut,
+    Meas: Fn(usize, u16, &str) -> MeasFut,
     MeasFut: Future<Output = Probed> + Send + 'static,
 {
     let Some(guard) = deps.gate.acquire(SpeedTestOrigin::Schedule).await else {
@@ -3893,34 +3879,20 @@ pub(crate) async fn run_scheduled_round(
             let proxy = Arc::clone(&proxy);
             async move { proxy.probe_select_slot(gen0, slot, &tag).await }
         },
-        |slot, port| {
+        |slot, port, member| {
             let url = url.clone();
             // `probe-in-k` 的凭据与池端口同源同刻（`SpeedProbeTargets::auth`；桌面 `None`）。
             let auth = probe.auth.clone();
             let readback = round_readback.get().cloned();
+            let probe = ConnectProbe::pool_background(member);
             async move {
                 match readback {
                     Some(readback) => {
-                        measure_slot(
-                            &readback,
-                            slot,
-                            port,
-                            auth.as_ref(),
-                            &url,
-                            ConnectProbe::Background,
-                        )
-                        .await
+                        measure_slot(&readback, slot, port, auth.as_ref(), &url, probe).await
                     }
                     // 测量只在准入之后发起，那时读回已开；取不到就照测，读回落成未验证。
                     None => {
-                        measure_via_local_proxy(
-                            port,
-                            auth.as_ref(),
-                            &url,
-                            ConnectProbe::Background,
-                            &|_| {},
-                        )
-                        .await
+                        measure_via_local_proxy(port, auth.as_ref(), &url, probe, &|_| {}).await
                     }
                 }
             }
@@ -3997,7 +3969,7 @@ async fn drive_pool_waves<Sel, SelFut, Meas, MeasFut>(
 where
     Sel: Fn(usize, String) -> SelFut,
     SelFut: Future<Output = bool>,
-    Meas: Fn(usize, u16) -> MeasFut,
+    Meas: Fn(usize, u16, &str) -> MeasFut,
     MeasFut: Future<Output = Probed> + Send + 'static,
 {
     let mut trace = WaveTrace::default();
@@ -4058,7 +4030,7 @@ async fn drive_pool_waves_traced<Sel, SelFut, Meas, MeasFut>(
 where
     Sel: Fn(usize, String) -> SelFut,
     SelFut: Future<Output = bool>,
-    Meas: Fn(usize, u16) -> MeasFut,
+    Meas: Fn(usize, u16, &str) -> MeasFut,
     MeasFut: Future<Output = Probed> + Send + 'static,
 {
     // 本腿「已裁定要测」的集合 = 分波后的全部槽位节点（`plan_waves` 就是按可测集分的波，
@@ -4113,7 +4085,7 @@ async fn drive_pool_waves_inner<Sel, SelFut, Meas, MeasFut>(
 where
     Sel: Fn(usize, String) -> SelFut,
     SelFut: Future<Output = bool>,
-    Meas: Fn(usize, u16) -> MeasFut,
+    Meas: Fn(usize, u16, &str) -> MeasFut,
     MeasFut: Future<Output = Probed> + Send + 'static,
 {
     let mut results = RoundResults::new();
@@ -4182,7 +4154,7 @@ where
                 // 3. 波内并发量 warm-TTFB，每个节点测完就回填。
                 let port = pool_ports[a.slot]; // slot < k = pool_ports.len()（plan_waves 保证）
                 let assignment = a.clone();
-                let fut = measure(a.slot, port);
+                let fut = measure(a.slot, port, &a.tag);
                 // 起测那一刻的网络代次：测完再取一次，两刻不同即这个值跨了一次网络变化。
                 let epoch0 = network_epoch();
                 let readback = readback.clone();
@@ -4226,6 +4198,11 @@ where
             let epoch = network_epoch();
             if network_epoch_changed(epoch0, epoch) {
                 log::info!("测速期间网络发生变化，节点 {id} 本轮记为未测");
+                continue;
+            }
+            if measured.is_err_and(|failure| failure.kind == FailKind::BindingMismatch) {
+                log::info!("测速 CONNECT 承载不符，节点 {id} 本轮记为未测");
+                trace.mismatch_skipped.insert(id);
                 continue;
             }
             // 连不上本机探针口 ⇒ 故障在本机一侧，不是这个节点的负面证据：不落账，排回队尾。

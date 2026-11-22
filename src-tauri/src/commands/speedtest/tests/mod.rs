@@ -14,15 +14,17 @@ fn system_probe(readback: &Readback) -> SystemProbe<'_> {
     }
 }
 
+type TestMeasurement<Fut, Out> = futures::future::Map<Fut, fn(Out) -> Probed>;
+
 /// 测试里的测量闭包多数只关心池端口、只给出测量结果：这里把它接成驱动函数要的形状
-/// （槽号 + 池端口 → 带源端口的结果）。
-fn plain<F, Fut, Out>(f: F) -> impl Fn(usize, u16) -> futures::future::Map<Fut, fn(Out) -> Probed>
+/// （槽号、池端口、所选成员 → 带源端口的结果）。
+fn plain<F, Fut, Out>(f: F) -> impl Fn(usize, u16, &str) -> TestMeasurement<Fut, Out>
 where
     F: Fn(u16) -> Fut,
     Fut: Future<Output = Out>,
     Out: Into<Probed>,
 {
-    move |_slot, port| futures::FutureExt::map(f(port), Into::into as fn(Out) -> Probed)
+    move |_slot, port, _member| futures::FutureExt::map(f(port), Into::into as fn(Out) -> Probed)
 }
 
 /// 同 [`plain`]，给回退腿与伴测那种只测一次的闭包用。
@@ -4242,6 +4244,52 @@ async fn a_scheduled_round_publishes_only_per_node_results() {
     assert!(bench.gate.holder().is_none(), "收尾后闸已释放");
 }
 
+#[tokio::test]
+async fn a_scheduled_connect_binding_mismatch_keeps_the_node_pending_and_preserves_history() {
+    let bench = ScheduleBench::new(2, 2);
+    bench.sequence.store(1, Ordering::SeqCst);
+    let digest = ScheduleBench::url_digest();
+    assert!(bench.ledger.record(
+        "n0",
+        Ok(80),
+        ResultIdentity {
+            url_digest: digest.clone(),
+            ..identity(1, 1)
+        },
+    ));
+    let mut collected = Vec::new();
+    let report = ran(bench
+        .run(
+            &bench.targets(2),
+            2,
+            |_, _| async { true },
+            |port| async move {
+                if port == 10_000 {
+                    Err(MeasureFailure::new(
+                        FailPhase::Connect,
+                        FailKind::BindingMismatch,
+                    ))
+                } else {
+                    Ok(120)
+                }
+            },
+            &mut collected,
+        )
+        .await);
+    assert_eq!(report.unmeasured, ids(&["n0"]));
+    assert_eq!(report.measured, BTreeMap::from([("n1".into(), true)]));
+    assert_eq!(collected.len(), 1);
+    assert_eq!(collected[0].1["serverId"], "n1");
+    assert_eq!(
+        bench
+            .ledger
+            .candidate_entry("n0", &digest)
+            .unwrap()
+            .measured,
+        Ok(80)
+    );
+}
+
 /// 周期一轮持闸时发起手动请求：周期一轮以「被抢占」收尾，已测部分留在账本，没测到的节点
 /// 不记失败；手动请求随后拿到闸。
 #[tokio::test]
@@ -6488,9 +6536,8 @@ fn production_entries_wire_the_readback() {
     assert_eq!(occurrences(&pool, "open_readback()"), 1);
     assert!(pool.contains(".with_readback(readback);"));
     assert!(pool.contains("targets.pool_ports.as_slice(),readback,)"));
-    assert!(pool.contains(
-        "measure_slot(&readback,slot,port,auth.as_ref(),&url,ConnectProbe::Foreground,)"
-    ));
+    assert!(pool.contains("letprobe=ConnectProbe::pool_foreground(member);"));
+    assert!(pool.contains("measure_slot(&readback,slot,port,auth.as_ref(),&url,probe)"));
     assert!(manual.contains(".with_readback(&readback);"));
     assert!(manual.contains(
         "measure_inbound(&readback,local_proxy.inbound.tag(),local_proxy.port,\
@@ -6528,6 +6575,10 @@ fn production_entries_wire_the_readback() {
     ));
 
     for (name, body) in [("后台探测", &failover), ("周期一轮", &scheduled)] {
+        assert!(
+            body.contains("letprobe=ConnectProbe::pool_background(member);"),
+            "{name}"
+        );
         assert_eq!(
             occurrences(
                 body,
@@ -6540,7 +6591,7 @@ fn production_entries_wire_the_readback() {
         assert_eq!(
             occurrences(
                 body,
-                "measure_slot(&readback,slot,port,auth.as_ref(),&url,ConnectProbe::Background,).await"
+                "measure_slot(&readback,slot,port,auth.as_ref(),&url,probe).await"
             ),
             1,
             "{name}"
@@ -6628,7 +6679,7 @@ async fn runtime_probe(
         &superseded_at(0),
         &SpeedTestCancel::default(),
         |_, _| async { true },
-        |_, _| {
+        |_, _, _| {
             let n = u16::try_from(calls.fetch_add(1, Ordering::SeqCst)).unwrap();
             let measure = Arc::clone(&measure);
             async move {
@@ -6652,20 +6703,29 @@ async fn runtime_probe(
     }
 }
 
-/// 故障切换腿在「强制」档下：读回不符的候选是**被跳过**，真测了没通的才是**失败**，两者不合并。
+/// CONNECT 错载或强制读回不符的候选都记为缺席。
 /// 只剩「被跳过 + 失败」时裁定为不下结论，不是全部不可用。
 #[tokio::test]
-async fn failover_tells_an_enforced_mismatch_apart_from_a_failed_node() {
+async fn failover_tells_a_binding_mismatch_apart_from_a_failed_node() {
     use crate::runtime::auto_switch::{judge_probes, ProbeVerdict};
     let mut records = matching_records();
-    records[0].outbound = "someone-else".to_string(); // a：读回不符
+    records[0].outbound = "someone-else".to_string();
     let readback = Readback::new(
         ReadbackMode::Enforce,
         FakeWitness::with(records),
         SpeedBindingContext::default(),
     );
-    // b（第二个起测的）真测了没通。
     let probes = runtime_probe(&readback, |n| if n == 1 { Err(TIMED_OUT) } else { Ok(120) }).await;
+    let without_readback = runtime_probe(&Readback::off(), |n| match n {
+        0 => Err(MeasureFailure::new(
+            FailPhase::Connect,
+            FailKind::BindingMismatch,
+        )),
+        1 => Err(TIMED_OUT),
+        _ => Ok(120),
+    })
+    .await;
+    assert_eq!(without_readback, probes);
     assert_eq!(
         probes,
         BTreeMap::from([
@@ -6909,32 +6969,26 @@ async fn the_readback_wait_stays_outside_the_value_measured_by_the_production_pa
     let waves = plan_waves(&pairs(&[("a", "tag-a")]), 1);
     let pool_ports = [port];
     let started = std::time::Instant::now();
-    let (results, _) = drive_pool_waves(
-        &waves,
-        1,
-        &superseded_at(0),
-        &SpeedTestCancel::default(),
-        &|| None,
-        |_, _| async { true },
-        |slot, port| {
-            let readback = readback.clone();
-            async move {
-                measure_slot(
-                    &readback,
-                    slot,
-                    port,
-                    None,
-                    DEFAULT_SPEED_TEST_URL,
-                    ConnectProbe::Foreground,
-                )
-                .await
-            }
-        },
-        &mut |ev: &str, payload: Value| collected.push((ev.to_string(), payload)),
-        &pool_ports,
-        &readback,
-    )
-    .await;
+    let (results, _) =
+        drive_pool_waves(
+            &waves,
+            1,
+            &superseded_at(0),
+            &SpeedTestCancel::default(),
+            &|| None,
+            |_, _| async { true },
+            |slot, port, member| {
+                let probe = ConnectProbe::pool_foreground(member);
+                let readback = readback.clone();
+                async move {
+                    measure_slot(&readback, slot, port, None, DEFAULT_SPEED_TEST_URL, probe).await
+                }
+            },
+            &mut |ev: &str, payload: Value| collected.push((ev.to_string(), payload)),
+            &pool_ports,
+            &readback,
+        )
+        .await;
     let took = started.elapsed();
     let latency = crate::commands::speedtest::round_results_json(&results)["a"]
         .as_u64()
@@ -7090,20 +7144,14 @@ async fn a_failed_tunnel_still_withdraws_its_registration() {
         &SpeedTestCancel::default(),
         &|| None,
         |_, _| async { true },
-        |slot, port| {
+        |slot, port, member| {
+            let probe = ConnectProbe::pool_foreground(member);
             let readback = readback.clone();
             let witness = kernel.witness.clone();
             let seen = Arc::clone(&registered_mid_flight);
             async move {
-                let probed = measure_slot(
-                    &readback,
-                    slot,
-                    port,
-                    None,
-                    DEFAULT_SPEED_TEST_URL,
-                    ConnectProbe::Foreground,
-                )
-                .await;
+                let probed =
+                    measure_slot(&readback, slot, port, None, DEFAULT_SPEED_TEST_URL, probe).await;
                 seen.store(witness.table_len().0, Ordering::SeqCst);
                 probed
             }
