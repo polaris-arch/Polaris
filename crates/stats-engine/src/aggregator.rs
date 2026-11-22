@@ -46,14 +46,14 @@ impl ConnectionsDetailChange {
         self.reset || !self.upserts.is_empty() || !self.removed_ids.is_empty()
     }
 
-    fn upsert(&mut self, entry: ConnectionEntry) {
+    fn upsert(&mut self, entry: &ConnectionEntry) {
         if self.reset {
             return;
         }
         let id = entry.id.clone();
         self.removed_ids.remove(&id);
         self.counters.remove(&id);
-        self.upserts.insert(id, entry);
+        self.upserts.insert(id, entry.clone());
     }
 
     fn update_counters(&mut self, counters: ConnectionCounters) {
@@ -991,8 +991,8 @@ impl StatsAggregator {
                     if !is_probe_pool_inbound_tag(&c.inbound) {
                         let mut entry = self.trim_with_rule_name(c);
                         entry.id.clone_from(&id);
-                        self.conn_map.insert(id, entry.clone());
-                        change.upsert(entry);
+                        change.upsert(&entry);
+                        self.conn_map.insert(id, entry);
                     }
                 }
             }
@@ -1014,8 +1014,8 @@ impl StatsAggregator {
                     if c.closed_at <= 0 && !is_probe_pool_inbound_tag(&c.inbound) {
                         let mut entry = self.trim_with_rule_name(c);
                         entry.id.clone_from(&id);
-                        self.conn_map.insert(id, entry.clone());
-                        change.upsert(entry);
+                        change.upsert(&entry);
+                        self.conn_map.insert(id, entry);
                     }
                 }
             }
