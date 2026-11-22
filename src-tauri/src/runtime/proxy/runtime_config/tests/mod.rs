@@ -826,13 +826,14 @@ async fn hot_config_edit_retries_a_contended_publication_claim_for_its_exact_own
     use polaris_config_engine::user_config::dns_constants::BLOCK_SERVER_ID;
 
     let (rt, _dir, running, _) = host_dns_restart_fixture();
+    let generation = rt.automatic_selection_generation();
     let mut selection = rt
         .config
         .update(|disk| {
             disk["selectedServerId"] = json!(DIRECT_SERVER_ID);
             let intent = rt.register_selector_intent();
             Decision::Write(
-                rt.own_automatic_selection(DIRECT_SERVER_ID, intent)
+                rt.own_automatic_selection(DIRECT_SERVER_ID, intent, generation)
                     .unwrap(),
             )
         })
@@ -979,13 +980,14 @@ fn selected_graph_apply_only_reports_recovery_after_its_exact_owner_releases() {
             saved["logLevel"] = json!("debug");
         }
         rt.config.save_full(&saved).unwrap();
+        let generation = rt.automatic_selection_generation();
         let mut owner = rt
             .config
             .update(|disk| {
                 disk["selectedServerId"] = json!(DIRECT_SERVER_ID);
                 let intent = rt.register_selector_intent();
                 Decision::Write(
-                    rt.own_automatic_selection(DIRECT_SERVER_ID, intent)
+                    rt.own_automatic_selection(DIRECT_SERVER_ID, intent, generation)
                         .unwrap(),
                 )
             })

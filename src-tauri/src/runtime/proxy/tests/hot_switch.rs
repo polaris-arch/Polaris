@@ -1678,29 +1678,46 @@ async fn full_restart_claim_during_unchanged_readback_queues_only_current_select
 }
 
 #[test]
-fn explicit_selection_writer_does_not_wait_for_the_lifecycle_lock() {
+fn explicit_selection_writer_keeps_its_owner_during_lifecycle_lock_contention() {
     let (rt, _dir, _sink, _running) = explicit_selection_fixture();
-    let generation = rt.core_generation();
-    let intent = rt.register_selector_intent();
+    let selection_generation = rt.automatic_selection_generation();
+    let generation = selection_generation.unwrap();
     let (held, ready) = std::sync::mpsc::sync_channel(0);
     let (release, done) = std::sync::mpsc::channel();
-    std::thread::scope(|scope| {
+    let mut owner = std::thread::scope(|scope| {
         let gate = &rt.gate;
         scope.spawn(move || {
             gate.with_current_generation(generation, |_| {
                 held.send(()).unwrap();
-                let _ = done.recv_timeout(std::time::Duration::from_secs(1));
+                done.recv_timeout(std::time::Duration::from_secs(2))
+                    .expect("the saved writer must finish while the lifecycle lock is held");
             })
             .unwrap();
         });
         ready.recv().unwrap();
-        let declined = rt
+        let (owner, saved) = rt
             .config
-            .try_with_saved_commit(|_| rt.own_automatic_selection("node-b", intent).is_none())
+            .update(|disk| {
+                disk["selectedServerId"] = "node-b".into();
+                let intent = rt.register_selector_intent();
+                ConfigDecision::Write(rt.own_automatic_selection(
+                    "node-b",
+                    intent,
+                    selection_generation,
+                ))
+            })
             .unwrap();
-        let _ = release.send(());
-        assert!(declined, "the writer must not wait for the lifecycle owner");
+        release.send(()).unwrap();
+        assert_eq!(saved.unwrap()["selectedServerId"], "node-b");
+        owner.expect("lock contention must not turn the in-flight switch into pending work")
     });
+    owner.mark_committed();
+    assert!(!rt.pending_changes().pending_apply);
+    let saved_revision = rt.config.saved_revision();
+    assert_ne!(rt.bump_generation(), generation);
+    assert!(!rt.executing_automatic_selection("node-b", saved_revision));
+    assert!(rt.pending_changes().pending_apply);
+    drop(owner);
 }
 
 #[test]
@@ -1754,6 +1771,7 @@ async fn failed_selection_stays_deferred_until_explicit_stop_takes_over() {
 async fn automatic_selection_hides_only_its_in_flight_selection_and_reveals_deferred() {
     let (rt, _dir, sink, _) = explicit_selection_fixture();
     *sink.groups.lock().unwrap() = Some(vec![group(PROXY_SELECTOR_TAG, "Node A")]);
+    let generation = rt.automatic_selection_generation();
     let mut owner = rt
         .config
         .update(|disk| {
@@ -1761,7 +1779,8 @@ async fn automatic_selection_hides_only_its_in_flight_selection_and_reveals_defe
             let intent = rt.register_selector_intent();
             ConfigDecision::Write((
                 intent,
-                rt.own_automatic_selection("node-b", intent).unwrap(),
+                rt.own_automatic_selection("node-b", intent, generation)
+                    .unwrap(),
             ))
         })
         .unwrap()
@@ -1789,12 +1808,16 @@ fn automatic_selection_never_borrows_another_revision_or_hides_prior_debt() {
     let mut prior = rt.config.current().unwrap();
     prior["logLevel"] = "debug".into();
     rt.config.save_full(&prior).unwrap();
+    let generation = rt.automatic_selection_generation();
     let mut owner = rt
         .config
         .update(|disk| {
             disk["selectedServerId"] = "node-b".into();
             let intent = rt.register_selector_intent();
-            ConfigDecision::Write(rt.own_automatic_selection("node-b", intent).unwrap())
+            ConfigDecision::Write(
+                rt.own_automatic_selection("node-b", intent, generation)
+                    .unwrap(),
+            )
         })
         .unwrap()
         .0;

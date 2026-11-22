@@ -210,15 +210,23 @@ impl ProxyRuntime {
         self.selector_reconcile.intent_generation() == intent_generation
     }
 
-    /// The caller is inside the config writer's lock. Persistence increments
-    /// the revision once, and an unsuccessful write drops this guard in that lock.
+    /// Sample before entering the config writer. A lifecycle claim can itself
+    /// take the writer, so their locks cannot be acquired in reverse order.
+    pub(crate) fn automatic_selection_generation(&self) -> Option<u64> {
+        let generation = self.core_generation();
+        (!self.gate.is_busy() && self.core_running()).then_some(generation)
+    }
+
+    /// Register against the next revision inside the config writer. Pending
+    /// observation rechecks the sampled generation against the live core.
     pub(crate) fn own_automatic_selection(
         &self,
         server_id: &str,
         intent: u64,
+        generation: Option<u64>,
     ) -> Option<AutomaticSelectionGuard<'_>> {
-        let generation = self.gate.try_idle_generation()?;
-        if !self.status.try_read().ok()?.running || !self.selector_intent_is_current(intent) {
+        let generation = generation?;
+        if !self.selector_intent_is_current(intent) {
             return None;
         }
         let owner = AutomaticSelection {
@@ -227,11 +235,7 @@ impl ProxyRuntime {
             revision: self.config.saved_revision().checked_add(1)?,
             server_id: server_id.to_owned(),
         };
-        *self
-            .selector_reconcile
-            .automatic_selection
-            .try_lock()
-            .ok()? = Some(owner.clone());
+        *self.selector_reconcile.automatic_selection.lock().ok()? = Some(owner.clone());
         Some(AutomaticSelectionGuard {
             runtime: self,
             owner,
@@ -244,18 +248,24 @@ impl ProxyRuntime {
         if self.gate.is_busy() || !self.core_running() {
             return false;
         }
-        self.selector_reconcile
+        let intent = self
+            .selector_reconcile
             .automatic_selection
             .lock()
-            .is_ok_and(|active| {
-                active.as_ref().is_some_and(|owner| {
-                    owner.revision == revision
-                        && owner.server_id == server_id
-                        && self.selector_intent_is_current(owner.intent)
-                        && self.config.saved_revision() == revision
-                        && generation == owner.generation
-                })
-            })
+            .ok()
+            .and_then(|active| {
+                active
+                    .as_ref()
+                    .filter(|owner| {
+                        owner.revision == revision
+                            && owner.server_id == server_id
+                            && generation == owner.generation
+                    })
+                    .map(|owner| owner.intent)
+            });
+        intent.is_some_and(|intent| {
+            self.selector_intent_is_current(intent) && self.config.saved_revision() == revision
+        })
     }
 }
 

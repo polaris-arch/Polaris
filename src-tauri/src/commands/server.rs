@@ -771,6 +771,7 @@ pub async fn server_switch(
     state: State<'_, AppRuntime>,
     server_id: String,
 ) -> Result<ApiResponse<ServerSwitchReceipt>, ()> {
+    let generation = state.proxy().automatic_selection_generation();
     let saved = server_switch_core_with_owner(
         state.config(),
         &server_id,
@@ -780,7 +781,11 @@ pub async fn server_switch(
                 .validate_selected_server_candidate_blocking(candidate)
         },
         || state.proxy().register_selector_intent(),
-        |intent| state.proxy().own_automatic_selection(&server_id, intent),
+        |intent| {
+            state
+                .proxy()
+                .own_automatic_selection(&server_id, intent, generation)
+        },
     );
     if saved.is_err() {
         // A durable write may fail after publication. Report the real diff
