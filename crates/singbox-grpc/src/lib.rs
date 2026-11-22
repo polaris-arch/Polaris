@@ -41,7 +41,7 @@ mod connection_events;
 mod h2c;
 mod reconnect;
 mod runtime_config;
-pub use connection_events::ConnectionEventStream;
+pub use connection_events::{ConnectionEventFrame, ConnectionEventFrames, ConnectionEventStream};
 pub use runtime_config::{
     ApiHandoffMetadata, ExitIpProbeError, RuntimeConfigError, RuntimeStatusEnvelope,
     RUNTIME_CONFIG_MAX_MESSAGE_BYTES,
@@ -718,6 +718,31 @@ impl SingBoxApiClient {
         cfg: ReconnectConfig,
     ) -> ReconnectingStream<daemon::ConnectionEvents> {
         reconnect::subscribe_connections(self.target.clone(), self.secret.clone(), interval_ns, cfg)
+    }
+
+    /// Open one connection event session on this client's authenticated transport.
+    /// The caller owns retries and any state staged across snapshot parts.
+    pub async fn open_connection_event_frames(
+        &self,
+        interval_ns: i64,
+    ) -> Result<ConnectionEventFrames, ClientError> {
+        let mut client = self
+            .client()
+            .max_decoding_message_size(CONNECTION_EVENTS_MAX_FRAME_BYTES);
+        let request = self.with_auth(Request::new(daemon::SubscribeConnectionsRequest {
+            interval: interval_ns,
+            batch_frames: true,
+        }));
+        // Bound the wait for headers without imposing a deadline on the stream.
+        let stream = in_api_lifetime(
+            &self._retained_lifetime,
+            within_unary_deadline(UNARY_DEADLINE, client.subscribe_connections(request)),
+        )
+        .await?;
+        Ok(ConnectionEventFrames::new(
+            stream.into_inner(),
+            self._retained_lifetime.clone(),
+        ))
     }
 
     /// 订阅核日志流（`SubscribeLog`）。返回一个会**自动重连**的 tokio Stream。

@@ -16,8 +16,8 @@
 
 use polaris_singbox_grpc::ClientError;
 use polaris_singbox_grpc::{
-    ConnectionEventStream, Endpoint, ReconnectConfig, SingBoxApiClient, TaildropOutgoingFile,
-    TaildropSendUpdate, UNARY_DEADLINE,
+    ConnectionEventFrame, ConnectionEventStream, Endpoint, ReconnectConfig, SingBoxApiClient,
+    TaildropOutgoingFile, TaildropSendUpdate, UNARY_DEADLINE,
 };
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -91,6 +91,7 @@ struct MockState {
     /// 脚本放完后流保持打开，直到客户端退订；脚本里的 `Err` 即流中途报错。
     connection_script: Arc<std::sync::Mutex<Option<FrameScript<ConnectionEvents>>>>,
     connection_script_ends: std::sync::atomic::AtomicBool,
+    connection_open_error: std::sync::Mutex<Option<Status>>,
     /// `SubscribeConnections` 被订阅的次数。
     connection_calls: Arc<AtomicU64>,
     /// 为真时 `SubscribeConnections` 永不应答（核卡死）。
@@ -526,6 +527,9 @@ impl StartedService for MockService {
     ) -> Result<Response<Self::SubscribeConnectionsStream>, Status> {
         check_auth(&req, &self.secret)?;
         self.state.connection_calls.fetch_add(1, Ordering::Relaxed);
+        if let Some(error) = self.state.connection_open_error.lock().unwrap().clone() {
+            return Err(error);
+        }
         if self.state.connection_hang.load(Ordering::Relaxed) {
             std::future::pending::<()>().await;
         }
@@ -1919,6 +1923,24 @@ async fn reconnecting_connection_events_discard_unfinished_snapshots() {
     let client = SingBoxApiClient::connect(Endpoint::new("127.0.0.1", addr.port()), SECRET)
         .await
         .unwrap();
+    let prior_calls = state.connection_calls.load(Ordering::Relaxed);
+    let mut framed = client.open_connection_event_frames(1).await.unwrap();
+    assert!(matches!(
+        framed.message().await.unwrap(),
+        Some(ConnectionEventFrame::SnapshotPart(part))
+            if part.reset && part.events[0].id == "stale"
+    ));
+    assert!(matches!(
+        framed.message().await,
+        Err(ClientError::Status(status)) if status.code() == tonic::Code::DataLoss
+    ));
+    assert!(framed.message().await.unwrap().is_none());
+    assert_eq!(
+        state.connection_calls.load(Ordering::Relaxed),
+        prior_calls + 1
+    );
+
+    let before_reconnect = state.connection_calls.load(Ordering::Relaxed);
     let mut continuous =
         client.subscribe_connections(1, ReconnectConfig::with_backoff(Duration::from_millis(10)));
     assert!(
@@ -1926,7 +1948,7 @@ async fn reconnecting_connection_events_discard_unfinished_snapshots() {
             .await
             .is_err()
     );
-    assert!(state.connection_calls.load(Ordering::Relaxed) >= 2);
+    assert!(state.connection_calls.load(Ordering::Relaxed) >= before_reconnect + 2);
 
     // The replacement is an empty snapshot, which must still publish one reset.
     *state.connection_script.lock().unwrap() = Some(vec![
@@ -1946,6 +1968,46 @@ async fn reconnecting_connection_events_discard_unfinished_snapshots() {
         .unwrap();
     assert!(reset.reset);
     assert!(reset.events.is_empty());
+    let mut framed = client.open_connection_event_frames(1).await.unwrap();
+    assert!(matches!(
+        framed.message().await.unwrap(),
+        Some(ConnectionEventFrame::SnapshotPart(part)) if part.reset && part.events.is_empty()
+    ));
+    assert!(matches!(
+        framed.message().await.unwrap(),
+        Some(ConnectionEventFrame::SnapshotComplete)
+    ));
+}
+
+#[tokio::test]
+async fn connection_event_frames_retain_and_obey_captured_epoch() {
+    let (addr, state, _h) = spawn_server(SECRET, 0).await;
+    *state.connection_script.lock().unwrap() = Some(vec![Ok(ConnectionEvents {
+        reset: true,
+        snapshot_complete: Some(false),
+        ..Default::default()
+    })]);
+    let (lease, close, retained) = epoch_lease();
+    let client =
+        SingBoxApiClient::connect_captured(Endpoint::new("127.0.0.1", addr.port()), SECRET)
+            .await
+            .unwrap()
+            .retain_lifetime(lease);
+    let mut framed = client.open_connection_event_frames(1).await.unwrap();
+    drop(client);
+    assert_eq!(retained.load(Ordering::SeqCst), 1);
+    assert!(matches!(
+        framed.message().await.unwrap(),
+        Some(ConnectionEventFrame::SnapshotPart(_))
+    ));
+    close.send(true).unwrap();
+    assert!(matches!(
+        framed.message().await,
+        Err(ClientError::Status(status)) if status.code() == tonic::Code::Cancelled
+    ));
+    assert!(framed.message().await.unwrap().is_none());
+    drop(framed);
+    assert_eq!(retained.load(Ordering::SeqCst), 0);
 }
 
 /// 订阅迟迟不应答（核卡死）：建流在兜底时限到期时报超时，不无限挂起。
@@ -2029,6 +2091,37 @@ async fn connection_events_at_decodes_a_first_frame_beyond_the_default_limit() {
         .await
         .expect("legacy fallback must handle the same bounded frame");
     assert_eq!(live.len(), 6000);
+
+    let mut framed = client.open_connection_event_frames(1).await.unwrap();
+    assert!(matches!(
+        framed.message().await.unwrap(),
+        Some(ConnectionEventFrame::Events(frame)) if frame.reset && frame.events.len() == 6000
+    ));
+    drop(framed);
+
+    // The same payload is legal for an old daemon but an oversized opted-in frame.
+    *state.connection_script.lock().unwrap() = Some(vec![
+        Ok(ConnectionEvents {
+            snapshot_complete: Some(false),
+            ..first.clone()
+        }),
+        Ok(ConnectionEvents {
+            snapshot_complete: Some(true),
+            ..Default::default()
+        }),
+    ]);
+    let mut framed = client.open_connection_event_frames(1).await.unwrap();
+    assert!(framed
+        .message()
+        .await
+        .unwrap_err()
+        .is_connection_snapshot_too_large());
+    assert!(framed.message().await.unwrap().is_none());
+    let mut aggregate = events_at(addr, SECRET).await.unwrap();
+    assert_eq!(
+        aggregate.message().await.unwrap().unwrap().events.len(),
+        6000
+    );
 
     // Replay the same large reset after a forced disconnect. Every open must
     // install the shared limit, including the second (reconnected) client.
@@ -2197,6 +2290,75 @@ async fn connection_events_still_reject_frames_above_the_shared_bound() {
             .is_err()
     );
     assert!(state.connection_calls.load(Ordering::Relaxed) >= 2);
+}
+
+#[tokio::test]
+async fn connection_event_frames_classify_only_deterministic_size_failures() {
+    let (addr, state, _h) = spawn_server(SECRET, 0).await;
+    let client = SingBoxApiClient::connect(Endpoint::new("127.0.0.1", addr.port()), SECRET)
+        .await
+        .unwrap();
+    let too_large = "connection event exceeds stream frame limit";
+    for (status, expected) in [
+        (Status::resource_exhausted(too_large), true),
+        (
+            Status::resource_exhausted("temporary capacity limit"),
+            false,
+        ),
+        (Status::aborted(too_large), false),
+    ] {
+        *state.connection_open_error.lock().unwrap() = Some(status.clone());
+        let error = client
+            .open_connection_event_frames(1)
+            .await
+            .err()
+            .expect("stream opener must preserve the gRPC status");
+        assert_eq!(error.is_connection_snapshot_too_large(), expected);
+        *state.connection_open_error.lock().unwrap() = None;
+
+        *state.connection_script.lock().unwrap() = Some(vec![
+            Ok(ConnectionEvents {
+                reset: true,
+                snapshot_complete: Some(false),
+                ..Default::default()
+            }),
+            Err(status),
+        ]);
+        let mut stream = client.open_connection_event_frames(1).await.unwrap();
+        assert!(matches!(
+            stream.message().await.unwrap(),
+            Some(ConnectionEventFrame::SnapshotPart(_))
+        ));
+        let error = stream.message().await.unwrap_err();
+        assert_eq!(error.is_connection_snapshot_too_large(), expected);
+    }
+
+    // The parts fit individually but the whole snapshot exceeds its wire budget.
+    let mut event = scripted_conn("wide", "mixed-in", "127.0.0.1:1", 0);
+    event.connection.as_mut().unwrap().rule = "r".repeat(900 * 1024);
+    let part = ConnectionEvents {
+        events: vec![event],
+        snapshot_complete: Some(false),
+        ..Default::default()
+    };
+    let n = polaris_singbox_grpc::CONNECTION_EVENTS_MAX_FRAME_BYTES
+        / prost::Message::encoded_len(&part);
+    let mut script = vec![Ok(part); n + 1];
+    script[0].as_mut().unwrap().reset = true;
+    *state.connection_script.lock().unwrap() = Some(script);
+    let mut stream = client.open_connection_event_frames(1).await.unwrap();
+    for _ in 0..n {
+        assert!(matches!(
+            stream.message().await.unwrap(),
+            Some(ConnectionEventFrame::SnapshotPart(_))
+        ));
+    }
+    assert!(stream
+        .message()
+        .await
+        .unwrap_err()
+        .is_connection_snapshot_too_large());
+    assert!(stream.message().await.unwrap().is_none());
 }
 
 #[tokio::test]

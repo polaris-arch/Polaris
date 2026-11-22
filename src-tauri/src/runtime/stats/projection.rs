@@ -437,13 +437,11 @@ impl ClosedHistory {
 }
 
 /// Holds the trimmed census of a single subscription until its completion frame.
-#[cfg(any(target_os = "android", test))]
 pub(super) struct PendingConnectionSnapshot {
     active: StatsAggregator,
     closed: Vec<ClosedConnectionEntry>,
 }
 
-#[cfg(any(target_os = "android", test))]
 impl PendingConnectionSnapshot {
     pub(super) fn new(active: &StatsAggregator) -> Self {
         Self {

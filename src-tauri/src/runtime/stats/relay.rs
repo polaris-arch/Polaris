@@ -30,13 +30,12 @@ use crate::runtime::config::ConfigManager;
 use crate::runtime::proxy::ProxyRuntime;
 
 use super::gate::{visibility_source, StreamGate};
-#[cfg(any(target_os = "android", test))]
-use super::projection::PendingConnectionSnapshot;
 use super::projection::{
-    ClosedHistory, ClosedHistoryChange, PendingClosedUpdate, PendingDetailUpdate,
+    ClosedHistory, ClosedHistoryChange, PendingClosedUpdate, PendingConnectionSnapshot,
+    PendingDetailUpdate,
 };
 use super::source;
-use super::source::ConnectionFrame;
+use super::source::{ConnectionFrame, ConnectionStreamFailure};
 use super::subscription::ConnectionStreamLifecycle;
 use super::{
     AGGREGATE_EMIT_MIN_INTERVAL, CLOSED_EMIT_MIN_INTERVAL, DETAIL_EMIT_MIN_INTERVAL,
@@ -262,6 +261,24 @@ fn stream_session_current(proxy: &ProxyRuntime, port: u16, generation: u64) -> b
     )
 }
 
+#[cfg(not(target_os = "android"))]
+pub(super) async fn wait_for_connection_retry(
+    gate: &mut StreamGate,
+    visible: &impl Fn() -> bool,
+    still_current: impl Fn() -> bool,
+) {
+    let until =
+        tokio::time::Instant::now() + polaris_singbox_grpc::ReconnectConfig::default().backoff;
+    while tokio::time::Instant::now() < until && still_current() {
+        let next_check = until.min(tokio::time::Instant::now() + PARK_RECHECK_INTERVAL);
+        tokio::select! {
+            biased;
+            () = gate.wait_until(false, visible) => break,
+            () = tokio::time::sleep_until(next_check) => {}
+        }
+    }
+}
+
 /// 当前 epoch 毫秒（聚合 `at` 采样时刻；签名比对时被剔除，故不影响去重）。
 pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
@@ -333,10 +350,8 @@ pub(super) struct ConnectionStreamTaskContext {
 ///
 /// # 为什么内循环还有一个 1s 的兜底唤醒
 ///
-/// [`ReconnectingStream`](polaris_singbox_grpc::ReconnectingStream) 的语义是**永不向消费方 yield 错误或 None**（断了自己重连），
-/// 于是「核停了」「核换端口重启了」这两件事**流本身不会告诉我们** —— 不兜底的话，核换口重启后
-/// 这条流会永远重连到旧端口，两个页面静默冻结。故内循环每 [`PARK_RECHECK_INTERVAL`] 至少醒一次
-/// 复核 `proxy.status()`。代价是一次进程内 mutex 读，与它替掉的每秒 5 次全量 gRPC 拉取不在一个量级。
+/// 传输结束与核生命周期变化可能顺序不同。即使没有新帧，也每
+/// [`PARK_RECHECK_INTERVAL`] 复核端口和 Core 世代。
 pub(super) async fn run_connections_stream(
     app: AppHandle,
     proxy: Arc<ProxyRuntime>,
@@ -363,7 +378,6 @@ pub(super) async fn run_connections_stream(
     let mut last_sig: Option<String> = None;
     let mut offline_sent = false;
     let mut offline_detail_was_open = false;
-    #[cfg(target_os = "android")]
     let mut oversized_at = None;
     // 每个连接任务出生即欠一帧新代 reset；编号来自跨任务 owner，不随此 future 重建而回退。
     if !begin_detail_generation(&lifecycle, task_epoch, &mut detail_pending) {
@@ -447,16 +461,46 @@ pub(super) async fn run_connections_stream(
         if !stream_session_current(&proxy, port, generation) {
             continue;
         }
-        #[cfg(target_os = "android")]
-        let demand_at_open = *gate.state.epoch.borrow();
-        #[cfg(target_os = "android")]
-        if oversized_at == Some((generation, demand_at_open)) {
+        #[cfg(not(target_os = "android"))]
+        let retry_current = || {
+            stream_session_current(&proxy, port, generation)
+                && !proxy
+                    .runtime_api_relay_borrow()
+                    .is_some_and(|b| b.is_closed())
+        };
+        let snapshot_key = (generation, *gate.state.epoch.borrow());
+        if oversized_at == Some(snapshot_key) {
             tokio::time::sleep(PARK_RECHECK_INTERVAL).await;
             continue;
         }
-        let Some(mut stream) = source::subscribe_connections(&config, &proxy, port).await else {
-            tokio::time::sleep(PARK_RECHECK_INTERVAL).await;
-            continue;
+        let mut park_oversized = || {
+            log::warn!("连接流：快照超过传输大小上限");
+            oversized_at = Some(snapshot_key);
+        };
+        let open = source::subscribe_connections(&config, &proxy, port);
+        #[cfg(not(target_os = "android"))]
+        let opened = tokio::select! {
+            biased;
+            () = gate.wait_until(false, &visible) => continue,
+            opened = open => opened,
+        };
+        #[cfg(target_os = "android")]
+        let opened = open.await;
+        let mut stream = match opened {
+            Ok(Some(stream)) => stream,
+            Err(ConnectionStreamFailure::SnapshotTooLarge) => {
+                park_oversized();
+                continue;
+            }
+            #[cfg(not(target_os = "android"))]
+            Err(ConnectionStreamFailure::Retry) => {
+                wait_for_connection_retry(&mut gate, &visible, retry_current).await;
+                continue;
+            }
+            _ => {
+                tokio::time::sleep(PARK_RECHECK_INTERVAL).await;
+                continue;
+            }
         };
         if !stream_session_current(&proxy, port, generation) {
             continue;
@@ -500,10 +544,10 @@ pub(super) async fn run_connections_stream(
         // `wait_until` 占着，这里另订一个：`watch::Receiver::changed()` 是 cancel-safe 的，被 select
         // 丢弃只是停止等待。每条流各建一个 ⇒ 建流那一刻的代次即基准，不会把上一条流的旧 bump 补收。
         let mut demand_epoch = gate.state.epoch.subscribe();
-        #[cfg(any(target_os = "android", test))]
         let mut pending_snapshot = None;
-        #[cfg(target_os = "android")]
         let mut awaiting_snapshot = true;
+        #[cfg(not(target_os = "android"))]
+        let mut transport_ended = false;
         log::debug!("连接流已订阅（{}）", source::stream_label(port));
 
         // ④ 流循环。
@@ -529,14 +573,8 @@ pub(super) async fn run_connections_stream(
 
             tokio::select! {
                 frame = stream.recv() => match frame {
-                    Some(frame) => {
+                    Ok(Some(frame)) => {
                         if !stream_session_current(&proxy, port, generation) {
-                            break;
-                        }
-                        #[cfg(target_os = "android")]
-                        if matches!(&frame, ConnectionFrame::SnapshotTooLarge) {
-                            log::warn!("连接流：快照超过传输大小上限");
-                            oversized_at = Some((generation, demand_at_open));
                             break;
                         }
                         let Some(change) = lifecycle.commit(task_epoch, || {
@@ -544,18 +582,30 @@ pub(super) async fn run_connections_stream(
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner);
                             let mut history = closed_history.lock().ok();
-                            #[cfg(target_os = "android")]
+                            let frame = match frame {
+                                ConnectionFrame::Events(events) if events.reset => {
+                                    // A legacy reset is one complete part. Reduce it before
+                                    // taking the Core lifecycle lock for the final install.
+                                    apply_connection_frame(
+                                        ConnectionFrame::SnapshotPart(events),
+                                        &mut table,
+                                        history.as_deref_mut(),
+                                        &mut pending_snapshot,
+                                    )?;
+                                    ConnectionFrame::SnapshotComplete
+                                }
+                                ConnectionFrame::Events(_) if awaiting_snapshot => return Err(()),
+                                frame => frame,
+                            };
                             let finishing = matches!(&frame, ConnectionFrame::SnapshotComplete);
                             let apply = || {
                                 apply_connection_frame(
                                     frame,
                                     &mut table,
                                     history.as_deref_mut(),
-                                    #[cfg(any(target_os = "android", test))]
                                     &mut pending_snapshot,
                                 )
                             };
-                            #[cfg(target_os = "android")]
                             if finishing {
                                 return proxy.with_idle_core_generation(generation, apply).unwrap_or(Err(()));
                             }
@@ -566,12 +616,15 @@ pub(super) async fn run_connections_stream(
                         let (closed_change, detail_change) = match change {
                             Ok(Some(change)) => change,
                             Ok(None) => continue,
-                            Err(()) => break,
+                            Err(()) => {
+                                #[cfg(not(target_os = "android"))]
+                                {
+                                    transport_ended = true;
+                                }
+                                break;
+                            }
                         };
-                        #[cfg(target_os = "android")]
-                        {
-                            awaiting_snapshot = false;
-                        }
+                        awaiting_snapshot = false;
                         let topology_changed = detail_change.affects_topology();
                         if detail_change.reset
                             && !begin_detail_generation(
@@ -592,8 +645,16 @@ pub(super) async fn run_connections_stream(
                             closed_emit.note_change();
                         }
                     }
-                    // ReconnectingStream 正常语义下不返 None；真返了说明它内部终止 → 重建。
-                    None => break,
+                    Ok(None) => break,
+                    Err(ConnectionStreamFailure::SnapshotTooLarge) => {
+                        park_oversized();
+                        break;
+                    }
+                    #[cfg(not(target_os = "android"))]
+                    Err(ConnectionStreamFailure::Retry) => {
+                        transport_ended = true;
+                        break;
+                    }
                 },
                 // 门关（退订 / 主窗隐藏）→ 跳出即 drop 流，整条链路成本归零。
                 () = gate.wait_until(false, &visible) => break,
@@ -613,7 +674,6 @@ pub(super) async fn run_connections_stream(
             if !stream_session_current(&proxy, port, generation) {
                 break;
             }
-            #[cfg(target_os = "android")]
             if awaiting_snapshot {
                 continue;
             }
@@ -720,10 +780,18 @@ pub(super) async fn run_connections_stream(
                 closed_emit.mark_emitted(now);
             }
 
-            // 核停 / 换端口（换核、重启动态口）→ 断流重来。ReconnectingStream 自己发现不了这两件事。
+            // 核停 / 换端口（换核、重启动态口）→ 断流重来。
             if !stream_session_current(&proxy, port, generation) {
                 break;
             }
+        }
+        drop(stream);
+        drop(pending_snapshot);
+        #[cfg(not(target_os = "android"))]
+        if transport_ended {
+            // Keep the last completed table during a same-Core transport retry.
+            // A hidden window or invalid session still clears it promptly.
+            wait_for_connection_retry(&mut gate, &visible, retry_current).await;
         }
         // 断流 / 隐藏 / 换核后的旧表不再是真值。立即清空，避免搜索命令在下一条 reset 到达前读到
         // 上一代连接；正常聚合签名仍由下一条流的 reset 重建。
@@ -740,8 +808,7 @@ pub(super) async fn run_connections_stream(
         }
         log::debug!("连接流已断开（待重订阅）");
         #[cfg(target_os = "android")]
-        if awaiting_snapshot && oversized_at != Some((generation, demand_at_open)) {
-            drop(stream);
+        if awaiting_snapshot && oversized_at != Some(snapshot_key) {
             tokio::time::sleep(PARK_RECHECK_INTERVAL).await;
         }
     }
@@ -757,11 +824,10 @@ pub(super) fn apply_connection_frame(
     frame: ConnectionFrame,
     table: &mut StatsAggregator,
     history: Option<&mut ClosedHistory>,
-    #[cfg(any(target_os = "android", test))] pending: &mut Option<PendingConnectionSnapshot>,
+    pending: &mut Option<PendingConnectionSnapshot>,
 ) -> Result<Option<ConnectionFrameChange>, ()> {
     match frame {
         ConnectionFrame::Events(events) => {
-            #[cfg(any(target_os = "android", test))]
             if pending.is_some() {
                 return Err(());
             }
@@ -771,7 +837,6 @@ pub(super) fn apply_connection_frame(
                 table.on_connection_events(&events, 0),
             )))
         }
-        #[cfg(any(target_os = "android", test))]
         ConnectionFrame::SnapshotPart(events) => {
             if events.reset != pending.is_none() {
                 return Err(());
@@ -782,7 +847,6 @@ pub(super) fn apply_connection_frame(
             }
             Ok(None)
         }
-        #[cfg(any(target_os = "android", test))]
         ConnectionFrame::SnapshotComplete => pending
             .take()
             .map(|snapshot| Some(snapshot.commit(table, history)))

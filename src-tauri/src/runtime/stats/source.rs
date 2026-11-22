@@ -3,11 +3,11 @@
 //! `runtime/stats` 的其余部分（活动连接表、已结束历史环、四条 emit 闸门、签名去重、订阅门、
 //! 五条渲染层事件）在两个平台上是**同一份代码**。会分叉的只有「帧从哪来」：
 //!
-//! | | 桌面 | Android |
+//! | | 桌面 / iOS | Android |
 //! |---|---|---|
 //! | 传输 | clash 管理 API 上的 daemon gRPC（loopback HTTP/2 + secret） | libbox `CommandClient`（**同进程** unix socket，无端口无 secret） |
 //! | 建流 | `SingBoxApiClient::connect` + `SubscribeConnections` / `SubscribeStatus` | Kotlin `PolarisVpnPlugin` 的 `connectionsOpen` / `statsOpen` |
-//! | 收帧 | `ReconnectingStream::recv` | `connectionsPoll` / `statsPoll` 长轮询（游标交接） |
+//! | 收帧 | 单会话连接事件流 / 自动重连状态流 | `connectionsPoll` / `statsPoll` 长轮询（游标交接） |
 //! | 帧形状 | `daemon::ConnectionEvents` / `daemon::Status` | 逐字段同形的 JSON（见 `BridgeConnection` 的头注） |
 //!
 //! 两侧的帧最后都变成同一对纯逻辑类型（`SingBoxConnectionEvents` / `SingBoxStatus`），
@@ -52,7 +52,10 @@ use crate::runtime::proxy::runtime_config::api_handoff::{relay_cancelled, ApiRel
 use crate::runtime::proxy::{ProxyRuntime, ProxyStatus};
 
 #[cfg(not(target_os = "android"))]
-use polaris_singbox_grpc::{daemon, ReconnectConfig, ReconnectingStream, SingBoxApiClient};
+use polaris_singbox_grpc::{
+    daemon, ConnectionEventFrame, ConnectionEventFrames, ReconnectConfig, ReconnectingStream,
+    SingBoxApiClient,
+};
 
 use crate::runtime::config::ConfigManager;
 
@@ -183,7 +186,7 @@ async fn read_management_client(
 /// 连接事件长驻流（平台各自的传输，同一种帧）。
 pub(super) struct ConnectionsStream {
     #[cfg(not(target_os = "android"))]
-    inner: ReconnectingStream<daemon::ConnectionEvents>,
+    inner: ConnectionEventFrames,
     #[cfg(target_os = "android")]
     inner: android::Pump<ConnectionFrame>,
     #[cfg(not(target_os = "android"))]
@@ -192,12 +195,27 @@ pub(super) struct ConnectionsStream {
 
 pub(super) enum ConnectionFrame {
     Events(SingBoxConnectionEvents),
-    #[cfg(any(target_os = "android", test))]
     SnapshotPart(SingBoxConnectionEvents),
-    #[cfg(any(target_os = "android", test))]
     SnapshotComplete,
     #[cfg(any(target_os = "android", test))]
     SnapshotTooLarge,
+}
+
+pub(super) enum ConnectionStreamFailure {
+    #[cfg(not(target_os = "android"))]
+    Retry,
+    SnapshotTooLarge,
+}
+
+#[cfg(not(target_os = "android"))]
+impl From<polaris_singbox_grpc::ClientError> for ConnectionStreamFailure {
+    fn from(error: polaris_singbox_grpc::ClientError) -> Self {
+        if error.is_connection_snapshot_too_large() {
+            Self::SnapshotTooLarge
+        } else {
+            Self::Retry
+        }
+    }
 }
 
 #[cfg(any(target_os = "android", test))]
@@ -246,18 +264,42 @@ pub(super) struct StatusStream {
 }
 
 impl ConnectionsStream {
-    /// 下一帧；`None` = 流终止（桌面：`ReconnectingStream` 内部终止；Android：桥断/溢出）→ 重建。
-    pub(super) async fn recv(&mut self) -> Option<ConnectionFrame> {
+    /// A transport end needs backoff. A retired epoch can immediately yield to its replacement.
+    pub(super) async fn recv(
+        &mut self,
+    ) -> Result<Option<ConnectionFrame>, ConnectionStreamFailure> {
         #[cfg(not(target_os = "android"))]
         {
-            let ev = tokio::select! {_ = relay_cancelled(&self.api_borrow)=>None, v=self.inner.recv()=>v}?;
-            Some(ConnectionFrame::Events(
-                super::relay::daemon_events_to_engine(&ev),
-            ))
+            let frame = tokio::select! {
+                biased;
+                _ = relay_cancelled(&self.api_borrow) => return Ok(None),
+                frame = self.inner.message() => frame,
+            };
+            match frame {
+                Ok(Some(ConnectionEventFrame::Events(events))) => Ok(Some(
+                    ConnectionFrame::Events(super::relay::daemon_events_to_engine(&events)),
+                )),
+                Ok(Some(ConnectionEventFrame::SnapshotPart(events))) => Ok(Some(
+                    ConnectionFrame::SnapshotPart(super::relay::daemon_events_to_engine(&events)),
+                )),
+                Ok(Some(ConnectionEventFrame::SnapshotComplete)) => {
+                    Ok(Some(ConnectionFrame::SnapshotComplete))
+                }
+                Ok(None) => Err(ConnectionStreamFailure::Retry),
+                Err(e) => {
+                    log::debug!("连接流：管理 API 订阅结束 {e}");
+                    Err(e.into())
+                }
+            }
         }
         #[cfg(target_os = "android")]
         {
-            self.inner.recv().await
+            match self.inner.recv().await {
+                Some(ConnectionFrame::SnapshotTooLarge) => {
+                    Err(ConnectionStreamFailure::SnapshotTooLarge)
+                }
+                frame => Ok(frame),
+            }
         }
     }
 }
@@ -281,40 +323,40 @@ impl StatusStream {
     }
 }
 
-/// 订阅连接事件流。`None` = 这一轮建不起来（调用方退避一拍重试，与桌面既有腿同语义）。
+/// A retired or unavailable local owner yields no stream.
 pub(super) async fn subscribe_connections(
     _config: &ConfigManager,
     proxy: &ProxyRuntime,
     port: u16,
-) -> Option<ConnectionsStream> {
+) -> Result<Option<ConnectionsStream>, ConnectionStreamFailure> {
     #[cfg(not(target_os = "android"))]
     {
         let api_borrow = proxy.runtime_api_relay_borrow();
         if api_borrow.as_ref().is_some_and(|b| b.is_closed()) {
-            return None;
+            return Ok(None);
         }
-        let client = match tokio::select! {_ = relay_cancelled(&api_borrow)=>return None, c=read_management_client(proxy,port)=>c}
-        {
-            Ok(c) => c,
-            Err(e) => {
-                log::debug!("连接流：管理 API 连接失败 {e}");
-                return None;
-            }
+        let opened = tokio::select! {
+            biased;
+            _ = relay_cancelled(&api_borrow) => return Ok(None),
+            opened = async {
+                let client = read_management_client(proxy, port).await?;
+                client.open_connection_event_frames(super::CONNECTIONS_STREAM_INTERVAL_NS).await
+            } => opened,
         };
-        Some(ConnectionsStream {
-            api_borrow,
-            inner: client.subscribe_connections(
-                super::CONNECTIONS_STREAM_INTERVAL_NS,
-                ReconnectConfig::default(),
-            ),
-        })
+        match opened {
+            Ok(inner) => Ok(Some(ConnectionsStream { inner, api_borrow })),
+            Err(e) => {
+                log::debug!("连接流：管理 API 建流失败 {e}");
+                Err(e.into())
+            }
+        }
     }
     #[cfg(target_os = "android")]
     {
         let _ = (_config, proxy, port);
-        android::open_connections()
+        Ok(android::open_connections()
             .await
-            .map(|inner| ConnectionsStream { inner })
+            .map(|inner| ConnectionsStream { inner }))
     }
 }
 

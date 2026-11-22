@@ -64,7 +64,7 @@ fn engine_conn(id: &str, closed_at: i64) -> SingBoxConnection {
 }
 
 #[test]
-fn android_snapshot_publishes_only_on_completion_and_obeys_latest_history_cutoff() {
+fn connection_snapshot_publishes_only_on_completion_and_obeys_latest_history_cutoff() {
     use super::source::ConnectionFrame;
 
     let mut active = StatsAggregator::with_max_conn_map_size(2);
@@ -138,6 +138,37 @@ fn android_snapshot_publishes_only_on_completion_and_obeys_latest_history_cutoff
     assert!(active.entry("second").is_some());
     assert_eq!(history.entries.len(), 1);
     assert_eq!(history.entries[0].entry.id, "new-close");
+}
+
+#[cfg(not(target_os = "android"))]
+#[tokio::test(start_paused = true)]
+async fn connection_retry_backs_off_and_yields_to_retired_demand() {
+    let (state, mut gate, visible) = test_stream_gate();
+    state
+        .registry
+        .lock()
+        .unwrap()
+        .subscribe(Topic::Connections, "main");
+    let visible_source = flag_visibility_source(visible.clone());
+    let time = tokio::time::Instant::now();
+    wait_for_connection_retry(&mut gate, &visible_source, || true).await;
+    assert_eq!(time.elapsed(), Duration::from_secs(2));
+
+    let time = tokio::time::Instant::now();
+    wait_for_connection_retry(&mut gate, &visible_source, || false).await;
+    assert_eq!(time.elapsed(), Duration::ZERO);
+
+    let time = tokio::time::Instant::now();
+    let hide = async {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        visible.store(false, Ordering::Relaxed);
+        state.bump();
+    };
+    tokio::join!(
+        wait_for_connection_retry(&mut gate, &visible_source, || true),
+        hide
+    );
+    assert_eq!(time.elapsed(), Duration::from_millis(25));
 }
 
 #[test]
