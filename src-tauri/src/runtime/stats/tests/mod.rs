@@ -64,6 +64,83 @@ fn engine_conn(id: &str, closed_at: i64) -> SingBoxConnection {
 }
 
 #[test]
+fn android_snapshot_publishes_only_on_completion_and_obeys_latest_history_cutoff() {
+    use super::source::ConnectionFrame;
+
+    let mut active = StatsAggregator::with_max_conn_map_size(2);
+    let mut history = ClosedHistory::default();
+    let mut pending = None;
+    let event = |id: &str, closed_at| SingBoxConnectionEvent {
+        kind: ConnectionEventType::New,
+        connection: Some(engine_conn(id, closed_at)),
+        ..Default::default()
+    };
+    let part =
+        |reset, events| ConnectionFrame::SnapshotPart(SingBoxConnectionEvents { reset, events });
+    assert!(apply_connection_frame(
+        ConnectionFrame::SnapshotComplete,
+        &mut active,
+        Some(&mut history),
+        &mut pending
+    )
+    .is_err());
+    assert!(apply_connection_frame(
+        part(true, vec![event("aborted", 20)]),
+        &mut active,
+        Some(&mut history),
+        &mut pending
+    )
+    .unwrap()
+    .is_none());
+    drop(pending.take());
+    assert_eq!(active.conn_count(), 0);
+    assert!(history.entries.is_empty());
+
+    assert!(apply_connection_frame(
+        part(true, vec![event("oldest", 0), event("cleared", 10)]),
+        &mut active,
+        Some(&mut history),
+        &mut pending
+    )
+    .unwrap()
+    .is_none());
+    history.clear(10);
+    assert!(apply_connection_frame(
+        part(
+            false,
+            vec![
+                event("first", 0),
+                event("second", 0),
+                event("new-close", 11)
+            ]
+        ),
+        &mut active,
+        Some(&mut history),
+        &mut pending
+    )
+    .unwrap()
+    .is_none());
+    assert!(history.entries.is_empty());
+    assert_eq!(active.conn_count(), 0);
+    let (closed, change) = apply_connection_frame(
+        ConnectionFrame::SnapshotComplete,
+        &mut active,
+        Some(&mut history),
+        &mut pending,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(matches!(closed, Some(ClosedHistoryChange::Reset { .. })));
+    assert!(change.reset);
+    assert_eq!(active.conn_count(), 2);
+    assert!(active.entry("oldest").is_none());
+    assert!(active.entry("first").is_some());
+    assert!(active.entry("second").is_some());
+    assert_eq!(history.entries.len(), 1);
+    assert_eq!(history.entries[0].entry.id, "new-close");
+}
+
+#[test]
 fn closed_history_is_newest_first_and_capped_to_history_limit() {
     let events = SingBoxConnectionEvents {
         reset: true,

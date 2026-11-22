@@ -2563,4 +2563,16 @@ impl ProxyRuntime {
     pub(crate) fn core_lifecycle_busy(&self) -> bool {
         self.gate.is_busy()
     }
+
+    #[cfg(any(target_os = "android", test))]
+    /// Commit a completed Android snapshot at the same boundary as Core claims.
+    pub(in crate::runtime) fn with_idle_core_generation<T>(
+        &self,
+        generation: u64,
+        commit: impl FnOnce() -> T,
+    ) -> Option<T> {
+        self.gate
+            .with_current_generation(generation, |live| (!live.is_busy()).then(commit))
+            .flatten()
+    }
 }

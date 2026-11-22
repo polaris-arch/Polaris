@@ -21,6 +21,7 @@
 
 use polaris_config_engine::builder::is_probe_pool_inbound_tag;
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 use crate::types::{
     ConnectionAggFlow, ConnectionAggHost, ConnectionAggOutbound, ConnectionCounters,
@@ -751,7 +752,7 @@ pub struct StatsAggregator {
     /// 连接事件只在入表时裁剪一次；不保留 gRPC 原始对象中 UI/拓扑永远不会读取的字段。
     conn_map: OrderedConnections,
     /// 仅从已启动核的配置建立；给新连接冻结身份，配置后续保存不回写旧条目。
-    named_rules: BTreeMap<String, RuleIdentity>,
+    named_rules: Arc<BTreeMap<String, RuleIdentity>>,
     /// max conn map size（OOM 安全网，默认 [`MAX_CONN_MAP_SIZE`]；测试可注入小值）。
     max_conn_map_size: usize,
     /// 速率差分基线：`(上一帧 at_ms, 该帧 uplink_total, 该帧 downlink_total)`。
@@ -778,7 +779,7 @@ impl StatsAggregator {
         Self {
             snapshot: TrafficStats::zeroed(),
             conn_map: OrderedConnections::new(),
-            named_rules: BTreeMap::new(),
+            named_rules: Arc::default(),
             max_conn_map_size,
             last_status: None,
         }
@@ -806,7 +807,30 @@ impl StatsAggregator {
     }
 
     pub fn set_named_rules(&mut self, named_rules: BTreeMap<String, RuleIdentity>) {
-        self.named_rules = named_rules;
+        self.named_rules = Arc::new(named_rules);
+    }
+
+    /// Start a private snapshot using the same rule identities and connection limit.
+    pub fn empty_connection_snapshot(&self) -> Self {
+        Self {
+            named_rules: self.named_rules.clone(),
+            ..Self::with_max_conn_map_size(self.max_conn_map_size)
+        }
+    }
+
+    /// Accumulate one snapshot part without constructing a disposable detail delta.
+    pub fn append_connection_snapshot(&mut self, events: &[SingBoxConnectionEvent]) {
+        self.fold_connection_events(events, true);
+    }
+
+    /// Install only the connection census after its transport confirms completion.
+    pub fn replace_connection_snapshot(&mut self, staged: Self) -> ConnectionsDetailChange {
+        self.conn_map = staged.conn_map;
+        self.snapshot.active_connections = staged.snapshot.active_connections;
+        ConnectionsDetailChange {
+            reset: true,
+            ..ConnectionsDetailChange::default()
+        }
     }
 
     fn trim_with_rule_name(&self, c: &SingBoxConnection) -> ConnectionEntry {
@@ -916,14 +940,22 @@ impl StatsAggregator {
         events: &SingBoxConnectionEvents,
         _at: u64,
     ) -> ConnectionsDetailChange {
-        let mut change = ConnectionsDetailChange {
-            reset: events.reset,
-            ..ConnectionsDetailChange::default()
-        };
         if events.reset {
             self.conn_map.clear();
         }
-        for ev in &events.events {
+        self.fold_connection_events(&events.events, events.reset)
+    }
+
+    fn fold_connection_events(
+        &mut self,
+        events: &[SingBoxConnectionEvent],
+        reset: bool,
+    ) -> ConnectionsDetailChange {
+        let mut change = ConnectionsDetailChange {
+            reset,
+            ..ConnectionsDetailChange::default()
+        };
+        for ev in events {
             self.apply_event(ev, &mut change);
         }
         // OOM 安全网：超硬上限按插入序（最旧、最可能是漏删死连接）驱逐。

@@ -305,92 +305,23 @@ impl ClosedHistory {
         let mut initially_present = HashMap::new();
 
         for event in &events.events {
-            let payload_closed_at = event
-                .connection
-                .as_ref()
-                .map_or(0, |connection| connection.closed_at);
-            let reported_closed_at = event.closed_at.max(payload_closed_at);
-            let closed_at = if reported_closed_at > 0 {
-                reported_closed_at
-            } else if event.kind == ConnectionEventType::Closed {
-                now_ns()
-            } else {
-                0
-            };
-            let is_closed = event.kind == ConnectionEventType::Closed || closed_at > 0;
-            if !is_closed || closed_at <= self.cutoff_ns {
-                continue;
-            }
-
-            let entry = event
-                .connection
-                .as_ref()
-                .filter(|connection| !is_probe_pool_inbound_tag(&connection.inbound))
-                .map(|connection| {
-                    let mut entry = trim_connection(connection);
-                    let frozen = active.entry(&connection.id).or_else(|| {
-                        self.identity_ids_from_core
-                            .contains(&connection.id)
-                            .then(|| {
-                                self.entries
-                                    .iter()
-                                    .find(|old| old.entry.id == connection.id)
-                                    .map(|old| &old.entry)
-                            })
-                            .flatten()
-                    });
-                    if let Some(frozen) = frozen {
-                        entry.rule_id.clone_from(&frozen.rule_id);
-                        entry.rule_name.clone_from(&frozen.rule_name);
-                    }
-                    entry
-                })
-                .or_else(|| active.entry(&event.id).cloned());
-            let Some(entry) = entry else {
+            let Some(entry) = self.closed_entry(event, active) else {
                 continue;
             };
-            if entry.id.is_empty() {
+            let Some((id, was_present)) = self.record_entry(entry) else {
                 continue;
-            }
-
-            let next = ClosedConnectionEntry { entry, closed_at };
-            let id = next.entry.id.clone();
-            if next.entry.rule_name.is_some() {
-                self.identity_ids_from_core.insert(id.clone());
-            } else {
-                self.identity_ids_from_core.remove(&id);
-            }
-            let old_at = self.entries.iter().position(|old| old.entry.id == id);
-            if old_at.is_some_and(|at| self.entries[at] == next) {
-                continue;
-            }
+            };
             if !events.reset {
-                initially_present
-                    .entry(id.clone())
-                    .or_insert(old_at.is_some());
-                changed_ids.insert(id.clone());
+                initially_present.entry(id.clone()).or_insert(was_present);
+                changed_ids.insert(id);
             }
-            if let Some(at) = old_at {
-                self.entries.remove(at);
-            }
-            self.entries.push(next);
         }
 
         self.entries
             .sort_by_key(|entry| std::cmp::Reverse(entry.closed_at));
 
         if events.reset {
-            self.entries.truncate(MAX_CLOSED_HISTORY);
-            let present: HashSet<_> = self
-                .entries
-                .iter()
-                .map(|entry| entry.entry.id.as_str())
-                .collect();
-            self.identity_ids_from_core
-                .retain(|id| present.contains(id.as_str()));
-            return Some(ClosedHistoryChange::Reset {
-                generation: self.generation,
-            });
+            return Some(self.finish_reset());
         }
 
         let evicted = if self.entries.len() > MAX_CLOSED_HISTORY {
@@ -423,5 +354,145 @@ impl ClosedHistory {
             connections,
             removed_ids,
         })
+    }
+
+    fn closed_entry(
+        &self,
+        event: &polaris_stats_engine::SingBoxConnectionEvent,
+        active: &StatsAggregator,
+    ) -> Option<ClosedConnectionEntry> {
+        let payload_closed_at = event
+            .connection
+            .as_ref()
+            .map_or(0, |connection| connection.closed_at);
+        let reported_closed_at = event.closed_at.max(payload_closed_at);
+        let closed_at = if reported_closed_at > 0 {
+            reported_closed_at
+        } else if event.kind == ConnectionEventType::Closed {
+            now_ns()
+        } else {
+            return None;
+        };
+        if closed_at <= self.cutoff_ns {
+            return None;
+        }
+        let entry = event
+            .connection
+            .as_ref()
+            .filter(|connection| !is_probe_pool_inbound_tag(&connection.inbound))
+            .map(|connection| {
+                let mut entry = trim_connection(connection);
+                let frozen = active.entry(&connection.id).or_else(|| {
+                    self.identity_ids_from_core
+                        .contains(&connection.id)
+                        .then(|| {
+                            self.entries
+                                .iter()
+                                .find(|old| old.entry.id == connection.id)
+                                .map(|old| &old.entry)
+                        })
+                        .flatten()
+                });
+                if let Some(frozen) = frozen {
+                    entry.rule_id.clone_from(&frozen.rule_id);
+                    entry.rule_name.clone_from(&frozen.rule_name);
+                }
+                entry
+            })
+            .or_else(|| active.entry(&event.id).cloned())?;
+        (!entry.id.is_empty()).then_some(ClosedConnectionEntry { entry, closed_at })
+    }
+
+    fn record_entry(&mut self, next: ClosedConnectionEntry) -> Option<(String, bool)> {
+        let id = next.entry.id.clone();
+        if next.entry.rule_name.is_some() {
+            self.identity_ids_from_core.insert(id.clone());
+        } else {
+            self.identity_ids_from_core.remove(&id);
+        }
+        let old_at = self.entries.iter().position(|old| old.entry.id == id);
+        if let Some(at) = old_at {
+            if self.entries[at] == next {
+                return None;
+            }
+            self.entries.remove(at);
+        }
+        self.entries.push(next);
+        Some((id, old_at.is_some()))
+    }
+
+    fn finish_reset(&mut self) -> ClosedHistoryChange {
+        self.entries.truncate(MAX_CLOSED_HISTORY);
+        let present: HashSet<_> = self
+            .entries
+            .iter()
+            .map(|entry| entry.entry.id.as_str())
+            .collect();
+        self.identity_ids_from_core
+            .retain(|id| present.contains(id.as_str()));
+        ClosedHistoryChange::Reset {
+            generation: self.generation,
+        }
+    }
+}
+
+/// Holds the trimmed census of a single subscription until its completion frame.
+#[cfg(any(target_os = "android", test))]
+pub(super) struct PendingConnectionSnapshot {
+    active: StatsAggregator,
+    closed: Vec<ClosedConnectionEntry>,
+}
+
+#[cfg(any(target_os = "android", test))]
+impl PendingConnectionSnapshot {
+    pub(super) fn new(active: &StatsAggregator) -> Self {
+        Self {
+            active: active.empty_connection_snapshot(),
+            closed: Vec::new(),
+        }
+    }
+
+    pub(super) fn append(
+        &mut self,
+        events: &SingBoxConnectionEvents,
+        active: &StatsAggregator,
+        history: Option<&ClosedHistory>,
+    ) -> bool {
+        if let Some(history) = history {
+            for entry in events
+                .events
+                .iter()
+                .filter_map(|event| history.closed_entry(event, active))
+            {
+                if self.closed.len() == MAX_CLOSED_HISTORY {
+                    return false;
+                }
+                self.closed.push(entry);
+            }
+        }
+        self.active.append_connection_snapshot(&events.events);
+        true
+    }
+
+    pub(super) fn commit(
+        self,
+        active: &mut StatsAggregator,
+        history: Option<&mut ClosedHistory>,
+    ) -> (Option<ClosedHistoryChange>, ConnectionsDetailChange) {
+        let closed_change = history.map(|history| {
+            for entry in self.closed {
+                if entry.closed_at > history.cutoff_ns {
+                    history.record_entry(entry);
+                }
+            }
+            history
+                .entries
+                .sort_by_key(|entry| std::cmp::Reverse(entry.closed_at));
+            history.finish_reset()
+        });
+        (
+            closed_change,
+            active.replace_connection_snapshot(self.active),
+        )
     }
 }

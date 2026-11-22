@@ -8,6 +8,34 @@ use super::*;
 use crate::runtime::proxy::ProxyStatus;
 use polaris_stats_engine::Topic;
 
+#[test]
+fn native_connection_frame_accepts_only_valid_snapshot_shapes() {
+    let empty = || SingBoxConnectionEvents {
+        reset: false,
+        events: Vec::new(),
+    };
+    assert!(matches!(
+        ConnectionFrame::from_native(0, empty()),
+        Some(ConnectionFrame::Events(_))
+    ));
+    assert!(ConnectionFrame::from_native(1, empty()).is_none());
+    let mut start = empty();
+    start.reset = true;
+    assert!(matches!(
+        ConnectionFrame::from_native(1, start),
+        Some(ConnectionFrame::SnapshotPart(_))
+    ));
+    assert!(matches!(
+        ConnectionFrame::from_native(2, empty()),
+        Some(ConnectionFrame::SnapshotComplete)
+    ));
+    assert!(matches!(
+        ConnectionFrame::from_native(3, empty()),
+        Some(ConnectionFrame::SnapshotTooLarge)
+    ));
+    assert!(ConnectionFrame::from_native(4, empty()).is_none());
+}
+
 #[tokio::test]
 async fn cancelled_native_handshake_drains_callback_before_next_generation() {
     static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());

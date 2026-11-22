@@ -1,5 +1,29 @@
 use super::*;
 
+#[test]
+fn completed_stats_snapshot_cannot_commit_after_core_claim() {
+    let (rt, _dir) = test_runtime();
+    let captured = rt.core_generation();
+    let table = std::sync::Mutex::new(Vec::new());
+    let reader = table.lock().unwrap();
+    std::thread::scope(|scope| {
+        let publication = scope.spawn(|| {
+            let mut table = table.lock().unwrap();
+            rt.with_idle_core_generation(captured, || table.push("old"))
+        });
+        let successor = rt
+            .claim_generation(Some(captured), LifecycleKind::Stop)
+            .unwrap();
+        drop(reader);
+        assert!(publication.join().unwrap().is_none());
+        assert_eq!(
+            rt.with_idle_core_generation(successor, || table.lock().unwrap().push("current")),
+            Some(())
+        );
+    });
+    assert_eq!(*table.lock().unwrap(), ["current"]);
+}
+
 #[tokio::test]
 async fn expected_stop_mismatch_does_not_claim_a_generation_or_stop_a_replacement() {
     let (rt, _dir) = test_runtime();

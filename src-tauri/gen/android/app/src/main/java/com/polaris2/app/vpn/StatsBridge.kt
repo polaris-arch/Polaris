@@ -50,13 +50,10 @@ import java.util.concurrent.locks.ReentrantLock
  * tauri 在 `tx.send(response).unwrap()` 上 panic（`tauri-2.11.5/src/plugin/mobile.rs:307`）。
  * Rust 侧因此绝不 `select!`/`timeout` racing 这些 future —— 但「请求可能白跑一趟」这件事仍要
  * 兜住（进程被杀、回执路径出错）。故 **drain 不破坏性**：帧只有在下一次请求带着更大的 `after`
- * 到达时才被裁掉。同一个 `after` 重放多少次，拿到的都是同一批帧。
+ * 到达时才被裁掉。重放同一个 `after` 会再次拿到尚未确认的帧。
  *
- * # 缓冲溢出 = 断流，不是丢帧
- *
- * 丢中间某几帧会静默毁掉两件事：CLOSED 事件丢了 ⇒ 已结束连接列表永远少几条；delta 丢了 ⇒
- * 逐连接累计字节从此偏低。两者都不报错、都看不出来。故溢出一律**整条流作废**（清空 + 标 closed），
- * Rust 收到 closed 就重订阅，而重订阅的首帧是 `reset=true` 全量表 —— 与桌面断流重连同一条语义。
+ * 连接流的单槽只在 Rust 确认上一帧后腾空。libbox 回调在编码前等待这个位置，
+ * 以免积压分片快照或丢掉 CLOSED 和流量 delta。状态流保留原缓冲，溢出时关闭流，由 Rust 重订阅。
  */
 internal object StatsBridge {
 
@@ -81,9 +78,10 @@ internal object StatsBridge {
      *
      * 通道由 Rust 侧 `CONNECTIONS_LIBBOX_COMMAND` 逐字对拍（契约门 A6）。
      */
-    val connectionsStream = object : CommandStream("connections") {
+    val connectionsStream = object : CommandStream("connections", singleFrame = true) {
         override fun subscribe(options: CommandClientOptions) {
             options.addCommand(Libbox.CommandConnections)
+            options.connectionEventFrames = true
         }
 
         override fun writeConnectionEvents(events: ConnectionEvents?) {
@@ -117,7 +115,10 @@ internal object StatsBridge {
  * 「订阅接上了、数据静默扔掉」—— 契约门 A7 正是守这件事（它按 [subscribe] 里的 `addCommand`
  * 推出该流必须实现哪个 `write*`，并要求那个方法体里出现 `enqueue(`）。
  */
-internal abstract class CommandStream(private val name: String) : CommandClientHandler {
+internal abstract class CommandStream(
+    private val name: String,
+    private val singleFrame: Boolean = false,
+) : CommandClientHandler {
 
     private val lock = ReentrantLock()
     private val ready = lock.newCondition()
@@ -246,15 +247,16 @@ internal abstract class CommandStream(private val name: String) : CommandClientH
     /**
      * 帧入缓冲。**已订通道的 `write*` 回调必须调到这里**（契约门 A7）。
      *
-     * 溢出即断流：见类文档「缓冲溢出 = 断流，不是丢帧」。
+     * 连接回调先在 [SubscriptionHandler] 等单槽腾空，同一把锁保护编码和入队。
      */
     protected fun enqueue(frame: JSObject) {
         lock.lock()
         try {
             if (closedReason != null) return
-            if (frames.size >= CAPACITY) {
+            val capacity = if (singleFrame) 1 else CAPACITY
+            if (frames.size >= capacity) {
                 frames.clear()
-                closedReason = "帧缓冲溢出（$CAPACITY 帧未被取走）"
+                closedReason = "帧缓冲溢出（$capacity 帧未被取走）"
                 Log.w(TAG, "[$name] $closedReason —— 整条流作废，等 Rust 重订阅")
             } else {
                 nextSeq += 1
@@ -270,7 +272,10 @@ internal abstract class CommandStream(private val name: String) : CommandClientH
         lock.lock()
         try {
             // 上一批已被确认收到 ⇒ 现在才裁掉。裁剪前的重放是安全的（见类文档）。
-            while (frames.isNotEmpty() && frames.peekFirst().first <= after) frames.removeFirst()
+            while (frames.isNotEmpty() && frames.getFirst().first <= after) {
+                frames.removeFirst()
+                if (singleFrame) ready.signalAll()
+            }
             var remaining = TimeUnit.MILLISECONDS.toNanos(MAX_WAIT_MS)
             while (frames.isEmpty() && closedReason == null && remaining > 0) {
                 remaining = ready.awaitNanos(remaining)
@@ -299,7 +304,10 @@ internal abstract class CommandStream(private val name: String) : CommandClientH
         if (expectedToken != null && client != null && clientToken !== expectedToken) return
         lock.lock()
         try {
-            if (expectedToken == null || subscriptionToken === expectedToken) subscriptionToken = null
+            if (expectedToken == null || subscriptionToken === expectedToken) {
+                subscriptionToken = null
+                ready.signalAll()
+            }
         } finally { lock.unlock() }
         val c = client ?: return
         client = null
@@ -311,16 +319,26 @@ internal abstract class CommandStream(private val name: String) : CommandClientH
     // stream lock through the callback's mutation (enqueue reenters this lock).
     // No thread-local token and no assumption that disconnect drained callbacks.
     private inner class SubscriptionHandler(private val token: Any) : CommandClientHandler by this@CommandStream {
-        private fun current(action: () -> Unit) {
+        private fun current(waitForCapacity: Boolean = false, action: () -> Unit) {
             lock.lock()
             try {
-                if (subscriptionToken === token && serviceReady && closedReason == null) action()
+                while (subscriptionToken === token && serviceReady && closedReason == null) {
+                    if (!waitForCapacity || frames.isEmpty()) {
+                        action()
+                        return
+                    }
+                    // Libbox's connection reader calls from its own goroutine.
+                    // Release the lock for ACK/close and recheck this token on wake.
+                    ready.awaitUninterruptibly()
+                }
             } finally { lock.unlock() }
         }
         override fun connected() = current { this@CommandStream.connected() }
         override fun disconnected(message: String?) = current { this@CommandStream.disconnected(message) }
         override fun writeStatus(message: StatusMessage) = current { this@CommandStream.writeStatus(message) }
-        override fun writeConnectionEvents(events: ConnectionEvents?) = current {
+        override fun writeConnectionEvents(events: ConnectionEvents?) = current(
+            waitForCapacity = singleFrame && events != null,
+        ) {
             this@CommandStream.writeConnectionEvents(events)
         }
     }
@@ -419,6 +437,7 @@ private fun encodeConnectionEvents(ev: ConnectionEvents): JSObject {
     return JSObject().apply {
         put("reset", ev.reset)
         put("events", arr)
+        put("snapshotState", ev.snapshotState)
     }
 }
 

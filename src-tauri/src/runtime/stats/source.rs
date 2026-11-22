@@ -185,9 +185,32 @@ pub(super) struct ConnectionsStream {
     #[cfg(not(target_os = "android"))]
     inner: ReconnectingStream<daemon::ConnectionEvents>,
     #[cfg(target_os = "android")]
-    inner: android::Pump<SingBoxConnectionEvents>,
+    inner: android::Pump<ConnectionFrame>,
     #[cfg(not(target_os = "android"))]
     api_borrow: Option<ApiRelayBorrow>,
+}
+
+pub(super) enum ConnectionFrame {
+    Events(SingBoxConnectionEvents),
+    #[cfg(any(target_os = "android", test))]
+    SnapshotPart(SingBoxConnectionEvents),
+    #[cfg(any(target_os = "android", test))]
+    SnapshotComplete,
+    #[cfg(any(target_os = "android", test))]
+    SnapshotTooLarge,
+}
+
+#[cfg(any(target_os = "android", test))]
+impl ConnectionFrame {
+    fn from_native(snapshot_state: i32, events: SingBoxConnectionEvents) -> Option<Self> {
+        match snapshot_state {
+            0 if !events.reset => Some(Self::Events(events)),
+            1 if events.reset || !events.events.is_empty() => Some(Self::SnapshotPart(events)),
+            2 if !events.reset && events.events.is_empty() => Some(Self::SnapshotComplete),
+            3 if !events.reset && events.events.is_empty() => Some(Self::SnapshotTooLarge),
+            _ => None,
+        }
+    }
 }
 
 /// Transport-only timing metadata, never compared across clock domains.
@@ -224,11 +247,13 @@ pub(super) struct StatusStream {
 
 impl ConnectionsStream {
     /// 下一帧；`None` = 流终止（桌面：`ReconnectingStream` 内部终止；Android：桥断/溢出）→ 重建。
-    pub(super) async fn recv(&mut self) -> Option<SingBoxConnectionEvents> {
+    pub(super) async fn recv(&mut self) -> Option<ConnectionFrame> {
         #[cfg(not(target_os = "android"))]
         {
             let ev = tokio::select! {_ = relay_cancelled(&self.api_borrow)=>None, v=self.inner.recv()=>v}?;
-            Some(super::relay::daemon_events_to_engine(&ev))
+            Some(ConnectionFrame::Events(
+                super::relay::daemon_events_to_engine(&ev),
+            ))
         }
         #[cfg(target_os = "android")]
         {
@@ -565,6 +590,7 @@ mod android {
     struct BridgeConnectionEvents {
         reset: bool,
         events: Vec<BridgeConnectionEvent>,
+        snapshot_state: i32,
     }
 
     /// libbox `ConnectionEvent`。`kind` 取 libbox 的 `ConnectionEventNew/Update/Closed`（0/1/2），
@@ -728,13 +754,13 @@ mod android {
         )
     }
 
-    pub(super) async fn open_connections() -> Option<Pump<SingBoxConnectionEvents>> {
+    pub(super) async fn open_connections() -> Option<Pump<super::ConnectionFrame>> {
         super::detached_open(&CONNECTION_STREAM_LOCK, open_connections_inner).await
     }
 
     async fn open_connections_inner(
         guard: MutexGuard<'static, ()>,
-    ) -> Option<Pump<SingBoxConnectionEvents>> {
+    ) -> Option<Pump<super::ConnectionFrame>> {
         let plugin = android_bridge::plugin()?;
         if let Err(e) = plugin
             .run_mobile_plugin_async::<()>("connectionsOpen", ())
@@ -762,7 +788,7 @@ mod android {
                 return None;
             }
         };
-        if first.closed {
+        if first.closed && first.frames.is_empty() {
             log::debug!(
                 "连接流：建流即作废（{}）—— 内核多半正在重启，退避一拍重试",
                 first.reason.as_deref().unwrap_or("无因由")
@@ -771,26 +797,48 @@ mod android {
             close_connections_stream(plugin).await;
             return None;
         }
-        let (tx, rx) = mpsc::channel(CHANNEL_DEPTH);
+        let (tx, rx) = mpsc::channel(1);
         let stop = Arc::new(AtomicBool::new(false));
         let task_stop = stop.clone();
         tauri::async_runtime::spawn(async move {
             let _stream_guard = guard;
-            let mut after = first.seq;
             let mut pump = PumpLog::new("连接流", &CONNECTIONS_EMPTY_STREAK);
-            pump.note(first.frames.len(), || describe_connections(&first.frames));
-            for frame in first.frames {
-                if tx.send(frame.into()).await.is_err() {
-                    close_connections_stream(plugin).await;
-                    return;
-                }
-            }
+            let mut batch = first;
             loop {
+                pump.note(batch.frames.len(), || describe_connections(&batch.frames));
+                pump.check_silence();
+                let after = batch.seq;
+                let mut frames = batch.frames.into_iter();
+                if let Some(frame) = frames.next() {
+                    let state = frame.snapshot_state;
+                    let Some(frame) = super::ConnectionFrame::from_native(state, frame.into())
+                    else {
+                        log::warn!("连接流：无效快照分片 {state}");
+                        break;
+                    };
+                    if frames.next().is_some() {
+                        log::warn!("连接流：桥回包含多个帧");
+                        break;
+                    }
+                    if tx.send(frame).await.is_err() {
+                        break;
+                    }
+                }
+                if batch.closed {
+                    if let Some(reason) = batch.reason {
+                        log::debug!("连接流：libbox 命令通道已作废（{reason}）");
+                    }
+                    break;
+                }
+                // ACK only after the previous frame has left the single-slot receiver.
+                let Ok(available) = tx.reserve().await else {
+                    break;
+                };
                 if task_stop.load(Ordering::SeqCst) {
                     break;
                 }
                 // 🔴 一路 await 到底：不 select、不 timeout（丢弃这个 future = tauri 侧 panic）。
-                let batch = match plugin
+                batch = match plugin
                     .run_mobile_plugin_async::<ConnectionsBatch>(
                         "connectionsPoll",
                         PollArgs { after },
@@ -803,22 +851,7 @@ mod android {
                         break;
                     }
                 };
-                after = batch.seq;
-                pump.note(batch.frames.len(), || describe_connections(&batch.frames));
-                pump.check_silence();
-                let mut disconnected = batch.closed;
-                for frame in batch.frames {
-                    if tx.send(frame.into()).await.is_err() {
-                        disconnected = true; // 消费方走了
-                        break;
-                    }
-                }
-                if disconnected {
-                    if let Some(reason) = batch.reason {
-                        log::debug!("连接流：libbox 命令通道已作废（{reason}）");
-                    }
-                    break;
-                }
+                drop(available);
             }
             pump.retire();
             // 收流。这一条同样一路 await 到底。
