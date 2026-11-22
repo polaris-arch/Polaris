@@ -99,6 +99,20 @@ fn connect_request_presents_the_loopback_credential_only_on_connect() {
             format!("{}{MEMBER_HEADER}\r\n", &expected[..expected.len() - 2]),
         );
     }
+    let ticketed = ConnectProbe::pool_background("节点-β")
+        .with_graph(Arc::from("fixture-graph"))
+        .with_ticket("fixture-ticket".into())
+        .unwrap();
+    let request = t.connect_request(Some(&user), &ticketed);
+    assert!(request.contains("X-Polaris-Probe-Ticket: fixture-ticket\r\n"));
+    assert!(request.contains("X-Polaris-Probe-Graph: fixture-graph\r\n"));
+    assert!(request.contains(MEMBER_HEADER));
+    assert!(!format!("{ticketed:?}").contains("fixture-ticket"));
+    for invalid in ["", "line\r\nInjected: 1", "two words"] {
+        assert!(ConnectProbe::pool_foreground("member")
+            .with_ticket(invalid.into())
+            .is_none());
+    }
     assert!(
         !t.get_request()
             .to_ascii_lowercase()

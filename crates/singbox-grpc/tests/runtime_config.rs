@@ -17,6 +17,7 @@ use tonic::{Code, Request, Response, Status};
 #[derive(Clone, Default)]
 struct Mock {
     code: Option<Code>,
+    pool_markers: Vec<&'static str>,
     preparation_delay: Duration,
     stall_apply: bool,
     stall_retry: bool,
@@ -51,6 +52,15 @@ fn identity() -> daemon::RuntimeIdentity {
     }
 }
 
+fn pool_request() -> daemon::AuthorizePoolProbeRequest {
+    daemon::AuthorizePoolProbeRequest {
+        graph: "fixture-graph".into(),
+        slot: 2,
+        member_tag: "candidate".into(),
+        connect_authority: "[2001:db8::1]:8443".into(),
+        background: true,
+    }
+}
 fn exit_ip_request() -> daemon::ProbeExitIpRequest {
     daemon::ProbeExitIpRequest {
         version: 1,
@@ -169,6 +179,31 @@ fn acknowledgement_request() -> daemon::RuntimePersistenceAcknowledgementRequest
 }
 #[tonic::async_trait]
 impl RuntimeConfigService for Mock {
+    async fn lookup_public_dns(
+        &self,
+        _: Request<daemon::LookupPublicDnsRequest>,
+    ) -> Result<Response<daemon::LookupPublicDnsResponse>, Status> {
+        Err(Status::unimplemented("public DNS lookup"))
+    }
+
+    async fn authorize_pool_probe(
+        &self,
+        request: Request<daemon::AuthorizePoolProbeRequest>,
+    ) -> Result<Response<daemon::AuthorizePoolProbeResponse>, Status> {
+        if let Err(mut status) = self.check(&request) {
+            for marker in &self.pool_markers {
+                status
+                    .metadata_mut()
+                    .append("x-polaris-pool-probe", marker.parse().unwrap());
+            }
+            return Err(status);
+        }
+        assert_eq!(request.into_inner(), pool_request());
+        Ok(Response::new(daemon::AuthorizePoolProbeResponse {
+            ticket: "fixture-ticket".into(),
+        }))
+    }
+
     async fn probe_exit_ip(
         &self,
         request: Request<daemon::ProbeExitIpRequest>,
@@ -201,6 +236,7 @@ impl RuntimeConfigService for Mock {
         Ok(Response::new(daemon::RuntimeCapabilities {
             contract_version: 1,
             connected_hot_enabled: true,
+            pool_probe_ticket_version: 1,
             active: Some(identity()),
             full_effective_schema_supported: false,
             control_revision: 7,
@@ -332,7 +368,7 @@ async fn start(mock: Mock, secret: &str) -> (SingBoxApiClient, Running) {
             .unwrap();
     });
     (
-        SingBoxApiClient::connect(Endpoint::new("127.0.0.1", port), secret)
+        SingBoxApiClient::connect_captured(Endpoint::new("127.0.0.1", port), secret)
             .await
             .unwrap(),
         Running(task),
@@ -400,6 +436,15 @@ async fn authenticated_round_trip_preserves_partial_support_and_operation_states
     let (client, _server) = start(mock, "secret").await;
     let capabilities = client.get_runtime_capabilities().await.unwrap();
     assert!(capabilities.connected_hot_enabled);
+    assert_eq!(capabilities.pool_probe_ticket_version, 1);
+    assert_eq!(
+        client
+            .authorize_pool_probe(pool_request())
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("fixture-ticket")
+    );
     assert!(!capabilities.full_effective_schema_supported);
     assert_eq!(capabilities.active, Some(identity()));
     let plan = client.plan_runtime_config(plan_request()).await.unwrap();
@@ -447,7 +492,7 @@ async fn authenticated_round_trip_preserves_partial_support_and_operation_states
     );
     assert_eq!(acknowledged.desired_state_digest, "desired-digest");
     assert_eq!(acknowledged.desired_state_revision, "desired-revision");
-    assert_eq!(calls.load(Ordering::SeqCst), 6);
+    assert_eq!(calls.load(Ordering::SeqCst), 7);
 }
 #[tokio::test]
 async fn unimplemented_is_unsupported_for_each_rpc() {
@@ -459,8 +504,37 @@ async fn unimplemented_is_unsupported_for_each_rpc() {
         "secret",
     )
     .await;
+    for (code, markers, fallback) in [
+        (Code::Unimplemented, vec!["legacy-member"], true),
+        (
+            Code::Unimplemented,
+            vec!["legacy-member", "legacy-member"],
+            false,
+        ),
+        (Code::Unimplemented, vec!["other"], false),
+        (Code::PermissionDenied, vec!["legacy-member"], false),
+    ] {
+        let (client, _peer) = start(
+            Mock {
+                code: Some(code),
+                pool_markers: markers,
+                ..Default::default()
+            },
+            "secret",
+        )
+        .await;
+        assert!(client.get_runtime_capabilities().await.is_err());
+        assert_eq!(
+            matches!(client.authorize_pool_probe(pool_request()).await, Ok(None)),
+            fallback
+        );
+    }
     assert!(matches!(
         client.get_runtime_capabilities().await,
+        Err(RuntimeConfigError::Unsupported(_))
+    ));
+    assert!(matches!(
+        client.authorize_pool_probe(pool_request()).await,
         Err(RuntimeConfigError::Unsupported(_))
     ));
     assert!(matches!(
@@ -509,6 +583,9 @@ async fn other_statuses_are_not_unsupported() {
             }
             other => panic!("wrong classification: {other:?}"),
         }
+        assert!(
+            matches!(client.authorize_pool_probe(pool_request()).await, Err(RuntimeConfigError::Call(ClientError::Status(status))) if status.code() == code)
+        );
         match client.retry_runtime_persistence(retry_request()).await {
             Err(RuntimeConfigError::Call(ClientError::Status(status))) => {
                 assert_eq!(status.code(), code)
@@ -526,6 +603,9 @@ async fn other_statuses_are_not_unsupported() {
         }
     }
     let (client, _server) = start(Mock::default(), "").await;
+    assert!(
+        matches!(client.authorize_pool_probe(pool_request()).await, Err(RuntimeConfigError::Call(ClientError::Status(status))) if status.code() == Code::FailedPrecondition)
+    );
     assert!(matches!(client.get_runtime_capabilities().await,
         Err(RuntimeConfigError::Call(ClientError::Status(status))) if status.code() == Code::Unauthenticated));
 }

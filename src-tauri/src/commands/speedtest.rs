@@ -85,7 +85,7 @@ use polaris_config_engine::user_config::LogLevel;
 use polaris_core_supervisor::PortExclusions;
 use polaris_helper_proto::Platform;
 use polaris_net_stack::subscription::server_fingerprint;
-use polaris_singbox_grpc::{daemon, SingBoxApiClient};
+use polaris_singbox_grpc::{daemon, RuntimeConfigError, SingBoxApiClient};
 
 use crate::events::channel::{
     EVENT_SPEED_TEST_DONE, EVENT_SPEED_TEST_PROGRESS, EVENT_SPEED_TEST_RESULT,
@@ -331,6 +331,7 @@ pub(crate) async fn read_pool_graph(
     Some((active, graph, can_select))
 }
 
+#[derive(Clone)]
 pub(crate) struct CapturedPoolGraph {
     pub(crate) client: SingBoxApiClient,
     pub(crate) graph: Arc<str>,
@@ -358,6 +359,102 @@ pub(crate) async fn capture_pool_graph(
             graph,
             can_select,
         })
+}
+
+/// Use the captured graph for legacy writes whenever the running Core supports it.
+async fn select_legacy_pool_slot(
+    scope: Option<&CapturedPoolGraph>,
+    proxy: &ProxyRuntime,
+    generation: u64,
+    slot: usize,
+    tag: &str,
+    ticket: Option<&ReadyMainTicket>,
+) -> bool {
+    if let Some(scope) = scope.filter(|scope| scope.can_select) {
+        return proxy
+            .probe_select_slot_on_graph(scope, generation, slot, tag)
+            .await;
+    }
+    match ticket {
+        Some(ticket) => proxy.probe_select_slot_bound(ticket, slot, tag).await,
+        None => proxy.probe_select_slot(generation, slot, tag).await,
+    }
+}
+
+/// The capability and CONNECT authority belong to this captured management channel and round.
+struct PoolProbeAccess<'a> {
+    scope: &'a CapturedPoolGraph,
+    authority: Option<String>,
+    background: bool,
+    version: Option<u32>,
+}
+
+enum SlotPreparation {
+    Ticket(ConnectProbe),
+    Legacy(ConnectProbe),
+    Unavailable,
+}
+
+impl SlotPreparation {
+    /// A timed-out legacy write may have reached Core, so it still owes a release.
+    async fn activate(
+        self,
+        current: impl FnOnce() -> bool,
+        select: impl Future<Output = bool>,
+    ) -> (Option<ConnectProbe>, bool) {
+        match self {
+            Self::Ticket(probe) => (Some(probe), false),
+            Self::Legacy(probe) if current() => (select.await.then_some(probe), true),
+            _ => (None, false),
+        }
+    }
+}
+
+impl<'a> PoolProbeAccess<'a> {
+    async fn new(scope: &'a CapturedPoolGraph, url: &str, background: bool) -> Self {
+        let version = match scope.client.get_runtime_capabilities().await {
+            Ok(caps) => Some(caps.pool_probe_ticket_version),
+            Err(RuntimeConfigError::Unsupported(_)) => Some(0),
+            Err(_) => None,
+        };
+        Self {
+            scope,
+            authority: SpeedTestTarget::parse(url).map(|target| target.authority()),
+            background,
+            version,
+        }
+    }
+
+    async fn prepare(&self, slot: usize, member: &str) -> SlotPreparation {
+        let (Some(authority), Ok(slot)) = (&self.authority, u32::try_from(slot)) else {
+            return SlotPreparation::Unavailable;
+        };
+        if !self.scope.client.captured_transport_live() {
+            return SlotPreparation::Unavailable;
+        }
+        let probe =
+            ConnectProbe::pool(member, self.background).with_graph(Arc::clone(&self.scope.graph));
+        match self.version {
+            Some(0) => SlotPreparation::Legacy(probe),
+            Some(1) => {
+                let request = daemon::AuthorizePoolProbeRequest {
+                    graph: self.scope.graph.to_string(),
+                    slot,
+                    member_tag: member.to_owned(),
+                    connect_authority: authority.clone(),
+                    background: self.background,
+                };
+                match self.scope.client.authorize_pool_probe(request).await {
+                    Ok(Some(ticket)) => probe
+                        .with_ticket(ticket)
+                        .map_or(SlotPreparation::Unavailable, SlotPreparation::Ticket),
+                    Ok(None) if self.scope.can_select => SlotPreparation::Legacy(probe),
+                    _ => SlotPreparation::Unavailable,
+                }
+            }
+            _ => SlotPreparation::Unavailable,
+        }
+    }
 }
 
 /// Producer-owned result. JSON is only a projection at the event/API boundary.
@@ -3263,12 +3360,11 @@ async fn run_pool_speed_test(
 
     // §15.11 让位（超代）基准：本轮归属的核世代。三检查点均以它比对（见 [`drive_pool_waves`]）。
     let gen0 = ticket.map_or_else(|| proxy.core_generation(), ReadyMainTicket::generation);
-    let graph = match prefilter.pool_graph {
-        Some(expected) => capture_pool_graph(proxy, gen0, expected)
-            .await
-            .map(|scope| scope.graph),
+    let scope = match prefilter.pool_graph {
+        Some(expected) => capture_pool_graph(proxy, gen0, expected).await,
         None => None,
     };
+    let graph = scope.as_ref().map(|scope| Arc::clone(&scope.graph));
     let invalid = Arc::new(AtomicBool::new(false));
     let superseded = || {
         graph
@@ -3319,9 +3415,10 @@ async fn run_pool_speed_test(
         &|| proxy.network_epoch(),
         |slot, tag: String| {
             let invalid = Arc::clone(&invalid);
+            let scope = scope.as_ref();
             async move {
                 if tag == DIRECT_TAG {
-                    return proxy.probe_select_slot(gen0, slot, &tag).await;
+                    return select_legacy_pool_slot(scope, proxy, gen0, slot, &tag, None).await;
                 }
                 bound_speed_io(
                     || async {
@@ -3331,21 +3428,13 @@ async fn run_pool_speed_test(
                         }
                     },
                     &invalid,
-                    || async {
-                        match ticket {
-                            Some(ticket) => proxy.probe_select_slot_bound(ticket, slot, &tag).await,
-                            None => proxy.probe_select_slot(gen0, slot, &tag).await,
-                        }
-                    },
+                    || select_legacy_pool_slot(scope, proxy, gen0, slot, &tag, ticket),
                 )
                 .await
                 .unwrap_or(false)
             }
         },
-        |slot, port, member| {
-            let probe = graph
-                .as_ref()
-                .map(|graph| ConnectProbe::pool_foreground(member).with_graph(Arc::clone(graph)));
+        |slot, port, probe| {
             let url = url.to_string();
             // `probe-in-k` 的凭据与池端口同源同刻（`SpeedProbeTargets::auth`；桌面 `None`）。
             let auth = targets.auth.clone();
@@ -3354,13 +3443,6 @@ async fn run_pool_speed_test(
             let invalid = Arc::clone(&invalid);
             let readback = readback.clone();
             async move {
-                let Some(probe) = probe else {
-                    return Err(MeasureFailure::new(
-                        FailPhase::Connect,
-                        FailKind::BindingMismatch,
-                    ))
-                    .into();
-                };
                 bound_speed_io(
                     || async {
                         match ticket.as_ref() {
@@ -3379,6 +3461,7 @@ async fn run_pool_speed_test(
         targets.pool_ports.as_slice(),
         &mut trace,
         readback,
+        scope.as_ref().map(|scope| (scope, url, false)),
     )
     .await;
     let outcome = trace.outcome(reason);
@@ -3490,9 +3573,10 @@ pub(crate) async fn probe_runtime_candidates(
         &waves,
         &superseded,
         guard.cancel(),
-        |slot, tag: String| async move { proxy.probe_select_slot(gen0, slot, &tag).await },
-        |slot, port, member| {
-            let probe = ConnectProbe::pool_background(member).with_graph(Arc::clone(graph));
+        |slot, tag: String| async move {
+            select_legacy_pool_slot(Some(scope), proxy, gen0, slot, &tag, None).await
+        },
+        |slot, port, probe| {
             let url = url.to_string();
             // `probe-in-k` 的凭据与池端口同源同刻（`SpeedProbeTargets::auth`；桌面 `None`）。
             let auth = targets.auth.clone();
@@ -3502,7 +3586,7 @@ pub(crate) async fn probe_runtime_candidates(
         &mut sink,
         targets.pool_ports.as_slice(),
         &readback,
-        true,
+        Some((scope, url, true)),
     )
     .await
 }
@@ -3519,14 +3603,15 @@ async fn drive_runtime_probe<Sel, SelFut, Meas, MeasFut>(
     emit: &mut dyn MeasurementEvents,
     pool_ports: &[u16],
     readback: &Readback,
-    graph_required: bool,
+    source: Option<(&CapturedPoolGraph, &str, bool)>,
 ) -> RuntimeProbeBatch
 where
     Sel: Fn(usize, String) -> SelFut,
     SelFut: Future<Output = bool>,
-    Meas: Fn(usize, u16, &str) -> MeasFut,
+    Meas: Fn(usize, u16, ConnectProbe) -> MeasFut,
     MeasFut: Future<Output = Probed> + Send + 'static,
 {
+    let graph_required = source.is_some();
     let mut trace = WaveTrace {
         graph_required,
         ..WaveTrace::default()
@@ -3544,6 +3629,7 @@ where
         pool_ports,
         &mut trace,
         readback,
+        source,
     )
     .await;
     if reason.is_some() {
@@ -3730,9 +3816,9 @@ pub(crate) async fn drive_scheduled_round<Sel, SelFut, Meas, MeasFut>(
     out: &mut (dyn FnMut(&str, Value) + Send),
 ) -> ScheduledRound
 where
-    Sel: Fn(usize, String) -> SelFut,
+    Sel: Fn(usize, String, Option<CapturedPoolGraph>) -> SelFut,
     SelFut: Future<Output = bool>,
-    Meas: Fn(usize, u16, &str, Option<Arc<str>>) -> MeasFut,
+    Meas: Fn(usize, u16, ConnectProbe) -> MeasFut,
     MeasFut: Future<Output = Probed> + Send + 'static,
 {
     let Some(guard) = deps.gate.acquire(SpeedTestOrigin::Schedule).await else {
@@ -3810,14 +3896,13 @@ where
         return ScheduledRound::Ran(report);
     }
     let graph_required = deps.pool_runtime.is_some();
-    let graph = match deps.pool_runtime {
+    let scope = match deps.pool_runtime {
         Some((proxy, generation, Some(expected))) => {
-            capture_pool_graph(proxy, generation, expected)
-                .await
-                .map(|scope| scope.graph)
+            capture_pool_graph(proxy, generation, expected).await
         }
         _ => None,
     };
+    let graph = scope.as_ref().map(|scope| Arc::clone(&scope.graph));
     let graph_unavailable = || {
         deps.pool_runtime.is_some_and(|(proxy, generation, _)| {
             graph
@@ -3897,12 +3982,13 @@ where
             },
             guard.cancel(),
             network_epoch,
-            select_slot,
-            |slot, port, member| measure(slot, port, member, graph.clone()),
+            |slot, tag| select_slot(slot, tag, scope.clone()),
+            measure,
             &mut gated,
             input.pool_ports,
             &mut trace,
             &readback,
+            scope.as_ref().map(|scope| (scope, input.url, true)),
         )
         .await
     };
@@ -4032,27 +4118,25 @@ pub(crate) async fn run_scheduled_round(
         &deps,
         &superseded,
         &|| proxy.network_epoch(),
-        |slot, tag: String| {
+        |slot, tag, scope| {
             let proxy = Arc::clone(&proxy);
-            async move { proxy.probe_select_slot(gen0, slot, &tag).await }
+            async move { select_legacy_pool_slot(scope.as_ref(), &proxy, gen0, slot, &tag, None).await }
         },
-        |slot, port, member, graph| {
+        |slot, port, connect_probe| {
             let url = url.clone();
             // `probe-in-k` 的凭据与池端口同源同刻（`SpeedProbeTargets::auth`；桌面 `None`）。
             let auth = probe.auth.clone();
             let readback = round_readback.get().cloned();
-            let mut probe = ConnectProbe::pool_background(member);
-            if let Some(graph) = graph {
-                probe = probe.with_graph(graph);
-            }
             async move {
                 match readback {
                     Some(readback) => {
-                        measure_slot(&readback, slot, port, auth.as_ref(), &url, probe).await
+                        measure_slot(&readback, slot, port, auth.as_ref(), &url, connect_probe)
+                            .await
                     }
                     // 测量只在准入之后发起，那时读回已开；取不到就照测，读回落成未验证。
                     None => {
-                        measure_via_local_proxy(port, auth.as_ref(), &url, probe, &|_| {}).await
+                        measure_via_local_proxy(port, auth.as_ref(), &url, connect_probe, &|_| {})
+                            .await
                     }
                 }
             }
@@ -4130,7 +4214,7 @@ async fn drive_pool_waves<Sel, SelFut, Meas, MeasFut>(
 where
     Sel: Fn(usize, String) -> SelFut,
     SelFut: Future<Output = bool>,
-    Meas: Fn(usize, u16, &str) -> MeasFut,
+    Meas: Fn(usize, u16, ConnectProbe) -> MeasFut,
     MeasFut: Future<Output = Probed> + Send + 'static,
 {
     let mut trace = WaveTrace::default();
@@ -4146,6 +4230,7 @@ where
         pool_ports,
         &mut trace,
         readback,
+        None,
     )
     .await;
     (results, trace.outcome(reason))
@@ -4188,16 +4273,21 @@ async fn drive_pool_waves_traced<Sel, SelFut, Meas, MeasFut>(
     pool_ports: &[u16],
     trace: &mut WaveTrace,
     readback: &Readback,
+    source: Option<(&CapturedPoolGraph, &str, bool)>,
 ) -> (RoundResults, Option<InterruptReason>)
 where
     Sel: Fn(usize, String) -> SelFut,
     SelFut: Future<Output = bool>,
-    Meas: Fn(usize, u16, &str) -> MeasFut,
+    Meas: Fn(usize, u16, ConnectProbe) -> MeasFut,
     MeasFut: Future<Output = Probed> + Send + 'static,
 {
     // 本腿「已裁定要测」的集合 = 分波后的全部槽位节点（`plan_waves` 就是按可测集分的波，
     // 故这里恒等于波前预筛后的 `pool_testable`，无第二真值源）。
     let intended: Vec<String> = waves.iter().flatten().map(|a| a.node_id.clone()).collect();
+    let access = match source {
+        Some((scope, url, background)) => Some(PoolProbeAccess::new(scope, url, background).await),
+        None => None,
+    };
     let (results, reason) = drive_pool_waves_inner(
         waves,
         total,
@@ -4211,6 +4301,7 @@ where
         LOCAL_SIDE_HALVING,
         trace,
         readback,
+        access.as_ref(),
     )
     .await;
     // 终态发出之前，读回用的连接事件流已经关闭。
@@ -4243,11 +4334,12 @@ async fn drive_pool_waves_inner<Sel, SelFut, Meas, MeasFut>(
     local_side_halving: bool,
     trace: &mut WaveTrace,
     readback: &Readback,
+    access: Option<&PoolProbeAccess<'_>>,
 ) -> (RoundResults, Option<InterruptReason>)
 where
     Sel: Fn(usize, String) -> SelFut,
     SelFut: Future<Output = bool>,
-    Meas: Fn(usize, u16, &str) -> MeasFut,
+    Meas: Fn(usize, u16, ConnectProbe) -> MeasFut,
     MeasFut: Future<Output = Probed> + Send + 'static,
 {
     let mut results = RoundResults::new();
@@ -4279,15 +4371,24 @@ where
         }
 
         // 1. 波内各槽热切 probe-selector-k → 本波节点（gRPC select_outbound，live 生效）。逐槽记成败：
-        //    热切失败（核未就绪 / stale tag）→ 该槽本波不测，节点记 -1（真实不可测，非伪造缺席）。
-        //
-        //    **并行**（对齐 上游 `SpeedTestService.ts:718-727` 的 `Promise.all(wave.map(...))`）：
-        //    每次热切 = 新建一条 lazy gRPC channel + 一次 select_outbound 往返，串行时这 K 次往返
-        //    全摊在每一波的关键路径上。`join_all` **保序** ⇒ `selected[i]` 仍与 `wave[i]` 逐位对应。
-        //    各槽热切的是**互不相同**的 `probe-selector-k`，本层无共享可变状态。
-        let selected: Vec<bool> =
-            futures::future::join_all(wave.iter().map(|a| select_slot(a.slot, a.tag.clone())))
-                .await;
+        // Ticket-backed CONNECTs never mutate the selector. Only a legacy write can require release,
+        // including a legacy write whose reply was lost.
+        let mut selected = futures::future::join_all(wave.iter().map(|a| async {
+            let preparation = match access {
+                Some(access) => access.prepare(a.slot, &a.tag).await,
+                None if !trace.graph_required => {
+                    SlotPreparation::Legacy(ConnectProbe::pool(&a.tag, false))
+                }
+                None => SlotPreparation::Unavailable,
+            };
+            preparation
+                .activate(
+                    || access.is_none() || interrupted(cancel, superseded).is_none(),
+                    async { select_slot(a.slot, a.tag.clone()).await },
+                )
+                .await
+        }))
+        .await;
 
         // ── 让位②（热切后）：热切期间跃迁 ⇒ 本波 select 结果作废，不得把超代的热切失败记成真实 -1 ──
         // 取消后先等在飞的热切结束，再归还槽；每次 RPC 自带 deadline。
@@ -4297,8 +4398,8 @@ where
         //    这次 select 失败是 stale tag / 节点不可用，不是超代所致）。对齐 上游 `:739-744`。
         let mut set = tokio::task::JoinSet::new();
         if reason.is_none() {
-            for (a, selected) in wave.iter().zip(selected) {
-                if !selected {
+            for (a, (probe, _)) in wave.iter().zip(&mut selected) {
+                let Some(probe) = probe.take() else {
                     // A graph-bound result needs a receipt from the same CONNECT.
                     if trace.graph_required {
                         trace.mismatch_skipped.insert(a.node_id.clone());
@@ -4317,11 +4418,11 @@ where
                         Some(&readback.bind(RoutePolicy::SlotPin, Some(&a.tag), None)),
                     );
                     continue;
-                }
+                };
                 // 3. 波内并发量 warm-TTFB，每个节点测完就回填。
                 let port = pool_ports[a.slot]; // slot < k = pool_ports.len()（plan_waves 保证）
                 let assignment = a.clone();
-                let fut = measure(a.slot, port, &a.tag);
+                let fut = measure(a.slot, port, probe);
                 // 起测那一刻的网络代次：测完再取一次，两刻不同即这个值跨了一次网络变化。
                 let epoch0 = network_epoch();
                 let readback = readback.clone();
@@ -4422,7 +4523,9 @@ where
         // 单飞租约跨过此处，下一波或下一轮要等归还完成才能开始。
         futures::future::join_all(
             wave.iter()
-                .map(|a| select_slot(a.slot, DIRECT_TAG.to_owned())),
+                .zip(&selected)
+                .filter(|(_, (_, legacy_attempted))| *legacy_attempted)
+                .map(|(a, _)| select_slot(a.slot, DIRECT_TAG.to_owned())),
         )
         .await;
         if let Some(reason) = reason.or_else(|| cancel.reason()) {

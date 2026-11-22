@@ -167,6 +167,30 @@ struct ReadyApiFixture {
 }
 #[polaris_singbox_grpc::tonic::async_trait]
 impl daemon::runtime_config_service_server::RuntimeConfigService for ReadyApiFixture {
+    async fn lookup_public_dns(
+        &self,
+        _: polaris_singbox_grpc::tonic::Request<daemon::LookupPublicDnsRequest>,
+    ) -> Result<
+        polaris_singbox_grpc::tonic::Response<daemon::LookupPublicDnsResponse>,
+        polaris_singbox_grpc::tonic::Status,
+    > {
+        Err(polaris_singbox_grpc::tonic::Status::unimplemented(
+            "public DNS lookup",
+        ))
+    }
+
+    async fn authorize_pool_probe(
+        &self,
+        _: polaris_singbox_grpc::tonic::Request<daemon::AuthorizePoolProbeRequest>,
+    ) -> Result<
+        polaris_singbox_grpc::tonic::Response<daemon::AuthorizePoolProbeResponse>,
+        polaris_singbox_grpc::tonic::Status,
+    > {
+        Err(polaris_singbox_grpc::tonic::Status::unimplemented(
+            "pool probe ticket",
+        ))
+    }
+
     async fn probe_exit_ip(
         &self,
         _: polaris_singbox_grpc::tonic::Request<daemon::ProbeExitIpRequest>,

@@ -2177,6 +2177,26 @@ impl ProxyRuntime {
         }
     }
 
+    pub(crate) async fn probe_select_slot_on_graph(
+        &self,
+        scope: &crate::commands::speedtest::CapturedPoolGraph,
+        generation: u64,
+        slot: usize,
+        member_tag: &str,
+    ) -> bool {
+        self.core_generation() == generation
+            && scope.client.captured_transport_live()
+            && scope
+                .client
+                .select_outbound_on_probe_graph(
+                    &format!("probe-selector-{slot}"),
+                    member_tag,
+                    &scope.graph,
+                )
+                .await
+                .unwrap_or(false)
+    }
+
     /// Select a node or release the probe slot to `direct` on the round's Core.
     pub async fn probe_select_slot(&self, generation: u64, slot: usize, member_tag: &str) -> bool {
         let status = self.status();

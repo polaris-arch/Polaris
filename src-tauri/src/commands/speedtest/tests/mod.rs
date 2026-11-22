@@ -18,7 +18,7 @@ type TestMeasurement<Fut, Out> = futures::future::Map<Fut, fn(Out) -> Probed>;
 
 /// 测试里的测量闭包多数只关心池端口、只给出测量结果：这里把它接成驱动函数要的形状
 /// （槽号、池端口、所选成员 → 带源端口的结果）。
-fn plain<F, Fut, Out>(f: F) -> impl Fn(usize, u16, &str) -> TestMeasurement<Fut, Out>
+fn plain<F, Fut, Out>(f: F) -> impl Fn(usize, u16, ConnectProbe) -> TestMeasurement<Fut, Out>
 where
     F: Fn(u16) -> Fut,
     Fut: Future<Output = Out>,
@@ -123,10 +123,11 @@ fn pool_selector_uses_ticket_transport_when_measuring_a_bound_node() {
         &crate_code("commands/speedtest.rs"),
         "async fn run_pool_speed_test(",
     );
-    assert!(
-        body.contains("Some(ticket) => proxy.probe_select_slot_bound(ticket, slot, &tag).await")
-    );
-    assert!(body.contains("None => proxy.probe_select_slot(gen0, slot, &tag).await"));
+    assert!(body.contains("select_legacy_pool_slot(scope, proxy, gen0, slot, &tag, ticket)"));
+    let legacy = compact_production_fn("async fn select_legacy_pool_slot(");
+    assert!(legacy.contains("Some(ticket)=>proxy.probe_select_slot_bound(ticket,slot,tag).await"));
+    assert!(legacy.contains("None=>proxy.probe_select_slot(generation,slot,tag).await"));
+    assert!(legacy.contains(".probe_select_slot_on_graph(scope,generation,slot,tag)"));
     assert!(body.contains("proxy.validate_ready_main(ticket).await.is_ok()"));
     assert!(body.contains("bound_speed_io("));
     let bound = crate::commands::guard_scan::impl_method_body(
@@ -1202,6 +1203,35 @@ async fn drive_waves_interrupts_at_wave_head() {
     assert_eq!(outcome, "interrupted");
     assert!(results.is_empty(), "超代下未测节点必须缺席，绝不写假 -1");
     assert_eq!(calls.into_inner(), 0, "未开始的波不会操作任何槽");
+}
+
+#[tokio::test]
+async fn only_attempted_legacy_selects_need_a_release() {
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    let probe = || ConnectProbe::pool_background("member");
+    for (entry, current, acknowledged, measured, release) in [
+        (
+            SlotPreparation::Ticket(probe().with_ticket("fixture".into()).unwrap()),
+            true,
+            false,
+            true,
+            false,
+        ),
+        (SlotPreparation::Unavailable, true, true, false, false),
+        (SlotPreparation::Legacy(probe()), false, true, false, false),
+        (SlotPreparation::Legacy(probe()), true, false, false, true),
+        (SlotPreparation::Legacy(probe()), true, true, true, true),
+    ] {
+        let before = calls.load(Ordering::Relaxed);
+        let (probe, legacy_attempted) = entry
+            .activate(|| current, async {
+                calls.fetch_add(1, Ordering::Relaxed);
+                acknowledged
+            })
+            .await;
+        assert_eq!((probe.is_some(), legacy_attempted), (measured, release));
+        assert_eq!(calls.load(Ordering::Relaxed) - before, usize::from(release));
+    }
 }
 
 /// 让位②（热切后）：第 2 次调用超代（= 第一波热切完那一刻）→ 本波作废。
@@ -4070,7 +4100,8 @@ fn production_entries_wire_origin_instance_cancel_and_terminal() {
     assert!(failover.contains("origin:SpeedTestOrigin::Failover,"));
     assert!(failover.contains("drive_runtime_probe(candidates,&waves,&superseded,guard.cancel(),"));
     assert!(failover.contains("letmutsink=events.sink(|_,_|{});"));
-    assert!(failover.contains("&mutsink,targets.pool_ports.as_slice(),&readback,true,)"));
+    assert!(failover
+        .contains("&mutsink,targets.pool_ports.as_slice(),&readback,Some((scope,url,true)),)"));
     assert_eq!(occurrences(&failover, "app.emit("), 0);
 
     // 整份生产源码：取消句柄只在准入处新建一次，终态事件只有命令入口那一处直接发。
@@ -4181,8 +4212,8 @@ impl ScheduleBench<'_> {
             },
             &|| self.superseded,
             &|| None,
-            select,
-            |slot, port, member, _| measure(slot, port, member),
+            |slot, tag, _| select(slot, tag),
+            measure,
             &mut |event, payload| collected.push((event.to_string(), payload)),
         )
         .await
@@ -4460,8 +4491,8 @@ async fn a_gap_between_results_over_the_threshold_discards_the_rest_as_frozen() 
             },
             &superseded_at(0),
             &|| None,
-            |_, _| async { true },
-            |slot, port, member, _| {
+            |_, _, _| async { true },
+            |slot, port, member| {
                 plain(|_| {
                     // 第一个节点耗时 14 秒出值；第二个 16 秒后才回来，而且是超时（解冻后的典型表现）。
                     let (elapsed, measured) = match step.fetch_add(1, Ordering::SeqCst) {
@@ -4657,6 +4688,7 @@ async fn waves_with_one_local_refusal(
         local_side_halving,
         &mut trace,
         &Readback::off(),
+        None,
     )
     .await;
     assert_eq!(reason, None);
@@ -4722,6 +4754,7 @@ async fn engine_pressure_retries_at_lower_width_and_preserves_unmeasured_results
             &[10_000, 10_001],
             &mut trace,
             &Readback::off(),
+            None,
         )
         .await;
         assert_eq!(reason, None);
@@ -4806,6 +4839,7 @@ async fn halving_stops_at_the_floor_and_a_node_is_requeued_once() {
             true,
             &mut trace,
             &Readback::off(),
+            None,
         )
         .await;
         let widest = widest.into_inner().unwrap();
@@ -6494,7 +6528,8 @@ fn speed_test_modules_only_repoint_probe_slots() {
         ] {
             assert_eq!(occurrences(&code, banned), 0, "{path} 不得出现 {banned}");
         }
-        slot_calls += occurrences(&code, "probe_select_slot(")
+        slot_calls += occurrences(&code, "probe_select_slot_on_graph(")
+            + occurrences(&code, "probe_select_slot(")
             + occurrences(&code, "probe_select_slot_bound(");
     }
     assert!(
@@ -6575,8 +6610,8 @@ fn production_entries_wire_the_readback() {
     assert!(zero < opened, "零可测时不建读回流");
     assert_eq!(occurrences(&pool, "open_readback()"), 1);
     assert!(pool.contains(".with_readback(readback);"));
-    assert!(pool.contains("targets.pool_ports.as_slice(),&muttrace,readback,)"));
-    assert!(pool.contains("ConnectProbe::pool_foreground(member).with_graph("));
+    assert!(pool.contains("targets.pool_ports.as_slice(),&muttrace,readback,scope.as_ref().map(|scope|(scope,url,false)),"));
+
     assert!(pool.contains("measure_slot(&readback,slot,port,auth.as_ref(),&url,probe)"));
     assert!(manual.contains(".with_readback(&readback);"));
     assert!(manual.contains(
@@ -6615,10 +6650,6 @@ fn production_entries_wire_the_readback() {
     ));
 
     for (name, body) in [("后台探测", &failover), ("周期一轮", &scheduled)] {
-        assert!(
-            body.contains("ConnectProbe::pool_background(member)"),
-            "{name}"
-        );
         assert_eq!(
             occurrences(
                 body,
@@ -6631,7 +6662,11 @@ fn production_entries_wire_the_readback() {
         assert_eq!(
             occurrences(
                 body,
-                "measure_slot(&readback,slot,port,auth.as_ref(),&url,probe).await"
+                if name == "周期一轮" {
+                    "measure_slot(&readback,slot,port,auth.as_ref(),&url,connect_probe).await"
+                } else {
+                    "measure_slot(&readback,slot,port,auth.as_ref(),&url,probe).await"
+                }
             ),
             1,
             "{name}"
@@ -6642,6 +6677,8 @@ fn production_entries_wire_the_readback() {
     assert!(core.contains("candidate_probes(candidates,&raw,&trace.mismatch_skipped)"));
     // 周期一轮的编排核：没拿到闸、零可测、领不到运行号的三处早退都在开流之前。
     let round = compact_production_fn("pub(crate) async fn drive_scheduled_round<");
+    assert!(round.contains("scope.as_ref().map(|scope|(scope,input.url,true))"));
+    assert!(failover.contains("Some((scope,url,true))"));
     let opened = round
         .find("letreadback=(deps.open_readback)();")
         .expect("编排核自己开流");
@@ -6735,7 +6772,7 @@ async fn runtime_probe(
         &mut sink,
         &[10000, 10001],
         readback,
-        false,
+        None,
     )
     .await;
     match batch {
@@ -7018,8 +7055,7 @@ async fn the_readback_wait_stays_outside_the_value_measured_by_the_production_pa
             &SpeedTestCancel::default(),
             &|| None,
             |_, _| async { true },
-            |slot, port, member| {
-                let probe = ConnectProbe::pool_foreground(member);
+            |slot, port, probe| {
                 let readback = readback.clone();
                 async move {
                     measure_slot(&readback, slot, port, None, DEFAULT_SPEED_TEST_URL, probe).await
@@ -7185,8 +7221,7 @@ async fn a_failed_tunnel_still_withdraws_its_registration() {
         &SpeedTestCancel::default(),
         &|| None,
         |_, _| async { true },
-        |slot, port, member| {
-            let probe = ConnectProbe::pool_foreground(member);
+        |slot, port, probe| {
             let readback = readback.clone();
             let witness = kernel.witness.clone();
             let seen = Arc::clone(&registered_mid_flight);

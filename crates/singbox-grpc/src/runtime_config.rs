@@ -68,6 +68,42 @@ impl SingBoxApiClient {
             .into_inner())
     }
 
+    /// None is the authenticated server's explicit permission to use graph-bound legacy selection.
+    pub async fn authorize_pool_probe(
+        &self,
+        request: daemon::AuthorizePoolProbeRequest,
+    ) -> Result<Option<String>, RuntimeConfigError> {
+        if self.authorization.is_none() || !self.captured_transport_live() {
+            return Err(ClientError::Status(tonic::Status::failed_precondition(
+                "pool ticket requires an authenticated captured management channel",
+            ))
+            .into());
+        }
+        let mut client = self.runtime_config_client();
+        match self
+            .unary(
+                client.authorize_pool_probe(self.runtime_config_request(request, UNARY_DEADLINE)),
+            )
+            .await
+        {
+            Ok(response) => Ok(Some(response.into_inner().ticket)),
+            Err(ClientError::Status(status)) if status.code() == tonic::Code::Unimplemented => {
+                let markers = status.metadata().get_all("x-polaris-pool-probe");
+                let mut markers = markers.iter();
+                if markers
+                    .next()
+                    .is_some_and(|marker| marker == "legacy-member")
+                    && markers.next().is_none()
+                {
+                    Ok(None)
+                } else {
+                    Err(RuntimeConfigError::Unsupported(status))
+                }
+            }
+            Err(error) => Err(classify(error)),
+        }
+    }
+
     pub async fn probe_exit_ip(
         &self,
         request: daemon::ProbeExitIpRequest,

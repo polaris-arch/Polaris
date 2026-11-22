@@ -105,23 +105,27 @@ pub(crate) enum ConnectProbe {
         member: String,
         background: bool,
         graph: Option<(Arc<str>, Arc<AtomicBool>)>,
+        ticket: Option<reqwest::header::HeaderValue>,
     },
 }
 
 impl ConnectProbe {
+    #[cfg(test)]
     pub(crate) fn pool_foreground(member: &str) -> Self {
         Self::pool(member, false)
     }
 
+    #[cfg(test)]
     pub(crate) fn pool_background(member: &str) -> Self {
         Self::pool(member, true)
     }
 
-    fn pool(member: &str, background: bool) -> Self {
+    pub(crate) fn pool(member: &str, background: bool) -> Self {
         Self::Pool {
             member: polaris_updater::sha256_hex(member.as_bytes()),
             background,
             graph: None,
+            ticket: None,
         }
     }
 
@@ -130,6 +134,25 @@ impl ConnectProbe {
             *graph = Some((expected, Arc::new(AtomicBool::new(false))));
         }
         self
+    }
+
+    pub(crate) fn with_ticket(mut self, value: String) -> Option<Self> {
+        if value.is_empty()
+            || value.len() > 768
+            || !value
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+        {
+            return None;
+        }
+        let mut header = reqwest::header::HeaderValue::from_str(&value).ok()?;
+        header.set_sensitive(true);
+        if let Self::Pool { ticket, .. } = &mut self {
+            *ticket = Some(header);
+        } else {
+            return None;
+        }
+        Some(self)
     }
 
     pub(crate) fn graph_receipt(&self) -> Option<Arc<AtomicBool>> {
@@ -203,7 +226,7 @@ impl SpeedTestTarget {
     /// 两条理由，缺一不可：① RFC 9110 §9.3.6 的 authority-form **要求**带端口，省了是协议违例；
     /// ② 上游 注释点名的那条 —— 省略端口后，「非标端口」与「标准端口」的拼接形态不再自洽，
     /// 一个 `host:8443` 目标会被误拼成 `host`（连到 443）。
-    fn authority(&self) -> String {
+    pub(crate) fn authority(&self) -> String {
         format!("{}:{}", self.host, self.port)
     }
 
@@ -223,9 +246,22 @@ impl SpeedTestTarget {
             _ => "X-Polaris-Probe: 1\r\n",
         };
         let mut request = format!("CONNECT {a} HTTP/1.1\r\nHost: {a}\r\n{mode}{proxy_auth}");
-        if let ConnectProbe::Pool { member, graph, .. } = probe {
+        if let ConnectProbe::Pool {
+            member,
+            graph,
+            ticket,
+            ..
+        } = probe
+        {
             use std::fmt::Write as _;
             let _ = write!(request, "X-Polaris-Probe-Member: {member}\r\n");
+            if let Some(ticket) = ticket {
+                let _ = write!(
+                    request,
+                    "X-Polaris-Probe-Ticket: {}\r\n",
+                    ticket.to_str().expect("validated ASCII ticket")
+                );
+            }
             if let Some((expected, _)) = graph {
                 let _ = write!(request, "X-Polaris-Probe-Graph: {expected}\r\n");
             }
