@@ -3823,6 +3823,26 @@ impl ProxyRuntime {
             .await;
         let rpc_finished_at = Instant::now();
         let transaction_id = pending.plan.transaction_id.clone();
+        // Core returns fixed error codes/messages here; RPC errors carry no node config.
+        let core_outcome = match &result {
+            Ok(operation) => format!(
+                "state={:?} errors={:?}",
+                daemon::RuntimeOperationState::try_from(operation.state),
+                operation
+                    .errors
+                    .iter()
+                    .map(|error| (&error.code, &error.message))
+                    .collect::<Vec<_>>()
+            ),
+            Err(error) => format!("rpcError={error}"),
+        };
+        let in_progress = result.as_ref().is_ok_and(|operation| {
+            matches!(
+                daemon::RuntimeOperationState::try_from(operation.state),
+                Ok(daemon::RuntimeOperationState::Preparing
+                    | daemon::RuntimeOperationState::AbortingUnapplied)
+            )
+        });
         let mut result = match result {
             Ok(operation) => {
                 match self
@@ -3840,12 +3860,42 @@ impl ProxyRuntime {
             }
             Err(_) => Box::pin(self.reconcile_runtime_operation(&client, pending)).await,
         };
-        log::debug!(
-            "runtime config apply timing: rpc_ms={} settle_ms={} status={}",
+        log::info!(
+            "runtime config apply settled: status={} reasons={:?} core={core_outcome} rpc_ms={} settle_ms={}",
+            result.status,
+            result.reasons,
             (rpc_finished_at - apply_started_at).as_millis(),
             rpc_finished_at.elapsed().as_millis(),
-            result.status
         );
+        if in_progress && result.status == "unconfirmed" {
+            // Core still owns this transaction and has no completion callback.
+            // Re-read only its original receipt; ABORTED_UNAPPLIED releases
+            // pending so the next edit can plan. The task ends with the
+            // generation, a settled status or the bounded deadline.
+            let me = Arc::clone(self);
+            let transaction_id = transaction_id.clone();
+            tokio::spawn(async move {
+                let deadline = Instant::now() + Duration::from_secs(60);
+                let mut delay = Duration::from_secs(1);
+                loop {
+                    tokio::time::sleep(delay).await;
+                    if me.gate.generation() != generation {
+                        return;
+                    }
+                    let status = me.runtime_apply_status(transaction_id.clone()).await.status;
+                    if status != "unconfirmed" {
+                        return;
+                    }
+                    if Instant::now() >= deadline {
+                        log::warn!(
+                            "runtime config transaction still unsettled after bounded reconcile"
+                        );
+                        return;
+                    }
+                    delay = (delay * 2).min(Duration::from_secs(8));
+                }
+            });
+        }
         result.transaction_id = Some(transaction_id);
         result.runtime_generation = Some(generation);
         result.selection_intent_generation = Some(intent);
@@ -3918,6 +3968,19 @@ impl ProxyRuntime {
                     }
                     None => RuntimeApplyResult::status("unconfirmed"),
                 }
+            }
+            // Core drops only records that are no longer in flight, and every
+            // commit advances applied_revision. An unchanged expected identity
+            // therefore proves this expired transaction never published.
+            Ok(status)
+                if status.contract_version == 1
+                    && status.lookup_state
+                        == daemon::RuntimeLookupState::UnknownOrExpired as i32
+                    && identity_equal(status.active.as_ref(), Some(identity))
+                    && status.control_revision == pending.plan.expected_control_revision =>
+            {
+                self.release_unapplied_runtime_pending(&pending);
+                RuntimeApplyResult::status("rejected")
             }
             _ => RuntimeApplyResult::status("unconfirmed"),
         };
@@ -4255,6 +4318,22 @@ impl ProxyRuntime {
         result
     }
 
+    /// Shared by a verified unapplied receipt and a proven-unapplied expired one.
+    fn release_unapplied_runtime_pending(&self, pending: &PendingOperation) {
+        if let Some(h) = pending.api_handoff.as_ref() {
+            h.revoke();
+        }
+        let _publication = self.gate.lock_generation_publication();
+        if self.gate.generation() == pending.generation {
+            if let Some(token) = pending.tailnet_suspended_token {
+                self.resume_tailnet_context(pending.generation, token);
+            }
+        }
+        if let Ok(mut state) = self.runtime_config_apply.lock() {
+            state.pending = None;
+        }
+    }
+
     async fn settle_runtime_operation(
         self: &Arc<Self>,
         pending: &PendingOperation,
@@ -4276,20 +4355,7 @@ impl ProxyRuntime {
                 {
                     return RuntimeApplyResult::status("unconfirmed");
                 }
-                if let Some(h) = pending.api_handoff.as_ref() {
-                    h.revoke();
-                }
-                {
-                    let _publication = self.gate.lock_generation_publication();
-                    if self.gate.generation() == pending.generation {
-                        if let Some(token) = pending.tailnet_suspended_token {
-                            self.resume_tailnet_context(pending.generation, token);
-                        }
-                    }
-                    if let Ok(mut state) = self.runtime_config_apply.lock() {
-                        state.pending = None;
-                    }
-                }
+                self.release_unapplied_runtime_pending(pending);
                 let mut result = RuntimeApplyResult::status("rejected");
                 result.reasons.extend(
                     [

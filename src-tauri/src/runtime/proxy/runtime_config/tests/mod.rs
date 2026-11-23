@@ -2040,6 +2040,66 @@ async fn ts_apply_unknown_stays_paused_only_proven_unapplied_resumes() {
     assert_eq!(rt.tailnet_context().unwrap().token, old.token);
 }
 
+// I1: ABORTING_UNAPPLIED keeps the original pending only until Core settles.
+// The bounded background read of the same receipt releases it on
+// ABORTED_UNAPPLIED, so the next edit is no longer declined by pending.
+#[tokio::test]
+async fn aborting_apply_settles_in_background_and_releases_pending() {
+    let (rt, _dir, _calls) = crate::runtime::proxy::tests::test_runtime_recording();
+    let pending = ts_pending_raw_fixture(&rt, runnable_config_fixture());
+    rt.config.save_full(&pending.desired).unwrap();
+    let mut operation = daemon::RuntimeConfigOperation {
+        contract_version: 1,
+        transaction_id: pending.plan.transaction_id.clone(),
+        candidate_digest: pending.plan.candidate_digest.clone(),
+        impact_digest: pending.plan.impact_digest.clone(),
+        before: pending.plan.expected.clone(),
+        active: pending.plan.expected.clone(),
+        control_revision: pending.plan.expected_control_revision,
+        state: daemon::RuntimeOperationState::AbortingUnapplied as i32,
+        ..Default::default()
+    };
+    let (rpc, server) = native_retirement_rpc_peer(&rt, &pending, operation.clone()).await;
+    *rpc.apply_response.lock().unwrap() = Some(operation.clone());
+    let client = rt
+        .runtime_management_client(pending.generation)
+        .await
+        .unwrap();
+    let result = rt
+        .execute_prepared_runtime_candidate(client, pending.clone(), None, false)
+        .await;
+    assert_eq!(result.status, "unconfirmed");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while rpc.requests.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(rt.runtime_config_apply.lock().unwrap().pending.is_some());
+    operation.state = daemon::RuntimeOperationState::AbortedUnapplied as i32;
+    *rpc.status.lock().unwrap() = native_retirement_status(operation);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while rt.runtime_config_apply.lock().unwrap().pending.is_some() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(rpc.mutations.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        rt.runtime_config_apply
+            .lock()
+            .unwrap()
+            .last
+            .as_ref()
+            .unwrap()
+            .status,
+        "rejected"
+    );
+    server.abort();
+}
+
 #[tokio::test]
 async fn confirmed_ts_binding_commit_replaces_token_in_same_main_generation() {
     let (rt, _dir, _calls) = crate::runtime::proxy::tests::test_runtime_recording();
@@ -3338,6 +3398,7 @@ struct NativeRetirementRpcFixture {
     mutations: Arc<std::sync::atomic::AtomicUsize>,
     acknowledgement_response: Arc<std::sync::Mutex<Option<daemon::RuntimeConfigOperation>>>,
     acknowledgements: Arc<std::sync::Mutex<Vec<daemon::RuntimePersistenceAcknowledgementRequest>>>,
+    apply_response: Arc<std::sync::Mutex<Option<daemon::RuntimeConfigOperation>>>,
 }
 
 #[derive(Clone)]
@@ -3549,7 +3610,10 @@ impl daemon::runtime_config_service_server::RuntimeConfigService for NativeRetir
         polaris_singbox_grpc::tonic::Response<daemon::RuntimeConfigOperation>,
         polaris_singbox_grpc::tonic::Status,
     > {
-        Err(self.forbidden())
+        match self.apply_response.lock().unwrap().clone() {
+            Some(response) => Ok(polaris_singbox_grpc::tonic::Response::new(response)),
+            None => Err(self.forbidden()),
+        }
     }
     async fn get_runtime_config_status(
         &self,
@@ -3629,6 +3693,7 @@ async fn native_retirement_rpc_peer(
         mutations: Arc::default(),
         acknowledgement_response: Arc::default(),
         acknowledgements: Arc::default(),
+        apply_response: Arc::default(),
     };
     let incoming = futures::stream::unfold(listener, |listener| async move {
         let next = listener.accept().await.map(|(stream, _)| stream);
