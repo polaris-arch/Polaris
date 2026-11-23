@@ -5453,6 +5453,10 @@ async fn subscribe_and_supervise(
     };
     match result {
         Ok(status) => {
+            log::info!(
+                "Tailscale 登录：临时核状态订阅已就绪（attempt={}）",
+                ctx.attempt_id
+            );
             let _ = ready.send(StartLoginOutcome::Started);
             supervise(ctx, child, status, cancel_rx).await;
         }
@@ -5755,6 +5759,10 @@ fn apply_status_frame(
                         "awaitingAuth",
                         None,
                         Some(u),
+                    );
+                    log::info!(
+                        "Tailscale 登录：已取得授权地址（attempt={}）",
+                        ctx.attempt_id
                     );
                     ctx.emitter.emit_auth_url(&ctx.server_id, &ctx.node_name, u);
                 }

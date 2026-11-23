@@ -145,12 +145,17 @@ impl ProxyRuntime {
     pub(super) async fn management_api(&self) -> GrpcManagementApi {
         let status = self.status();
         if !status.running || status.clash_api_port == 0 {
+            log::warn!(
+                "管理 API 客户端未就绪：running={} port={}",
+                status.running,
+                status.clash_api_port
+            );
             return GrpcManagementApi::not_ready();
         }
         match self.current_management_client(status.clash_api_port).await {
             Ok(client) => GrpcManagementApi::new(client),
             Err(error) => {
-                log::debug!("管理 API 客户端未就绪：{error}");
+                log::warn!("管理 API 客户端未就绪：{error}");
                 GrpcManagementApi::not_ready()
             }
         }
