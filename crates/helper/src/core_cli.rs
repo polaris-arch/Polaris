@@ -134,21 +134,14 @@ pub(crate) const BUNDLED_CORE_DIR: Option<&str> =
 #[cfg(all(target_os = "macos", target_arch = "x86_64", not(test)))]
 pub(crate) const BUNDLED_CORE_DIR: Option<&str> =
     Some("/Applications/Polaris.app/Contents/Resources/_up_/resources/mac-x64");
-#[cfg(any(
-    test,
-    not(any(
-        target_os = "linux",
-        all(
-            target_os = "macos",
-            any(target_arch = "aarch64", target_arch = "x86_64")
-        )
-    ))
-))]
+#[cfg(any(test, target_os = "windows"))]
 pub(crate) const BUNDLED_CORE_DIR: Option<&str> = None;
 
 /// IPC installation. Path and hashes never come from the client: only bytes below
 /// a directory whose every ancestor is administrator-owned and not group/other
 /// writable are admitted, under a self-verifying manifest naming the requested id.
+/// Gated to the union of its platform handlers, like `elapsed_ms`: Android builds no handler.
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux", test))]
 pub(crate) fn install_bundled(
     root: &Path,
     source: Option<&str>,
