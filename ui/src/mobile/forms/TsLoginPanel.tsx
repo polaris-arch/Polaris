@@ -280,12 +280,21 @@ export function TsLoginPanel({
     }
   };
 
+  // A node saved by this Add panel is removed on close unless it was authorized or handed to the main core.
   const closeAfterCancel = async (): Promise<void> => {
     const active = pendingRef.current;
+    const addedPhase = savedServer && useTailscaleLoginProgressStore.getState().attempts[savedServer.id]?.phase;
     if (active && !await cancelPendingLogin(active)) return;
     pendingRef.current = null;
     setPending(null);
     closeInstance(instanceId);
+    if (!serverId && savedServer && addedPhase !== 'authorized' && addedPhase !== 'mainCore') {
+      try {
+        await api.server.delete(savedServer.id);
+      } catch {
+        toast.error(t('nodes.deleteFail'));
+      }
+    }
   };
 
   const requestClose = (): void => {

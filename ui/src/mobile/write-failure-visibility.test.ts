@@ -511,6 +511,8 @@ const FEEDBACK: readonly ScreenFeedback[] = [
     dir: 'mobile/forms/',
     shape: 'reporter',
     mechanism: 'setNotice',
+    // The panel is already closed when an unauthorized node from Add is removed.
+    reporterByCall: { 'api.server.delete': 'toast.error' },
     teeth: {
       file: 'mobile/forms/NodeFormPanel.tsx',
       decl: 'submit',

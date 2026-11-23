@@ -184,17 +184,23 @@ export function TsLoginDialog({ instanceId, serverId, replaceIdentity = false }:
     setPendingRequest(null);
   };
 
+  // A node saved by this Add dialog is removed on close unless it was authorized or handed to the main core.
   useEffect(() => () => {
     const request = activeRequest.current;
     activeRequest.current = null;
-    if (!request) return;
     const s = useAppStore.getState();
-    const current = useTailscaleLoginProgressStore.getState().attempts[request.serverId];
-    if (current?.attemptId === request.attemptId && loginAttemptActive(current.phase)) {
+    const added = serverId ? undefined : savedServer.current;
+    const addedPhase = added && useTailscaleLoginProgressStore.getState().attempts[added.id]?.phase;
+    let cancelled: Promise<unknown> = Promise.resolve();
+    const current = request && useTailscaleLoginProgressStore.getState().attempts[request.serverId];
+    if (request && current?.attemptId === request.attemptId && loginAttemptActive(current.phase)) {
       useTailscaleLoginProgressStore.getState().apply({ ...current, phase: 'cancelled', url: null });
       s.setTailscaleLoginInitiated(request.serverId, false);
       s.setTailscaleAuthUrl(request.serverId, null);
-      void api.server.tailscaleLoginCancel(request.serverId, request.attemptId).catch(() => {});
+      cancelled = api.server.tailscaleLoginCancel(request.serverId, request.attemptId).catch(() => {});
+    }
+    if (added && addedPhase !== 'authorized' && addedPhase !== 'mainCore') {
+      void cancelled.then(() => api.server.delete(added.id)).catch(() => toast.error(t('nodes.deleteFail')));
     }
   }, []);
 

@@ -566,6 +566,12 @@ const SITES: readonly Site[] = [
     why: 'W-3：撤销已发起的远端登录会话，副作用已经在远端发生',
   },
   {
+    file: 'components/dialogs/TsLoginDialog.tsx',
+    callee: 'api.server.delete(',
+    route: 'direct',
+    why: 'W-3：撤回本弹窗「添加」时经 addTailscaleLoginProfile 直写落盘、关闭时仍未授权的新节点；与那条直写对称，进暂存会留下一条待 Apply 的残留',
+  },
+  {
     file: 'App.tsx',
     callee: 'api.server.tailscaleLoginCancel(',
     route: 'direct',
@@ -721,6 +727,12 @@ const SITES: readonly Site[] = [
     callee: 'api.server.tailscaleLoginCancel(',
     route: 'direct',
     why: 'W-3：撤销已发起的远端登录会话，副作用已经在远端发生',
+  },
+  {
+    file: 'mobile/forms/TsLoginPanel.tsx',
+    callee: 'api.server.delete(',
+    route: 'direct',
+    why: 'W-3：撤回本面板「添加」时经 addTailscaleLoginProfile 直写落盘、关闭时仍未授权的新节点（同 TsLoginDialog）',
   },
   {
     file: 'mobile/forms/TsLoginPanel.tsx',

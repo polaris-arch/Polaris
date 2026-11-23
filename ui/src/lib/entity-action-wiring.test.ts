@@ -324,6 +324,13 @@ const SITES: readonly ActionSite[] = [
     route: 'no-staged-only-id',
     why: '仅取磁盘镜像或本次新建的 id：焦点回读只使用提交前登记的 serverId+attemptId；节点已保存并通过刷新对账，不取 effective 暂存身份，旧请求回执不能覆盖新请求。',
   },
+  {
+    file: 'components/dialogs/TsLoginDialog.tsx',
+    callee: 'api.server.delete',
+    count: 1,
+    route: 'no-staged-only-id',
+    why: '仅取磁盘镜像或本次新建的 id：只删本弹窗「添加」时保存的 savedServer.id，且未授权、未交主核',
+  },
   // 移动端登录与桌面共用提交计划；既有身份从磁盘 servers 寻址，新身份先 mint 再保存。
   {
     file: 'mobile/forms/TsLoginPanel.tsx',
@@ -359,6 +366,13 @@ const SITES: readonly ActionSite[] = [
     count: 2,
     route: 'no-staged-only-id',
     why: '仅取磁盘镜像或本次新建的 id：取消只使用本次提交生成的 request.serverId 或 server.id',
+  },
+  {
+    file: 'mobile/forms/TsLoginPanel.tsx',
+    callee: 'api.server.delete',
+    count: 1,
+    route: 'no-staged-only-id',
+    why: '仅取磁盘镜像或本次新建的 id：只删本面板「添加」时保存的 savedServer.id，且未授权、未交主核',
   },
 
   // ── 移动端表单宿主与节点面（2026-09-06 批 2）。逐条与桌面同形腿的裁定**逐字一致** ──
