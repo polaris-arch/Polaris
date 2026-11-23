@@ -111,7 +111,7 @@ fn run(config: &serde_json::Value, platform: &str, ports: &Ports) -> Vec<serde_j
         observed_tailnet_addresses: Default::default(),
         log: |_, _| {},
     };
-    build_inbounds(&cfg, None, &deps)
+    build_inbounds(&cfg, &deps)
         .iter()
         .map(|ib| serde_json::to_value(ib).unwrap())
         .collect()

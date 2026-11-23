@@ -124,7 +124,7 @@ pub fn preview_tun_exclusion(
         // 端口全空 ⇒ 回环入站一个都不发，凭据无处可用（只关心 TUN 排除面）。
         loopback_auth: None,
     };
-    let inbounds = build_inbounds(config, None, &deps);
+    let inbounds = build_inbounds(config, &deps);
     let tun = inbounds.iter().find(|i| i.type_field == "tun");
 
     TunExclusionPreview {

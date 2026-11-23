@@ -46,7 +46,7 @@ fn user_inbounds(
         observed_tailnet_addresses: Default::default(),
         loopback_auth: None,
     };
-    let inbounds = build_inbounds(config, None, &deps);
+    let inbounds = build_inbounds(config, &deps);
     serde_json::to_value(inbounds)
         .map(|inbounds| serde_json::json!({"inbounds": inbounds}))
         .map_err(|_| UserPreflightError::Gateway(UNCONFIRMED))

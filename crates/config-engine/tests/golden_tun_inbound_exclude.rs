@@ -35,8 +35,7 @@ const USER_CIDRS: &str = r#"[
 
 /// 组网 + FakeIP 场景的 UserConfig：一个 WG endpoint（`alwaysRouteSubnets` 缺省 true → engaged），
 /// `dnsConfig` 缺省 → `usesFakeIp` 为 true → 非 Linux 平台 fakeip 段非空。
-/// `selectedServerId` 留空是刻意的：避免节点 IP 排除块往 `route_exclude_address` 里追加无关条目，
-/// 让金样只反映「连入排除」这一条派生链。
+/// 金样只反映「连入排除」这一条派生链。
 fn config_with(bypass_lan: bool) -> UserConfig {
     let json = format!(
         r#"{{
@@ -77,7 +76,7 @@ fn deps(platform: &str) -> InboundsDeps {
 
 /// 取 TUN inbound 的 `route_exclude_address`（缺省 → None 表示字段整体不下发）。
 fn tun_exclude(config: &UserConfig, deps: &InboundsDeps) -> Option<Vec<String>> {
-    let inbounds = build_inbounds(config, None, deps);
+    let inbounds = build_inbounds(config, deps);
     let tun = inbounds
         .iter()
         .find(|i| i.type_field == "tun")

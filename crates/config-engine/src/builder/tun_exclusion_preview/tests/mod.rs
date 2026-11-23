@@ -71,7 +71,6 @@ fn real_build(
     REAL_NOTES.with(|c| c.borrow_mut().clear());
     let inbounds = build_inbounds(
         config,
-        None,
         &InboundsDeps {
             probe_direct_port: None,
             probe_proxy_port: None,

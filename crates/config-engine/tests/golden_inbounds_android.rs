@@ -116,7 +116,7 @@ fn run_case(case: &AndroidCase) -> Vec<serde_json::Value> {
         observed_tailnet_addresses: Default::default(),
         log: |_, _| {},
     };
-    build_inbounds(&config, None, &deps)
+    build_inbounds(&config, &deps)
         .iter()
         .map(|ib| serde_json::to_value(ib).unwrap())
         .collect()
@@ -143,7 +143,7 @@ fn run_config(config: &serde_json::Value, platform: &str, ports: &Ports) -> Vec<
         observed_tailnet_addresses: Default::default(),
         log: |_, _| {},
     };
-    build_inbounds(&cfg, None, &deps)
+    build_inbounds(&cfg, &deps)
         .iter()
         .map(|ib| serde_json::to_value(ib).unwrap())
         .collect()
@@ -395,14 +395,11 @@ fn loopback_inbounds_carry_credentials_exactly_where_required() {
             platform,
             "node_tag({platform:?}) = {tag:?} 解析不回同一个变体 —— 平台轴投影写歪了"
         );
-        let out: Vec<serde_json::Value> = build_inbounds(
-            &cfg,
-            None,
-            &all_loopback_deps(tag, Some(placeholder_auth())),
-        )
-        .iter()
-        .map(|ib| serde_json::to_value(ib).unwrap())
-        .collect();
+        let out: Vec<serde_json::Value> =
+            build_inbounds(&cfg, &all_loopback_deps(tag, Some(placeholder_auth())))
+                .iter()
+                .map(|ib| serde_json::to_value(ib).unwrap())
+                .collect();
         for want in LOOPBACK_TAGS {
             let ib = out
                 .iter()
@@ -463,7 +460,7 @@ fn missing_credential_suppresses_loopback_inbounds_instead_of_opening_them() {
         .filter(|p| loopback_inbounds_require_auth(*p))
     {
         let tag = node_tag(platform);
-        let out: Vec<serde_json::Value> = build_inbounds(&cfg, None, &all_loopback_deps(tag, None))
+        let out: Vec<serde_json::Value> = build_inbounds(&cfg, &all_loopback_deps(tag, None))
             .iter()
             .map(|ib| serde_json::to_value(ib).unwrap())
             .collect();

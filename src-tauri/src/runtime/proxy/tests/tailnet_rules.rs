@@ -197,7 +197,7 @@ fn tun_exclude_with(
         log: no_log,
         observed_tailnet_addresses: observed,
     };
-    build_inbounds(config, None, &deps)
+    build_inbounds(config, &deps)
         .iter()
         .find(|i| i.type_field == "tun")
         .and_then(|t| t.route_exclude_address.clone())

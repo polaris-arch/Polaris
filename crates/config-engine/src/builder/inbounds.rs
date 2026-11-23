@@ -10,7 +10,7 @@ use crate::builder::endpoint_routes::{
 };
 use crate::builder::helpers::{
     effective_app_rules, effective_custom_rules, get_custom_domestic_dns_endpoint,
-    host_to_exclude_cidr, is_ipv4_host, is_ipv6_host, probe_pool_inbound_tag,
+    host_to_exclude_cidr, probe_pool_inbound_tag,
 };
 use crate::builder::tun_route_exclude::{compute_user_tun_exclude, UserTunExcludeInput};
 use crate::singbox::inbound::TunDnsMode;
@@ -101,11 +101,7 @@ pub const fn loopback_inbounds_require_auth(platform: Platform) -> bool {
 }
 
 /// 生成 sing-box inbounds。上游 `buildInbounds`。
-pub fn build_inbounds(
-    config: &UserConfig,
-    resolved_ips: Option<&std::collections::BTreeMap<String, String>>,
-    deps: &InboundsDeps,
-) -> Vec<Inbound> {
+pub fn build_inbounds(config: &UserConfig, deps: &InboundsDeps) -> Vec<Inbound> {
     let mut inbounds: Vec<Inbound> = Vec::new();
     // 🔴 **接管方式取「本平台生效值」，不是磁盘上存的那个**（判据与因果链全在
     // [`ProxyModeType::effective_on`] 的文档注释里，此处不复述）。
@@ -255,7 +251,7 @@ pub fn build_inbounds(
 
     // TUN inbound。Android 上 `is_tun` 恒真（见函数开头那段），故这里是**无条件**发射。
     if is_tun {
-        if let Some(tun) = build_tun_inbound(config, resolved_ips, deps) {
+        if let Some(tun) = build_tun_inbound(config, deps) {
             inbounds.push(tun);
         }
     }
@@ -365,11 +361,7 @@ fn udp_nat_behaviors(nat: UdpNatType) -> (UdpNatBehavior, UdpNatBehavior) {
     }
 }
 
-fn build_tun_inbound(
-    config: &UserConfig,
-    resolved_ips: Option<&std::collections::BTreeMap<String, String>>,
-    deps: &InboundsDeps,
-) -> Option<Inbound> {
+fn build_tun_inbound(config: &UserConfig, deps: &InboundsDeps) -> Option<Inbound> {
     let should_bypass_lan = config.bypass_lan != Some(false);
     let fakeip_ranges: Vec<String> = if uses_fake_ip(config) && deps.platform != "linux" {
         let mut r = vec![FAKEIP_INET4_RANGE.to_string()];
@@ -515,59 +507,8 @@ fn build_tun_inbound(
         }
     }
 
-    // 节点 IP 排除（非 Linux）。
-    if deps.platform != "linux" {
-        let mut all_server_ids: std::collections::BTreeSet<String> =
-            std::collections::BTreeSet::new();
-        if let Some(sid) = config.effective_selected_server_id() {
-            all_server_ids.insert(sid.to_owned());
-        }
-        if !crate::user_config::auto_select::referenced_targets(config).is_empty() {
-            all_server_ids.extend(crate::builder::endpoint_routes::active_physical_root_ids(
-                config,
-            ));
-        }
-        for r in &effective_app_rules_proxy(config) {
-            if let Some(tid) = &r.target_server_id {
-                all_server_ids.insert(tid.clone());
-            }
-        }
-        for sid in &all_server_ids {
-            if let Some(server) = config.servers.iter().find(|s| &s.id == sid) {
-                if is_ipv4_host(&server.address) || is_ipv6_host(&server.address) {
-                    if let Some(cidr) = host_to_exclude_cidr(&server.address) {
-                        exclude_addr.push(cidr);
-                    }
-                } else if let Some(ips) = resolved_ips {
-                    if let Some(ip) = ips.get(sid) {
-                        if let Some(cidr) = host_to_exclude_cidr(ip) {
-                            exclude_addr.push(cidr);
-                        }
-                    }
-                }
-                // Tailcat 的 `address` 恒空（对端经 DERP 定位），上面两腿什么都不加；其「服务器」是 DERP。
-                // servers 模式：各项的 host（裸字符串项即 host）/ `ipv4` / `ipv6` 是 IP 字面值 → 排除；
-                // 主机名 / `"none"` / 空由 `host_to_exclude_cidr` 返回 None 跳过，同一 IP 只加一次（host 常与 ipv4 同值）。
-                // region / 自定义 map 模式 DERP IP 在起核后才从地图得知，此处无从排除 ——
-                // 靠 `route.auto_detect_interface` 让内核自身的拨号绑物理网卡兜底。
-                if let Some(t) = server.tailcat_settings.as_deref().filter(|_| {
-                    server.protocol == crate::user_config::server_config::Protocol::Tailcat
-                }) {
-                    for item in &t.derp_servers {
-                        let field = |k: &str| item.get(k).and_then(serde_json::Value::as_str);
-                        let host = item.as_str().or_else(|| field("host"));
-                        for addr in [host, field("ipv4"), field("ipv6")].into_iter().flatten() {
-                            if let Some(cidr) = host_to_exclude_cidr(addr) {
-                                if !exclude_addr.contains(&cidr) {
-                                    exclude_addr.push(cidr);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
+    // 节点 IP 不进排除表：Core 出站 socket 经 `route.auto_detect_interface` 绑物理网卡（Android 为
+    // protect），route 层另有节点直连规则；排除表因此与选中节点、订阅内容无关。
 
     // 「连入来源排除」（上游 singbox-inbounds-builder.ts L297-358）：本机作服务端被 **off-subnet** 私网连入
     // （如经 ZeroTier→路由器 DNAT）时，回包目的地落在本机直连子网外 → 被 TUN 捕获 → 用户态栈误当新连接重拨 →

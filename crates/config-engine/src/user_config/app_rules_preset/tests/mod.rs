@@ -113,7 +113,7 @@ fn android_exclude_packages_of(custom: &[CustomAppPreset]) -> Vec<String> {
         observed_tailnet_addresses: Default::default(),
         log: |_, _| {},
     };
-    build_inbounds(&config, None, &deps)
+    build_inbounds(&config, &deps)
         .into_iter()
         .find(|i| i.tag == "tun-in")
         .and_then(|i| i.exclude_package)

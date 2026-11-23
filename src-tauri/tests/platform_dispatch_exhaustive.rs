@@ -1807,14 +1807,6 @@ const STRING_DISPATCH_REGISTRY: &[StringDispatch] = &[
     ),
     (
         "crates/config-engine/src/builder/inbounds.rs",
-        "if deps.platform != \"linux\"",
-        1,
-        "未知平台 → true，做节点 IP 排除。这是「别把自己的出口流量绕回 TUN」的通用防护，Linux 例外\
-         的理由是它的 route_exclude 整块恒空。对未知平台做这层排除是安全侧：多排一条服务端 IP 不会\
-         断网。",
-    ),
-    (
-        "crates/config-engine/src/builder/inbounds.rs",
         "if !user_inbound_cidrs.is_empty() && deps.platform == \"linux\"",
         1,
         "未知平台 → false ⇒ 走 else 真正计算用户「连入来源排除」。Linux 那条是忽略腿 + 告警（该平\

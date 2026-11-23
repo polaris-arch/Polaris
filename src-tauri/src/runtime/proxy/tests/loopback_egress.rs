@@ -100,7 +100,7 @@ fn every_platform_exposes_only_ports_that_its_generated_inbounds_listen_on() {
             observed_tailnet_addresses: Default::default(),
             log: |_, _| {},
         };
-        let inbounds: Vec<serde_json::Value> = build_inbounds(&config, None, &deps)
+        let inbounds: Vec<serde_json::Value> = build_inbounds(&config, &deps)
             .iter()
             .map(|ib| serde_json::to_value(ib).unwrap())
             .collect();

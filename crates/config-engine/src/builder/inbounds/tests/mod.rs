@@ -29,7 +29,7 @@ fn proxy_probe_remains_authenticated_http_on_all_platforms() {
     });
     for platform in ["android", "linux", "darwin", "win32"] {
         deps.platform = platform.into();
-        let list = build_inbounds(&UserConfig::default(), None, &deps);
+        let list = build_inbounds(&UserConfig::default(), &deps);
         let probe = list.iter().find(|i| i.tag == "probe-proxy-in").unwrap();
         assert_eq!(probe.type_field, "http");
         assert_eq!(probe.listen.as_deref(), Some("127.0.0.1"));
@@ -40,7 +40,7 @@ fn proxy_probe_remains_authenticated_http_on_all_platforms() {
     }
     deps.platform = "android".into();
     assert_eq!(
-        build_inbounds(&UserConfig::default(), None, &deps)
+        build_inbounds(&UserConfig::default(), &deps)
             .iter()
             .find(|i| i.tag == "probe-proxy-in")
             .unwrap()
@@ -48,7 +48,7 @@ fn proxy_probe_remains_authenticated_http_on_all_platforms() {
         "http"
     );
     deps.loopback_auth = None;
-    assert!(!build_inbounds(&UserConfig::default(), None, &deps)
+    assert!(!build_inbounds(&UserConfig::default(), &deps)
         .iter()
         .any(|i| i.tag == "probe-proxy-in"));
 }
@@ -59,7 +59,7 @@ fn linux_tun_uses_stable_resolved_interface_name() {
         proxy_mode_type: ProxyModeType::Tun,
         ..Default::default()
     };
-    let inbounds = build_inbounds(&config, None, &deps_linux());
+    let inbounds = build_inbounds(&config, &deps_linux());
     let tun = inbounds.iter().find(|i| i.tag == "tun-in").expect("有 tun");
     assert_eq!(
         tun.interface_name.as_deref(),
@@ -100,7 +100,7 @@ fn inbound_exclude_on_linux_warns_and_emits_nothing() {
     };
     let mut deps = deps_linux();
     deps.log = capture_warn;
-    let inbounds = build_inbounds(&config, None, &deps);
+    let inbounds = build_inbounds(&config, &deps);
     let warns = take_warns();
     assert!(
         warns
@@ -124,7 +124,7 @@ fn inbound_exclude_on_linux_is_silent_when_user_declared_nothing() {
     };
     let mut deps = deps_linux();
     deps.log = capture_warn;
-    let _ = build_inbounds(&config, None, &deps);
+    let _ = build_inbounds(&config, &deps);
     assert!(take_warns().is_empty(), "未声明任何段 → 不得告警");
 }
 
@@ -141,7 +141,7 @@ fn inbound_exclude_warns_invalid_cidr() {
     let mut deps = deps_linux();
     deps.platform = "darwin".into();
     deps.log = capture_warn;
-    let _ = build_inbounds(&config, None, &deps);
+    let _ = build_inbounds(&config, &deps);
     let warns = take_warns();
     assert!(
         warns.iter().any(|m| m.contains("非法/过宽网段")),
@@ -179,7 +179,7 @@ fn inbound_exclude_warns_mesh_overlap() {
     let mut deps = deps_linux();
     deps.platform = "darwin".into();
     deps.log = capture_warn;
-    let _ = build_inbounds(&config, None, &deps);
+    let _ = build_inbounds(&config, &deps);
     let warns = take_warns();
     assert!(
         warns
@@ -203,7 +203,7 @@ fn inbound_exclude_warns_mac_own_lan_overlap() {
     deps.platform = "darwin".into();
     deps.own_lan_cidrs = vec!["10.0.0.0/24".into()];
     deps.log = capture_warn;
-    let _ = build_inbounds(&config, None, &deps);
+    let _ = build_inbounds(&config, &deps);
     let warns = take_warns();
     assert!(
         warns.iter().any(|m| m.contains("本机物理 LAN")),
@@ -242,7 +242,7 @@ fn inbound_exclude_warns_custom_rule_overlap() {
     let mut deps = deps_linux();
     deps.platform = "darwin".into();
     deps.log = capture_warn;
-    let _ = build_inbounds(&config, None, &deps);
+    let _ = build_inbounds(&config, &deps);
     let warns = take_warns();
     assert!(
         warns
@@ -255,7 +255,7 @@ fn inbound_exclude_warns_custom_rule_overlap() {
 #[test]
 fn system_proxy_single_mixed_inbound() {
     let config = UserConfig::default();
-    let inbounds = build_inbounds(&config, None, &deps_linux());
+    let inbounds = build_inbounds(&config, &deps_linux());
     assert_eq!(inbounds.len(), 1);
     assert_eq!(inbounds[0].type_field, "mixed");
     assert_eq!(inbounds[0].tag, "mixed-in");
@@ -269,7 +269,7 @@ fn system_proxy_allow_lan_listens_all() {
         allow_lan: Some(true),
         ..Default::default()
     };
-    let inbounds = build_inbounds(&config, None, &deps_linux());
+    let inbounds = build_inbounds(&config, &deps_linux());
     assert_eq!(inbounds[0].listen.as_deref(), Some("::"));
 }
 
@@ -278,7 +278,7 @@ fn probe_inbounds_when_ports_set() {
     let mut deps = deps_linux();
     deps.probe_direct_port = Some(12345);
     deps.probe_proxy_port = Some(12346);
-    let inbounds = build_inbounds(&UserConfig::default(), None, &deps);
+    let inbounds = build_inbounds(&UserConfig::default(), &deps);
     assert_eq!(inbounds.len(), 3); // mixed + probe-direct + probe-proxy
     assert_eq!(inbounds[1].tag, "probe-direct-in");
     assert_eq!(inbounds[2].tag, "probe-proxy-in");
@@ -289,7 +289,7 @@ fn proxy_health_inbound_does_not_require_direct_probe() {
     let mut deps = deps_linux();
     deps.probe_direct_port = None;
     deps.probe_proxy_port = Some(12346);
-    let inbounds = build_inbounds(&UserConfig::default(), None, &deps);
+    let inbounds = build_inbounds(&UserConfig::default(), &deps);
 
     assert_eq!(inbounds.len(), 2); // mixed + dedicated proxy health probe
     assert!(inbounds
@@ -308,7 +308,7 @@ fn proxy_health_inbound_does_not_require_direct_probe() {
 fn update_inbound_when_port_set() {
     let mut deps = deps_linux();
     deps.update_in_port = Some(12347);
-    let inbounds = build_inbounds(&UserConfig::default(), None, &deps);
+    let inbounds = build_inbounds(&UserConfig::default(), &deps);
     assert_eq!(inbounds.len(), 2); // mixed + update-in
     assert_eq!(inbounds[1].type_field, "socks");
     assert_eq!(inbounds[1].tag, "update-in");
@@ -319,7 +319,7 @@ fn subscription_update_inbound_is_independent_loopback_socks() {
     let mut deps = deps_linux();
     deps.update_in_port = Some(12347);
     deps.subscription_update_in_port = Some(12348);
-    let inbounds = build_inbounds(&UserConfig::default(), None, &deps);
+    let inbounds = build_inbounds(&UserConfig::default(), &deps);
     let subscription = inbounds
         .iter()
         .find(|inbound| inbound.tag == "subscription-update-in")
@@ -343,7 +343,7 @@ fn tun_linux_no_exclude_addr() {
         proxy_mode_type: ProxyModeType::Tun,
         ..Default::default()
     };
-    let inbounds = build_inbounds(&config, None, &deps_linux());
+    let inbounds = build_inbounds(&config, &deps_linux());
     assert_eq!(inbounds.len(), 2); // mixed + tun
     let tun = &inbounds[1];
     assert_eq!(tun.type_field, "tun");
@@ -363,7 +363,7 @@ fn tun_mac_has_loopback_exclude() {
     };
     let mut deps = deps_linux();
     deps.platform = "darwin".into();
-    let inbounds = build_inbounds(&config, None, &deps);
+    let inbounds = build_inbounds(&config, &deps);
     let tun = &inbounds[1];
     assert_eq!(tun.mtu, None); // mac 同样不发键
     let exclude = tun.route_exclude_address.as_ref().unwrap();
@@ -379,7 +379,7 @@ fn tun_mac_has_http_proxy_platform() {
     };
     let mut deps = deps_linux();
     deps.platform = "darwin".into();
-    let inbounds = build_inbounds(&config, None, &deps);
+    let inbounds = build_inbounds(&config, &deps);
     let tun = &inbounds[1];
     assert!(tun.platform.is_some());
     assert!(tun.platform.as_ref().unwrap().http_proxy.is_some());
@@ -392,7 +392,7 @@ fn tun_ipv6_address_when_enabled() {
         enable_ipv6: Some(true),
         ..Default::default()
     };
-    let inbounds = build_inbounds(&config, None, &deps_linux());
+    let inbounds = build_inbounds(&config, &deps_linux());
     let tun = &inbounds[1];
     let addr = tun.address.as_ref().unwrap();
     assert_eq!(addr.len(), 2); // v4 + v6
@@ -407,7 +407,7 @@ fn tun_probe_pool_inbounds() {
     };
     let mut deps = deps_linux();
     deps.probe_pool_ports = vec![20000, 20001];
-    let inbounds = build_inbounds(&config, None, &deps);
+    let inbounds = build_inbounds(&config, &deps);
     // mixed + probe-in-0 + probe-in-1 + tun
     assert_eq!(inbounds.len(), 4);
     assert_eq!(inbounds[1].tag, "probe-in-0");
@@ -457,7 +457,7 @@ fn tun_platform_axis() -> Vec<(Platform, &'static str)> {
 fn tun_json_on(config: &UserConfig, platform: &str) -> serde_json::Value {
     let mut deps = deps_linux();
     deps.platform = platform.into();
-    let tun = build_inbounds(config, None, &deps)
+    let tun = build_inbounds(config, &deps)
         .into_iter()
         .find(|i| i.type_field == "tun")
         .expect("TUN 模式必产出 tun inbound");
@@ -652,7 +652,7 @@ fn tun_with_nat(nat: Option<UdpNatType>) -> Inbound {
         }),
         ..Default::default()
     };
-    let inbounds = build_inbounds(&config, None, &deps_linux());
+    let inbounds = build_inbounds(&config, &deps_linux());
     inbounds
         .into_iter()
         .find(|i| i.type_field == "tun")
@@ -678,7 +678,7 @@ fn udp_nat_absent_by_default_emits_no_key() {
     // 同一条不变量的另一半：非 TUN inbound 永远不带这组键（内核 schema 里 mixed/http/socks 没有它们，
     // 发了即 `sing-box check` FATAL）。
     let config = UserConfig::default(); // 默认 systemProxy ⇒ 只有 mixed
-    let mixed = serde_json::to_value(&build_inbounds(&config, None, &deps_linux())[0]).unwrap();
+    let mixed = serde_json::to_value(&build_inbounds(&config, &deps_linux())[0]).unwrap();
     assert!(!mixed.as_object().unwrap().contains_key("udp_mapping"));
 }
 
@@ -733,100 +733,13 @@ fn udp_nat_type_deserializes_from_user_config_json() {
         config.tun_config.as_ref().unwrap().udp_nat_type,
         Some(UdpNatType::PortRestrictedCone)
     );
-    let tun = build_inbounds(&config, None, &deps_linux())
+    let tun = build_inbounds(&config, &deps_linux())
         .into_iter()
         .find(|i| i.type_field == "tun")
         .unwrap();
     assert_eq!(
         tun.udp_filtering,
         Some(UdpNatBehavior::AddressAndPortDependent)
-    );
-}
-
-/// Tailcat 节点 `address` 恒空：非 Linux 的「节点 IP 排除」改从 servers 模式 DERP 项的
-/// host（含裸字符串项）/ `ipv4` / `ipv6` 里的 IP 字面值取（主机名 / `"none"` / 空跳过）；region 模式 IP 未知不加；Linux 整段不发射。
-#[test]
-fn tailcat_derp_server_ips_join_route_exclude_on_non_linux() {
-    use crate::user_config::protocol_settings::TailcatSettings;
-    use crate::user_config::server_config::{Protocol, ServerConfig};
-    let tailcat = |derp_region: Option<i64>, derp_servers: Vec<serde_json::Value>| UserConfig {
-        proxy_mode_type: ProxyModeType::Tun,
-        selected_server_id: Some("tc".into()),
-        servers: vec![ServerConfig {
-            id: "tc".into(),
-            name: "TC".into(),
-            protocol: Protocol::Tailcat,
-            tailcat_settings: Some(Box::new(TailcatSettings {
-                derp_region,
-                derp_servers,
-                ..Default::default()
-            })),
-            ..Default::default()
-        }],
-        ..Default::default()
-    };
-    let exclude = |config: &UserConfig, platform: &str| -> Vec<String> {
-        let mut deps = deps_linux();
-        deps.platform = platform.into();
-        let inbounds = build_inbounds(config, None, &deps);
-        let tun = inbounds.iter().find(|i| i.tag == "tun-in").expect("有 tun");
-        tun.route_exclude_address.clone().unwrap_or_default()
-    };
-    let servers = tailcat(
-        None,
-        vec![
-            serde_json::json!({ "host": "derp1.example.com", "ipv4": "203.0.113.7", "ipv6": "2001:db8::7" }),
-            serde_json::json!({ "host": "derp2.example.com", "ipv4": "none", "ipv6": "" }),
-            serde_json::json!({ "host": "derp3.example.com", "ipv4": "derp3.example.com" }),
-            serde_json::json!("derp4.example.com"),
-            // host 为 IP 字面值同样排除；与 ipv4 同值只加一次。
-            serde_json::json!({ "host": "198.51.100.5", "ipv4": "198.51.100.5" }),
-            serde_json::json!({ "host": "[2001:db8::5]" }),
-            // 裸字符串项即 host。
-            serde_json::json!("198.51.100.6"),
-        ],
-    );
-    let got = exclude(&servers, "darwin");
-    assert!(got.contains(&"203.0.113.7/32".to_string()), "{got:?}");
-    assert!(got.contains(&"2001:db8::7/128".to_string()), "{got:?}");
-    for cidr in ["198.51.100.5/32", "2001:db8::5/128", "198.51.100.6/32"] {
-        assert!(
-            got.contains(&cidr.to_string()),
-            "host 为 IP 字面值须排除 {cidr}：{got:?}"
-        );
-    }
-    assert_eq!(
-        got.iter().filter(|c| *c == "198.51.100.5/32").count(),
-        1,
-        "host 与 ipv4 同值只加一次：{got:?}"
-    );
-    assert!(
-        !got.iter().any(|c| c.contains("none") || c.contains("derp")),
-        "\"none\" / 非 IP 字面值必须跳过：{got:?}"
-    );
-    let baseline = exclude(
-        &UserConfig {
-            proxy_mode_type: ProxyModeType::Tun,
-            ..Default::default()
-        },
-        "darwin",
-    );
-    assert_eq!(
-        got.len(),
-        baseline.len() + 5,
-        "servers 模式恰多出五条 DERP 字面 IP：{got:?} vs {baseline:?}"
-    );
-
-    let region = tailcat(Some(1), vec![]);
-    assert_eq!(
-        exclude(&region, "darwin"),
-        baseline,
-        "region 模式 DERP IP 未知，不得多加任何段"
-    );
-
-    assert!(
-        exclude(&servers, "linux").is_empty(),
-        "Linux 恒不发射 route_exclude_address（与节点 IP 排除的非 Linux 条件一致）"
     );
 }
 
@@ -869,7 +782,7 @@ fn tun_dns_contract_all_platforms_and_missing_config() {
                 username: "test".into(),
                 password: "b".repeat(32),
             });
-            for inbound in build_inbounds(&config, None, &deps) {
+            for inbound in build_inbounds(&config, &deps) {
                 if inbound.type_field != "tun" {
                     assert!(serde_json::to_value(inbound)
                         .unwrap()
@@ -878,7 +791,7 @@ fn tun_dns_contract_all_platforms_and_missing_config() {
                 }
             }
             config.proxy_mode_type = ProxyModeType::SystemProxy;
-            for inbound in build_inbounds(&config, None, &deps) {
+            for inbound in build_inbounds(&config, &deps) {
                 assert!(serde_json::to_value(inbound)
                     .unwrap()
                     .get("dns_mode")
@@ -1001,7 +914,7 @@ fn engaged_mesh_carves_tun_exclusion_once_and_keeps_platform_lan_guards() {
             }
             let mut deps = deps_linux();
             deps.platform = platform.into();
-            let inbounds = build_inbounds(&config, None, &deps);
+            let inbounds = build_inbounds(&config, &deps);
             let exclude = inbounds
                 .iter()
                 .find(|i| i.tag == "tun-in")
@@ -1016,7 +929,7 @@ fn engaged_mesh_carves_tun_exclusion_once_and_keeps_platform_lan_guards() {
             );
             if platform == "win32" && engagement != "unused" {
                 deps.own_lan_cidrs = vec!["10.20.0.0/24".into()];
-                let physical = build_inbounds(&config, None, &deps);
+                let physical = build_inbounds(&config, &deps);
                 let exclude = physical
                     .iter()
                     .find(|i| i.tag == "tun-in")

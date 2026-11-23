@@ -72,7 +72,7 @@ fn inbounds_matches_polaris_golden() {
             log: |_, _| {},
         };
 
-        let rust_inbounds = build_inbounds(&config, None, &deps);
+        let rust_inbounds = build_inbounds(&config, &deps);
         let rust_json: Vec<serde_json::Value> = rust_inbounds
             .iter()
             .map(|ib| serde_json::to_value(ib).unwrap())

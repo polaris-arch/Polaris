@@ -95,7 +95,7 @@ fn config_with(servers: Vec<ServerConfig>) -> UserConfig {
     UserConfig {
         servers,
         // `"__direct__"` 是「未选择真实节点」的哨兵：selected_server_id 必须是某个真实节点或它，
-        // 否则 generate 直接 Err。用它可以避开「选中节点 IP 排除」块往产物里追加无关条目。
+        // 否则 generate 直接 Err。
         selected_server_id: Some("__direct__".into()),
         ..Default::default()
     }
@@ -397,7 +397,7 @@ fn inbounds_deps(obs: ObservedTailnetAddresses) -> InboundsDeps {
 fn tun_exclude_of(config: &UserConfig, obs: ObservedTailnetAddresses) -> (Vec<String>, bool) {
     take_captured();
     let deps = inbounds_deps(obs);
-    let inbounds = build_inbounds(config, None, &deps);
+    let inbounds = build_inbounds(config, &deps);
     let exclude = inbounds
         .iter()
         .find(|i| i.type_field == "tun")

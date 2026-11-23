@@ -470,7 +470,7 @@ pub fn generate_running_candidate(
 
 fn generate_base_config(
     config: &UserConfig,
-    resolved_ips: &BTreeMap<String, String>,
+    _resolved_ips: &BTreeMap<String, String>,
     deps: &GenerateConfigDeps,
     runtime_bind_interfaces: &BTreeMap<String, String>,
 ) -> Result<GenerateOutcome, String> {
@@ -692,7 +692,7 @@ fn generate_base_config(
         observed_tailnet_addresses: deps.observed_tailnet_addresses.clone(),
         loopback_auth: deps.loopback_auth.clone(),
     };
-    let mut inbounds = build_inbounds(config, Some(resolved_ips), &inbounds_deps);
+    let mut inbounds = build_inbounds(config, &inbounds_deps);
     for inbound in &mut inbounds {
         inbound.linux_resolved_external = match Platform::parse(&deps.platform) {
             Platform::Linux if inbound.type_field == "tun" && deps.linux_resolved_external => {

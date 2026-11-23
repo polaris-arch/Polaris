@@ -211,6 +211,7 @@ fn android_warm_block_keeps_the_existing_clash_control_and_uses_block_policy() {
     use crate::user_config::dns_constants::{BLOCK_SERVER_ID, DIRECT_SERVER_ID};
 
     let mut config = base_config();
+    config.servers[0].address = "203.0.113.10".into();
     config.servers.push(ServerConfig {
         id: "ts".into(),
         name: "Tailnet".into(),

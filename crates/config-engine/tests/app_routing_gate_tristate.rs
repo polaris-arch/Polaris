@@ -8,7 +8,7 @@
 //! |---|---|
 //! | `builder/route.rs`（`build_route_config` 的 `app_rules_eff`） | `route.rules` 里按应用身份命中的应用规则（桌面 `process_name` 两条；Android `package_name` 只 proxy 一条） |
 //! | `builder/outbounds.rs`（规则选择器生成） | 出站 `rule-sel-app-<appId>` |
-//! | `builder/inbounds.rs`（`effective_app_rules_proxy`） | Android `exclude_package`；非 Linux TUN 的节点 IP 排除 |
+//! | `builder/inbounds.rs`（`effective_app_rules_proxy`） | Android `exclude_package`；节点 IP 各平台都不进 TUN 排除表 |
 //! | `builder/endpoint_routes.rs`（`engaged_rule_targeted_server_ids`） | 返回集含应用规则的目标节点 |
 //! | `builder/endpoint_routes.rs`（`referenced_server_ids` 的播种） | 返回集含应用规则的目标节点 |
 //!
@@ -22,8 +22,8 @@
 //! - 三态逐一量，**缺省与显式 false 分开量**（否则「这条规则本来就进不去」会同时满足两者）。
 //! - 每个平台都跑，平台轴取自 [`Platform::ALL`]；平台 → builder 平台串的映射是穷举 `match`，
 //!   新增变体编译不过，逼着回答这个平台上 inbounds 那一站能观测到什么。
-//! - 正面断言（开时逐字出现的具体值）与反面断言（关时不出现）成对；另有一条与门无关的正对照
-//!   （选中节点 IP 恒在排除表里），证明读的那张表不是空的。
+//! - 正面断言（开时逐字出现的具体值）与反面断言（关时不出现）成对；另有一条与门无关的对照
+//!   （选中节点 IP 恒不在排除表里），钉住排除表与选中节点无关。
 
 use polaris_config_engine::builder::endpoint_routes::{
     engaged_rule_targeted_server_ids, referenced_server_ids,
@@ -60,7 +60,7 @@ fn platform_str(p: Platform) -> &'static str {
 struct InboundsSignal {
     /// Android：`direct` 档应用的包名进 `exclude_package`。
     exclude_package: bool,
-    /// TUN 下节点 IP 进 `route_exclude_address`（`deps.platform != "linux"` 那条腿）。
+    /// TUN 下节点 IP 进 `route_exclude_address`。各平台恒否：排除表与选中节点、订阅内容无关。
     node_ip_excluded: bool,
 }
 
@@ -68,18 +68,14 @@ fn inbounds_signal(p: Platform) -> InboundsSignal {
     match p {
         Platform::Android => InboundsSignal {
             exclude_package: true,
-            node_ip_excluded: true,
-        },
-        Platform::Mac | Platform::Win | Platform::Ios | Platform::Other => InboundsSignal {
-            exclude_package: false,
-            node_ip_excluded: true,
-        },
-        // `inbounds.rs` 的节点 IP 排除这条腿门在 `deps.platform != "linux"` ⇒ inbounds 这一站在
-        // Linux 上没有可观测量（route / outbounds / endpoint_routes 三站仍然量）。
-        Platform::Linux => InboundsSignal {
-            exclude_package: false,
             node_ip_excluded: false,
         },
+        Platform::Mac | Platform::Win | Platform::Linux | Platform::Ios | Platform::Other => {
+            InboundsSignal {
+                exclude_package: false,
+                node_ip_excluded: false,
+            }
+        }
     }
 }
 
@@ -299,24 +295,17 @@ fn generated_config_follows_the_tristate_gate_on_every_platform() {
                 );
             }
             let rea = str_list(&tun["route_exclude_address"]);
-            if sig.node_ip_excluded {
-                // 正对照：选中节点的 IP 与门无关、恒在 ⇒ 下面那条「目标节点 IP 不在」有信息量。
-                assert!(
-                    rea.contains(&format!("{SELECTED_IP}/32")),
-                    "{ctx} 正对照：选中节点 IP 不在排除表 —— 本平台节点 IP 排除这条腿已不存在，inbounds_signal 要重答"
-                );
-                assert_eq!(
-                    rea.contains(&format!("{TARGET_IP}/32")),
-                    on,
-                    "{ctx} inbounds.rs 站：应用规则目标节点 IP 排除，实得 {rea:?}"
-                );
-            } else {
-                assert!(
-                    !rea.iter()
-                        .any(|c| c.starts_with(SELECTED_IP) || c.starts_with(TARGET_IP)),
-                    "{ctx} 本平台不该发派生的节点 IP 排除，实得 {rea:?} —— inbounds_signal 要重答"
-                );
-            }
+            // 对照：选中节点的 IP 与门无关 ⇒ 排除表与选中节点无关。
+            assert_eq!(
+                rea.iter().any(|c| c.starts_with(SELECTED_IP)),
+                sig.node_ip_excluded,
+                "{ctx} 选中节点 IP 排除与 inbounds_signal 不符，实得 {rea:?}"
+            );
+            assert_eq!(
+                rea.iter().any(|c| c.starts_with(TARGET_IP)),
+                sig.node_ip_excluded && on,
+                "{ctx} inbounds.rs 站：应用规则目标节点 IP 排除，实得 {rea:?}"
+            );
             runs += 1;
         }
     }
