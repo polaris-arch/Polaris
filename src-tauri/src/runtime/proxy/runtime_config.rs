@@ -4038,10 +4038,11 @@ impl ProxyRuntime {
             if !self.protected_runtime_publication_current(pending) {
                 return false;
             }
-            let Ok(mut current) = self.current_config.write() else {
+            // Native exit-status readers acquire the selector before current config.
+            let Ok(mut snapshot) = self.switch_snapshot.write() else {
                 return false;
             };
-            let Ok(mut snapshot) = self.switch_snapshot.write() else {
+            let Ok(mut current) = self.current_config.write() else {
                 return false;
             };
             let Ok(mut startup) = self.startup_snapshot.write() else {
