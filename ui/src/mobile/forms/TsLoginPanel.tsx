@@ -98,6 +98,7 @@ export function TsLoginPanel({
   const submissionRef = useRef(0);
   const editedAfterSaveRef = useRef(false);
   const editRevisionRef = useRef(0);
+  const authorizedRef = useRef(false);
   const progress = useTailscaleLoginProgressStore((s) => progressForLoginRequest(
     pending ? s.attempts[pending.serverId] : undefined,
     pending,
@@ -198,6 +199,7 @@ export function TsLoginPanel({
     if (active?.serverId !== pending.serverId || active.attemptId !== pending.attemptId
       || current?.attemptId !== pending.attemptId || current.phase !== 'authorized') return;
     pendingRef.current = null;
+    authorizedRef.current = true;
     setPending(null);
     setSubmitting(false);
     setTailscaleAuthUrl(pending.serverId, null);
@@ -288,7 +290,7 @@ export function TsLoginPanel({
     pendingRef.current = null;
     setPending(null);
     closeInstance(instanceId);
-    if (!serverId && savedServer && addedPhase !== 'authorized' && addedPhase !== 'mainCore') {
+    if (!serverId && savedServer && !authorizedRef.current && addedPhase !== 'authorized' && addedPhase !== 'mainCore') {
       try {
         await api.server.delete(savedServer.id);
       } catch {

@@ -223,7 +223,7 @@ function Host() {
     ? <TsLoginPanel key={form.instanceId} instanceId={form.instanceId} serverId={form.serverId} replaceIdentity={mode?.startsWith('ios-replace') || mode === 'state-switch' || mode?.startsWith('android-switch') || mode === 'desktop-switch-held'} /> : form.kind === 'confirm'
       ? <ConfirmPanel key={form.instanceId} instanceId={form.instanceId} payload={form.payload} /> : null);
 }
-useMobileFormStore.getState().open({kind:mode === 'ios-settings' || mode?.includes('credential-settings') ? 'ts-settings' : 'ts-login', serverId:mode === 'add' ? undefined : 'ts-1'});
+useMobileFormStore.getState().open({kind:mode === 'ios-settings' || mode?.includes('credential-settings') ? 'ts-settings' : 'ts-login', serverId:mode?.startsWith('add') ? undefined : 'ts-1'});
 createRoot(document.getElementById('root')).render(<main className="mobile-root"><Host /><MobileToaster /></main>);
 `;
 const desktopEntry = entry.replace(
@@ -826,16 +826,24 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile TS attempt lif
   it.each([['__ts-login', '.m-form-head .m-form-x'], ['__ts-desktop', '.entry-form-dlg .btn.ghost']])('%s close removes an unauthorized node saved by Add, never an existing one', async (endpoint, close) => {
     const page = await browser.newPage({ viewport: { width: 1100, height: 850 }, locale: 'zh-CN' });
     try {
-      for (const mode of ['add', 'existing']) {
+      for (const mode of ['add', 'existing', 'add-authorized']) {
         await page.goto(`${origin}/${endpoint}?mode=${mode}`);
         await page.locator('.m-form-foot .primary, .entry-form-dlg .btn.flow').click();
         await page.waitForFunction(() => (window as any).__tsTest.starts === 1);
+        if (mode === 'add-authorized') {
+          // Authorized after an edit keeps it open; a later attempt resets the phase to starting.
+          await page.locator('#mts-name, #ts-login-name').fill('Edited');
+          await page.evaluate(() => { const t = (window as any).__tsTest; t.emit('onTailscaleLoginProgress', { ...t.startRequest, phase: 'authorized', url: null }); });
+          await page.locator('.m-form-foot .primary, .entry-form-dlg .btn.flow').click();
+          await page.waitForFunction(() => (window as any).__tsTest.starts === 2);
+        }
         await page.locator(close).click();
+        await page.evaluate(() => (window as any).__tsTest.topConfirm()?.onConfirm());
         await page.waitForFunction(() => (window as any).__tsTest.cancels.length > 0);
         await page.waitForTimeout(100);
         const { deletes, id } = await page.evaluate(() => ({ deletes: (window as any).__tsTest.deletes, id: (window as any).__tsTest.candidate.id }));
         expect(deletes).toEqual(mode === 'add' ? [id] : []);
-        if (mode === 'add') expect(id).not.toBe('ts-1');
+        expect(id === 'ts-1').toBe(mode === 'existing');
       }
     } finally { await page.close(); }
   }, 30_000);

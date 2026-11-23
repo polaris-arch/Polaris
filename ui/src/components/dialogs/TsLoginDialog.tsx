@@ -50,6 +50,7 @@ export function TsLoginDialog({ instanceId, serverId, replaceIdentity = false }:
   const savedServer = useRef<ServerConfig | undefined>(undefined);
   const activeRequest = useRef<{ serverId: string; attemptId: string; revision: number } | null>(null);
   const editRevision = useRef(0);
+  const authorized = useRef(false);
   const [saved, setSaved] = useState(Boolean(serverId));
   const existingTs = servers.find((s) => s.id === (serverId ?? savedServer.current?.id)) ?? savedServer.current;
   const meshNames = groupServersBySubscription(visibleServers, subscriptions)
@@ -160,6 +161,7 @@ export function TsLoginDialog({ instanceId, serverId, replaceIdentity = false }:
     // Detach before closing: unmount must not send cancel for a completed login,
     // and a late start receipt cannot complete a successor dialog or attempt.
     activeRequest.current = null;
+    authorized.current = true;
     setPendingRequest(null);
     setSubmitting(false);
     setTailscaleAuthUrl(request.serverId, null);
@@ -199,7 +201,7 @@ export function TsLoginDialog({ instanceId, serverId, replaceIdentity = false }:
       s.setTailscaleAuthUrl(request.serverId, null);
       cancelled = api.server.tailscaleLoginCancel(request.serverId, request.attemptId).catch(() => {});
     }
-    if (added && addedPhase !== 'authorized' && addedPhase !== 'mainCore') {
+    if (added && !authorized.current && addedPhase !== 'authorized' && addedPhase !== 'mainCore') {
       void cancelled.then(() => api.server.delete(added.id)).catch(() => toast.error(t('nodes.deleteFail')));
     }
   }, []);
