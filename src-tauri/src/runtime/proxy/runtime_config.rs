@@ -3970,10 +3970,13 @@ impl ProxyRuntime {
                 }
             }
             // Core drops only records that are no longer in flight, and every
-            // commit advances applied_revision. An unchanged expected identity
-            // therefore proves this expired transaction never published.
+            // commit advances applied_revision. Before plan expiry an unconsumed
+            // plan is also UNKNOWN and Core may still admit it; after expiry
+            // Core refuses it, so an unchanged expected identity proves this
+            // transaction never published.
             Ok(status)
                 if status.contract_version == 1
+                    && !runtime_plan_ticket_is_live(pending.plan.expires_at_unix_milli)
                     && status.lookup_state
                         == daemon::RuntimeLookupState::UnknownOrExpired as i32
                     && identity_equal(status.active.as_ref(), Some(identity))

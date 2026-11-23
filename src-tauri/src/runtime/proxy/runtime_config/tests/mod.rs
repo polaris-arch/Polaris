@@ -2100,6 +2100,47 @@ async fn aborting_apply_settles_in_background_and_releases_pending() {
     server.abort();
 }
 
+// An unconsumed plan is UNKNOWN to Core until it is applied, and Core may still
+// admit it before expiry. Only an expired plan with the unchanged expected
+// identity proves the transaction never published.
+#[tokio::test]
+async fn unknown_receipt_keeps_pending_until_plan_expiry() {
+    let (rt, _dir, _calls) = crate::runtime::proxy::tests::test_runtime_recording();
+    let mut pending = ts_pending_raw_fixture(&rt, runnable_config_fixture());
+    pending.plan.expires_at_unix_milli = i64::try_from(
+        (SystemTime::now() + Duration::from_secs(60))
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap();
+    let operation = daemon::RuntimeConfigOperation {
+        active: pending.plan.expected.clone(),
+        control_revision: pending.plan.expected_control_revision,
+        ..Default::default()
+    };
+    let (rpc, server) = native_retirement_rpc_peer(&rt, &pending, operation).await;
+    *rpc.status.lock().unwrap() = daemon::RuntimeConfigStatus {
+        contract_version: 1,
+        active: pending.plan.expected.clone(),
+        lookup_state: daemon::RuntimeLookupState::UnknownOrExpired as i32,
+        control_revision: pending.plan.expected_control_revision,
+        ..Default::default()
+    };
+    rt.runtime_config_apply.lock().unwrap().pending = Some(pending.clone());
+    let id = pending.plan.transaction_id.clone();
+    assert_eq!(
+        rt.runtime_apply_status(id.clone()).await.status,
+        "unconfirmed"
+    );
+    assert!(rt.runtime_config_apply.lock().unwrap().pending.is_some());
+    pending.plan.expires_at_unix_milli = 1;
+    rt.runtime_config_apply.lock().unwrap().pending = Some(pending);
+    assert_eq!(rt.runtime_apply_status(id).await.status, "rejected");
+    assert!(rt.runtime_config_apply.lock().unwrap().pending.is_none());
+    server.abort();
+}
+
 #[tokio::test]
 async fn confirmed_ts_binding_commit_replaces_token_in_same_main_generation() {
     let (rt, _dir, _calls) = crate::runtime::proxy::tests::test_runtime_recording();
