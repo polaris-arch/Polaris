@@ -419,8 +419,8 @@ impl RuleResourceScheduler {
             return;
         }
         let (mut ok_count, mut failures) = (0usize, Vec::new());
+        let mut retried = false;
         for tag in due {
-            let mut retried = false;
             let data = loop {
                 let state = app.state::<AppRuntime>();
                 let resp = crate::commands::rules::rule_resources_update_builtin_silent(
@@ -431,7 +431,7 @@ impl RuleResourceScheduler {
                 )
                 .await;
                 let data = resp.ok().and_then(|r| r.data).unwrap_or(Value::Null);
-                // 内核启停中拒绝替换生效副本：不是源故障，短延迟后重试一次。
+                // 内核启停中拒绝替换生效副本：不是源故障，每轮只短延迟重试一次。
                 if retried
                     || data.get("error").and_then(Value::as_str) != Some(RESOURCE_LIFECYCLE_BUSY)
                 {
