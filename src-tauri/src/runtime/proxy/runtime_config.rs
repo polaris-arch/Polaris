@@ -3882,8 +3882,13 @@ impl ProxyRuntime {
                     if me.gate.generation() != generation {
                         return;
                     }
-                    let status = me.runtime_apply_status(transaction_id.clone()).await.status;
-                    if status != "unconfirmed" {
+                    let settled = me.runtime_apply_status(transaction_id.clone()).await;
+                    if settled.status != "unconfirmed" {
+                        log::info!(
+                            "runtime config transaction reconciled: status={} reasons={:?}",
+                            settled.status,
+                            settled.reasons,
+                        );
                         return;
                     }
                     if Instant::now() >= deadline {
