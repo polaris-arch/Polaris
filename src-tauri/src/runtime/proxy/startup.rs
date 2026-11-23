@@ -2092,6 +2092,7 @@ impl ProxyRuntime {
                             self.set_error(exhausted, code::STARTUP_FAILED);
                             return Err(StartError::coded(exhausted, code::STARTUP_FAILED));
                         }
+                        self.retain_failed_android_start_for_stop(&android_birth);
                         self.set_error(&msg, error_code);
                         return Err(StartError::coded(msg, error_code));
                     }

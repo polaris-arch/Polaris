@@ -1800,6 +1800,11 @@ fn persist_builtin_geo_updated(
     paths: (&Path, &Path, &ResourceStageDir),
     operation: &BuiltinUpdateOperation,
 ) -> Result<(), String> {
+    // Core snapshots rule-set files while a Start/Restart builds it and rechecks
+    // them before commit. Never replace a live file inside a lifecycle.
+    if state.proxy().core_lifecycle_busy() {
+        return Err("内核正在启停，规则资源稍后重试".to_owned());
+    }
     let owner = StagedSaveOwner::capture(state.proxy(), 0);
     let saved = save_resource_change(state.config(), tag, updated_at, paths, operation, owner)
         .map_err(|error| {

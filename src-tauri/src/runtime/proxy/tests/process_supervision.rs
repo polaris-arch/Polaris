@@ -540,6 +540,39 @@ async fn typed_pre_dispatch_retirement_releases_only_exact_android_custody_and_t
         .is_err());
 }
 
+// I2: an ordinary Start error keeps its birth, but hands it to Stop. A certain
+// Stop ACK then releases the TS claim and custody so the next Start can book.
+#[tokio::test]
+async fn failed_android_start_is_released_by_certain_stop_ack() {
+    let (rt, _dir) = test_runtime();
+    let gate = rt.mesh.tailscale_state_gate().await;
+    let state = rt.mesh.tailscale_state_dir("ts-android-failed").unwrap();
+    let token = rt.mesh.mint_tailscale_main_birth();
+    let mut reservation = rt
+        .mesh
+        .reserve_tailscale_main_states(
+            &serde_json::json!({"endpoints":[{"type":"tailscale", "state_directory":state}]}),
+            &gate,
+            token.clone(),
+        )
+        .await
+        .unwrap();
+    let birth = rt.book_android_global_start(Some(token)).unwrap();
+    reservation.arm_external_start();
+    drop(reservation);
+    assert!(rt.begin_android_stop_booking(true).is_err());
+    rt.retain_failed_android_start_for_stop(&birth);
+    assert!(rt.book_android_global_start(None).is_err());
+    assert!(rt
+        .confirm_android_global_start(&birth, android_target("late-start"))
+        .is_err());
+    let booking = rt.begin_android_stop_booking(true).unwrap();
+    booking.finish_with_gate(Ok(()), &rt.mesh, &gate).unwrap();
+    assert!(!rt.mesh.main_owns_tailscale("ts-android-failed", true));
+    assert!(rt.android_main_token.lock().unwrap().is_none());
+    rt.book_android_global_start(None).unwrap();
+}
+
 #[test]
 fn no_birth_retirement_never_erases_unknown_android_custody() {
     let (rt, _dir) = test_runtime();

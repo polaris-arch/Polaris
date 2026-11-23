@@ -660,6 +660,20 @@ impl ProxyRuntime {
         }
     }
 
+    /// An ordinary Start failure cannot prove that no native owner exists, so
+    /// this birth stays booked. It becomes Stop-only: a later Stop delivers to
+    /// native, and only its certain ACK releases the TS claim and custody.
+    pub(super) fn retain_failed_android_start_for_stop(&self, birth: &super::AndroidRequestBirth) {
+        if let Ok(mut custody) = self.android_main_token.lock() {
+            if let Some(attempt) = custody
+                .as_mut()
+                .filter(|attempt| attempt.birth.same(birth) && !attempt.start_confirmed)
+            {
+                attempt.stop_only = true;
+            }
+        }
+    }
+
     pub(super) fn begin_android_stop_booking(
         &self,
         allow_main: bool,
