@@ -471,6 +471,35 @@ body {
   overflow-wrap: anywhere;
 }
 
+/* 文字区即明细入口（同桌面 `.pb-tx`）：按钮外观归零，排版沿用 `.m-pending-text`。 */
+button.m-pending-text {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  font-family: inherit;
+  text-align: start;
+  cursor: pointer;
+}
+
+/* 明细面板（`FormSheet` 内）：组标题 + 行，同桌面 `.pd-h` / `.pd-row`。 */
+.m-pending-h {
+  margin: 0 0 4px;
+  color: hsl(var(--fg-dim));
+  font-size: 0.8125rem;
+  font-weight: 600;
+}
+
+.m-pending-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  min-height: 2rem;
+  font-size: 0.9375rem;
+  overflow-wrap: anywhere;
+}
+
 .m-pending-acts {
   display: flex;
   flex: 0 1 auto;

@@ -25,9 +25,12 @@
  *
  * # 三处与桌面**不同**的处置，逐条写明为什么
  *
- * ① **不渲染桌面可点击的明细入口。** 桌面两个 detailKey 的文案分别是「需重启内核生效 · 点击查看明细」与
- *    「点击查看明细」，而明细 popover（`.pd-pop`，逐条撤销 + 逐条标生效类别）本批不做。
- *    移动端保留 B 维的短说明「已保存的改动仍待应用」，让放弃 A 草稿后留下的待应用状态可解释。
+ * ① **明细走 `FormSheet`，不是桌面那种向上弹的 popover。** 条上的文字区就是入口（同桌面 `.pb-tx`），
+ *    点开后内容与桌面 `.pd-pop` 同一份口径：待保存组（逐条撤销，同一个 `revert(id)` + 同一句 toast）、
+ *    配置变更行、added / modified / removed 三组节点名（`pendingNodeGroups`，id 回落同桌面）。
+ *    `.pd-pop` 的定位依赖桌面 docked 条，长列表在停靠区里也放不下；`FormSheet` 本文件已在用，
+ *    自带滚动、遮罩与返回键出栈。没有可列的明细时文字区不是按钮，不开空面板。
+ *    B 维的短说明「已保存的改动仍待应用」照旧保留。
  * ② **「重置」的二次确认走 `useConfirmTwice`**（与桌面同一份实现、同一个 2600ms）。这颗按钮一次
  *    误点丢光全部未保存编辑，而移动端的手指比鼠标更容易误点；其余动作都不销毁用户输入，不设闸。
  * ③ **保存冲突就地呈现，不开弹窗。** 桌面在 `conflict !== null` 时开 `StagedConflictDialog` 逐项选择，
@@ -64,7 +67,9 @@ import {
   runtimePersistenceRecoveryEnded,
   applyStateOnLifecycle,
   composeBarView,
+  hasPendingWork,
   pendingChangesCount,
+  pendingNodeGroups,
   pendingPhaseOf,
   stagedPhaseOf,
   type ApplyState,
@@ -99,6 +104,7 @@ export function MobilePendingBar(): ReactElement | null {
   /** 「立即应用」保存后请求 HOT；仅确认重启时允许中断连接。核没在跑时没有应用对象，那颗整颗不渲染（见 `BarInput.coreRunning`）。 */
   const coreRunning = useAppStore((s) => s.proxyStatus?.running ?? false);
   const coreGeneration = useAppStore((s) => s.proxyStatus?.mainGeneration);
+  const servers = useAppStore((s) => s.servers);
   const stagedEntries = useStagedConfigStore((s) => s.entries);
   const saveStatus = useStagedConfigStore((s) => s.saveStatus);
   const conflict = useStagedConfigStore((s) => s.conflict);
@@ -134,6 +140,7 @@ export function MobilePendingBar(): ReactElement | null {
   const translateRef = useRef(simpleT);
   translateRef.current = simpleT;
   const { armed, confirmTwice } = useConfirmTwice();
+  const [detailOpen, setDetailOpen] = useState(false);
 
   const reconciliation = useRuntimeApplyReconciliation(apply, setApply, applyRequest, simpleT);
 
@@ -259,6 +266,9 @@ export function MobilePendingBar(): ReactElement | null {
     persistenceOnly: apply.persistenceOnly,
     persistenceRecoveryEnded: apply.persistenceRecoveryEnded,
   });
+  // 明细随最后一项一起消失时收起，免得下一批改动出现时面板自己弹开。
+  const detail = stagedEntries.length > 0 || hasPendingWork(pending);
+  if (detailOpen && !detail) setDetailOpen(false);
   if (!view.visible && restartPrompt === null && impactChoice.prompt === null) return null;
 
   const onApply = async (restartConfirmation?: string, persistenceTransactionId?: string, impactConfirmation?: string, hostRetry = false): Promise<void> => {
@@ -482,21 +492,36 @@ export function MobilePendingBar(): ReactElement | null {
     }
   };
 
+  // 文字区：有可列的明细时是入口（按钮），否则只是说明（不给一颗点了也打不开的按钮）。
+  const text = (
+    <>
+      <b>{armed === RESET_KEY ? t('home.pendingResetShortConfirm') : t(view.titleKey, view.titleVars)}</b>
+      {view.accountDetailKeys?.map(key => <span className="m-pending-detail" key={key}>{t(key)}</span>)}
+      {view.detailKey !== '' && (apply.nativeRetirements?.length || pending.nativeRetirements?.length || apply.host && apply.host.phase !== 'settled') ? (
+        <span className="m-pending-detail">{t(view.detailKey)}</span>
+      ) : saveStatus !== 'saving' && pendingPhase === 'pending' && (
+        <span className="m-pending-detail">{t('home.pendingSavedStillNeedsApply')}</span>
+      )}
+    </>
+  );
+
   return (
     <div
       className={`m-pending${view.err ? ' m-pending-err' : ''}`}
       role="status"
       aria-live="polite"
     >
-      <div className="m-pending-text">
-        <b>{armed === RESET_KEY ? t('home.pendingResetShortConfirm') : t(view.titleKey, view.titleVars)}</b>
-        {view.accountDetailKeys?.map(key => <span className="m-pending-detail" key={key}>{t(key)}</span>)}
-        {view.detailKey !== '' && (apply.nativeRetirements?.length || pending.nativeRetirements?.length || apply.host && apply.host.phase !== 'settled') ? (
-          <span className="m-pending-detail">{t(view.detailKey)}</span>
-        ) : saveStatus !== 'saving' && pendingPhase === 'pending' && (
-          <span className="m-pending-detail">{t('home.pendingSavedStillNeedsApply')}</span>
-        )}
-      </div>
+      {detail ? (
+        <button
+          type="button"
+          className="m-pending-text"
+          aria-expanded={detailOpen}
+          aria-haspopup="dialog"
+          onClick={() => setDetailOpen(true)}
+        >
+          {text}
+        </button>
+      ) : <div className="m-pending-text">{text}</div>}
       <div className="m-pending-acts" data-revert-pair={view.actions.length === 2 && view.actions[0].id === 'revertSaved'}>
         {view.actions.map((a) => {
           const arming = (a.id === 'reset' && armed === RESET_KEY)
@@ -518,6 +543,41 @@ export function MobilePendingBar(): ReactElement | null {
           );
         })}
       </div>
+      {detailOpen && detail && (
+        <FormSheet compact title={t(view.titleKey, view.titleVars)}
+          onRequestClose={() => setDetailOpen(false)} closeLabel={t('common.close')}
+          cancelLabel={t('common.close')}>
+          {stagedEntries.length > 0 && (
+            <section>
+              <h3 className="m-pending-h">{t('home.pendingGroupStaged')}</h3>
+              {stagedEntries.map((e) => (
+                <div className="m-pending-row" key={e.id}>
+                  <span>{e.label}</span>
+                  <button
+                    type="button"
+                    className="m-pending-btn"
+                    onClick={() => {
+                      useStagedConfigStore.getState().revert(e.id);
+                      toast.success(t('home.pendingRevertedOne'));
+                    }}
+                  >
+                    {t('home.pendingRevertOne')}
+                  </button>
+                </div>
+              ))}
+            </section>
+          )}
+          {pendingChangesCount(pending) === 0 && pending.restartDeferred && (
+            <h3 className="m-pending-h">{t('home.pendingGroupConfig')}</h3>
+          )}
+          {pendingNodeGroups(pending, servers).map((g) => (
+            <section key={g.key}>
+              <h3 className="m-pending-h">{t(g.labelKey)}</h3>
+              {g.rows.map((r) => <div className="m-pending-row" key={r.id}>{r.name}</div>)}
+            </section>
+          ))}
+        </FormSheet>
+      )}
       {impactChoice.prompt !== null && (
         <FormSheet compact title={t('home.impactApplyTitle')}
           onRequestClose={impactChoice.dismiss} closeLabel={t('common.close')}

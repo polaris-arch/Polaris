@@ -1,4 +1,4 @@
-import type { NativeRetirementDebt, PendingApplyResult, PendingNodeChanges, ProxyLifecycleEvent } from '@/contracts/types';
+import type { NativeRetirementDebt, PendingApplyResult, PendingNodeChanges, ProxyLifecycleEvent, ServerConfig } from '@/contracts/types';
 import { nativeRetirementDebts, mergeNativeRetirementDebts, nativeRetirementEndGeneration } from '@/domain/native-retirement';
 export { nativeRetirementDebts } from '@/domain/native-retirement';
 import {
@@ -36,6 +36,28 @@ export function pendingChangesCount(pending: PendingNodeChanges): number {
  */
 export function hasPendingWork(pending: PendingNodeChanges): boolean {
   return pendingChangesCount(pending) > 0 || pending?.restartDeferred === true;
+}
+
+/**
+ * 明细里的三组节点（桌面 popover 与移动端明细共用，同一份口径）。三组顺序 = 计数口径顺序
+ * （`pendingChangesCount`），保证「条上的数字 = 明细行数」逐项对得上；空组不出。
+ *
+ * 差集里存的是 serverId。节点可能刚被删（差集是快照、servers 是当下）→ 回落显 id 而非空行：
+ * 「有一项待应用但说不出是哪个」也比凭空少一行诚实。
+ */
+export function pendingNodeGroups(
+  pending: PendingNodeChanges,
+  servers: readonly Pick<ServerConfig, 'id' | 'name'>[],
+): { key: string; labelKey: string; rows: { id: string; name: string }[] }[] {
+  return [
+    { key: 'added', labelKey: 'home.pendingGroupAdded', ids: pending?.added ?? [] },
+    { key: 'modified', labelKey: 'home.pendingGroupModified', ids: pending?.modified ?? [] },
+    { key: 'removed', labelKey: 'home.pendingGroupRemoved', ids: pending?.removed ?? [] },
+  ].filter((g) => g.ids.length > 0).map((g) => ({
+    key: g.key,
+    labelKey: g.labelKey,
+    rows: g.ids.map((id) => ({ id, name: servers.find((s) => s.id === id)?.name ?? id })),
+  }));
 }
 
 /** HOT receipt outcomes plus the backward-compatible explicit restart scheduling states. */

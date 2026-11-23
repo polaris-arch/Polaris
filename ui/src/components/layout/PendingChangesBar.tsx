@@ -64,6 +64,7 @@ import {
   composeBarView,
   hasPendingWork,
   pendingChangesCount,
+  pendingNodeGroups,
   pendingPhaseOf,
   stagedPhaseOf,
   type ApplyState,
@@ -510,17 +511,6 @@ export default function PendingChangesBar() {
   const spins = (id: BarActionId): boolean =>
     (id === 'save' && saveStatus === 'saving') || (id === 'apply' && apply.phase === 'applying');
 
-  /** 差集里存的是 serverId。节点可能刚被删（差集是快照、config 是当下）→ 回落显 id 而非空行：
-   *  「有一项待应用但说不出是哪个」也比凭空少一行诚实。 */
-  const nameOf = (id: string): string => servers.find((s) => s.id === id)?.name ?? id;
-
-  // 三组顺序 = 计数口径顺序（pendingChangesCount），保证「条上的数字 = popover 行数」逐项对得上。
-  const groups: { key: string; labelKey: string; ids: string[] }[] = [
-    { key: 'added', labelKey: 'home.pendingGroupAdded', ids: pending?.added ?? [] },
-    { key: 'modified', labelKey: 'home.pendingGroupModified', ids: pending?.modified ?? [] },
-    { key: 'removed', labelKey: 'home.pendingGroupRemoved', ids: pending?.removed ?? [] },
-  ].filter((g) => g.ids.length > 0);
-
   return (
     <div
       className={cn('pending-bar show', view.err && 'err')}
@@ -624,14 +614,15 @@ export default function PendingChangesBar() {
               <div className="pd-h">{t('home.pendingGroupConfig')}</div>
             </div>
           )}
-          {groups.map((g) => (
+          {/* 三组的顺序、标签与 id 回落与移动端明细同一份；只在 popover 开着时推导。 */}
+          {pendingNodeGroups(pending, servers).map((g) => (
             <div key={g.key}>
               <div className="pd-h">{t(g.labelKey)}</div>
-              {g.ids.map((id) => (
-                <div className="pd-row" key={id}>
+              {g.rows.map((r) => (
+                <div className="pd-row" key={r.id}>
                   <span className="dot idle" aria-hidden />
-                  <span className="pd-l" data-tip={nameOf(id)}>
-                    {nameOf(id)}
+                  <span className="pd-l" data-tip={r.name}>
+                    {r.name}
                   </span>
                 </div>
               ))}

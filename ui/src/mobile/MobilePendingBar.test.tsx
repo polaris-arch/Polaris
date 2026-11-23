@@ -41,6 +41,7 @@ const h = vi.hoisted(() => ({
     nativeRetirementEndedBeforeGeneration: 0, confirmNativeRetirementEnd: vi.fn(),
     config: null as Record<string, unknown> | null,
     refreshPendingChanges: vi.fn(),
+    servers: [{ id: 'node-1', name: 'Node One' }],
   },
 }));
 
@@ -857,4 +858,14 @@ describe('mobile original native listener cleanup', () => {
     h.app.pendingChanges = { ...empty(), nativeRetirements: [native] };
     expect(renderBar()).toBeNull();
   });
+});
+
+it('lists the saved pending nodes in the shared desktop grouping, falling back to the id', () => {
+  h.app.pendingChanges = { added: ['node-1'], modified: [], removed: ['gone-node'], restartDeferred: false };
+  const entry = elements(renderBar()).find((element) => element.type === 'button' && (element.props as { className?: string }).className === 'm-pending-text');
+  entry!.props.onClick!();
+  const html = markup(restartSheet());
+  expect(html.indexOf('home.pendingGroupAdded')).toBeLessThan(html.indexOf('Node One'));
+  expect(html.indexOf('home.pendingGroupRemoved')).toBeLessThan(html.indexOf('gone-node'));
+  expect(html).not.toContain('home.pendingGroupModified');
 });
