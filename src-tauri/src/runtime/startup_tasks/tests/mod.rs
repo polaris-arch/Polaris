@@ -223,6 +223,18 @@ fn helper_upgradeable_notified_only_when_installed_and_upgradeable() {
         !should_notify_helper_upgradeable(&HelperStatusSnapshot::default()),
         "缺省态（不支持/未装）一律不发"
     );
+    let mut core_missing = helper_status(true, true, false);
+    core_missing.selected_core = Some(crate::runtime::helper::SelectedCoreSnapshot {
+        id: "core".to_owned(),
+        version: "1".to_owned(),
+        provider_fingerprint: "fixture".to_owned(),
+        state: crate::runtime::helper::SelectedCoreState::Absent,
+        admission: None,
+    });
+    assert!(
+        should_notify_helper_upgradeable(&core_missing),
+        "助手兼容但配套内核未安装 → 发（引导安装内核）"
+    );
 }
 
 /// 🟡 **四条启动腿必须各占各的时刻**——本文件自己立的错峰约定，此前出口 IP 首探与自动连接

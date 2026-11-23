@@ -121,19 +121,21 @@ function pullPendingChanges(): void {
  * 返回值 = **这次真的弹了吗**（供单测把「判定为假」与「被去重挡下」区分开；生产侧不消费）。
  */
 export function handleHelperUpgradeable(
-  status: { installed?: boolean; upgradeable?: boolean; selectedCore?: { admission?: string } } | null | undefined,
+  status: { installed?: boolean; upgradeable?: boolean; selectedCore?: { admission?: string; state?: string } } | null | undefined,
   t: (key: string) => string
 ): boolean {
-  // 判据与后端 `startup_tasks::should_notify_helper_upgradeable` 同口径（`installed && upgradeable`）：
+  // 判据与后端 `startup_tasks::should_notify_helper_upgradeable` 同口径（已装，且可升级或本版本配套内核未安装）：
   // 未装是「去安装」轴（归起核门与 HomeScreen 的 HELPER_NOT_INSTALLED 分支），不是本腿的事。
-  if (!status?.installed || !status.upgradeable) return false;
+  // 内核缺失与设置页 `needs-core` 同文案，三平台共用这一条提示。
+  const coreMissing = !status?.upgradeable && status?.selectedCore?.state === 'absent';
+  if (!status?.installed || !(status.upgradeable || coreMissing)) return false;
   if (!helperUpgradeToastGate()) return false;
-  toast.warning(t('helper.statusUpgradeable'), {
+  toast.warning(t(coreMissing ? 'helper.coreState.absent' : 'helper.statusUpgradeable'), {
     key: HELPER_UPGRADE_TOAST_KEY,
-    description: t('helper.upgradeDescCard'),
+    description: t(coreMissing ? 'helper.coreInstallDesc' : 'helper.upgradeDescCard'),
     actions: [
       {
-        label: t('helper.upgradeToastAction'),
+        label: t(coreMissing ? 'errors.helperNotInstalledAction' : 'helper.upgradeToastAction'),
         onClick: () => useNavStore.getState().enterSettings('helper'),
       },
     ],

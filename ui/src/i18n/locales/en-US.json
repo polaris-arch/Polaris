@@ -76,10 +76,10 @@
       "unavailable": "Safe core startup could not be verified. Check the logs and try again."
     },
     "coreState": {
-      "present": "Selected installed content verified",
-      "absent": "Selected content not installed",
-      "invalid": "Selected content verification failed",
-      "unavailable": "Selected content could not be checked"
+      "present": "Selected core verified",
+      "absent": "Selected core not installed",
+      "invalid": "Selected core verification failed",
+      "unavailable": "Selected core could not be checked"
     },
     "failureNextStep": "Recheck only checks the current status; it does not install Helper again.",
     "viewLogsAction": "View logs",

@@ -359,9 +359,10 @@ fn spawn_auto_download(app: &AppHandle, config: &Value, update_info: Option<Valu
     });
 }
 
-/// 纯决策：是否发 `event:helperUpgradeable`（proto 落后，或同 proto 的 helper build 与随包不一致）。
+/// 纯决策：是否发 `event:helperUpgradeable`（proto 落后，或同 proto 的 helper build 与随包不一致，
+/// 或助手兼容但本版本配套内核未安装）。
 ///
-/// `installed && upgradeable`。`ready` **刻意不再查一遍** —— `helper-client` 的
+/// `installed && (upgradeable || selected_core_missing)`，内核缺失口径同起核门（`proxy.rs` 的配套内核安装腿）。`ready` **刻意不再查一遍** —— `helper-client` 的
 /// `compute_status` 里 `upgradeable` 已经合取 `ready`；
 /// 在这里重复只会制造「两处判据、改一处漏一处」。留 `installed` 是给它变异牙齿：
 /// 未装的机器上 `upgradeable` 恒 false，但把判据写成恒真的形态（如直接 `true`）时这条会转红。
@@ -369,8 +370,8 @@ fn spawn_auto_download(app: &AppHandle, config: &Value, update_info: Option<Valu
 /// 事件语义 = **一次性引导**（前端 `SettingsHelper` 收到就重拉 status 并提示可升级），不是状态推送，
 /// 故只在启动期发一次，不做周期重发。
 #[must_use]
-pub const fn should_notify_helper_upgradeable(status: &HelperStatusSnapshot) -> bool {
-    status.installed && status.upgradeable
+pub fn should_notify_helper_upgradeable(status: &HelperStatusSnapshot) -> bool {
+    status.installed && (status.upgradeable || status.selected_core_missing())
 }
 
 /// 7s：`EVENT_HELPER_UPGRADEABLE` 发射端。
@@ -391,7 +392,9 @@ fn spawn_helper_upgradeable_probe(app: AppHandle) {
             return;
         }
         log::info!(
-            "提权 helper 可升级（当前 proto {:?}, helper build {:?}, expected build {}）：已通知渲染端引导升级",
+            "提权 helper 需要处理（可升级={} 配套内核缺失={}，当前 proto {:?}, helper build {:?}, expected build {}）：已通知渲染端引导",
+            status.upgradeable,
+            status.selected_core_missing(),
             status.version,
             status.helper_build_id,
             status.expected_build_id,

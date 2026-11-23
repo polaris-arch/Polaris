@@ -9,12 +9,12 @@
     "followupIncomplete": "后续处理未完成，请确认当前订阅状态后再决定是否重试。"
   },
   "helper": {
-    "connectionRecoveryTitle": "连接前需要检查 Helper",
-    "connectionRecoveryMessage": "Polaris 无法验证本次连接所需的 Helper 内核。你可以前往 Helper 设置查看状态，再决定是否安装、修复或升级。此提示不会安装或停止任何服务。",
-    "connectionRecoverySettings": "前往 Helper 设置",
+    "connectionRecoveryTitle": "连接前需要检查提权助手",
+    "connectionRecoveryMessage": "Polaris 无法验证本次连接所需的配套内核。你可以前往提权助手设置查看状态，再决定是否安装、修复或升级。此提示不会安装或停止任何服务。",
+    "connectionRecoverySettings": "前往提权助手设置",
     "title": "提权助手",
     "statusChecking": "检测中…",
-    "statusInstalled": "辅助服务已安装且可用",
+    "statusInstalled": "提权助手已安装且可用",
     "statusNotInstalled": "未安装",
     "statusNeedsRepair": "需要修复",
     "statusUpgradeable": "需升级",
@@ -52,16 +52,16 @@
       "cancelled": "已取消管理员授权",
       "authorizationIncomplete": "管理员操作未完成，请查看日志",
       "proxyRunning": "请先停止正在运行的代理与内核任务，再恢复内核或重新安装提权助手。",
-      "unsupported": "此平台不支持提权 helper",
+      "unsupported": "此平台不支持提权助手",
       "missingAsset": "恢复文件与本应用不匹配，请使用可信安装包重新安装相同版本的 Polaris。",
-      "notReady": "helper 已安装，但暂未就绪",
+      "notReady": "提权助手已安装，但暂未就绪",
       "invalidInstallation": "安装身份参数无效。请使用已核验的安装包重新安装 Polaris，并查看日志。",
-      "tokenWriteFailed": "无法保存 Helper 认证数据。请检查磁盘剩余空间和应用数据目录的访问权限，具体原因见日志。",
-      "scriptWriteFailed": "无法写入 Helper 安装脚本。请检查磁盘剩余空间和应用数据目录的访问权限，具体原因见日志。",
+      "tokenWriteFailed": "无法保存提权助手认证数据。请检查磁盘剩余空间和应用数据目录的访问权限，具体原因见日志。",
+      "scriptWriteFailed": "无法写入提权助手安装脚本。请检查磁盘剩余空间和应用数据目录的访问权限，具体原因见日志。",
       "authorizationLaunchFailed": "无法启动管理员授权进程。请先查看安装日志，再决定是否重试。",
       "upgradeDeferred": "现有助手未批准安全升级，可能仍在使用中或不支持升级协议。请断开它管理的连接后重新检测；若仍被阻止，请查看日志，确认是否需要旧版迁移。",
-      "installerFailed": "Helper 安装命令执行失败。请先查看安装日志中的具体原因，再决定是否重试。",
-      "failed": "helper 操作未能完成",
+      "installerFailed": "提权助手安装命令执行失败。请先查看安装日志中的具体原因，再决定是否重试。",
+      "failed": "提权助手操作未能完成",
       "bundleMismatch": "恢复文件与本应用不匹配，请使用可信安装包重新安装相同版本的 Polaris。"
     },
     "selectedCoreVersion": "选定内核版本",
@@ -76,12 +76,12 @@
       "unavailable": "无法确认内核是否可安全启动。请查看日志后重试。"
     },
     "coreState": {
-      "present": "选定安装内容已核验",
-      "absent": "选定内容未安装",
-      "invalid": "选定内容核验失败",
-      "unavailable": "未能核验选定内容"
+      "present": "配套内核已核验",
+      "absent": "配套内核未安装",
+      "invalid": "配套内核核验失败",
+      "unavailable": "未能核验配套内核"
     },
-    "failureNextStep": "重新检测只检查当前状态，不会再次安装 Helper。",
+    "failureNextStep": "重新检测只检查当前状态，不会再次安装提权助手。",
     "viewLogsAction": "查看日志",
     "installSelectedCoreAction": "安装本版本配套内核",
     "linuxStopAndUpgradeTitle": "停止 Linux Helper 并升级？",
@@ -92,7 +92,7 @@
     "stopAndUpgradeWarning": "这会停止 com.polaris.helper 及其管理的所有连接，包括其他应用会话的连接。这些连接将被中断，随后 Polaris 会请求管理员授权以升级助手。只有同意停止上述所有连接时才继续。",
     "stopAndUpgradeConfirm": "停止所有受管连接并升级",
     "checksTitle": "状态快照：具体检查对象",
-    "checkInstallation": "辅助服务文件已安装",
+    "checkInstallation": "提权助手文件已安装",
     "checkReady": "助手通道及选定内核已就绪",
     "checkLoaded": "系统服务已加载",
     "checkYes": "是",
@@ -288,7 +288,7 @@
     },
     "helperNotInstalled": {
       "title": "Polaris 未能启动 TUN 模式",
-      "body": "TUN 模式需要提权助手，但助手尚未安装或版本过旧。请打开应用到「设置 › Helper」安装或升级后重试"
+      "body": "TUN 模式需要提权助手，但助手尚未安装或版本过旧。请打开应用到「设置 › 助手」安装或升级后重试"
     },
     "tunRouteNotCaptured": {
       "title": "Polaris 未能接管默认路由",
@@ -312,7 +312,7 @@
     },
     "helperCoreMismatch": {
       "title": "Polaris 无法启动",
-      "body": "无法核验选定内核的回执，请前往「设置 › Helper」修复或升级助手。"
+      "body": "无法核验选定内核的回执，请前往「设置 › 助手」修复或升级助手。"
     },
     "coreBundleMismatch": {
       "title": "Polaris 无法启动",
@@ -320,11 +320,11 @@
     },
     "helperCoreAbsent": {
       "title": "Polaris 无法启动",
-      "body": "本应用选定的内核尚未安装，请前往「设置 › Helper」安装。"
+      "body": "本应用选定的内核尚未安装，请前往「设置 › 助手」安装。"
     },
     "helperCoreInvalid": {
       "title": "Polaris 无法启动",
-      "body": "已安装内核未通过内容核验，请前往「设置 › Helper」修复。"
+      "body": "已安装内核未通过内容核验，请前往「设置 › 助手」修复。"
     },
     "helperCoreOccupied": {
       "title": "Polaris 无法启动",
@@ -1882,14 +1882,14 @@
     "configRefreshInvalidResponse": "配置响应无效",
     "startupFailed": "sing-box 启动失败，请检查服务器配置",
     "coreLibraryLoadFailed": "内核组件加载失败，代理未启动。请更新应用及系统助手；若仍失败，请查看启动日志。",
-    "helperNotInstalledTitle": "helper 未安装或需要升级",
+    "helperNotInstalledTitle": "提权助手未安装或需要升级",
     "helperNotInstalledDesc": "当前模式使用助手的受保护内核，请通过助手设置中的可信安装流程处理。",
     "helperNotInstalledAction": "去安装",
     "helperGateAborted": "已取消安装提权助手，本次未启动 TUN 模式代理",
     "tunRouteNotCaptured": "检测到其他 VPN 占用默认路由，请先断开后重试",
     "rootOrphanBlocked": "检测到残留的核心进程占用缓存文件，起核已被阻断",
     "coreNotExecutable": "安装包内的内核文件没有可执行权限，无法启动。请重新安装应用。",
-    "helperCoreMismatch": "无法核验选定内核的回执，请前往「设置 › Helper」修复或升级助手。",
+    "helperCoreMismatch": "无法核验选定内核的回执，请前往「设置 › 助手」修复或升级助手。",
     "tunAdapterMissing": "TUN 虚拟网卡未能创建，请检查 wintun 驱动是否被安全软件拦截，或重启后重试",
     "autoSwitchNeedsRestart": "已尝试自动换节点，但本次未能换成：有候选节点需要重启内核才能切换过去。请手动选择其他节点。",
     "tunAddressUnavailable": "TUN 虚拟网卡地址无法分配，可能被残留网卡或其他 VPN 占用。请断开其他 VPN，或重启系统后重试",
@@ -1897,8 +1897,8 @@
     "vpnPermissionDenied": "VPN 授权尚未完成。请完成或关闭当前授权窗口，再点击连接，并在系统 VPN 连接请求中选择允许。",
     "systemInterfaceUnsupported": "此节点请求系统网卡，Android VPN 模式不支持。请在节点编辑中关闭系统网卡选项；自定义节点请将 JSON 中的 system 设为 false。",
     "coreBundleMismatch": "随包内核与本应用的内容身份不符，请重新安装 Polaris。",
-    "helperCoreAbsent": "本应用选定的内核尚未安装，请前往「设置 › Helper」安装。",
-    "helperCoreInvalid": "已安装内核未通过内容核验，请前往「设置 › Helper」修复。",
+    "helperCoreAbsent": "本应用选定的内核尚未安装，请前往「设置 › 助手」安装。",
+    "helperCoreInvalid": "已安装内核未通过内容核验，请前往「设置 › 助手」修复。",
     "helperCoreOccupied": "助手资源已被占用，或上一内核尚未收口。请先在属主应用中正常断开，再重试；归属无法确认时，请安排管理员维护。",
     "nodeResolverUnsupported": "所选节点 DNS 不受支持。请在设置 > DNS 中选择纯 IP 地址的 HTTPS、TLS 或 UDP 解析器。",
     "speedTestUrlInvalid": "测速地址无效。请在设置 > 网络中修正，或清空以使用默认地址。"

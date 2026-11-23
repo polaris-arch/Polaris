@@ -523,7 +523,7 @@ pub(super) struct KernelGateCacheRecord {
 pub(super) fn helper_core_mismatch_message(why: &str) -> String {
     format!(
         "无法确认提权助手将要运行的内核就是本应用配套的内核，已拒绝以 TUN 模式启动：{why}。\
-         请到「设置 › Helper」重新安装或升级提权助手后重试。"
+         请到「设置 › 助手」重新安装或升级提权助手后重试。"
     )
 }
 

@@ -65,8 +65,8 @@ describe('内核信息与只读诊断', () => {
     expect(nodes(CoreInfoCard({ info: null })).find(n => typeof n.props.onClick === 'function')?.props.disabled).toBe(true);
   });
   it.each([
-    ['present', '选定安装内容已核验'], ['absent', '选定内容未安装'],
-    ['invalid', '选定内容核验失败'], ['unavailable', '未能核验选定内容'],
+    ['present', '配套内核已核验'], ['absent', '配套内核未安装'],
+    ['invalid', '配套内核核验失败'], ['unavailable', '未能核验配套内核'],
   ] as const)('明确 %s 核验对象，完整身份只出现在默认关闭的诊断内', (state, label) => {
     const markup = renderToStaticMarkup(<CoreInfoCard info={FULL} selectedCore={{ ...selectedCore, state }} />);
     expect(cell(markup, 'installed-state')).toBe(label);
@@ -128,7 +128,7 @@ it('未证明的平台能力不把重装当前版本展示成可恢复保证', (
   const info = { ...FULL, admission: { state: 'rejected', kind: 'UnsupportedExactObject', recovery: 'reinstallCurrentApp' } } as CoreVersionInfo;
   const markup=renderToStaticMarkup(<CoreInfoCard info={info}/>);
   expect(markup).toContain('当前版本无法在此环境中安全启动内核。');
-  expect(markup).not.toContain('选定内容核验失败');
+  expect(markup).not.toContain('配套内核核验失败');
   expect(markup).toContain('href="#app-update-card"');
   expect(markup).toContain(translate('coreRecovery.reinstall'));
 });
