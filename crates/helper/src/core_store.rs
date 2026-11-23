@@ -1444,7 +1444,7 @@ impl CoreStore {
     }
 }
 
-fn object_present(path: &Path) -> io::Result<bool> {
+pub(crate) fn object_present(path: &Path) -> io::Result<bool> {
     match fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),

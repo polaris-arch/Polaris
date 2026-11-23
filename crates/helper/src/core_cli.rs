@@ -125,21 +125,25 @@ pub(crate) fn install(args: &InstallArgs) -> io::Result<String> {
 
 /// Administrator-owned directory shipped with this platform's package. Windows
 /// currentUser installs have none, so the client keeps its administrator path.
-#[cfg(target_os = "linux")]
+/// Tests inject their own directory and never read the host package.
+#[cfg(all(target_os = "linux", not(test)))]
 pub(crate) const BUNDLED_CORE_DIR: Option<&str> = Some("/usr/lib/Polaris/_up_/resources/linux");
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(all(target_os = "macos", target_arch = "aarch64", not(test)))]
 pub(crate) const BUNDLED_CORE_DIR: Option<&str> =
     Some("/Applications/Polaris.app/Contents/Resources/_up_/resources/mac-arm64");
-#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+#[cfg(all(target_os = "macos", target_arch = "x86_64", not(test)))]
 pub(crate) const BUNDLED_CORE_DIR: Option<&str> =
     Some("/Applications/Polaris.app/Contents/Resources/_up_/resources/mac-x64");
-#[cfg(not(any(
-    target_os = "linux",
-    all(
-        target_os = "macos",
-        any(target_arch = "aarch64", target_arch = "x86_64")
-    )
-)))]
+#[cfg(any(
+    test,
+    not(any(
+        target_os = "linux",
+        all(
+            target_os = "macos",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        )
+    ))
+))]
 pub(crate) const BUNDLED_CORE_DIR: Option<&str> = None;
 
 /// IPC installation. Path and hashes never come from the client: only bytes below
@@ -155,6 +159,19 @@ pub(crate) fn install_bundled(
         let source = Path::new(source.ok_or_else(|| {
             io::Error::new(io::ErrorKind::Unsupported, "no administrator installation")
         })?);
+        // Only an Absent id is loaded: repair, re-verification and retention stay
+        // with the administrator path.
+        for stored in [
+            root.join("manifests").join(format!("{}.json", id.as_str())),
+            root.join("versions").join(id.as_str()),
+        ] {
+            if crate::core_store::object_present(&stored)? {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "core already stored",
+                ));
+            }
+        }
         for directory in source.ancestors() {
             owner.check(directory)?;
         }

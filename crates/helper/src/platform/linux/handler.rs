@@ -209,7 +209,8 @@ pub fn handle<P, S, D, SD>(
     }
 
     // Outside the child-state lock: store mutation/lease locks serialize the copy,
-    // so status/stop are not blocked behind it.
+    // so status/stop are not blocked behind it. A brief lock check refuses it during
+    // shutdown or a helper upgrade: no stage is left and the installer keeps the store.
     if command == cmd::INSTALL_BUNDLED_CORE {
         let (Ok(Some(id)), Ok(None)) = (conn.read_line_strict(), conn.read_line_strict()) else {
             let _ = conn.write_line("ERR bad-args");
@@ -219,15 +220,18 @@ pub fn handle<P, S, D, SD>(
             let _ = conn.write_line("ERR bad-args");
             return;
         };
-        let response = if deps.core_dir.is_some_and(|root| {
-            crate::core_cli::install_bundled(
-                root,
-                crate::core_cli::BUNDLED_CORE_DIR,
-                &id,
-                crate::core_store::OwnerPolicy::privileged(),
-            )
-            .is_ok()
-        }) {
+        let response = if state
+            .lock()
+            .is_ok_and(|guard| !guard.shutting_down && !guard.upgrade_closed)
+            && deps.core_dir.is_some_and(|root| {
+                crate::core_cli::install_bundled(
+                    root,
+                    crate::core_cli::BUNDLED_CORE_DIR,
+                    &id,
+                    crate::core_store::OwnerPolicy::privileged(),
+                )
+                .is_ok()
+            }) {
             Response::Ok(ResponseKind::Installed)
         } else {
             Response::Err(ProtoError::with_detail(
