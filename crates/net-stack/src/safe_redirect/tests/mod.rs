@@ -294,7 +294,7 @@ impl HttpClient for SlowRedirectFetch {
         let url = url.to_string();
         let calls = Arc::clone(&self.calls);
         async move {
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
             *calls.lock().unwrap() += 1;
             Ok(if url.ends_with("/start") {
                 MinimalResponse {
@@ -324,7 +324,8 @@ async fn absolute_deadline_is_shared_across_redirect_hops() {
     };
     let result = safe_redirect_fetch_until(
         opts(&fetch, &lookup, "https://redirect.example/start"),
-        Instant::now() + Duration::from_millis(30),
+        // 每跳 200 ms、总期限 300 ms：首跳留足 100 ms 调度余量，第二跳必然越过期限。
+        Instant::now() + Duration::from_millis(300),
     )
     .await;
     assert_eq!(result.unwrap_err().reason, SafeFetchRejectReason::Timeout);
