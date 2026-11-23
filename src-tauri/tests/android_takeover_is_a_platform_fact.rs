@@ -144,7 +144,7 @@ const RAW_JSON_REGISTRY: &[RawJsonSite] = &[
     ),
     (
         "src-tauri/src/runtime/proxy/runtime_config.rs",
-        "const REVERTIBLE_PROXY_SETTINGS: &[&str] = &[ \"proxyMode\", \"proxyModeType\", \"mixedPort\", \"controlPort\", \"httpPort\", \"allowLan\", \"tunConfig\", \"dnsConfig\", \"logLevel\", \"disableLogFile\", \"fakeIpFilter\", \"fakeIpFilterList\", \"blockBrowserDoh\", \"browserDohList\", \"blockQuic\", \"webrtcLeakProtection\", \"bypassLAN\", \"bypassLANList\", \"enableIPv6\", \"networkInterfaces\", \"tlsFragment\", \"utlsPolicy\", ]",
+        "const REVERTIBLE_PROXY_SETTINGS: &[&str] = &[ \"proxyMode\", \"proxyModeType\", \"mixedPort\", \"controlPort\", \"httpPort\", \"allowLan\", \"singboxDashboard\", \"tunConfig\", \"dnsConfig\", \"logLevel\", \"disableLogFile\", \"fakeIpFilter\", \"fakeIpFilterList\", \"blockBrowserDoh\", \"browserDohList\", \"blockQuic\", \"webrtcLeakProtection\", \"bypassLAN\", \"bypassLANList\", \"enableIPv6\", \"networkInterfaces\", \"tlsFragment\", \"utlsPolicy\", ]",
         1,
         "The revert transaction copies stored values from its running snapshot into a saved candidate. The stored mode is compared and restored as metadata; Android still derives effective TUN from the typed platform policy.",
     ),
