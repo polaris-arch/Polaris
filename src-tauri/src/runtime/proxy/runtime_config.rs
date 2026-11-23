@@ -5508,6 +5508,7 @@ const REVERTIBLE_PROXY_SETTINGS: &[&str] = &[
     "controlPort",
     "httpPort",
     "allowLan",
+    "singboxDashboard",
     "tunConfig",
     "dnsConfig",
     "logLevel",
