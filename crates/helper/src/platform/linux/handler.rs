@@ -209,8 +209,9 @@ pub fn handle<P, S, D, SD>(
     }
 
     // Outside the child-state lock: store mutation/lease locks serialize the copy,
-    // so status/stop are not blocked behind it. A brief lock check refuses it during
-    // shutdown or a helper upgrade: no stage is left and the installer keeps the store.
+    // so status/stop are not blocked behind it. A brief lock check refuses new loads during
+    // shutdown or a helper upgrade; a copy already past it may leave a stage under the
+    // store root, which uninstall removes with the store.
     if command == cmd::INSTALL_BUNDLED_CORE {
         let (Ok(Some(id)), Ok(None)) = (conn.read_line_strict(), conn.read_line_strict()) else {
             let _ = conn.write_line("ERR bad-args");

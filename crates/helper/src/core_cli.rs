@@ -159,8 +159,8 @@ pub(crate) fn install_bundled(
         let source = Path::new(source.ok_or_else(|| {
             io::Error::new(io::ErrorKind::Unsupported, "no administrator installation")
         })?);
-        // Only an Absent id is loaded: repair, re-verification and retention stay
-        // with the administrator path.
+        // Only an Absent id is loaded: repair and re-verification stay with the
+        // administrator path; a fresh load still applies the shared retention.
         for stored in [
             root.join("manifests").join(format!("{}.json", id.as_str())),
             root.join("versions").join(id.as_str()),
