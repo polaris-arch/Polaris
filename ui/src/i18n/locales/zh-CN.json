@@ -1881,7 +1881,7 @@
     "configRefreshScopeMismatch": "此窗口不能同时使用主窗口和托盘的配置会话",
     "configRefreshInvalidResponse": "配置响应无效",
     "startupFailed": "sing-box 启动失败，请检查服务器配置",
-    "coreLibraryLoadFailed": "内核组件加载失败，代理未启动。请更新应用及系统助手；若仍失败，请查看启动日志。",
+    "coreLibraryLoadFailed": "内核组件加载失败，代理未启动。请更新应用及提权助手；若仍失败，请查看启动日志。",
     "helperNotInstalledTitle": "提权助手未安装或需要升级",
     "helperNotInstalledDesc": "当前模式使用助手的受保护内核，请通过助手设置中的可信安装流程处理。",
     "helperNotInstalledAction": "去安装",

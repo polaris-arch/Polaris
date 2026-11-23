@@ -840,7 +840,7 @@ pub(super) fn settle_start_failure(
 ) -> (String, &'static str) {
     match fatal {
         Some(CoreFatalKind::CronetLoadFailed) => (
-            "内核组件加载失败，代理未启动。请更新应用及系统助手；若仍失败，请查看启动日志。"
+            "内核组件加载失败，代理未启动。请更新应用及提权助手；若仍失败，请查看启动日志。"
                 .to_string(),
             code::CORE_LIBRARY_LOAD_FAILED,
         ),

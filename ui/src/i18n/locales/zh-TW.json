@@ -1881,7 +1881,7 @@
     "configRefreshScopeMismatch": "此視窗無法同時使用主視窗和系統匣的設定工作階段",
     "configRefreshInvalidResponse": "設定回應無效",
     "startupFailed": "sing-box 啟動失敗，請檢查伺服器設定",
-    "coreLibraryLoadFailed": "核心元件載入失敗，代理未啟動。請更新應用程式及系統助手；若仍失敗，請查看啟動日誌。",
+    "coreLibraryLoadFailed": "核心元件載入失敗，代理未啟動。請更新應用程式及提權助手；若仍失敗，請查看啟動日誌。",
     "helperNotInstalledTitle": "提權助手未安裝或需要升級",
     "helperNotInstalledDesc": "目前模式使用助手的受保護核心，請透過助手設定中的可信安裝流程處理。",
     "helperNotInstalledAction": "去安裝",
