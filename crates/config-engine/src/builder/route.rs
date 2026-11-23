@@ -1249,6 +1249,7 @@ pub fn build_route_config_with_report(
                             url: None,
                             http_client: None,
                             update_interval: None,
+                            rules: None,
                         });
                     }
                     rules.push(RouteRule {
@@ -1542,6 +1543,7 @@ pub fn build_route_config_with_report(
                     url: None,
                     http_client: None,
                     update_interval: None,
+                    rules: None,
                 });
                 continue;
             }
@@ -1897,6 +1899,7 @@ pub(super) fn add_local_geo_rule_set(
             url: None,
             http_client: None,
             update_interval: None,
+            rules: None,
         });
         defined_tags.insert(tag.to_string());
     }

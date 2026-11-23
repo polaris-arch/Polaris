@@ -197,11 +197,18 @@ fn android_config_is_identical_for_every_stored_proxy_mode_type() {
 fn the_rich_shape_actually_reaches_the_node_resolver_rule() {
     let cfg = generate("android", Shape::NodeResolverSystem, ProxyModeType::Tun);
     let rules = cfg["dns"]["rules"].as_array().expect("dns.rules 不是数组");
-    let hit = rules.iter().any(|r| {
-        r["domain"]
+    // 节点域名在 inline rule_set `node-domains` 里，rule1 按 tag 引用它。
+    let hit = rules.iter().any(|r| r["rule_set"] == "node-domains")
+        && cfg["route"]["rule_set"]
             .as_array()
-            .is_some_and(|d| d.iter().any(|x| x == "a.example.com"))
-    });
+            .into_iter()
+            .flatten()
+            .any(|set| {
+                set["tag"] == "node-domains"
+                    && set["rules"][0]["domain"]
+                        .as_array()
+                        .is_some_and(|d| d.iter().any(|x| x == "a.example.com"))
+            });
     assert!(
         hit,
         "富配置没有产出节点域名解析规则 —— INV-1 那一格在本门里没有取材面。实得 dns.rules={rules:?}"

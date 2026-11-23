@@ -30,6 +30,8 @@ pub struct RuleSet {
     pub tag: String,
     #[serde(rename = "type")]
     pub type_field: String,
+    /// inline 形态无此字段。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub format: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
@@ -46,6 +48,9 @@ pub struct RuleSet {
     pub http_client: Option<HttpClient>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub update_interval: Option<String>,
+    /// `type: inline` 的 headless 规则（只用匹配字段）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rules: Option<Vec<RouteRule>>,
 }
 
 /// `route.rules[]`（`singbox-config-types.ts:297`）。logical 规则递归（rules 字段）。

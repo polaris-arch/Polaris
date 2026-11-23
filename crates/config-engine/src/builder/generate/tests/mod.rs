@@ -1301,9 +1301,7 @@ fn native_policy_is_referenced_only_by_node_dial_resolution() {
         .unwrap()
         .iter()
         .find(|rule| {
-            rule.domain
-                .as_ref()
-                .is_some_and(|domains| domains.contains(&"hk.example.com".to_string()))
+            matches!(&rule.rule_set, Some(OneOrMany::One(tag)) if tag == NODE_DOMAINS_RULE_SET_TAG)
         })
         .expect("节点域名 DNS 规则应存在");
     assert_eq!(node_dns_rule.server.as_deref(), Some("dns-domestic"));
@@ -1316,6 +1314,54 @@ fn native_policy_is_referenced_only_by_node_dial_resolution() {
         .unwrap()
         .iter()
         .all(|rule| rule.server.as_deref() != Some("dns-node-race")));
+}
+
+/// 订阅只换节点域名：DNS 段逐字节不变，域名只落在 inline rule_set，rule1 未被悬空剪枝。
+#[test]
+fn node_domain_change_leaves_dns_section_unchanged() {
+    let deps = deps_default();
+    let before = base_config();
+    let mut after = base_config();
+    after.servers[0].address = "jp.example.com".into();
+    let generate =
+        |config: &UserConfig| generate_sing_box_config(config, &BTreeMap::new(), &deps).unwrap();
+    let (old, new) = (generate(&before), generate(&after));
+    assert_eq!(
+        serde_json::to_string(&old.dns).unwrap(),
+        serde_json::to_string(&new.dns).unwrap()
+    );
+    assert!(new
+        .dns
+        .as_ref()
+        .unwrap()
+        .rules
+        .as_ref()
+        .unwrap()
+        .iter()
+        .any(|rule| {
+            matches!(&rule.rule_set, Some(OneOrMany::One(tag)) if tag == NODE_DOMAINS_RULE_SET_TAG)
+        }));
+    let set = new
+        .route
+        .as_ref()
+        .unwrap()
+        .rule_set
+        .as_ref()
+        .unwrap()
+        .iter()
+        .find(|set| set.tag == NODE_DOMAINS_RULE_SET_TAG)
+        .expect("节点域名 inline rule_set 应存在");
+    assert_eq!(
+        serde_json::to_value(set).unwrap(),
+        serde_json::json!({
+            "tag": NODE_DOMAINS_RULE_SET_TAG,
+            "type": "inline",
+            "rules": [{
+                "domain": ["jp.example.com"],
+                "domain_suffix": ["jp.example.com", ".jp.example.com"],
+            }],
+        })
+    );
 }
 
 /// 取 DNS 直连放行规则的端口集（`ip_cidr` 含引导 DNS + route→direct 的那条）。

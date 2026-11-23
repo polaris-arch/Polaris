@@ -538,19 +538,15 @@ fn domestic_queries_fall_back_to_dns_lan_only_when_it_exists() {
 
 #[test]
 fn node_domain_rule1_emits_when_server_has_domain() {
-    // 节点 address=域名 → rule1 含 domain + domain_suffix（exact + .suffix）。
+    // 节点 address=域名 → rule1 按 tag 引用节点域名 rule_set，DNS 段自身不含域名。
     let c = build_dns_config(&base_config(), &BTreeMap::new(), &deps_false());
-    let rule1 = c.rules.as_ref().unwrap().iter().find(|r| {
-        r.domain
-            .as_ref()
-            .map(|d| d.contains(&"hk.example.com".to_string()))
-            .unwrap_or(false)
-    });
+    let rule1 = c.rules.as_ref().unwrap().iter().find(
+        |r| matches!(&r.rule_set, Some(OneOrMany::One(tag)) if tag == NODE_DOMAINS_RULE_SET_TAG),
+    );
     assert!(rule1.is_some(), "rule1 node-domain present");
     let r = rule1.unwrap();
-    let suffix = r.domain_suffix.as_ref().unwrap();
-    assert!(suffix.contains(&"hk.example.com".into()));
-    assert!(suffix.contains(&".hk.example.com".into()));
+    assert!(r.domain.is_none() && r.domain_suffix.is_none());
+    assert!(node_domains(&base_config()).contains(&"hk.example.com".to_string()));
 }
 
 #[test]
@@ -558,14 +554,10 @@ fn node_domain_rule1_skips_ip_literals() {
     // address=IPv4 → 不进 rule1。
     let mut cfg = base_config();
     cfg.servers[0].address = "1.2.3.4".into();
-    let c = build_dns_config(&cfg, &BTreeMap::new(), &deps_false());
-    let has_node_rule = c.rules.as_ref().unwrap().iter().any(|r| {
-        r.domain
-            .as_ref()
-            .map(|d| d.contains(&"1.2.3.4".to_string()))
-            .unwrap_or(false)
-    });
-    assert!(!has_node_rule, "IP 字面量不进 rule1");
+    assert!(
+        !node_domains(&cfg).contains(&"1.2.3.4".to_string()),
+        "IP 字面量不进 rule1"
+    );
 }
 
 #[test]

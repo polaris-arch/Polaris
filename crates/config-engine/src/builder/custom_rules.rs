@@ -215,6 +215,7 @@ pub(super) fn resolve_resource_rule_set(
                 url: None,
                 http_client: None,
                 update_interval: None,
+                rules: None,
             });
         }
         return Some(tag);
@@ -259,6 +260,7 @@ pub(super) fn resolve_resource_rule_set(
             url: None,
             http_client: None,
             update_interval: None,
+            rules: None,
         });
     }
     Some(tag)
@@ -501,6 +503,7 @@ pub fn build_custom_rules(
                             url: None,
                             http_client: None,
                             update_interval: None,
+                            rules: None,
                         });
                     }
                 }
@@ -529,6 +532,7 @@ pub fn build_custom_rules(
                         url: None,
                         http_client: None,
                         update_interval: None,
+                        rules: None,
                     });
                 }
                 let mut ext_fields = RouteFields::new();

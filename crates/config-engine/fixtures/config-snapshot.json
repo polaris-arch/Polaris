@@ -132,13 +132,7 @@
                 "rcode": "SERVFAIL"
               },
               {
-                "domain": [
-                  "a.example.com"
-                ],
-                "domain_suffix": [
-                  "a.example.com",
-                  ".a.example.com"
-                ],
+                "rule_set": "node-domains",
                 "server": "dns-domestic"
               },
               {
@@ -744,6 +738,21 @@
                 "type": "local",
                 "format": "binary",
                 "path": "/fake/userData/rules/geoip-private.srs"
+              },
+              {
+                "tag": "node-domains",
+                "type": "inline",
+                "rules": [
+                  {
+                    "domain": [
+                      "a.example.com"
+                    ],
+                    "domain_suffix": [
+                      "a.example.com",
+                      ".a.example.com"
+                    ]
+                  }
+                ]
               }
             ]
           },
@@ -900,13 +909,7 @@
                 "rcode": "SERVFAIL"
               },
               {
-                "domain": [
-                  "a.example.com"
-                ],
-                "domain_suffix": [
-                  "a.example.com",
-                  ".a.example.com"
-                ],
+                "rule_set": "node-domains",
                 "server": "dns-domestic"
               },
               {
@@ -1519,6 +1522,21 @@
                 "type": "local",
                 "format": "binary",
                 "path": "/fake/userData/rules/geoip-ir.srs"
+              },
+              {
+                "tag": "node-domains",
+                "type": "inline",
+                "rules": [
+                  {
+                    "domain": [
+                      "a.example.com"
+                    ],
+                    "domain_suffix": [
+                      "a.example.com",
+                      ".a.example.com"
+                    ]
+                  }
+                ]
               }
             ]
           },
@@ -1675,13 +1693,7 @@
                 "rcode": "SERVFAIL"
               },
               {
-                "domain": [
-                  "a.example.com"
-                ],
-                "domain_suffix": [
-                  "a.example.com",
-                  ".a.example.com"
-                ],
+                "rule_set": "node-domains",
                 "server": "dns-domestic"
               },
               {
@@ -2294,6 +2306,21 @@
                 "type": "local",
                 "format": "binary",
                 "path": "/fake/userData/rules/geoip-ru.srs"
+              },
+              {
+                "tag": "node-domains",
+                "type": "inline",
+                "rules": [
+                  {
+                    "domain": [
+                      "a.example.com"
+                    ],
+                    "domain_suffix": [
+                      "a.example.com",
+                      ".a.example.com"
+                    ]
+                  }
+                ]
               }
             ]
           },
@@ -2450,13 +2477,7 @@
                 "rcode": "SERVFAIL"
               },
               {
-                "domain": [
-                  "a.example.com"
-                ],
-                "domain_suffix": [
-                  "a.example.com",
-                  ".a.example.com"
-                ],
+                "rule_set": "node-domains",
                 "server": "dns-domestic"
               },
               {
@@ -3062,6 +3083,21 @@
                 "type": "local",
                 "format": "binary",
                 "path": "/fake/userData/rules/geoip-private.srs"
+              },
+              {
+                "tag": "node-domains",
+                "type": "inline",
+                "rules": [
+                  {
+                    "domain": [
+                      "a.example.com"
+                    ],
+                    "domain_suffix": [
+                      "a.example.com",
+                      ".a.example.com"
+                    ]
+                  }
+                ]
               }
             ]
           },
@@ -3218,13 +3254,7 @@
                 "rcode": "SERVFAIL"
               },
               {
-                "domain": [
-                  "a.example.com"
-                ],
-                "domain_suffix": [
-                  "a.example.com",
-                  ".a.example.com"
-                ],
+                "rule_set": "node-domains",
                 "server": "dns-domestic"
               },
               {
@@ -3803,6 +3833,21 @@
                 "type": "local",
                 "format": "binary",
                 "path": "/fake/userData/rules/geoip-private.srs"
+              },
+              {
+                "tag": "node-domains",
+                "type": "inline",
+                "rules": [
+                  {
+                    "domain": [
+                      "a.example.com"
+                    ],
+                    "domain_suffix": [
+                      "a.example.com",
+                      ".a.example.com"
+                    ]
+                  }
+                ]
               }
             ]
           },
@@ -3955,13 +4000,7 @@
                 "rcode": "SERVFAIL"
               },
               {
-                "domain": [
-                  "a.example.com"
-                ],
-                "domain_suffix": [
-                  "a.example.com",
-                  ".a.example.com"
-                ],
+                "rule_set": "node-domains",
                 "server": "dns-domestic"
               },
               {
@@ -4589,6 +4628,21 @@
                 "type": "local",
                 "format": "binary",
                 "path": "/fake/userData/rules/geoip-private.srs"
+              },
+              {
+                "tag": "node-domains",
+                "type": "inline",
+                "rules": [
+                  {
+                    "domain": [
+                      "a.example.com"
+                    ],
+                    "domain_suffix": [
+                      "a.example.com",
+                      ".a.example.com"
+                    ]
+                  }
+                ]
               }
             ]
           },
@@ -4741,13 +4795,7 @@
                 "rcode": "SERVFAIL"
               },
               {
-                "domain": [
-                  "a.example.com"
-                ],
-                "domain_suffix": [
-                  "a.example.com",
-                  ".a.example.com"
-                ],
+                "rule_set": "node-domains",
                 "server": "dns-domestic"
               },
               {
@@ -5386,6 +5434,21 @@
                 "type": "local",
                 "format": "binary",
                 "path": "/fake/userData/rules/geoip-private.srs"
+              },
+              {
+                "tag": "node-domains",
+                "type": "inline",
+                "rules": [
+                  {
+                    "domain": [
+                      "a.example.com"
+                    ],
+                    "domain_suffix": [
+                      "a.example.com",
+                      ".a.example.com"
+                    ]
+                  }
+                ]
               }
             ]
           },
@@ -5538,13 +5601,7 @@
                 "rcode": "SERVFAIL"
               },
               {
-                "domain": [
-                  "a.example.com"
-                ],
-                "domain_suffix": [
-                  "a.example.com",
-                  ".a.example.com"
-                ],
+                "rule_set": "node-domains",
                 "server": "dns-domestic"
               },
               {
@@ -6195,6 +6252,21 @@
                 "type": "local",
                 "format": "binary",
                 "path": "/fake/userData/rules/geoip-private.srs"
+              },
+              {
+                "tag": "node-domains",
+                "type": "inline",
+                "rules": [
+                  {
+                    "domain": [
+                      "a.example.com"
+                    ],
+                    "domain_suffix": [
+                      "a.example.com",
+                      ".a.example.com"
+                    ]
+                  }
+                ]
               }
             ]
           },
@@ -6349,13 +6421,7 @@
                 "rcode": "SERVFAIL"
               },
               {
-                "domain": [
-                  "a.example.com"
-                ],
-                "domain_suffix": [
-                  "a.example.com",
-                  ".a.example.com"
-                ],
+                "rule_set": "node-domains",
                 "server": "dns-domestic"
               },
               {
@@ -6934,6 +7000,21 @@
                 "type": "local",
                 "format": "binary",
                 "path": "/fake/userData/rules/geoip-private.srs"
+              },
+              {
+                "tag": "node-domains",
+                "type": "inline",
+                "rules": [
+                  {
+                    "domain": [
+                      "a.example.com"
+                    ],
+                    "domain_suffix": [
+                      "a.example.com",
+                      ".a.example.com"
+                    ]
+                  }
+                ]
               }
             ]
           },
@@ -7113,13 +7194,7 @@
                 "rcode": "SERVFAIL"
               },
               {
-                "domain": [
-                  "a.example.com"
-                ],
-                "domain_suffix": [
-                  "a.example.com",
-                  ".a.example.com"
-                ],
+                "rule_set": "node-domains",
                 "server": "dns-domestic"
               },
               {
@@ -7749,6 +7824,21 @@
                 "type": "local",
                 "format": "binary",
                 "path": "/fake/userData/rules/geoip-private.srs"
+              },
+              {
+                "tag": "node-domains",
+                "type": "inline",
+                "rules": [
+                  {
+                    "domain": [
+                      "a.example.com"
+                    ],
+                    "domain_suffix": [
+                      "a.example.com",
+                      ".a.example.com"
+                    ]
+                  }
+                ]
               }
             ]
           },
@@ -7921,13 +8011,7 @@
                 "rcode": "SERVFAIL"
               },
               {
-                "domain": [
-                  "a.example.com"
-                ],
-                "domain_suffix": [
-                  "a.example.com",
-                  ".a.example.com"
-                ],
+                "rule_set": "node-domains",
                 "server": "dns-domestic"
               },
               {
@@ -8550,6 +8634,21 @@
                 "type": "local",
                 "format": "binary",
                 "path": "/fake/userData/rules/geoip-private.srs"
+              },
+              {
+                "tag": "node-domains",
+                "type": "inline",
+                "rules": [
+                  {
+                    "domain": [
+                      "a.example.com"
+                    ],
+                    "domain_suffix": [
+                      "a.example.com",
+                      ".a.example.com"
+                    ]
+                  }
+                ]
               }
             ]
           },
@@ -8708,13 +8807,7 @@
                 "rcode": "SERVFAIL"
               },
               {
-                "domain": [
-                  "a.example.com"
-                ],
-                "domain_suffix": [
-                  "a.example.com",
-                  ".a.example.com"
-                ],
+                "rule_set": "node-domains",
                 "server": "dns-domestic"
               },
               {
@@ -9303,6 +9396,21 @@
                 "type": "local",
                 "format": "binary",
                 "path": "/fake/userData/rules/geoip-private.srs"
+              },
+              {
+                "tag": "node-domains",
+                "type": "inline",
+                "rules": [
+                  {
+                    "domain": [
+                      "a.example.com"
+                    ],
+                    "domain_suffix": [
+                      "a.example.com",
+                      ".a.example.com"
+                    ]
+                  }
+                ]
               }
             ]
           },
@@ -9462,13 +9570,7 @@
                 "rcode": "SERVFAIL"
               },
               {
-                "domain": [
-                  "a.example.com"
-                ],
-                "domain_suffix": [
-                  "a.example.com",
-                  ".a.example.com"
-                ],
+                "rule_set": "node-domains",
                 "server": "dns-domestic"
               },
               {
@@ -10089,6 +10191,21 @@
                 "type": "local",
                 "format": "binary",
                 "path": "/fake/userData/rules/geoip-private.srs"
+              },
+              {
+                "tag": "node-domains",
+                "type": "inline",
+                "rules": [
+                  {
+                    "domain": [
+                      "a.example.com"
+                    ],
+                    "domain_suffix": [
+                      "a.example.com",
+                      ".a.example.com"
+                    ]
+                  }
+                ]
               }
             ]
           },
@@ -10247,13 +10364,7 @@
                 "rcode": "SERVFAIL"
               },
               {
-                "domain": [
-                  "a.example.com"
-                ],
-                "domain_suffix": [
-                  "a.example.com",
-                  ".a.example.com"
-                ],
+                "rule_set": "node-domains",
                 "server": "dns-domestic"
               },
               {
@@ -10856,6 +10967,21 @@
                 "type": "local",
                 "format": "binary",
                 "path": "/fake/userData/rules/geoip-private.srs"
+              },
+              {
+                "tag": "node-domains",
+                "type": "inline",
+                "rules": [
+                  {
+                    "domain": [
+                      "a.example.com"
+                    ],
+                    "domain_suffix": [
+                      "a.example.com",
+                      ".a.example.com"
+                    ]
+                  }
+                ]
               }
             ]
           },
@@ -11126,13 +11252,7 @@
                 "rcode": "SERVFAIL"
               },
               {
-                "domain": [
-                  "a.example.com"
-                ],
-                "domain_suffix": [
-                  "a.example.com",
-                  ".a.example.com"
-                ],
+                "rule_set": "node-domains",
                 "server": "dns-domestic"
               },
               {
@@ -11879,6 +11999,21 @@
                 "type": "local",
                 "format": "binary",
                 "path": "/fake/userData/rules/geoip-private.srs"
+              },
+              {
+                "tag": "node-domains",
+                "type": "inline",
+                "rules": [
+                  {
+                    "domain": [
+                      "a.example.com"
+                    ],
+                    "domain_suffix": [
+                      "a.example.com",
+                      ".a.example.com"
+                    ]
+                  }
+                ]
               }
             ]
           },
@@ -12063,16 +12198,7 @@
                 "rcode": "SERVFAIL"
               },
               {
-                "domain": [
-                  "a.example.com",
-                  "apple.com"
-                ],
-                "domain_suffix": [
-                  "a.example.com",
-                  ".a.example.com",
-                  "apple.com",
-                  ".apple.com"
-                ],
+                "rule_set": "node-domains",
                 "server": "dns-domestic"
               },
               {
@@ -12732,6 +12858,24 @@
                 "type": "local",
                 "format": "binary",
                 "path": "/fake/userData/rules/geoip-private.srs"
+              },
+              {
+                "tag": "node-domains",
+                "type": "inline",
+                "rules": [
+                  {
+                    "domain": [
+                      "a.example.com",
+                      "apple.com"
+                    ],
+                    "domain_suffix": [
+                      "a.example.com",
+                      ".a.example.com",
+                      "apple.com",
+                      ".apple.com"
+                    ]
+                  }
+                ]
               }
             ]
           },
@@ -12904,13 +13048,7 @@
                 "rcode": "SERVFAIL"
               },
               {
-                "domain": [
-                  "a.example.com"
-                ],
-                "domain_suffix": [
-                  "a.example.com",
-                  ".a.example.com"
-                ],
+                "rule_set": "node-domains",
                 "server": "dns-domestic"
               },
               {
@@ -13544,6 +13682,21 @@
                 "type": "local",
                 "format": "binary",
                 "path": "/fake/userData/rules/geoip-private.srs"
+              },
+              {
+                "tag": "node-domains",
+                "type": "inline",
+                "rules": [
+                  {
+                    "domain": [
+                      "a.example.com"
+                    ],
+                    "domain_suffix": [
+                      "a.example.com",
+                      ".a.example.com"
+                    ]
+                  }
+                ]
               }
             ]
           },
@@ -13694,13 +13847,7 @@
                 "rcode": "SERVFAIL"
               },
               {
-                "domain": [
-                  "a.example.com"
-                ],
-                "domain_suffix": [
-                  "a.example.com",
-                  ".a.example.com"
-                ],
+                "rule_set": "node-domains",
                 "server": "dns-domestic"
               },
               {
@@ -14254,6 +14401,21 @@
                 "type": "local",
                 "format": "binary",
                 "path": "/fake/userData/rules/geoip-private.srs"
+              },
+              {
+                "tag": "node-domains",
+                "type": "inline",
+                "rules": [
+                  {
+                    "domain": [
+                      "a.example.com"
+                    ],
+                    "domain_suffix": [
+                      "a.example.com",
+                      ".a.example.com"
+                    ]
+                  }
+                ]
               }
             ]
           },
@@ -14408,13 +14570,7 @@
                 "rcode": "SERVFAIL"
               },
               {
-                "domain": [
-                  "a.example.com"
-                ],
-                "domain_suffix": [
-                  "a.example.com",
-                  ".a.example.com"
-                ],
+                "rule_set": "node-domains",
                 "server": "dns-domestic"
               },
               {
@@ -14975,6 +15131,21 @@
                 "type": "local",
                 "format": "binary",
                 "path": "/fake/userData/rules/geoip-ir.srs"
+              },
+              {
+                "tag": "node-domains",
+                "type": "inline",
+                "rules": [
+                  {
+                    "domain": [
+                      "a.example.com"
+                    ],
+                    "domain_suffix": [
+                      "a.example.com",
+                      ".a.example.com"
+                    ]
+                  }
+                ]
               }
             ]
           },
@@ -15129,13 +15300,7 @@
                 "rcode": "SERVFAIL"
               },
               {
-                "domain": [
-                  "a.example.com"
-                ],
-                "domain_suffix": [
-                  "a.example.com",
-                  ".a.example.com"
-                ],
+                "rule_set": "node-domains",
                 "server": "dns-domestic"
               },
               {
@@ -15689,6 +15854,21 @@
                 "type": "local",
                 "format": "binary",
                 "path": "/fake/userData/rules/geoip-private.srs"
+              },
+              {
+                "tag": "node-domains",
+                "type": "inline",
+                "rules": [
+                  {
+                    "domain": [
+                      "a.example.com"
+                    ],
+                    "domain_suffix": [
+                      "a.example.com",
+                      ".a.example.com"
+                    ]
+                  }
+                ]
               }
             ]
           },
@@ -15840,13 +16020,7 @@
                 "rcode": "SERVFAIL"
               },
               {
-                "domain": [
-                  "a.example.com"
-                ],
-                "domain_suffix": [
-                  "a.example.com",
-                  ".a.example.com"
-                ],
+                "rule_set": "node-domains",
                 "server": "dns-domestic"
               },
               {
@@ -16452,6 +16626,21 @@
                 "type": "local",
                 "format": "binary",
                 "path": "/fake/userData/rules/geoip-private.srs"
+              },
+              {
+                "tag": "node-domains",
+                "type": "inline",
+                "rules": [
+                  {
+                    "domain": [
+                      "a.example.com"
+                    ],
+                    "domain_suffix": [
+                      "a.example.com",
+                      ".a.example.com"
+                    ]
+                  }
+                ]
               }
             ]
           },
@@ -16617,13 +16806,7 @@
                 "rcode": "SERVFAIL"
               },
               {
-                "domain": [
-                  "a.example.com"
-                ],
-                "domain_suffix": [
-                  "a.example.com",
-                  ".a.example.com"
-                ],
+                "rule_set": "node-domains",
                 "server": "dns-domestic"
               },
               {
@@ -17255,6 +17438,21 @@
                 "type": "local",
                 "format": "binary",
                 "path": "/fake/userData/rules/geoip-private.srs"
+              },
+              {
+                "tag": "node-domains",
+                "type": "inline",
+                "rules": [
+                  {
+                    "domain": [
+                      "a.example.com"
+                    ],
+                    "domain_suffix": [
+                      "a.example.com",
+                      ".a.example.com"
+                    ]
+                  }
+                ]
               }
             ]
           },
@@ -17413,13 +17611,7 @@
                 "rcode": "SERVFAIL"
               },
               {
-                "domain": [
-                  "a.example.com"
-                ],
-                "domain_suffix": [
-                  "a.example.com",
-                  ".a.example.com"
-                ],
+                "rule_set": "node-domains",
                 "server": "dns-domestic"
               },
               {
@@ -18030,6 +18222,21 @@
                 "type": "local",
                 "format": "binary",
                 "path": "/fake/userData/rules/geoip-private.srs"
+              },
+              {
+                "tag": "node-domains",
+                "type": "inline",
+                "rules": [
+                  {
+                    "domain": [
+                      "a.example.com"
+                    ],
+                    "domain_suffix": [
+                      "a.example.com",
+                      ".a.example.com"
+                    ]
+                  }
+                ]
               }
             ]
           },
@@ -18188,16 +18395,7 @@
                 "rcode": "SERVFAIL"
               },
               {
-                "domain": [
-                  "a.example.com",
-                  "cdn.example.com"
-                ],
-                "domain_suffix": [
-                  "a.example.com",
-                  ".a.example.com",
-                  "cdn.example.com",
-                  ".cdn.example.com"
-                ],
+                "rule_set": "node-domains",
                 "server": "dns-domestic"
               },
               {
@@ -18810,6 +19008,24 @@
                 "type": "local",
                 "format": "binary",
                 "path": "/fake/userData/rules/geoip-private.srs"
+              },
+              {
+                "tag": "node-domains",
+                "type": "inline",
+                "rules": [
+                  {
+                    "domain": [
+                      "a.example.com",
+                      "cdn.example.com"
+                    ],
+                    "domain_suffix": [
+                      "a.example.com",
+                      ".a.example.com",
+                      "cdn.example.com",
+                      ".cdn.example.com"
+                    ]
+                  }
+                ]
               }
             ]
           },
@@ -18973,13 +19189,7 @@
                 "rcode": "SERVFAIL"
               },
               {
-                "domain": [
-                  "a.example.com"
-                ],
-                "domain_suffix": [
-                  "a.example.com",
-                  ".a.example.com"
-                ],
+                "rule_set": "node-domains",
                 "server": "dns-domestic"
               },
               {
@@ -19594,6 +19804,21 @@
                 "type": "local",
                 "format": "binary",
                 "path": "/fake/userData/rules/geoip-private.srs"
+              },
+              {
+                "tag": "node-domains",
+                "type": "inline",
+                "rules": [
+                  {
+                    "domain": [
+                      "a.example.com"
+                    ],
+                    "domain_suffix": [
+                      "a.example.com",
+                      ".a.example.com"
+                    ]
+                  }
+                ]
               }
             ]
           },
@@ -19748,13 +19973,7 @@
                 "rcode": "SERVFAIL"
               },
               {
-                "domain": [
-                  "a.example.com"
-                ],
-                "domain_suffix": [
-                  "a.example.com",
-                  ".a.example.com"
-                ],
+                "rule_set": "node-domains",
                 "server": "dns-domestic"
               },
               {
@@ -20362,6 +20581,21 @@
                 "type": "local",
                 "format": "binary",
                 "path": "/fake/userData/rules/geoip-private.srs"
+              },
+              {
+                "tag": "node-domains",
+                "type": "inline",
+                "rules": [
+                  {
+                    "domain": [
+                      "a.example.com"
+                    ],
+                    "domain_suffix": [
+                      "a.example.com",
+                      ".a.example.com"
+                    ]
+                  }
+                ]
               }
             ]
           },
@@ -20516,13 +20750,7 @@
                 "rcode": "SERVFAIL"
               },
               {
-                "domain": [
-                  "a.example.com"
-                ],
-                "domain_suffix": [
-                  "a.example.com",
-                  ".a.example.com"
-                ],
+                "rule_set": "node-domains",
                 "server": "dns-domestic"
               },
               {
@@ -21140,6 +21368,21 @@
                 "type": "local",
                 "format": "binary",
                 "path": "/fake/userData/rules/geoip-private.srs"
+              },
+              {
+                "tag": "node-domains",
+                "type": "inline",
+                "rules": [
+                  {
+                    "domain": [
+                      "a.example.com"
+                    ],
+                    "domain_suffix": [
+                      "a.example.com",
+                      ".a.example.com"
+                    ]
+                  }
+                ]
               }
             ]
           },
@@ -21314,13 +21557,7 @@
                 "rcode": "SERVFAIL"
               },
               {
-                "domain": [
-                  "a.example.com"
-                ],
-                "domain_suffix": [
-                  "a.example.com",
-                  ".a.example.com"
-                ],
+                "rule_set": "node-domains",
                 "server": "dns-domestic"
               },
               {
@@ -21984,6 +22221,21 @@
                 "type": "local",
                 "format": "binary",
                 "path": "/fake/userData/rules/geoip-private.srs"
+              },
+              {
+                "tag": "node-domains",
+                "type": "inline",
+                "rules": [
+                  {
+                    "domain": [
+                      "a.example.com"
+                    ],
+                    "domain_suffix": [
+                      "a.example.com",
+                      ".a.example.com"
+                    ]
+                  }
+                ]
               }
             ]
           },
@@ -22153,17 +22405,11 @@
                 "server": "dns-lan"
               },
               {
-                "domain": [
-                  "a.example.com"
-                ],
-                "domain_suffix": [
-                  "a.example.com",
-                  ".a.example.com"
-                ],
                 "timeout": "3000ms",
                 "action": "evaluate",
                 "server": "dns-domestic",
-                "tag": "dns-lan-eval-0"
+                "tag": "dns-lan-eval-0",
+                "rule_set": "node-domains"
               },
               {
                 "action": "respond",
@@ -22176,13 +22422,7 @@
                 "response_rcode": "NXDOMAIN"
               },
               {
-                "domain": [
-                  "a.example.com"
-                ],
-                "domain_suffix": [
-                  "a.example.com",
-                  ".a.example.com"
-                ],
+                "rule_set": "node-domains",
                 "server": "dns-lan"
               },
               {
@@ -22990,6 +23230,21 @@
                 "type": "local",
                 "format": "binary",
                 "path": "/fake/userData/rules/geoip-private.srs"
+              },
+              {
+                "tag": "node-domains",
+                "type": "inline",
+                "rules": [
+                  {
+                    "domain": [
+                      "a.example.com"
+                    ],
+                    "domain_suffix": [
+                      "a.example.com",
+                      ".a.example.com"
+                    ]
+                  }
+                ]
               }
             ]
           },
@@ -23145,13 +23400,7 @@
                 "rcode": "SERVFAIL"
               },
               {
-                "domain": [
-                  "a.example.com"
-                ],
-                "domain_suffix": [
-                  "a.example.com",
-                  ".a.example.com"
-                ],
+                "rule_set": "node-domains",
                 "server": "dns-domestic"
               },
               {
@@ -23791,6 +24040,21 @@
                 "type": "local",
                 "format": "binary",
                 "path": "/fake/userData/rules/geoip-private.srs"
+              },
+              {
+                "tag": "node-domains",
+                "type": "inline",
+                "rules": [
+                  {
+                    "domain": [
+                      "a.example.com"
+                    ],
+                    "domain_suffix": [
+                      "a.example.com",
+                      ".a.example.com"
+                    ]
+                  }
+                ]
               }
             ]
           },
@@ -23962,13 +24226,7 @@
                 "disable_cache": true
               },
               {
-                "domain": [
-                  "a.example.com"
-                ],
-                "domain_suffix": [
-                  "a.example.com",
-                  ".a.example.com"
-                ],
+                "rule_set": "node-domains",
                 "server": "dns-domestic"
               },
               {
@@ -24600,6 +24858,21 @@
                 "type": "local",
                 "format": "binary",
                 "path": "/fake/userData/rules/geoip-private.srs"
+              },
+              {
+                "tag": "node-domains",
+                "type": "inline",
+                "rules": [
+                  {
+                    "domain": [
+                      "a.example.com"
+                    ],
+                    "domain_suffix": [
+                      "a.example.com",
+                      ".a.example.com"
+                    ]
+                  }
+                ]
               }
             ]
           },
@@ -24751,13 +25024,7 @@
                 "rcode": "SERVFAIL"
               },
               {
-                "domain": [
-                  "a.example.com"
-                ],
-                "domain_suffix": [
-                  "a.example.com",
-                  ".a.example.com"
-                ],
+                "rule_set": "node-domains",
                 "server": "dns-domestic"
               },
               {
@@ -25376,6 +25643,21 @@
                 "type": "local",
                 "format": "binary",
                 "path": "/fake/userData/rules/geoip-private.srs"
+              },
+              {
+                "tag": "node-domains",
+                "type": "inline",
+                "rules": [
+                  {
+                    "domain": [
+                      "a.example.com"
+                    ],
+                    "domain_suffix": [
+                      "a.example.com",
+                      ".a.example.com"
+                    ]
+                  }
+                ]
               }
             ]
           },
@@ -25527,13 +25809,7 @@
                 "rcode": "SERVFAIL"
               },
               {
-                "domain": [
-                  "a.example.com"
-                ],
-                "domain_suffix": [
-                  "a.example.com",
-                  ".a.example.com"
-                ],
+                "rule_set": "node-domains",
                 "server": "dns-domestic"
               },
               {
@@ -25952,7 +26228,24 @@
               }
             ],
             "default_domain_resolver": "dns-bootstrap",
-            "final": "direct"
+            "final": "direct",
+            "rule_set": [
+              {
+                "tag": "node-domains",
+                "type": "inline",
+                "rules": [
+                  {
+                    "domain": [
+                      "a.example.com"
+                    ],
+                    "domain_suffix": [
+                      "a.example.com",
+                      ".a.example.com"
+                    ]
+                  }
+                ]
+              }
+            ]
           },
           "experimental": {
             "cache_file": {
@@ -26113,13 +26406,7 @@
                 "rcode": "SERVFAIL"
               },
               {
-                "domain": [
-                  "a.example.com"
-                ],
-                "domain_suffix": [
-                  "a.example.com",
-                  ".a.example.com"
-                ],
+                "rule_set": "node-domains",
                 "server": "dns-domestic"
               },
               {
@@ -26790,6 +27077,21 @@
                 "type": "local",
                 "format": "binary",
                 "path": "/fake/userData/rules/geoip-private.srs"
+              },
+              {
+                "tag": "node-domains",
+                "type": "inline",
+                "rules": [
+                  {
+                    "domain": [
+                      "a.example.com"
+                    ],
+                    "domain_suffix": [
+                      "a.example.com",
+                      ".a.example.com"
+                    ]
+                  }
+                ]
               }
             ]
           },
@@ -26948,13 +27250,7 @@
                 "rcode": "SERVFAIL"
               },
               {
-                "domain": [
-                  "a.example.com"
-                ],
-                "domain_suffix": [
-                  "a.example.com",
-                  ".a.example.com"
-                ],
+                "rule_set": "node-domains",
                 "server": "dns-domestic"
               },
               {
@@ -27586,6 +27882,21 @@
                 "type": "local",
                 "format": "binary",
                 "path": "/fake/userData/rules/geoip-private.srs"
+              },
+              {
+                "tag": "node-domains",
+                "type": "inline",
+                "rules": [
+                  {
+                    "domain": [
+                      "a.example.com"
+                    ],
+                    "domain_suffix": [
+                      "a.example.com",
+                      ".a.example.com"
+                    ]
+                  }
+                ]
               }
             ]
           },
@@ -27739,13 +28050,7 @@
                 "rcode": "SERVFAIL"
               },
               {
-                "domain": [
-                  "a.example.com"
-                ],
-                "domain_suffix": [
-                  "a.example.com",
-                  ".a.example.com"
-                ],
+                "rule_set": "node-domains",
                 "server": "dns-domestic"
               },
               {
@@ -28376,6 +28681,21 @@
                 "type": "local",
                 "format": "binary",
                 "path": "/fake/userData/rules/geoip-private.srs"
+              },
+              {
+                "tag": "node-domains",
+                "type": "inline",
+                "rules": [
+                  {
+                    "domain": [
+                      "a.example.com"
+                    ],
+                    "domain_suffix": [
+                      "a.example.com",
+                      ".a.example.com"
+                    ]
+                  }
+                ]
               }
             ]
           },
@@ -28528,13 +28848,7 @@
                 "rcode": "SERVFAIL"
               },
               {
-                "domain": [
-                  "a.example.com"
-                ],
-                "domain_suffix": [
-                  "a.example.com",
-                  ".a.example.com"
-                ],
+                "rule_set": "node-domains",
                 "server": "dns-domestic"
               },
               {
@@ -29116,6 +29430,21 @@
                 "type": "local",
                 "format": "binary",
                 "path": "/fake/userData/rules/geoip-private.srs"
+              },
+              {
+                "tag": "node-domains",
+                "type": "inline",
+                "rules": [
+                  {
+                    "domain": [
+                      "a.example.com"
+                    ],
+                    "domain_suffix": [
+                      "a.example.com",
+                      ".a.example.com"
+                    ]
+                  }
+                ]
               }
             ]
           },

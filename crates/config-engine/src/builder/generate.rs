@@ -22,7 +22,9 @@ use polaris_helper_proto::Platform;
 use serde::Serialize;
 
 use crate::builder::custom_rules::{resolve_resource_rule_set, CustomRulesDeps};
-use crate::builder::dns::{build_dns_config, DnsConfigDeps};
+use crate::builder::dns::{
+    build_dns_config, node_domains, DnsConfigDeps, NODE_DOMAINS_RULE_SET_TAG,
+};
 use crate::builder::endpoint_routes::mesh_system_supported_on_platform;
 use crate::builder::helpers::{build_id_to_tag_map, ServerLike};
 use crate::builder::inbounds::{build_inbounds, InboundsDeps};
@@ -38,7 +40,7 @@ use crate::builder::route::{
 };
 use crate::singbox::{
     ApiDashboard, ApiService, CacheFile, DnsConfig, DnsRule, Experimental, HttpClient, OneOrMany,
-    RouteConfig, RouteRule, SingBoxConfig,
+    RouteConfig, RouteRule, RuleSet, SingBoxConfig,
 };
 use crate::user_config::app_config::UserConfig;
 use crate::user_config::dns_constants::{
@@ -961,7 +963,29 @@ fn close_dns_rule_set_graph(
         if defined.contains(tag) {
             continue;
         }
-        if let Some(resource_id) = tag.strip_prefix("local-rs-") {
+        if tag == NODE_DOMAINS_RULE_SET_TAG {
+            // 与 rule1 同一次构建产生，不落文件：五端同一份配置，不存在定义缺失而被剪枝。
+            let domains = node_domains(config);
+            let suffix = domains
+                .iter()
+                .flat_map(|d| [d.clone(), format!(".{d}")])
+                .collect();
+            definitions.push(RuleSet {
+                tag: tag.clone(),
+                type_field: "inline".to_string(),
+                format: String::new(),
+                path: None,
+                url: None,
+                http_client: None,
+                update_interval: None,
+                rules: Some(vec![RouteRule {
+                    domain: Some(domains),
+                    domain_suffix: Some(suffix),
+                    ..Default::default()
+                }]),
+            });
+            defined.insert(tag.clone());
+        } else if let Some(resource_id) = tag.strip_prefix("local-rs-") {
             if let Some(resolved_tag) = resolve_resource_rule_set(
                 resource_id,
                 &config.rule_resources,

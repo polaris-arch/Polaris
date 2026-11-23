@@ -184,6 +184,17 @@
 //! 从 2s 改为 4500ms（三个串行 tier 各 1500ms），避免前两级超时后 dns-lan 无预算启动。
 //! 金样只机械替换该 policy 的 timeout；direct-lan-fallback 的 6000ms 保持原值。
 //!
+//! **第十三次例外（2026-11-23，节点域名移入 inline rule_set）**：rule1 的 `domain`/`domain_suffix`
+//! 移到 `route.rule_set` 末尾的 inline 条目 `node-domains`，rule1 改为 `rule_set:"node-domains"`，
+//! 使订阅换节点不再改动 DNS 段（内核据此复用 DNS 路由）。
+//! - **变换**（脚本按规则独立改写，未从 Rust 输出重录）：37 个 case 各恰有一条形状为
+//!   `{domain, domain_suffix, server}` 且 suffix 为 `[d, .d]` 逐项展开的 rule1；去掉两个域名键、加
+//!   `rule_set:"node-domains"`，原 `domain`/`domain_suffix` 原样写入新增的
+//!   `{tag:"node-domains", type:"inline", rules:[{domain, domain_suffix}]}`（无 `route.rule_set` 的 1 个
+//!   case 新建该数组）。`DNS lanResolverForDns 注入` 的 dns-lan 回退链把 rule1 复制成 evaluate，那 1 条
+//!   副本做同样的键替换。
+//! - **验收**：变换前 37/37 红、首差异均为 rule1（或其 evaluate 副本）缺 `domain`；变换后 37/37 diff=0。
+//!
 //! # 重生方式（不要在本仓手搓）
 //!
 //! 导出器在 **上游仓**：`scripts/export-config-snapshot-fixtures.test.ts`。重生要求 上游 主工作树

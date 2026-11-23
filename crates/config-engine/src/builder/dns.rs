@@ -111,6 +111,29 @@ fn with_dot_prefix(d: &str) -> Vec<String> {
 /// P4b 内部预留 tag：tailscale 按名解析 DNS server 的固定 tag。不与节点 tag 撞车。
 /// 上游 `TS_NAME_DNS_TAG`。
 const TS_NAME_DNS_TAG: &str = "dns-tailscale";
+pub(crate) const NODE_DOMAINS_RULE_SET_TAG: &str = "node-domains";
+
+/// rule1 的节点域名：#57 全量化，遍历【全部】节点的 address + tlsSettings.serverName（过滤 IP 字面量）。
+pub(crate) fn node_domains(config: &UserConfig) -> Vec<String> {
+    let node_domains_set: std::collections::BTreeSet<String> = config
+        .servers
+        .iter()
+        .flat_map(|s| {
+            let mut ds: Vec<String> = Vec::new();
+            if !s.address.is_empty() {
+                ds.push(s.address.clone());
+            }
+            if let Some(sn) = s.tls_settings.as_ref().and_then(|t| t.server_name.as_ref()) {
+                ds.push(sn.clone());
+            }
+            ds
+        })
+        .collect();
+    node_domains_set
+        .into_iter()
+        .filter(|d| !d.is_empty() && !is_ipv4_host(d) && !is_ipv6_host(d))
+        .collect()
+}
 
 /// 内网与反向解析命名空间；裸后缀同时匹配 apex 和子域名。
 const INTERNAL_DNS_SUFFIXES: &[&str] = &["arpa", "lan", "home.arpa", "home", "internal"];
@@ -1139,25 +1162,9 @@ pub fn build_dns_config(
     let mut dns_rules: Vec<DnsRule> = vec![];
 
     // ── rule1：代理服务器域名必须用真实 DNS 解析（避免 FakeIP 劫持死循环）。
-    // #57 全量化：遍历【全部】节点的 address + tlsSettings.serverName（过滤 IP 字面量）。
-    let node_domains_set: std::collections::BTreeSet<String> = config
-        .servers
-        .iter()
-        .flat_map(|s| {
-            let mut ds: Vec<String> = Vec::new();
-            if !s.address.is_empty() {
-                ds.push(s.address.clone());
-            }
-            if let Some(sn) = s.tls_settings.as_ref().and_then(|t| t.server_name.as_ref()) {
-                ds.push(sn.clone());
-            }
-            ds
-        })
-        .collect();
-    let node_domains: Vec<String> = node_domains_set
-        .into_iter()
-        .filter(|d| !d.is_empty() && !is_ipv4_host(d) && !is_ipv6_host(d))
-        .collect();
+    // 域名放进 inline rule_set（定义见 generate.rs 的 DNS rule_set 闭合）：订阅换节点只改
+    // `route.rule_set`，DNS 段不变，内核据此不重建 DNS 路由及依赖它的出站。
+    let node_domains = node_domains(config);
     if !node_domains.is_empty() {
         // 观测：超大订阅下 rule1 域名规模。
         deps.log_info(&format!(
@@ -1185,15 +1192,11 @@ pub fn build_dns_config(
             ProxyModeType::SystemProxy => "systemProxy",
             ProxyModeType::Manual => "manual",
         };
-        let node_suffix: Vec<String> = node_domains
-            .iter()
-            .flat_map(|d| vec![d.clone(), format!(".{d}")])
-            .collect();
         dns_rules.push(DnsRule {
-            rule_set: None,
+            rule_set: Some(OneOrMany::One(NODE_DOMAINS_RULE_SET_TAG.into())),
             query_type: None,
-            domain: Some(node_domains.clone()),
-            domain_suffix: Some(node_suffix),
+            domain: None,
+            domain_suffix: None,
             domain_keyword: None,
             domain_regex: None,
             source_mac_address: None,
