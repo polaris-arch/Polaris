@@ -137,7 +137,7 @@ impl ProxyRuntime {
     ///
     /// # 为什么两个消费点共用它，而不是各写一份
     ///
-    /// 消费点是[提交事务](Self::auto_hot_switch_transaction_with_api)（非热切 ⇒ `NotEligible`）与
+    /// 消费点是[提交事务](Self::auto_hot_switch_transaction_for_graph)（非热切 ⇒ `NotEligible`）与
     /// [探测前的候选剔除](Self::retain_hot_switchable_candidates)（非热切 ⇒ 根本不探）。两处判据**必须
     /// 逐字相同**：探测前放行、提交时才拒 = 整轮全量探测白跑，且 `do_switch_io` 返 false 不计熔断 ⇒
     /// 约 90 秒后原样重来一轮，永不成功 —— 而那正是用户真需要切换的时刻。
@@ -965,7 +965,7 @@ impl ProxyRuntime {
 
     /// **C3 换节点执行体**。闸门（熔断/冷却/在飞）决策全在
     /// [`AutoSwitchMachine::evaluate_switch`]；放行后只测运行核 clean 候选 → 选最优 →
-    /// [`Self::auto_hot_switch_transaction`] 做零重启提交并回读自证 → emit。**真机门**（真起核 + 碰网络）。
+    /// [`Self::auto_hot_switch_transaction_for_graph`] 做零重启提交并回读自证 → emit。**真机门**（真起核 + 碰网络）。
     async fn run_auto_switch(self: &Arc<Self>, machine: &mut AutoSwitchMachine, reason: &str) {
         match machine.evaluate_switch(monotonic_now_ms()) {
             SwitchGate::Proceed => {}

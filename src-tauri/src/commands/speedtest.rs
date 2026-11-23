@@ -3101,7 +3101,7 @@ pub async fn server_speed_test(
 ///
 /// # 为什么这条腿也必须守让位
 ///
-/// 池路径的让位三检查点（[`drive_pool_waves`]）此前**没有对应物在回退腿上**：`probe_pool_ports` 为空的
+/// 池路径的让位三检查点（[`drive_pool_waves_inner`]）此前**没有对应物在回退腿上**：`probe_pool_ports` 为空的
 /// 回退腿既无 gen0 捕获、`measure_via_local_proxy` 前后也无检查，`outcome` 硬编码 `"completed"`。后果是
 /// 测量中途核重启/崩溃会把一个 `-1`（或经**新**出口测得的值）记在**旧** `selectedServerId` 上 —— 正是
 /// 模块文档「绝不伪造数值」承诺要消灭的那类伪造，只是发生在更少见的路径上（端口分配失败才走回退）。
@@ -3109,7 +3109,7 @@ pub async fn server_speed_test(
 /// # 语义与池路径逐字一致
 ///
 /// 被取代 → 该节点**缺席**（不写 `results`、不推 `result`/`progress` 事件）+ `outcome="interrupted"`，
-/// 而不是记 `-1`。「超代未测」与「真实超时」不可混淆，这是诚实性根基（同 [`drive_pool_waves`] 的让位③）。
+/// 而不是记 `-1`。「超代未测」与「真实超时」不可混淆，这是诚实性根基（同 [`drive_pool_waves_inner`] 的让位③）。
 /// 未被取代 → 照常记账：`total` 恒 1（本腿真可测数就是 1，把 `notInPool` 算进 total 等于谎报测过）。
 ///
 /// # 终态事件的唯一出口就在本函数
@@ -4258,7 +4258,7 @@ impl WaveTrace {
     }
 }
 
-/// [`drive_pool_waves`] 的本体：多带一个 [`WaveTrace`]，并把中断成因原样交回（而不是折成
+/// `drive_pool_waves` 的本体：多带一个 [`WaveTrace`]，并把中断成因原样交回（而不是折成
 /// `outcome` 字符串）。终态事件仍在这里单点发出。
 #[allow(clippy::too_many_arguments)]
 async fn drive_pool_waves_traced<Sel, SelFut, Meas, MeasFut>(
@@ -4551,7 +4551,7 @@ where
 /// 单个节点的落账 + 推事件（`result` 与 `progress` 成对，计数在此处自增 ⇒ 恒单调）。
 ///
 /// 失败 ⇒ 记 -1（**真实**不可测，阶段与成因随事件带出）。「让位未测」的节点根本
-/// 不会走到这里 —— 它们缺席，见 [`drive_pool_waves`] 的三检查点。
+/// 不会走到这里 —— 它们缺席，见 [`drive_pool_waves_inner`] 的三检查点。
 #[allow(clippy::too_many_arguments)]
 fn record_measured(
     results: &mut RoundResults,

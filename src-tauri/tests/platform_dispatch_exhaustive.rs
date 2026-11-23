@@ -2509,6 +2509,15 @@ const CFG_REGISTRY: &[CfgSite] = &[
         IosSide::WithAndroid,
         "The normal-library native acceptance carrier requires separate desktop, native-production-verification feature and debug_assertions attributes. Android and iOS exclude the carrier, release excludes it even with the feature, and enabling the feature cannot grant a mobile runtime a desktop issuer.",
     ),
+    (
+        "src-tauri/src/runtime/proxy/auto_switch.rs",
+        "any( test, all(desktop, feature = \"native-production-verification\", debug_assertions) )",
+        2,
+        IosSide::WithAndroid,
+        "`auto_hot_switch_transaction` / `auto_hot_switch_transaction_with_api` 两层旧入口薄壳只留给单测与桌面 debug 原生验收载体；\
+         生产提交（故障切换与自动选择）直接调用无 cfg 的 `auto_hot_switch_transaction_for_graph`。\
+         Android 与 iOS 在 release/debug 下都不编译这两层壳，两个移动平台同侧，任何移动端提交路径都不经过它们。",
+    ),
 
     (
         "src-tauri/src/commands/updater/core_info.rs",
@@ -3011,6 +3020,52 @@ const CFG_REGISTRY: &[CfgSite] = &[
          「哪条前端 topic 由哪个 libbox 通道供数」的声明。iOS 落**不在场**那一侧 ⇒ \
          它将来接进程内核时，这张对应表在 iOS 编译单元里根本不存在，而契约门 A6 的双向对拍\
          也就跟着不覆盖 iOS。同上，本批不改；改时这三条要与上面两条一起动。",
+    ),
+    (
+        "src-tauri/src/runtime/stats/source.rs",
+        "any(target_os = \"android\", test)",
+        2,
+        IosSide::DiffersWrongToday,
+        "🔴 `ConnectionFrame::SnapshotTooLarge` 变体与 `ConnectionFrame::from_native`（解码 Android 桥的 \
+         `snapshot_state` 0–3 分片态）。iOS 落**不在场**那一侧，与上一条三个 libbox 常量同族：\
+         将来接进程内核时这层分片解码在 iOS 编译单元里不存在。延续既有债，本批不改。",
+    ),
+    (
+        "src-tauri/src/runtime/stats/source.rs",
+        "not(target_os = \"android\")",
+        2,
+        IosSide::DiffersWrongToday,
+        "🔴 `ConnectionStreamFailure::Retry` 变体与 `From<ClientError>`（把管理 API 建流 / 收帧错误分成 \
+         `SnapshotTooLarge` 与 `Retry`）。依附同一条 gRPC 传输；iOS 落这一侧，与上面 15 处同族。\
+         不因编译到这一份就宣称 iOS 供数已实现。同上，本批不改。",
+    ),
+    (
+        "src-tauri/src/runtime/stats/relay.rs",
+        "any(target_os = \"android\", test)",
+        1,
+        IosSide::DiffersWrongToday,
+        "🔴 `apply_connection_frame` 里消费 Android 桥 `SnapshotTooLarge` 帧的那一臂；非 Android 侧的超限\
+         经 `ConnectionStreamFailure` 报出。iOS 落非 Android 侧 ⇒ 走管理 API gRPC 那一份，\
+         与 `stats/source.rs` 同谓词各条同族：iOS 核在扩展进程内、没有管理端口，统计仍无供数。延续既有债，本批不改。",
+    ),
+    (
+        "src-tauri/src/runtime/stats/relay.rs",
+        "not(target_os = \"android\")",
+        8,
+        IosSide::DiffersWrongToday,
+        "🔴 单会话连接事件流的重试腿：`wait_for_connection_retry` 退避、`retry_current` 复核 relay 借用、\
+         建流期间可被关门打断的 `select!`、`Retry` 两臂，以及 `transport_ended` 三处（同 Core 传输重试期间\
+         保留上一张完整表）。全部依附管理 API gRPC 传输；iOS 落这一侧，与 `stats/source.rs` 的\
+         `not(target_os = \"android\")` 同族。不因编译到这一份就宣称 iOS 供数已实现。同上，本批不改。",
+    ),
+    (
+        "src-tauri/src/runtime/stats/relay.rs",
+        "target_os = \"android\"",
+        2,
+        IosSide::DiffersWrongToday,
+        "🔴 Android 桥建流 future 不套 `select!`、一路 await（丢弃即 JNI 回调线程 panic，见 `source.rs` 头注），\
+         以及断流时仍在等首份快照则退避一拍。iOS 不走这两处而落桌面 gRPC 那一侧，与 `stats/source.rs` 的\
+         `target_os = \"android\"` 供数通道同族。同上，本批不改。",
     ),
     (
         "src-tauri/src/runtime/stats/gate.rs",
@@ -4723,7 +4778,10 @@ const IOS_SIDE_CENSUS: &[(&str, usize)] = &[
     ("DiffersRight", 448),
     ("DiffersUndecided", 26),
     // Saved temporary-core concurrency adds three group members; no old debt is repaid.
-    ("DiffersWrongToday", 140),
+    // Bounded connection snapshots add 15 stats transport sites to the existing stats
+    // debt family: relay.rs (1 + 8 + 2) and source.rs (2 + 2). No old debt is repaid
+    // and no iOS compile or device evidence is claimed.
+    ("DiffersWrongToday", 155),
     // b84e adds eight explicitly same-side cfg sites (1 + 4 + 2 + 1).
     // TLS presentation adds five more: core_info (1 + 1), core_identity (2),
     // and tls_capabilities (1). eval_cfg checks Android/iOS in release/debug.
@@ -4740,7 +4798,9 @@ const IOS_SIDE_CENSUS: &[(&str, usize)] = &[
     // mobile no-op pair in startup (2 same-side sites). No debt changed.
     // The authenticated first exit-IP attempt has the same mobile dispatch on Android and iOS.
     // The platform split adds two desktop-only branches shared by neither mobile target.
-    ("WithAndroid", 143),
+    // The two auto-switch transaction wrappers become test/desktop-acceptance only;
+    // production commits call the graph-scoped entry (2 same-side sites). No debt changed.
+    ("WithAndroid", 145),
 ];
 
 /// 「债」的两个格子。同样只写名字，不写 `IosSide::`，理由同 [`IOS_SIDE_CENSUS`]。
@@ -4850,6 +4910,21 @@ const IOS_DEBT_SITES: &[(&str, &str, usize)] = &[
         1,
     ),
     (
+        "src-tauri/src/runtime/stats/relay.rs",
+        "any(target_os = \"android\", test)",
+        1,
+    ),
+    (
+        "src-tauri/src/runtime/stats/relay.rs",
+        "not(target_os = \"android\")",
+        8,
+    ),
+    (
+        "src-tauri/src/runtime/stats/relay.rs",
+        "target_os = \"android\"",
+        2,
+    ),
+    (
         "src-tauri/src/runtime/stats/source.rs",
         "any(target_os = \"android\", test)",
         1,
@@ -4857,7 +4932,17 @@ const IOS_DEBT_SITES: &[(&str, &str, usize)] = &[
     (
         "src-tauri/src/runtime/stats/source.rs",
         "any(target_os = \"android\", test)",
+        2,
+    ),
+    (
+        "src-tauri/src/runtime/stats/source.rs",
+        "any(target_os = \"android\", test)",
         3,
+    ),
+    (
+        "src-tauri/src/runtime/stats/source.rs",
+        "not(target_os = \"android\")",
+        2,
     ),
     (
         "src-tauri/src/runtime/stats/source.rs",

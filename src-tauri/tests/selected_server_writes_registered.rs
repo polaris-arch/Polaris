@@ -230,12 +230,12 @@ const WRITES: &[(&str, &[Site])] = &[
             ),
             (
                 Class::System,
-                "auto_hot_switch_transaction_with_api",
+                "auto_hot_switch_transaction_for_graph",
                 "后台提交事务的落盘：故障切换与自动选择换点。只改实际出口",
             ),
             (
                 Class::System,
-                "auto_hot_switch_transaction_with_api",
+                "auto_hot_switch_transaction_for_graph",
                 "后台提交事务未自证时回滚到旧出口",
             ),
         ],
