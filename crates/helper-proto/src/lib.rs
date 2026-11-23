@@ -321,8 +321,9 @@ pub mod proto_version {
     /// 兼容代数不随 App/Core 版本或构建身份递增。
     ///
     /// 唯一定义点：helper 侧的 `ping`/`version` 响应与 client 侧的握手期望都读它 → 结构上不可能分叉。
-    /// v2 uses immutable content ids and rejects all runtime installation and
-    /// executable-path/legacy birth Start frames before dispatch.
+    /// v2 uses immutable content ids and rejects client-supplied installation bytes
+    /// and executable-path/legacy birth Start frames before dispatch. IPC may only
+    /// load from the administrator-owned trusted installation directory.
     /// v3 requires executor-owned selected admission and a strict v3 marker in
     /// every pinned Start. Version is a compatibility hint, never object proof.
     pub const MIN_TRUSTED_EXECUTION: u32 = 3;
@@ -344,12 +345,14 @@ pub mod proto_version {
     /// Linux v8 retires DNS ownership after the previous TUN link is gone.
     /// Linux v9 pins the default DNS route before setting the server.
     pub const LINUX_CHECKED_DNS_TAKEOVER: u32 = 9;
+    /// Linux v10 loads the bundled Core from the administrator-owned deb directory.
+    pub const LINUX_BUNDLED_CORE: u32 = 10;
 
     /// Required generation for the target platform, including cross-target clients.
     pub const fn for_platform(platform: crate::Platform) -> u32 {
         match platform {
             crate::Platform::Win => WINDOWS_EXACT_OBJECT,
-            crate::Platform::Linux => LINUX_CHECKED_DNS_TAKEOVER,
+            crate::Platform::Linux => LINUX_BUNDLED_CORE,
             crate::Platform::Mac => BASELINE,
             // Mobile targets have no privileged desktop helper. Keep the shared
             // wire baseline without claiming Windows native execution support.
@@ -362,9 +365,9 @@ pub mod proto_version {
     /// Native helper advertisement and installer receipt use the same generation.
     #[cfg(windows)]
     pub const CURRENT: u32 = WINDOWS_EXACT_OBJECT;
-    /// The Linux helper must include the resolved-link ownership fix.
+    /// The Linux helper must include the bundled Core installation.
     #[cfg(target_os = "linux")]
-    pub const CURRENT: u32 = LINUX_CHECKED_DNS_TAKEOVER;
+    pub const CURRENT: u32 = LINUX_BUNDLED_CORE;
     /// Unaffected platforms retain the reusable v7 helper generation.
     #[cfg(not(any(windows, target_os = "linux")))]
     pub const CURRENT: u32 = BASELINE;

@@ -441,6 +441,23 @@ where
                     crate::pinned_core::status(Some(&self.derived_core_dir()), &id),
                 )))
             }
+            Request::InstallBundledCore { id } => HandleOutcome::Respond(
+                if crate::core_cli::install_bundled(
+                    &self.derived_core_dir(),
+                    crate::core_cli::BUNDLED_CORE_DIR,
+                    &id,
+                    crate::core_store::OwnerPolicy::privileged(),
+                )
+                .is_ok()
+                {
+                    Response::Ok(ResponseKind::Installed)
+                } else {
+                    Response::Err(polaris_helper_proto::Error::with_detail(
+                        polaris_helper_proto::ErrorCode::Other,
+                        "bundled-core-unavailable",
+                    ))
+                },
+            ),
             Request::NativeStartPinned(params) => self.handle_native_pinned(&params, peer),
             Request::HelperLogs => HandleOutcome::Respond(Response::Ok(ResponseKind::HelperLogs(
                 crate::log_ring::read(peer.map(|peer| peer.identity.key()).as_deref()),

@@ -36,7 +36,7 @@ fn compatible_helpers_survive_app_releases_but_required_fixes_upgrade() {
 #[test]
 fn platform_behavior_fixes_advance_once_then_reuse_compatible_helpers() {
     use polaris_helper_proto::{proto_version, Platform};
-    for (platform, expected) in [(Platform::Win, 8), (Platform::Linux, 9)] {
+    for (platform, expected) in [(Platform::Win, 8), (Platform::Linux, 10)] {
         let current = proto_version::for_platform(platform);
         assert_eq!(current, expected, "{platform:?}");
         assert_eq!(

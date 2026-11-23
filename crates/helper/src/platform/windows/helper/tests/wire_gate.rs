@@ -33,6 +33,7 @@ request_samples! {
     PrepareHelperUpgrade => Request::PrepareHelperUpgrade,
     CancelHelperUpgrade => Request::CancelHelperUpgrade,
     CoreStatus => Request::CoreStatus { id: polaris_helper_proto::core_manifest::CoreId::parse(&"a".repeat(64)).unwrap() },
+    InstallBundledCore => Request::InstallBundledCore { id: polaris_helper_proto::core_manifest::CoreId::parse(&"a".repeat(64)).unwrap() },
     LinuxStartPinned => Request::LinuxStartPinned(polaris_helper_proto::core_protocol::PinnedStartParams {
         runtime_directory: None,
         id: polaris_helper_proto::core_manifest::CoreId::parse(&"a".repeat(64)).unwrap(),

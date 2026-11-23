@@ -1242,6 +1242,44 @@ impl HelperRuntime {
         if !self.supported() {
             return self.action_failed(HelperActionErrorCode::Unsupported, "helper unsupported");
         }
+        // A compatible helper missing only this App's Core first loads it from its own
+        // administrator-owned installation directory. Any other reply, including an old
+        // helper's `ERR unknown`, keeps the administrator path below.
+        let status = self.status();
+        if status.selected_core_missing() && !status.upgradeable {
+            let installed = self.build_client().is_ok_and(|client| {
+                status.selected_core.as_ref().is_some_and(|core| {
+                    polaris_helper_proto::core_manifest::CoreId::parse(&core.id).is_ok_and(|id| {
+                        matches!(
+                            client.send_with_timeout(
+                                &Request::InstallBundledCore { id },
+                                Duration::from_secs(120),
+                            ),
+                            Ok(Response::Ok(ResponseKind::Installed))
+                        )
+                    })
+                })
+            });
+            let status = self.status();
+            let present = status
+                .selected_core
+                .as_ref()
+                .is_some_and(|core| core.state == SelectedCoreState::Present);
+            log::info!(
+                "needs-core install path: helper-bundled installed={installed} present={present}"
+            );
+            if installed && present {
+                return HelperActionResult {
+                    success: true,
+                    uninstall_effect: None,
+                    execution_diagnostic: None,
+                    error_code: None,
+                    diagnostic: None,
+                    status,
+                };
+            }
+            log::info!("needs-core install path: administrator authorization");
+        }
         let started = std::time::Instant::now();
         let (mut params, _stage) = match self.install_params() {
             Ok(p) => p,

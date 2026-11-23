@@ -683,6 +683,48 @@ fn protected_core_platforms_are_a_subset_of_helper_platforms() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn missing_core_falls_back_to_administrator_install_when_helper_rejects_bundled_load() {
+    if crate::test_support::ran_in_isolated_worker(
+        module_path!(),
+        "missing_core_falls_back_to_administrator_install_when_helper_rejects_bundled_load",
+    ) {
+        return;
+    }
+    std::env::remove_var("POLARIS_HELPER_PATH");
+    let dir = TestDir::new("polaris-helper-test-");
+    let frames = Arc::new(Mutex::new(Vec::new()));
+    let connector = SequenceConnector {
+        streams: Mutex::new(vec![polaris_helper_client::MockStream::with_response(
+            b"ERR unknown\n".to_vec(),
+        )]),
+        connects: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        frames: Arc::clone(&frames),
+    };
+    let status = HelperStatusSnapshot {
+        selected_core: Some(SelectedCoreSnapshot {
+            id: "a".repeat(64),
+            version: "1.15.0-alpha.12".into(),
+            provider_fingerprint: "b".repeat(64),
+            state: SelectedCoreState::Absent,
+            admission: None,
+        }),
+        installed: true,
+        ..Default::default()
+    };
+    let rt = HelperRuntime::with_test_connector_for_tests(dir.clone(), status, Arc::new(connector));
+    let result = rt.install_with_mode(HelperInstallMode::Ordinary);
+    assert_eq!(
+        *frames.lock().unwrap(),
+        vec![format!("install-bundled-core\n{}\n", "a".repeat(64))]
+    );
+    // The bundled branch never fails by itself; this failure is the existing
+    // administrator path stopping before escalation for lack of packaged inputs.
+    assert!(!result.success);
+    assert!(result.error_code.is_some());
+}
+
 #[test]
 fn helper_install_success_requires_compatible_protocol_and_selected_content() {
     let current = HelperStatusSnapshot {

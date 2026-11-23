@@ -20,6 +20,9 @@ pub mod common {
     /// `OK <ver>`（mac/win/linux，纯协议版本查询）。
     pub const VERSION: &str = "version";
     pub const CORE_STATUS: &str = "core-status";
+    /// `OK installed`: the helper loads the selected Core only from its own
+    /// administrator-owned installation directory. No client path or hash is read.
+    pub const INSTALL_BUNDLED_CORE: &str = "install-bundled-core";
     pub const PREPARE_HELPER_UPGRADE: &str = "prepare-helper-upgrade";
     pub const CANCEL_HELPER_UPGRADE: &str = "cancel-helper-upgrade";
     pub const NATIVE_START_PINNED_BIRTH: &str = "start-native-pinned-birth-safe";

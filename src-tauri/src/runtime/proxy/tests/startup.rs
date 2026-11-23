@@ -1533,8 +1533,9 @@ async fn helper_start_without_daemon_keeps_unconfirmed_route() {
 /// The current daemon must attest the compiled selected CoreID before Start
 /// custody is reserved. Clear the isolated readiness fixture to exercise the
 /// real CoreStatus preflight: NeverConnect cannot confirm that installed ID.
-/// No binary path, runtime install-core fallback, privileged IPC, or native core
-/// is admitted by this fixture. Its positive control restores readiness only.
+/// No binary path, native core, or client-supplied installation bytes are admitted
+/// by this fixture: IPC may only load from the administrator-owned trusted
+/// installation directory. Its positive control restores readiness only.
 /// Removing this preflight would reach Start communication and retain custody.
 #[tokio::test]
 async fn helper_start_is_refused_when_the_protected_core_cannot_be_confirmed() {

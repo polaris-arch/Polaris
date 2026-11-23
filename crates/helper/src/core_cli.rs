@@ -1,9 +1,10 @@
-//! Administrative content installation. This command is never exposed on IPC.
+//! Core content installation. IPC may only load from the administrator-owned trusted
+//! installation directory; it never installs client-supplied bytes.
 use crate::{
     core_objects::PayloadDir,
     core_store::{CoreStore, OwnerPolicy},
 };
-use polaris_helper_proto::core_manifest::InstalledCoreManifest;
+use polaris_helper_proto::core_manifest::{CoreId, InstalledCoreManifest};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
@@ -119,13 +120,75 @@ pub(crate) fn install(args: &InstallArgs) -> io::Result<String> {
             return Err(invalid("invalid native source owner"));
         }
     }
+    install_from(args, OwnerPolicy::privileged(), source_uid, None)
+}
+
+/// Administrator-owned directory shipped with this platform's package. Windows
+/// currentUser installs have none, so the client keeps its administrator path.
+#[cfg(target_os = "linux")]
+pub(crate) const BUNDLED_CORE_DIR: Option<&str> = Some("/usr/lib/Polaris/_up_/resources/linux");
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) const BUNDLED_CORE_DIR: Option<&str> =
+    Some("/Applications/Polaris.app/Contents/Resources/_up_/resources/mac-arm64");
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+pub(crate) const BUNDLED_CORE_DIR: Option<&str> =
+    Some("/Applications/Polaris.app/Contents/Resources/_up_/resources/mac-x64");
+#[cfg(not(any(
+    target_os = "linux",
+    all(
+        target_os = "macos",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    )
+)))]
+pub(crate) const BUNDLED_CORE_DIR: Option<&str> = None;
+
+/// IPC installation. Path and hashes never come from the client: only bytes below
+/// a directory whose every ancestor is administrator-owned and not group/other
+/// writable are admitted, under a self-verifying manifest naming the requested id.
+pub(crate) fn install_bundled(
+    root: &Path,
+    source: Option<&str>,
+    id: &CoreId,
+    owner: OwnerPolicy,
+) -> io::Result<String> {
+    let result = (|| {
+        let source = Path::new(source.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::Unsupported, "no administrator installation")
+        })?);
+        for directory in source.ancestors() {
+            owner.check(directory)?;
+        }
+        let args = InstallArgs {
+            root: root.to_path_buf(),
+            source: source.to_path_buf(),
+            manifest: source.join("core-manifest.json"),
+            source_owner: None,
+            preserve_existing: false,
+        };
+        install_from(&args, owner, owner.uid, Some(id))
+    })();
+    match &result {
+        Ok(line) => log::info!("install-bundled-core -> {line}"),
+        Err(error) => log::warn!("install-bundled-core -> fallback: {error}"),
+    }
+    result
+}
+
+/// Shared body. `bundled` binds the IPC request id; otherwise the administrator
+/// utility must match its compiled selection and its own manifest hash.
+fn install_from(
+    args: &InstallArgs,
+    owner: OwnerPolicy,
+    source_uid: Option<u32>,
+    bundled: Option<&CoreId>,
+) -> io::Result<String> {
     let manifest_parent = args
         .manifest
         .parent()
         .ok_or_else(|| invalid("manifest parent unavailable"))?;
-    OwnerPolicy::privileged().check(manifest_parent)?;
-    OwnerPolicy::privileged().check(&args.manifest)?;
-    let objects = PayloadDir::open(manifest_parent, OwnerPolicy::privileged().uid)?;
+    owner.check(manifest_parent)?;
+    owner.check(&args.manifest)?;
+    let objects = PayloadDir::open(manifest_parent, owner.uid)?;
     let (file, bytes) = objects.open_regular("core-manifest.json")?;
     if bytes > 64 * 1024 {
         return Err(invalid("manifest too large"));
@@ -137,18 +200,24 @@ pub(crate) fn install(args: &InstallArgs) -> io::Result<String> {
     if manifest.core.platform != current_platform()? {
         return Err(invalid("core platform differs from installer"));
     }
-    require_compiled_selection(&manifest, current_platform()?)?;
-    // Check the actual utility bytes, not its filename, a version string, or the
-    // helper installed by another App. The staged manifest hash is mandatory here.
-    let helper = manifest
-        .core
-        .helper_sha256
-        .as_deref()
-        .ok_or_else(|| invalid("missing helper hash"))?;
-    if hash_file(&std::env::current_exe()?)? != helper {
-        return Err(invalid("installer helper hash differs"));
+    if let Some(id) = bundled {
+        if manifest.id != id.as_str() {
+            return Err(invalid("bundled core differs from requested id"));
+        }
+    } else {
+        require_compiled_selection(&manifest, current_platform()?)?;
+        // Check the actual utility bytes, not its filename, a version string, or the
+        // helper installed by another App. The staged manifest hash is mandatory here.
+        let helper = manifest
+            .core
+            .helper_sha256
+            .as_deref()
+            .ok_or_else(|| invalid("missing helper hash"))?;
+        if hash_file(&std::env::current_exe()?)? != helper {
+            return Err(invalid("installer helper hash differs"));
+        }
     }
-    let store = CoreStore::initialize(&args.root, OwnerPolicy::privileged())?;
+    let store = CoreStore::initialize(&args.root, owner)?;
     let source_sid = match &args.source_owner {
         Some(polaris_helper_proto::core_protocol::CallerIdentity::Windows(sid)) => {
             Some(sid.as_str())

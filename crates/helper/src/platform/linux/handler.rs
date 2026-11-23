@@ -208,6 +208,37 @@ pub fn handle<P, S, D, SD>(
         return;
     }
 
+    // Outside the child-state lock: store mutation/lease locks serialize the copy,
+    // so status/stop are not blocked behind it.
+    if command == cmd::INSTALL_BUNDLED_CORE {
+        let (Ok(Some(id)), Ok(None)) = (conn.read_line_strict(), conn.read_line_strict()) else {
+            let _ = conn.write_line("ERR bad-args");
+            return;
+        };
+        let Ok(id) = polaris_helper_proto::core_manifest::CoreId::parse(&id) else {
+            let _ = conn.write_line("ERR bad-args");
+            return;
+        };
+        let response = if deps.core_dir.is_some_and(|root| {
+            crate::core_cli::install_bundled(
+                root,
+                crate::core_cli::BUNDLED_CORE_DIR,
+                &id,
+                crate::core_store::OwnerPolicy::privileged(),
+            )
+            .is_ok()
+        }) {
+            Response::Ok(ResponseKind::Installed)
+        } else {
+            Response::Err(ProtoError::with_detail(
+                ErrorCode::Other,
+                "bundled-core-unavailable",
+            ))
+        };
+        let _ = conn.write_line(&response.to_wire_line());
+        return;
+    }
+
     if matches!(
         command.as_str(),
         lcmd::RESOLVED_DNS_SNAPSHOT | lcmd::RESOLVED_DNS_COMPARE
@@ -694,7 +725,8 @@ fn dispatch_locked<P, S, D, SD>(
         }
         lcmd::START_PINNED_BIRTH => handle_start(state, deps, cred, conn),
         // Retired executable-path/content-write commands never dispatch, even
-        // when no child is running. Only administrative CLI installs bytes.
+        // when no child is running. IPC only loads from the administrator-owned
+        // trusted installation directory, never client-supplied bytes.
         cmd::START | lcmd::START_REAP_SAFE | lcmd::START_BIRTH_SAFE | lcmd::INSTALL_CORE => {
             let _ = conn.write_line("ERR unknown");
         }

@@ -318,6 +318,23 @@ pub fn dispatch_from_peer(
         Request::CoreStatus { id } => Response::Ok(ResponseKind::CoreStatus(
             crate::pinned_core::status(Some(Path::new(&config.core_dir)), id),
         )),
+        Request::InstallBundledCore { id } => {
+            if crate::core_cli::install_bundled(
+                Path::new(&config.core_dir),
+                crate::core_cli::BUNDLED_CORE_DIR,
+                id,
+                crate::core_store::OwnerPolicy::privileged(),
+            )
+            .is_ok()
+            {
+                Response::Ok(ResponseKind::Installed)
+            } else {
+                Response::Err(ProtoError::with_detail(
+                    ErrorCode::Other,
+                    "bundled-core-unavailable",
+                ))
+            }
+        }
         Request::NativeStartPinned(params) => {
             let Some(uid) = peer_uid else {
                 return Response::Err(ProtoError::new(ErrorCode::Auth));

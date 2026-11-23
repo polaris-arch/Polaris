@@ -121,14 +121,21 @@ pub fn decode_request<I: Iterator<Item = String>>(
                 },
             )
         }
-        polaris_helper_proto::command::common::CORE_STATUS => {
+        polaris_helper_proto::command::common::CORE_STATUS
+        | polaris_helper_proto::command::common::INSTALL_BUNDLED_CORE => {
             let raw = required_line(lines, "core id")?;
             if checked_line(lines, None)?.is_some() {
-                return Err(DecodeError::MissingArg("exact core status frame"));
+                return Err(DecodeError::MissingArg("exact core id frame"));
             }
             let id = polaris_helper_proto::core_manifest::CoreId::parse(&raw)
                 .map_err(|_| DecodeError::MissingArg("core id"))?;
-            Ok(Request::CoreStatus { id })
+            Ok(
+                if command == polaris_helper_proto::command::common::CORE_STATUS {
+                    Request::CoreStatus { id }
+                } else {
+                    Request::InstallBundledCore { id }
+                },
+            )
         }
         polaris_helper_proto::command::common::NATIVE_START_PINNED_BIRTH => {
             let mut args = Vec::new();

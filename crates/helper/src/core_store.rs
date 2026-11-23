@@ -824,7 +824,8 @@ impl CoreStore {
         })
     }
 
-    /// Administrative installer only. Runtime status/open never creates directories.
+    /// Installers only (administrative CLI and bundled IPC). Runtime status/open never
+    /// creates directories.
     pub fn initialize(root: &Path, owner: OwnerPolicy) -> io::Result<Self> {
         Self::initialize_scoped(root, owner)
     }

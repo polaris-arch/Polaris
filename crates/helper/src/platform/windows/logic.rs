@@ -345,6 +345,9 @@ pub fn parse_request(cmd: &str, args: &[&str]) -> Option<Request> {
         command::common::CORE_STATUS if args.len() == 1 => Request::CoreStatus {
             id: polaris_helper_proto::core_manifest::CoreId::parse(args[0]).ok()?,
         },
+        command::common::INSTALL_BUNDLED_CORE if args.len() == 1 => Request::InstallBundledCore {
+            id: polaris_helper_proto::core_manifest::CoreId::parse(args[0]).ok()?,
+        },
         command::common::NATIVE_START_PINNED_BIRTH => Request::NativeStartPinned(
             polaris_helper_proto::core_protocol::PinnedStartParams::parse(
                 &args

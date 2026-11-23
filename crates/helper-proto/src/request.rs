@@ -201,6 +201,10 @@ pub enum Request {
     CoreStatus {
         id: crate::core_manifest::CoreId,
     },
+    /// Install one Core from the helper's administrator-owned installation directory.
+    InstallBundledCore {
+        id: crate::core_manifest::CoreId,
+    },
     LinuxStartPinned(crate::core_protocol::PinnedStartParams),
     NativeStartPinned(crate::core_protocol::PinnedStartParams),
     /// `status`（无参数行）。
@@ -302,6 +306,7 @@ impl Request {
             Self::PrepareHelperUpgrade => command::common::PREPARE_HELPER_UPGRADE,
             Self::CancelHelperUpgrade => command::common::CANCEL_HELPER_UPGRADE,
             Self::CoreStatus { .. } => command::common::CORE_STATUS,
+            Self::InstallBundledCore { .. } => command::common::INSTALL_BUNDLED_CORE,
             Self::LinuxStartPinned(_) => command::linux::START_PINNED_BIRTH,
             Self::NativeStartPinned(_) => command::common::NATIVE_START_PINNED_BIRTH,
             Self::Status => command::common::STATUS,
@@ -344,7 +349,9 @@ impl Request {
     /// （Go 的 `readLine` 对 EOF 返回 `""`，故少发一行 ≠ 协议错，只是该参数取默认值 —— 如 start 的 ppid）。
     pub fn write_args(&self, out: &mut Vec<String>) {
         match self {
-            Self::CoreStatus { id } => out.push(id.as_str().to_owned()),
+            Self::CoreStatus { id } | Self::InstallBundledCore { id } => {
+                out.push(id.as_str().to_owned())
+            }
             Self::LinuxStartPinned(params) | Self::NativeStartPinned(params) => {
                 out.push(crate::core_protocol::PINNED_EXECUTION_DISCRIMINATOR.to_owned());
                 out.push(params.id.as_str().to_owned());
