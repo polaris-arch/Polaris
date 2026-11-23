@@ -874,6 +874,13 @@ export const ANDROID_IMPACT_SCOPES = Object.freeze({
  * 那正是完备性门 C 组固定 comment-only 合成负例要证伪的形态；原 mesh.rs 已有真实 Android 分支。
  */
 export const NO_ANDROID_IMPACT_SCOPES = Object.freeze({
+  'src-tauri/src/runtime/stats/relay.rs':
+    'Android awaits the connection subscription without the desktop window-visibility gate and rechecks an oversized snapshot after a park interval. '
+    + 'ci.yml cargo check --target aarch64-linux-android -p polaris compiles those arms; desktop cargo test covers the non-Android arms. '
+    + 'No JNI, packaged resource or APK content changes; bounded native delivery on a device is not observable in CI.',
+  'src-tauri/src/runtime/stats/tests/mod.rs':
+    'Host cfg(test) regressions; the not(Android) predicate only keeps the visibility-gated retry test off Android targets. '
+    + 'ci.yml host cargo test --workspace executes them; Android cargo check -p polaris and APK builds do not compile test targets.',
   'src-tauri/src/runtime/config.rs':
     'Android skips the desktop legacy-start lease inside the shared saved-state restart admission. '
     + 'ci.yml cargo check --target aarch64-linux-android -p polaris compiles that branch. '

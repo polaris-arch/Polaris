@@ -638,6 +638,13 @@ const MIRROR_SITES: readonly MirrorSite[] = [
     why: '与后端对账：pendingDiff 的节点 id 来自后端（startup_snapshot ↔ 磁盘），名字必须在同一侧解析，否则条上会出现盘上不存在的名字',
   },
   {
+    file: 'mobile/MobilePendingBar.tsx',
+    shape: 'useAppStore((s)=>s.servers)',
+    count: 1,
+    surface: 'operation',
+    why: '与桌面待应用条共用 pendingNodeGroups：节点 id 来自后端 pendingDiff，名字在同一磁盘镜像解析',
+  },
+  {
     file: 'components/layout/StatusBar.tsx',
     shape: 'useAppStore((s)=>s.servers)',
     count: 1,
