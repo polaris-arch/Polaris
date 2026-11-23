@@ -41,6 +41,8 @@ const ERR_RESOURCE_NOT_FOUND: &str = "RULE_RESOURCE_NOT_FOUND";
 /// 用户在下载途中主动取消（`rule_resources_cancel`）。**不是故障**——前端据此报「已取消」
 /// 而非「更新失败」（红行会让用户以为源挂了）。
 const ERR_RESOURCE_CANCELLED: &str = "RULE_RESOURCE_CANCELLED";
+/// Built-in publication waits for a Core lifecycle; schedulers retry it without backoff.
+pub(crate) const RESOURCE_LIFECYCLE_BUSY: &str = "内核正在启停，规则资源稍后重试";
 
 /// 规则资源单次下载体积硬闸（16 MiB）：sing-box .srs / .json 规则集通常 < 数 MB，超此即拒防 OOM。
 const RULE_RESOURCE_MAX_BYTES: usize = 16 * 1024 * 1024;
@@ -1803,7 +1805,7 @@ fn persist_builtin_geo_updated(
     // Core snapshots rule-set files while a Start/Restart builds it and rechecks
     // them before commit. Never replace a live file inside a lifecycle.
     if state.proxy().core_lifecycle_busy() {
-        return Err("内核正在启停，规则资源稍后重试".to_owned());
+        return Err(RESOURCE_LIFECYCLE_BUSY.to_owned());
     }
     let owner = StagedSaveOwner::capture(state.proxy(), 0);
     let saved = save_resource_change(state.config(), tag, updated_at, paths, operation, owner)

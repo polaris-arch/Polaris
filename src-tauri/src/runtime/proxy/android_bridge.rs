@@ -1215,6 +1215,10 @@ pub(super) async fn stop_core() -> Result<(), String> {
     .await
 }
 
+/// Kotlin answered this exact Stop with a rejection, so no part of it remains in
+/// flight. Timeouts and task failures stay unknown.
+pub(super) const STOP_REJECTED: &str = "Android 停核桥失败：";
+
 pub(super) async fn stop_core_with_birth(
     request_birth: super::AndroidRequestBirth,
 ) -> Result<(), String> {
@@ -1227,7 +1231,7 @@ pub(super) async fn stop_core_with_birth(
                 .await
             {
                 Ok(()) => Ok(()),
-                Err(BridgeCallError::Invoke(e)) => Err(format!("Android 停核桥失败：{e}")),
+                Err(BridgeCallError::Invoke(e)) => Err(format!("{STOP_REJECTED}{e}")),
                 Err(BridgeCallError::TimedOut) => Err(format!(
                     "Android 停核桥 {}s 无回应（隧道可能仍在）",
                     STOP_TIMEOUT.as_secs()

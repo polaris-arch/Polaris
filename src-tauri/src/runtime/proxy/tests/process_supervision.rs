@@ -540,8 +540,9 @@ async fn typed_pre_dispatch_retirement_releases_only_exact_android_custody_and_t
         .is_err());
 }
 
-// I2: an ordinary Start error keeps its birth, but hands it to Stop. A certain
-// Stop ACK then releases the TS claim and custody so the next Start can book.
+// I2: an ordinary Start error keeps its birth, but hands it to Stop. A definite
+// Busy rejection keeps it; a later certain Stop ACK releases the TS claim and
+// custody so the next Start can book.
 #[tokio::test]
 async fn failed_android_start_is_released_by_certain_stop_ack() {
     let (rt, _dir) = test_runtime();
@@ -566,6 +567,13 @@ async fn failed_android_start_is_released_by_certain_stop_ack() {
     assert!(rt
         .confirm_android_global_start(&birth, android_target("late-start"))
         .is_err());
+    // Busy while native close is still owned is a definite answer, not unknown.
+    let busy = rt.begin_android_stop_booking(true).unwrap();
+    let rejected = format!("{}busy", super::super::android_bridge::STOP_REJECTED);
+    assert!(busy
+        .finish_with_gate(Err(rejected), &rt.mesh, &gate)
+        .is_err());
+    assert!(rt.mesh.main_owns_tailscale("ts-android-failed", true));
     let booking = rt.begin_android_stop_booking(true).unwrap();
     booking.finish_with_gate(Ok(()), &rt.mesh, &gate).unwrap();
     assert!(!rt.mesh.main_owns_tailscale("ts-android-failed", true));

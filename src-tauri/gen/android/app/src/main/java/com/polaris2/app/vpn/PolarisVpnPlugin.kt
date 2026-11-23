@@ -1692,7 +1692,9 @@ internal object VpnBridge {
             request = it.copy(revoked = true)
             return StopAdmission.AlreadyStopped
         }
-        if (!running && !starting) return StopAdmission.AlreadyStopped
+        // A failed native attempt keeps its request until its close settles in
+        // takeFinishStop. Wait for that close instead of acknowledging early.
+        if (!running && !starting && request == null) return StopAdmission.AlreadyStopped
         stopping = true
         pendingStop = invoke
         return StopAdmission.Started

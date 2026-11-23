@@ -247,6 +247,18 @@ impl AndroidStopBooking<'_> {
                         .is_some_and(|nonce| Arc::ptr_eq(nonce, &self.nonce))
             })
             .ok_or("Android global Stop custody changed")?;
+        // A definite rejection (for example Busy while native close is still
+        // owned) adds no uncertainty; a later certain ACK may still release.
+        if self.was_certain
+            && !attempt.historic_unknown
+            && result
+                .as_ref()
+                .is_err_and(|error| error.starts_with(super::android_bridge::STOP_REJECTED))
+        {
+            attempt.stop_inflight = None;
+            self.completed = true;
+            return result;
+        }
         if !self.was_certain || attempt.historic_unknown || result.is_err() {
             attempt.stop_inflight = None;
             attempt.historic_unknown = true;

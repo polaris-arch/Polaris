@@ -17,6 +17,7 @@ pub(crate) use resources::{
     cached_catalog_fetched_at, remove_builtin_rule_resource_files, remove_rule_resource_file,
     rule_resource_file_is_referenced, rule_resources_redownload_silent,
     rule_resources_update_builtin_silent, ProgressMode, RegisteredResourceBatch, ResourceChanges,
+    RESOURCE_LIFECYCLE_BUSY,
 };
 pub use resources::{
     rule_resources_cancel, rule_resources_delete, rule_resources_download,

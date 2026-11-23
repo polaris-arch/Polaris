@@ -35,6 +35,7 @@ use polaris_config_engine::user_config::builtin_geo_rulesets::{
 
 use crate::commands::rules::{
     cached_catalog_fetched_at, ProgressMode, RegisteredResourceBatch, ResourceChanges,
+    RESOURCE_LIFECYCLE_BUSY,
 };
 use crate::runtime::subscription_scheduler::{
     elapsed_or_clock_rollback, now_ms, rfc3339_to_epoch_ms, BackoffTracker,
@@ -419,21 +420,34 @@ impl RuleResourceScheduler {
         }
         let (mut ok_count, mut failures) = (0usize, Vec::new());
         for tag in due {
-            let state = app.state::<AppRuntime>();
-            let resp = crate::commands::rules::rule_resources_update_builtin_silent(
-                app,
-                &state,
-                tag.clone(),
-                changes,
-            )
-            .await;
-            let data = resp.ok().and_then(|r| r.data).unwrap_or(Value::Null);
+            let mut retried = false;
+            let data = loop {
+                let state = app.state::<AppRuntime>();
+                let resp = crate::commands::rules::rule_resources_update_builtin_silent(
+                    app,
+                    &state,
+                    tag.clone(),
+                    changes,
+                )
+                .await;
+                let data = resp.ok().and_then(|r| r.data).unwrap_or(Value::Null);
+                // 内核启停中拒绝替换生效副本：不是源故障，短延迟后重试一次。
+                if retried
+                    || data.get("error").and_then(Value::as_str) != Some(RESOURCE_LIFECYCLE_BUSY)
+                {
+                    break data;
+                }
+                retried = true;
+                tokio::time::sleep(Duration::from_millis(STARTUP_DELAY_MS)).await;
+            };
             let ok = data.get("ok").and_then(Value::as_bool) == Some(true);
             let key = builtin_id_for(&tag);
             let mut inner = lock_inner(&self.inner);
             if ok {
                 ok_count += 1;
                 inner.backoff.record_success(&key);
+            } else if data.get("error").and_then(Value::as_str) == Some(RESOURCE_LIFECYCLE_BUSY) {
+                // 仍在启停：不计失败、不翻倍，留给下一轮巡检/前台补更。
             } else {
                 let code = data
                     .get("errorCode")

@@ -2093,6 +2093,11 @@ impl ProxyRuntime {
                             return Err(StartError::coded(exhausted, code::STARTUP_FAILED));
                         }
                         self.retain_failed_android_start_for_stop(&android_birth);
+                        // Close the failed attempt while still holding the TS gate, as the
+                        // readiness failure legs do; a certain ACK lets Start run again.
+                        if let Err(error) = self.kill_core_and_release_main(ts_gate).await {
+                            log::warn!("Android 起核失败后收尾停核未确认：{error}");
+                        }
                         self.set_error(&msg, error_code);
                         return Err(StartError::coded(msg, error_code));
                     }
