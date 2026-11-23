@@ -226,7 +226,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                         let file = try FileHandle(forReadingFrom: executable)
                         defer { try? file.close() }
                         var hash = SHA256()
-                        while let bytes = try file.read(upToCount: 65536), !bytes.isEmpty { hash.update(data: bytes) }
+                        // Each read returns an autoreleased buffer; the worker queue never drains them
+                        // mid-loop, and hashing the executable twice exceeds the extension memory limit.
+                        while let bytes = try autoreleasepool(invoking: { try file.read(upToCount: 65536) }), !bytes.isEmpty {
+                            hash.update(data: bytes)
+                        }
                         return hash.finalize().map { String(format: "%02x", $0) }.joined()
                     }
                     let before = try digest()
