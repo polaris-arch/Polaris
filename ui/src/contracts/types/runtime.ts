@@ -76,6 +76,7 @@ export enum ProxyErrorCode {
   TLS_CERT_ERROR = 'TLS_CERT_ERROR', // 'certificate'|'tls'|'ssl'（排除 anytls/shadowtls）
   AUTH_FAILED = 'AUTH_FAILED', // 'authentication failed'|'auth fail'
   // 配置类 → ErrorCategory.Config
+  RUNTIME_APPLY_REJECTED = 'RUNTIME_APPLY_REJECTED',
   VISION_TRANSPORT_UNSUPPORTED = 'VISION_TRANSPORT_UNSUPPORTED',
   NODE_RESOLVER_UNSUPPORTED = 'NODE_RESOLVER_UNSUPPORTED',
   SPEED_TEST_URL_INVALID = 'SPEED_TEST_URL_INVALID',

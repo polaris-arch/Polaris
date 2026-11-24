@@ -1091,7 +1091,7 @@ impl ProxyErrorEmitter for RecordingErrorEmitter {
 }
 
 /// 装 mock emitter 的运行时 + 其发射记录句柄。
-fn test_runtime_recording_errors() -> (Arc<ProxyRuntime>, TestDir, ErrorEvents) {
+pub(super) fn test_runtime_recording_errors() -> (Arc<ProxyRuntime>, TestDir, ErrorEvents) {
     let (rt, dir) = test_runtime();
     let events = Arc::new(Mutex::new(Vec::new()));
     rt.set_error_emitter(Box::new(RecordingErrorEmitter {

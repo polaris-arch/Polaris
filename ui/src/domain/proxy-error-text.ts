@@ -21,6 +21,7 @@ export interface ProxyErrorTextInput {
 
 /** Rust `runtime/proxy.rs::code` 的全量用户可见映射。 */
 export const PROXY_ERROR_TEXT_KEY: Readonly<Record<string, string>> = {
+  RUNTIME_APPLY_REJECTED: 'home.pendingHotRejected',
   VISION_TRANSPORT_UNSUPPORTED: 'nodes.invalidVisionTransport',
   STARTUP_FAILED: 'errors.startupFailed',
   CORE_LIBRARY_LOAD_FAILED: 'errors.coreLibraryLoadFailed',

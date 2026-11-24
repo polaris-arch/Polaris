@@ -368,6 +368,7 @@ pub enum AndroidSystemVpnPhase {
 /// **只收录本层能从控制流位置诚实断言的成员**：本仓无「核 stderr / 退出码 → 错误码」分类器，
 /// 只收录可由控制流直接证明的分类；未收录的类别需先建立判据，不能靠 message 关键字补全。
 pub mod code {
+    pub const RUNTIME_APPLY_REJECTED: &str = "RUNTIME_APPLY_REJECTED";
     /// This invocation was rejected by Android's permanent process metadata budget.
     pub const ANDROID_NATIVE_LEDGER_CAPACITY_CLOSED: &str = "ANDROID_NATIVE_LEDGER_CAPACITY_CLOSED";
     /// 显式用户态入站策略遇到最终 System endpoint；OS 路径需外部防火墙。

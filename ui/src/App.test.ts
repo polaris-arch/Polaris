@@ -110,6 +110,13 @@ describe('handleProxyErrorEvent（代理错误分腿）', () => {
     });
   });
 
+  it('shows one localized error for a rejected background Apply without changing connection state', () => {
+    handleProxyErrorEvent({ errorCode: 'RUNTIME_APPLY_REJECTED', message: 'private diagnostics' }, { t, refreshProxyStatus });
+    expect(toastErrorMock.mock.calls).toEqual([['home.pendingHotRejected']]);
+    expect(refreshProxyStatus).not.toHaveBeenCalled();
+    expect(notifyDesktopMock).not.toHaveBeenCalled();
+  });
+
   it.each(['PROCESS_EXITED', 'AUTO_RESTART_FAILED'])(
     '崩溃腿 %s → 刷连接态 + 断开 toast + 桌面通知',
     (errorCode) => {

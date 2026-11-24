@@ -1602,7 +1602,10 @@ impl ProxyRuntime {
             );
             if graph_change {
                 // 隔离大事务 future，避免普通 selector 热切也携带其内联状态机。
-                let result = Box::pin(self.apply_runtime_candidate(new_config.clone(), None)).await;
+                let result = Box::pin(
+                    self.apply_runtime_candidate(new_config, scope == SwitchApplyScope::Full),
+                )
+                .await;
                 return Self::runtime_result_outcome(&result);
             }
         }

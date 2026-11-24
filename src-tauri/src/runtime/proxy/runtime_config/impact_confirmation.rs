@@ -169,7 +169,7 @@ impl ProxyRuntime {
             self.cancel_runtime_impact_choice(&token);
             return self.remember_runtime_result(RuntimeApplyResult::status("conflict"));
         }
-        self.execute_prepared_runtime_candidate(client, choice.pending, Some(token), true, 0)
+        self.execute_prepared_runtime_candidate(client, choice.pending, Some(token), true, 0, false)
             .await
     }
 }

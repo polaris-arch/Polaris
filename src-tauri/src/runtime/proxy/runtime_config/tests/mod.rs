@@ -2090,7 +2090,7 @@ async fn aborting_apply_settles_in_background_and_releases_pending() {
         .await
         .unwrap();
     let result = rt
-        .execute_prepared_runtime_candidate(client, pending.clone(), None, false, 0)
+        .execute_prepared_runtime_candidate(client, pending.clone(), None, false, 0, false)
         .await;
     assert_eq!(result.status, "unconfirmed");
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -2121,6 +2121,75 @@ async fn aborting_apply_settles_in_background_and_releases_pending() {
             .status,
         "rejected"
     );
+    server.abort();
+}
+
+#[tokio::test]
+async fn background_broadcast_reports_only_the_exhausted_apply_rejection() {
+    let (rt, _dir, errors) = crate::runtime::proxy::tests::test_runtime_recording_errors();
+    let mut running = runnable_config_fixture();
+    running["proxyMode"] = json!("global");
+    running["proxyModeType"] = json!("manual");
+    running["clashApiSecret"] = json!("native-retirement-test");
+    *rt.current_config.write().unwrap() = Some(running.clone());
+    *rt.startup_snapshot.write().unwrap() = Some(running.clone());
+    *rt.switch_snapshot.write().unwrap() = Some(Default::default());
+    let pending = ts_pending_raw_fixture(&rt, running.clone());
+    let (rpc, server) = native_retirement_rpc_peer(
+        &rt,
+        &pending,
+        daemon::RuntimeConfigOperation {
+            active: pending.plan.expected.clone(),
+            control_revision: pending.plan.expected_control_revision,
+            ..Default::default()
+        },
+    )
+    .await;
+    *rpc.selected_group_member.lock().unwrap() = Some("direct".into());
+    *rpc.rejected_apply_transactions.lock().unwrap() = Some(Vec::new());
+
+    let mut desired = running.clone();
+    desired["logLevel"] = json!("debug");
+    desired["privacyPasswordHash"] = json!("salt$hash");
+    desired["builtinGeoMeta"] = json!({"geoip-cn": {"updatedAt": "2026-11-24T12:00:00Z"}});
+    let mut broadcast = desired.clone();
+    crate::commands::config::strip_privacy_secrets(&mut broadcast);
+    desired["builtinGeoMeta"]["geoip-cn"]["updatedAt"] = json!("2026-11-24T12:00:01Z");
+    rt.config.save_full(&desired).unwrap();
+
+    let intent = rt.register_selector_intent();
+    crate::commands::config::apply_config_broadcast_core(
+        &rt,
+        broadcast,
+        false,
+        intent,
+        |_| {},
+        |_, outcome| {
+            assert_eq!(outcome, Some(SwitchOutcome::Deferred));
+        },
+    )
+    .await;
+    let transactions = rpc.rejected_apply_transactions.lock().unwrap();
+    assert_eq!(
+        transactions.as_deref().unwrap(),
+        ["transaction-1", "transaction-2", "transaction-3"],
+        "last result: {:?}, gRPC readback: {:?}",
+        rt.runtime_config_apply
+            .lock()
+            .unwrap()
+            .last
+            .as_ref()
+            .map(|result| (result.status, result.reasons.clone())),
+        rpc.probe_select_calls.lock().unwrap(),
+    );
+    let errors = errors.lock().unwrap();
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].1, super::super::code::RUNTIME_APPLY_REJECTED);
+    assert!(rt.status().running);
+    assert!(rt.status().error_code.is_none());
+    assert_eq!(rt.current_config_snapshot().as_ref(), Some(&running));
+    assert!(rt.pending_changes().pending_apply);
+    assert!(!rt.gate.pending().restart_pending);
     server.abort();
 }
 
@@ -3519,6 +3588,7 @@ struct NativeRetirementRpcFixture {
     acknowledgement_response: Arc<std::sync::Mutex<Option<daemon::RuntimeConfigOperation>>>,
     acknowledgements: Arc<std::sync::Mutex<Vec<daemon::RuntimePersistenceAcknowledgementRequest>>>,
     apply_response: Arc<std::sync::Mutex<Option<daemon::RuntimeConfigOperation>>>,
+    rejected_apply_transactions: Arc<std::sync::Mutex<Option<Vec<String>>>>,
 }
 
 #[derive(Clone)]
@@ -3716,20 +3786,61 @@ impl daemon::runtime_config_service_server::RuntimeConfigService for NativeRetir
     }
     async fn plan_runtime_config(
         &self,
-        _: polaris_singbox_grpc::tonic::Request<daemon::PlanRuntimeConfigRequest>,
+        request: polaris_singbox_grpc::tonic::Request<daemon::PlanRuntimeConfigRequest>,
     ) -> Result<
         polaris_singbox_grpc::tonic::Response<daemon::RuntimeConfigPlan>,
         polaris_singbox_grpc::tonic::Status,
     > {
+        if let Some(transactions) = self.rejected_apply_transactions.lock().unwrap().as_ref() {
+            let next = transactions.len() + 1;
+            let request = request.into_inner();
+            return Ok(polaris_singbox_grpc::tonic::Response::new(
+                daemon::RuntimeConfigPlan {
+                    contract_version: request.contract_version,
+                    transaction_id: format!("transaction-{next}"),
+                    plan_id: format!("plan-{next}"),
+                    expected: request.expected,
+                    expected_control_revision: request.expected_control_revision,
+                    candidate_digest: polaris_updater::sha256_hex(
+                        request.config_content.as_bytes(),
+                    ),
+                    impact_digest: "impact".into(),
+                    applicable: true,
+                    expires_at_unix_milli: i64::MAX,
+                    ..Default::default()
+                },
+            ));
+        }
         Err(self.forbidden())
     }
     async fn apply_runtime_config(
         &self,
-        _: polaris_singbox_grpc::tonic::Request<daemon::ApplyRuntimeConfigRequest>,
+        request: polaris_singbox_grpc::tonic::Request<daemon::ApplyRuntimeConfigRequest>,
     ) -> Result<
         polaris_singbox_grpc::tonic::Response<daemon::RuntimeConfigOperation>,
         polaris_singbox_grpc::tonic::Status,
     > {
+        if let Some(transactions) = self.rejected_apply_transactions.lock().unwrap().as_mut() {
+            let request = request.into_inner();
+            transactions.push(request.transaction_id.clone());
+            return Ok(polaris_singbox_grpc::tonic::Response::new(
+                daemon::RuntimeConfigOperation {
+                    contract_version: request.contract_version,
+                    transaction_id: request.transaction_id,
+                    candidate_digest: request.candidate_digest,
+                    impact_digest: request.accepted_impact_digest,
+                    before: request.expected.clone(),
+                    active: request.expected,
+                    control_revision: request.expected_control_revision,
+                    state: daemon::RuntimeOperationState::RejectedUnapplied as i32,
+                    errors: vec![daemon::RuntimePlanError {
+                        code: PLAN_PRECONDITION_CHANGED.into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            ));
+        }
         match self.apply_response.lock().unwrap().clone() {
             Some(response) => Ok(polaris_singbox_grpc::tonic::Response::new(response)),
             None => Err(self.forbidden()),
@@ -3820,6 +3931,7 @@ async fn native_retirement_rpc_peer(
         acknowledgement_response: Arc::default(),
         acknowledgements: Arc::default(),
         apply_response: Arc::default(),
+        rejected_apply_transactions: Arc::default(),
     };
     let incoming = futures::stream::unfold(listener, |listener| async move {
         let next = listener.accept().await.map(|(stream, _)| stream);

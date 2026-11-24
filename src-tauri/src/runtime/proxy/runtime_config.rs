@@ -2172,6 +2172,7 @@ impl ProxyRuntime {
             Some(&candidate),
             Some(owner),
             true,
+            false,
         ))
         .await;
         let current_owner =
@@ -2329,6 +2330,7 @@ impl ProxyRuntime {
                     None,
                     false,
                     RUNTIME_APPLY_REPLANS,
+                    false,
                 ))
                 .await
             }
@@ -2514,10 +2516,16 @@ impl ProxyRuntime {
     pub(super) async fn apply_runtime_candidate(
         self: &Arc<Self>,
         candidate: Value,
-        expected_desired: Option<&Value>,
+        notify_rejection: bool,
     ) -> RuntimeApplyResult {
-        Box::pin(self.apply_runtime_candidate_with_policy(candidate, expected_desired, None, false))
-            .await
+        Box::pin(self.apply_runtime_candidate_with_policy(
+            candidate,
+            None,
+            None,
+            false,
+            notify_rejection,
+        ))
+        .await
     }
 
     pub(super) async fn apply_selected_runtime_candidate(
@@ -2531,6 +2539,7 @@ impl ProxyRuntime {
             Some(desired),
             Some(owner),
             false,
+            false,
         ))
         .await
     }
@@ -2541,6 +2550,7 @@ impl ProxyRuntime {
         expected_desired: Option<&Value>,
         saved_owner: Option<StagedSaveOwner>,
         staged_save: bool,
+        notify_rejection: bool,
     ) -> RuntimeApplyResult {
         let offer_confirmation = !staged_save;
         let prepared = Box::pin(self.prepare_runtime_candidate(
@@ -2559,6 +2569,7 @@ impl ProxyRuntime {
                     None,
                     offer_confirmation,
                     RUNTIME_APPLY_REPLANS,
+                    notify_rejection,
                 ))
                 .await
             }
@@ -3687,6 +3698,7 @@ impl ProxyRuntime {
         confirmation: Option<String>,
         offer_confirmation: bool,
         replans_left: u8,
+        notify_rejection: bool,
     ) -> RuntimeApplyResult {
         let generation = pending.generation;
         let intent = pending.intent;
@@ -3886,14 +3898,12 @@ impl ProxyRuntime {
             intent,
             revision: admitted_saved_revision,
         };
-        if replans_left > 0
-            && result.status == "rejected"
+        let precondition_rejected = result.status == "rejected"
             && result
                 .reasons
                 .iter()
-                .any(|reason| reason.code == PLAN_PRECONDITION_CHANGED)
-            && owner.is_current(self)
-        {
+                .any(|reason| reason.code == PLAN_PRECONDITION_CHANGED);
+        if replans_left > 0 && precondition_rejected && owner.is_current(self) {
             // Retry this saved edit with a fresh plan, never resend its Apply.
             // Keep intermediate rejections out of the pending-change UI.
             let attempt = u64::from(RUNTIME_APPLY_REPLANS - replans_left + 1);
@@ -3914,6 +3924,7 @@ impl ProxyRuntime {
                         None,
                         offer_confirmation,
                         replans_left - 1,
+                        notify_rejection,
                     ))
                     .await
                 }
@@ -3957,7 +3968,32 @@ impl ProxyRuntime {
         result.transaction_id = Some(transaction_id);
         result.runtime_generation = Some(generation);
         result.selection_intent_generation = Some(intent);
-        self.remember_runtime_result(result)
+        let result = self.remember_runtime_result(result);
+        if notify_rejection
+            && replans_left == 0
+            && precondition_rejected
+            && self
+                .try_runtime_saved_commit(Some(owner), None, |desired| {
+                    if desired != &pending.desired
+                        || !self.saved_revision_matches(Some(owner.revision))
+                    {
+                        return Err(RuntimeClaimError::Rejected);
+                    }
+                    self.with_runtime_candidate_claim(true, generation, intent, || ())
+                })
+                .await
+                .is_some()
+            && owner.is_current(self)
+        {
+            // Emit outside the saved writer. The live proxy status is unchanged.
+            if let Some(emitter) = self.error_emitter.get() {
+                emitter.emit_proxy_error(
+                    "runtime configuration rejected after replanning",
+                    super::code::RUNTIME_APPLY_REJECTED,
+                );
+            }
+        }
+        result
     }
 
     async fn reconcile_runtime_operation(
@@ -5243,6 +5279,7 @@ impl ProxyRuntime {
             Some(&desired),
             Some(saved_owner),
             false,
+            false,
         ))
         .await
     }
@@ -5284,7 +5321,7 @@ impl ProxyRuntime {
             Ok(candidate) => candidate,
             Err(_) => return RuntimeApplyResult::status("rejected"),
         };
-        Box::pin(self.apply_runtime_candidate(candidate, None)).await
+        Box::pin(self.apply_runtime_candidate(candidate, false)).await
     }
 
     pub(crate) fn cancel_runtime_restart_choice(&self, token: &str) -> RuntimeApplyResult {
