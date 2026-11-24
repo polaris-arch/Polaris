@@ -2125,6 +2125,10 @@ async fn aborting_apply_settles_in_background_and_releases_pending() {
 }
 
 #[tokio::test]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "hold the saved writer through the rejection receipt"
+)]
 async fn background_broadcast_reports_only_the_exhausted_apply_rejection() {
     let (rt, _dir, errors) = crate::runtime::proxy::tests::test_runtime_recording_errors();
     let mut running = runnable_config_fixture();
@@ -2147,6 +2151,9 @@ async fn background_broadcast_reports_only_the_exhausted_apply_rejection() {
     .await;
     *rpc.selected_group_member.lock().unwrap() = Some("direct".into());
     *rpc.rejected_apply_transactions.lock().unwrap() = Some(Vec::new());
+    let (entered, entered_rx) = tokio::sync::oneshot::channel();
+    let (release, release_rx) = tokio::sync::oneshot::channel();
+    *rpc.exhausted_apply_hold.lock().unwrap() = Some((entered, release_rx));
 
     let mut desired = running.clone();
     desired["logLevel"] = json!("debug");
@@ -2156,9 +2163,10 @@ async fn background_broadcast_reports_only_the_exhausted_apply_rejection() {
     crate::commands::config::strip_privacy_secrets(&mut broadcast);
     desired["builtinGeoMeta"]["geoip-cn"]["updatedAt"] = json!("2026-11-24T12:00:01Z");
     rt.config.save_full(&desired).unwrap();
+    let revision = rt.config.saved_revision();
 
     let intent = rt.register_selector_intent();
-    crate::commands::config::apply_config_broadcast_core(
+    let apply = crate::commands::config::apply_config_broadcast_core(
         &rt,
         broadcast,
         false,
@@ -2167,8 +2175,19 @@ async fn background_broadcast_reports_only_the_exhausted_apply_rejection() {
         |_, outcome| {
             assert_eq!(outcome, Some(SwitchOutcome::Deferred));
         },
-    )
-    .await;
+    );
+    tokio::pin!(apply);
+    tokio::select! {
+        entered = entered_rx => entered.unwrap(),
+        () = &mut apply => panic!("broadcast returned before the final rejection"),
+    }
+    // A different edit can be preparing under the writer without publishing a revision.
+    {
+        let _writer = rt.config.hold_write_lock_for_test();
+        release.send(()).unwrap();
+        apply.await;
+    }
+    assert_eq!(rt.config.saved_revision(), revision);
     let transactions = rpc.rejected_apply_transactions.lock().unwrap();
     assert_eq!(
         transactions.as_deref().unwrap(),
@@ -3589,6 +3608,7 @@ struct NativeRetirementRpcFixture {
     acknowledgements: Arc<std::sync::Mutex<Vec<daemon::RuntimePersistenceAcknowledgementRequest>>>,
     apply_response: Arc<std::sync::Mutex<Option<daemon::RuntimeConfigOperation>>>,
     rejected_apply_transactions: Arc<std::sync::Mutex<Option<Vec<String>>>>,
+    exhausted_apply_hold: RuntimeRpcReplyHold,
 }
 
 #[derive(Clone)]
@@ -3820,9 +3840,24 @@ impl daemon::runtime_config_service_server::RuntimeConfigService for NativeRetir
         polaris_singbox_grpc::tonic::Response<daemon::RuntimeConfigOperation>,
         polaris_singbox_grpc::tonic::Status,
     > {
-        if let Some(transactions) = self.rejected_apply_transactions.lock().unwrap().as_mut() {
+        let rejection_count = self
+            .rejected_apply_transactions
+            .lock()
+            .unwrap()
+            .as_mut()
+            .map(|transactions| {
+                transactions.push(request.get_ref().transaction_id.clone());
+                transactions.len()
+            });
+        if let Some(count) = rejection_count {
+            if count == usize::from(RUNTIME_APPLY_REPLANS) + 1 {
+                let hold = self.exhausted_apply_hold.lock().unwrap().take();
+                if let Some((entered, release)) = hold {
+                    entered.send(()).unwrap();
+                    release.await.unwrap();
+                }
+            }
             let request = request.into_inner();
-            transactions.push(request.transaction_id.clone());
             return Ok(polaris_singbox_grpc::tonic::Response::new(
                 daemon::RuntimeConfigOperation {
                     contract_version: request.contract_version,
@@ -3932,6 +3967,7 @@ async fn native_retirement_rpc_peer(
         acknowledgements: Arc::default(),
         apply_response: Arc::default(),
         rejected_apply_transactions: Arc::default(),
+        exhausted_apply_hold: Arc::default(),
     };
     let incoming = futures::stream::unfold(listener, |listener| async move {
         let next = listener.accept().await.map(|(stream, _)| stream);

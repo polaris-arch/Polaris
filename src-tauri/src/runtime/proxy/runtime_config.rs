@@ -3969,23 +3969,14 @@ impl ProxyRuntime {
         result.runtime_generation = Some(generation);
         result.selection_intent_generation = Some(intent);
         let result = self.remember_runtime_result(result);
+        // The last Apply already admitted this saved revision. Recheck its owner
+        // for feedback without waiting on another writer that may only be preparing.
         if notify_rejection
             && replans_left == 0
             && precondition_rejected
-            && self
-                .try_runtime_saved_commit(Some(owner), None, |desired| {
-                    if desired != &pending.desired
-                        || !self.saved_revision_matches(Some(owner.revision))
-                    {
-                        return Err(RuntimeClaimError::Rejected);
-                    }
-                    self.with_runtime_candidate_claim(true, generation, intent, || ())
-                })
-                .await
-                .is_some()
+            && !self.gate.is_busy()
             && owner.is_current(self)
         {
-            // Emit outside the saved writer. The live proxy status is unchanged.
             if let Some(emitter) = self.error_emitter.get() {
                 emitter.emit_proxy_error(
                     "runtime configuration rejected after replanning",
