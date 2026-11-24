@@ -1193,6 +1193,9 @@ async fn update_builtin_with_mode(
         &builtin_runtime_dir(state),
         async |resource, staged, operation, stage| {
             let _publication = state.config().lock_builtin_rule_publication().await;
+            // Land the file and its metadata between hot applies, never inside one's
+            // prepare-to-admission window, which would otherwise drop that edit.
+            let _serial = state.proxy().lock_config_patch().await;
             persist_builtin_geo_updated(
                 app,
                 state,
