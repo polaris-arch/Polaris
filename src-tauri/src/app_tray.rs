@@ -577,6 +577,7 @@ pub(crate) fn tray_menu_config_projection(config: &serde_json::Value) -> TrayMen
         }
     }
 
+    let selected_server_id = selected_server_id.map(str::to_string);
     TrayMenuConfigProjection {
         mode: config
             .get("proxyMode")
@@ -586,7 +587,7 @@ pub(crate) fn tray_menu_config_projection(config: &serde_json::Value) -> TrayMen
             .get("proxyModeType")
             .and_then(serde_json::Value::as_str)
             .map(str::to_string),
-        selected_server_id: selected_server_id.map(str::to_string),
+        selected_server_id,
         has_real_nodes: has_more_nodes || !nodes.is_empty(),
         has_more_nodes,
         node_groups,

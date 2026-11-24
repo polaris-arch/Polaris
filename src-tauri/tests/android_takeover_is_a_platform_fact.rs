@@ -164,7 +164,8 @@ const RAW_JSON_REGISTRY: &[RawJsonSite] = &[
         "src-tauri/src/app_tray.rs",
         "mode: config .get(\"proxyMode\") .and_then(serde_json::Value::as_str) .map(str::to_string), \
          mode_type: config .get(\"proxyModeType\") .and_then(serde_json::Value::as_str) \
-         .map(str::to_string), selected_server_id, has_real_nodes: !nodes.is_empty(), node_groups,",
+         .map(str::to_string), selected_server_id, has_real_nodes: has_more_nodes || !nodes.is_empty(), \
+         has_more_nodes, node_groups,",
         1,
         "托盘菜单投影：`mode_type` 唯一消费点是 `build_tray_menu` 里那三个 `CheckMenuItem` 的选中\
          态（`*k == m.mode_type`），纯**呈现**，不驱动任何接管动作。整条链 `#[cfg(desktop)]`，\
