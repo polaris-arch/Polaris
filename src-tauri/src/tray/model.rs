@@ -150,9 +150,8 @@ pub const ROUTING_MODES: [&str; 3] = ["smart", "global", "direct"];
 // # 选型：给 `tray_show_main` 加**受限**目标屏参数 + 一条窄事件，而不是复活 `EVENT_NAVIGATE`
 //
 // `events.rs:66-72` 已把 上游的 `navigate` 通道删净并写明理由（Polaris 托盘是同源 webview 浮层，
-// 自己渲染子视图，**没有**任何路径需要「跨窗令主窗跳到第 N 屏」）。「打开设置」是那条论证的**唯一反例**：
-// 设置屏在主窗里，浮层里没有也不该有。但反例只有一个 ⇒ 不该为它重开一条**任意字符串路由**的通用通道
-// （那正是 上游 那条通道会长出 `/server` `/settings` `/logs` 一堆消费点、最后没人说得清谁在用的成因）。
+// 自己渲染子视图）。设置、助手修复和超限原生菜单的完整节点列表使用主窗已有的界面，
+// 显式登记所需目标屏即可。
 //
 // 故取窄形态：
 //  1. 复用既有 `tray_show_main` command（不新增 command），加一个 `Option<String>` 目标屏参数——
@@ -161,15 +160,17 @@ pub const ROUTING_MODES: [&str; 3] = ["smart", "global", "direct"];
 //     「只显示主窗、不导航」——通道的值域由 Rust 侧枚举钉死，不是「前端传什么就发什么」。
 //  3. 事件 `EVENT_TRAY_OPEN_SCREEN` 单播给主窗（`emit_to_main`），不广播。
 //
-// 想加第二个目标屏必须同时改白名单 + 补测试，成本恰好落在该落的地方。
+// 新目标屏必须同时改白名单和测试。
 
 /// 托盘可导航的目标屏**白名单**（纯函数，可单测）。
 ///
 /// 返回 `'static` 串而非透传入参：发出去的值域被本函数钉死 ⇒ 前端传任意字符串也只能命中登记项，
-/// 通道不会退化成通用路由。`settings` 打开通用设置，`settings-helper` 复用助手修复页，`helper-recovery` 仅显示可取消的说明。
+/// `nodes` 打开主窗的完整节点列表。`settings` 打开通用设置，`settings-helper` 复用助手修复页，
+/// `helper-recovery` 仅显示可取消的说明。
 #[must_use]
 pub fn normalize_tray_screen(screen: &str) -> Option<&'static str> {
     match screen.trim() {
+        "nodes" => Some("nodes"),
         "settings" => Some("settings"),
         "settings-helper" => Some("settings-helper"),
         "helper-recovery" => Some("helper-recovery"),

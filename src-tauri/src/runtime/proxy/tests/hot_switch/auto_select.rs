@@ -1941,6 +1941,8 @@ async fn native_wrong_endpoint_dirty_connection_and_missing_history_stay_pending
                 &desired,
                 crate::runtime::subscription_scheduler::now_ms(),
                 Some(&"a".repeat(64)),
+                &crate::commands::speedtest::current_server_fingerprints(&desired),
+                &crate::runtime::node_fingerprints::measurement_table_json(&desired),
             );
             assert_eq!(rows.get("node-a"), Some(&Value::Null));
             assert_eq!(rows.get("node-b"), Some(&Value::Null));

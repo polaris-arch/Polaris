@@ -369,6 +369,7 @@ fn tls_sni_ws_edits_expire_temp_results_without_changing_the_subscription_finger
 #[test]
 fn omission_identity_is_bounded_by_node_url_generation_network_and_cleared_by_new_result() {
     let ledger = MeasurementLedger::new();
+    assert!(!ledger.has_display_records());
     let fingerprints = BTreeMap::from([("a".to_owned(), "node".to_owned())]);
     ledger.set_display_skipped(
         &["a".to_owned()],
@@ -376,6 +377,7 @@ fn omission_identity_is_bounded_by_node_url_generation_network_and_cleared_by_ne
         identity(2, MeasurePath::Candidate),
         &connections(),
     );
+    assert!(ledger.has_display_records());
     assert_eq!(
         ledger.display_rows(
             &context(&fingerprints),
@@ -418,6 +420,7 @@ fn omission_identity_is_bounded_by_node_url_generation_network_and_cleared_by_ne
         identity(3, MeasurePath::Candidate),
         200,
     );
+    assert!(ledger.has_display_records());
     assert!(ledger.display_rows(
         &context(&fingerprints),
         Some("config"),

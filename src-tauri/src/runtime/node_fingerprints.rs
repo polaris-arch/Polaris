@@ -42,7 +42,7 @@
 
 use std::collections::BTreeMap;
 
-use polaris_config_engine::user_config::server_config::ServerConfig;
+use polaris_config_engine::user_config::{server_config::ServerConfig, UserConfig};
 use serde_json::Value;
 
 /// **`pending_changes().modified` 的判据**（单一可替换点）：**全维**逐节点投影。
@@ -278,7 +278,7 @@ pub(crate) fn measurement_table_config(
         .collect()
 }
 
-pub(crate) fn measurement_connections_json(config: &Value) -> MeasurementConnections {
+fn measurement_policy_json(config: &Value) -> UserConfig {
     // Only the fields consulted by effective_proxy_bind_interface are parsed;
     // unrelated malformed settings cannot discard a preserved interface policy.
     let servers: Vec<ServerConfig> = config["servers"]
@@ -290,7 +290,7 @@ pub(crate) fn measurement_connections_json(config: &Value) -> MeasurementConnect
                 .collect()
         })
         .unwrap_or_default();
-    let policy = polaris_config_engine::user_config::UserConfig {
+    UserConfig {
         servers,
         utls_policy: config
             .get("utlsPolicy")
@@ -306,7 +306,11 @@ pub(crate) fn measurement_connections_json(config: &Value) -> MeasurementConnect
             .cloned()
             .and_then(|value| serde_json::from_value(value).ok()),
         ..Default::default()
-    };
+    }
+}
+
+pub(crate) fn measurement_connections_json(config: &Value) -> MeasurementConnections {
+    let policy = measurement_policy_json(config);
     MeasurementConnections {
         main: measurement_table_config(&policy),
         temp: measurement_temp_table(&policy.servers, &policy),
@@ -314,7 +318,7 @@ pub(crate) fn measurement_connections_json(config: &Value) -> MeasurementConnect
 }
 
 pub(crate) fn measurement_table_json(config: &Value) -> BTreeMap<String, String> {
-    measurement_connections_json(config).main
+    measurement_table_config(&measurement_policy_json(config))
 }
 
 #[cfg(test)]

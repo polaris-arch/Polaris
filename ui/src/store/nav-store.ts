@@ -110,7 +110,7 @@ export const useNavStore = create<NavState>((set) => ({
  *
  * 托盘浮层是独立窗口、独立 JS 堆，够不着本 store；而设置屏只存在于主窗。后端因此给了一条**窄通道**：
  * `tray_show_main` 的受限目标屏参数 → `event:trayOpenScreen`（值域由 Rust 白名单
- * `normalize_tray_screen` 钉死，仅 `'settings'` / `'settings-helper'` / `'helper-recovery'`）。这不是已删除的 `EVENT_NAVIGATE` 通用路由的
+ * `normalize_tray_screen` 钉死，仅 `'nodes'` / `'settings'` / `'settings-helper'` / `'helper-recovery'`）。这不是已删除的 `EVENT_NAVIGATE` 通用路由的
  * 复活——选型理由见 `src-tauri/src/events.rs` 该常量上方与 `src-tauri/src/tray/model.rs::normalize_tray_screen`。
  *
  * 两条投递腿，对应主窗的两种状态：
@@ -122,6 +122,10 @@ export const useNavStore = create<NavState>((set) => ({
 
 /** 窄通道的目标屏 → 导航动作。未登记值一律忽略（**不猜**：宁可不跳，也不跳错屏）。 */
 export function applyTrayScreenIntent(screen: unknown): boolean {
+  if (screen === 'nodes') {
+    useNavStore.getState().navigate('nodes');
+    return true;
+  }
   if (screen === 'helper-recovery') {
     trayIntentGeneration += 1;
     const dialogs = useDialogStore.getState();

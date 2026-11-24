@@ -353,6 +353,7 @@ fn unknown_config_values_fall_back_to_the_same_default_as_the_overlay() {
 
 #[test]
 fn tray_screen_whitelist_only_admits_registered_targets() {
+    assert_eq!(normalize_tray_screen("nodes"), Some("nodes"));
     assert_eq!(normalize_tray_screen("settings"), Some("settings"));
     assert_eq!(
         normalize_tray_screen("settings-helper"),
@@ -373,7 +374,7 @@ fn tray_screen_whitelist_only_admits_registered_targets() {
         "home",
         "/settings",
         "Settings",
-        "nodes",
+        "/nodes",
         "../settings",
         "helper-recovery/install",
         "Helper-Recovery",
@@ -390,6 +391,11 @@ fn tray_screen_boot_script_only_ever_carries_whitelisted_values() {
     assert_eq!(
         tray_screen_boot_script(s),
         "window.__POLARIS_TRAY_SCREEN__ = 'settings';\n"
+    );
+    let nodes = normalize_tray_screen("nodes").expect("registered Nodes screen");
+    assert_eq!(
+        tray_screen_boot_script(nodes),
+        "window.__POLARIS_TRAY_SCREEN__ = 'nodes';\n"
     );
     let recovery = normalize_tray_screen("helper-recovery").expect("registered explanation");
     assert_eq!(

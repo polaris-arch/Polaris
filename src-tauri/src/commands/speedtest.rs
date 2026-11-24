@@ -4156,8 +4156,22 @@ pub fn speed_test_schedule_status(app: AppHandle) -> ApiResponse<Value> {
 
 /// Read the existing ledger; no measurement, selection or proxy start is performed.
 #[tauri::command]
-pub fn speed_test_result_snapshot(app: AppHandle) -> ApiResponse<Value> {
-    crate::runtime::measurement_ledger::display::snapshot(&app)
+pub async fn speed_test_result_snapshot(app: AppHandle) -> ApiResponse<Value> {
+    static SNAPSHOT_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let permit = SNAPSHOT_SERIAL.lock().await;
+    // Keep the permit for the whole worker lifetime, even if the invoke is cancelled.
+    match tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        crate::runtime::measurement_ledger::display::snapshot(&app)
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            log::warn!("measurement display snapshot task failed: {error}");
+            ApiResponse::err("measurement display snapshot task failed")
+        }
+    }
 }
 
 /// **§15.11 让位判据**（纯逻辑，对齐 上游 `SpeedTestService.ts:706` 的 `superseded()`）。

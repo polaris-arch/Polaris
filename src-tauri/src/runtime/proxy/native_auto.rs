@@ -1429,6 +1429,8 @@ impl ProxyRuntime {
         config: &Value,
         now: u64,
         emission_digest: Option<&str>,
+        fingerprints: &BTreeMap<String, String>,
+        connections: &BTreeMap<String, String>,
     ) -> Value {
         let Ok(typed) = serde_json::from_value::<UserConfig>(config.clone()) else {
             return json!({});
@@ -1438,8 +1440,6 @@ impl ProxyRuntime {
         }
         let status = self.native_auto_cached_status();
         let owned = native_owned_members(config);
-        let fingerprints = crate::commands::speedtest::current_server_fingerprints(config);
-        let connections = crate::runtime::node_fingerprints::measurement_connections_json(config);
         let mut caps: BTreeMap<String, u64> = BTreeMap::new();
         for target in model::referenced_targets(&typed) {
             let cap = model::interval_minutes(&typed, &target) * 60_000;
@@ -1477,7 +1477,7 @@ impl ProxyRuntime {
                     "urlDigest":polaris_updater::sha256_hex(model::test_url(&typed).as_bytes()),
                     "configDigest":emission_digest,"coreBinarySha256":self.measurement_core_sha256(),
                     "nodeFingerprintDigest":fingerprints.get(&id).map(|value|polaris_updater::sha256_hex(value.as_bytes())),
-                    "connectionDigest":connections.for_temp(false).get(&id),
+                    "connectionDigest":connections.get(&id),
                     "networkEpoch":null,"measuredAt":measured_at
                 }
             }));

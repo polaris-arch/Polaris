@@ -1964,11 +1964,27 @@ impl LedgerView {
         network_epoch: Option<u64>,
         platform: Platform,
     ) -> Self {
+        Self::with_main_connections(
+            config,
+            generation,
+            network_epoch,
+            platform,
+            crate::runtime::node_fingerprints::measurement_table_json(config),
+        )
+    }
+
+    pub(crate) fn with_main_connections(
+        config: &Value,
+        generation: Option<u64>,
+        network_epoch: Option<u64>,
+        platform: Platform,
+        main_connections: BTreeMap<String, String>,
+    ) -> Self {
         Self {
             core_binary_sha256: None,
             generation,
             fingerprints: current_server_fingerprints(config),
-            main_connections: crate::runtime::node_fingerprints::measurement_table_json(config),
+            main_connections,
             network_epoch,
             url_digest: polaris_updater::sha256_hex(resolve_speed_test_url(config).as_bytes()),
             mobile: is_mobile(platform),

@@ -371,6 +371,7 @@ pub(crate) struct TrayMenuModel {
     pub(crate) mode_type: String,
     pub(crate) selected_server_id: Option<String>,
     pub(crate) has_real_nodes: bool,
+    pub(crate) has_more_nodes: bool,
     pub(crate) node_groups: Vec<TrayMenuGroup>,
     pub(crate) lang: crate::i18n::Lang,
 }
@@ -408,13 +409,31 @@ pub(crate) struct TrayMenuConfigProjection {
     mode_type: Option<String>,
     selected_server_id: Option<String>,
     has_real_nodes: bool,
+    has_more_nodes: bool,
     node_groups: Vec<TrayMenuGroup>,
 }
 
+// AppIndicator inserts each child by position in a linked list on the GTK main thread.
+// Bound the whole native menu and offer the full Nodes screen for larger catalogs.
+const NATIVE_TRAY_NODE_LIMIT: usize = 1_000;
+
 /// Linux AppIndicator 不派发托盘点击事件、也不给图标矩形，无法把自绘 WebView 稳定锚到托盘旁；
-/// 因而完整出口选择直接投影成 GTK 原生级联菜单：节点 → 自建/组网/各订阅 → 节点。分组口径与
+/// 因而出口选择直接投影成 GTK 原生级联菜单：节点 → 自建/组网/各订阅 → 节点。分组口径与
 /// `ui/src/domain/server-grouping.ts` 一致，协议凭据、订阅 URL 等字段不进入长生命周期菜单缓存。
 pub(crate) fn tray_menu_config_projection(config: &serde_json::Value) -> TrayMenuConfigProjection {
+    let selected_server_id = config
+        .get("selectedServerId")
+        .and_then(serde_json::Value::as_str);
+    let servers = config
+        .get("servers")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|server| {
+            let id = server.get("id")?.as_str()?.trim();
+            (!id.is_empty()).then_some((id, server))
+        });
+    let has_more_nodes = servers.clone().nth(NATIVE_TRAY_NODE_LIMIT).is_some();
     let subscriptions = config
         .get("subscriptions")
         .and_then(serde_json::Value::as_array)
@@ -439,16 +458,14 @@ pub(crate) fn tray_menu_config_projection(config: &serde_json::Value) -> TrayMen
         .map(|(id, _)| id.as_str())
         .collect::<std::collections::HashSet<_>>();
 
-    let mut nodes = config
-        .get("servers")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|server| {
-            let id = server.get("id")?.as_str()?.trim();
-            if id.is_empty() {
-                return None;
-            }
+    let mut nodes = servers
+        .filter(|(id, _)| !has_more_nodes || selected_server_id == Some(*id))
+        .take(if has_more_nodes {
+            1
+        } else {
+            NATIVE_TRAY_NODE_LIMIT
+        })
+        .map(|(id, server)| {
             let name = server
                 .get("name")
                 .and_then(serde_json::Value::as_str)
@@ -471,14 +488,14 @@ pub(crate) fn tray_menu_config_projection(config: &serde_json::Value) -> TrayMen
                     .ok()
                 })
                 .is_some_and(polaris_config_engine::user_config::server_config::lands_in_endpoints);
-            Some(TrayMenuNodeProjection {
+            TrayMenuNodeProjection {
                 node: TrayMenuNode {
                     id: id.to_string(),
                     name: name.to_string(),
                 },
                 subscription_id,
                 lands_in_endpoints,
-            })
+            }
         })
         .collect::<Vec<_>>();
 
@@ -554,13 +571,11 @@ pub(crate) fn tray_menu_config_projection(config: &serde_json::Value) -> TrayMen
                 label: TrayMenuGroupLabel::Subscription(subscription_name),
                 nodes: group_nodes,
             });
+            if has_more_nodes {
+                break;
+            }
         }
     }
-
-    let selected_server_id = config
-        .get("selectedServerId")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string);
 
     TrayMenuConfigProjection {
         mode: config
@@ -571,8 +586,9 @@ pub(crate) fn tray_menu_config_projection(config: &serde_json::Value) -> TrayMen
             .get("proxyModeType")
             .and_then(serde_json::Value::as_str)
             .map(str::to_string),
-        selected_server_id,
-        has_real_nodes: !nodes.is_empty(),
+        selected_server_id: selected_server_id.map(str::to_string),
+        has_real_nodes: has_more_nodes || !nodes.is_empty(),
+        has_more_nodes,
         node_groups,
     }
 }
@@ -630,6 +646,7 @@ pub(crate) enum MenuAction {
     Show,
     Quit,
     ToggleProxy,
+    ManageNodes,
     OpenSettings,
     CheckUpdate,
     SpeedTest,
@@ -652,6 +669,7 @@ pub(crate) fn parse_menu_action(id: &str) -> Option<MenuAction> {
         "tray_show" => return Some(MenuAction::Show),
         "tray_quit" => return Some(MenuAction::Quit),
         "tray_toggle" => return Some(MenuAction::ToggleProxy),
+        "tray_manage_nodes" => return Some(MenuAction::ManageNodes),
         "tray_settings" => return Some(MenuAction::OpenSettings),
         "tray_check_update" => return Some(MenuAction::CheckUpdate),
         "tray_speed_test" => return Some(MenuAction::SpeedTest),
@@ -773,6 +791,16 @@ pub(crate) fn build_tray_menu(
             )?)?;
         }
         nodes.append(&group_menu)?;
+    }
+    if m.has_more_nodes {
+        nodes.append(&PredefinedMenuItem::separator(app)?)?;
+        nodes.append(&MenuItem::with_id(
+            app,
+            "tray_manage_nodes",
+            crate::i18n::t(lang, crate::i18n::key::TRAY_MANAGE_IN_MAIN),
+            true,
+            None::<&str>,
+        )?)?;
     }
 
     let takeover_items = crate::tray::TAKEOVER_KINDS
@@ -927,6 +955,7 @@ pub(crate) fn reconcile_tray_menu(app: &tauri::AppHandle) {
             .unwrap_or_else(|| "systemProxy".to_string()),
         selected_server_id: projection.selected_server_id,
         has_real_nodes: projection.has_real_nodes,
+        has_more_nodes: projection.has_more_nodes,
         node_groups: projection.node_groups,
         lang: crate::i18n::app_lang(app),
     };
@@ -1026,6 +1055,11 @@ pub(crate) fn run_menu_action(app: &tauri::AppHandle, action: MenuAction) {
     match action {
         MenuAction::Show => show_main_window(app),
         MenuAction::Quit => crate::exit_lifecycle::queue_quit(app),
+        MenuAction::ManageNodes => {
+            let lang = i18n::app_lang(app);
+            let response = tray::tray_show_main(app.clone(), Some("nodes".into()));
+            notify_menu_response_failure(app, lang, i18n::key::TRAY_MANAGE_IN_MAIN, &response);
+        }
         MenuAction::OpenSettings => {
             // 与浮层「打开设置」逐字节同一条路径（含轻量模式重建时的首帧种子腿）。
             let lang = i18n::app_lang(app);

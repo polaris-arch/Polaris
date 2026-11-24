@@ -355,6 +355,7 @@ pub mod key {
     pub const TRAY_CANCEL_STARTUP: &str = "tray.cancelStartup";
     /// 节点/出口子菜单标题。
     pub const TRAY_NODES: &str = "tray.nodes";
+    pub const TRAY_MANAGE_IN_MAIN: &str = "tray.manageInMain";
     /// 自建节点分组。
     pub const TRAY_GROUP_MANUAL: &str = "tray.groupManual";
     /// 组网节点分组。

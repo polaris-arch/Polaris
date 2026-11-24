@@ -32,7 +32,7 @@ describe('applyTrayScreenIntent', () => {
   });
 
   it('未登记值一律忽略，且不动导航态', () => {
-    for (const evil of ['home', 'nodes', '/settings', 'Settings', '', null, undefined, 42, {}]) {
+    for (const evil of ['home', '/nodes', '/settings', 'Settings', '', null, undefined, 42, {}]) {
       expect(applyTrayScreenIntent(evil), `${String(evil)} 不该被放行`).toBe(false);
     }
     const s = useNavStore.getState();
@@ -40,10 +40,17 @@ describe('applyTrayScreenIntent', () => {
     expect(s.mainScreen).toBe('home');
   });
 
-  it('复用既有 enterSettings 语义（默认落 general 子页，不另造一套导航写法）', () => {
+  it('复用既有设置和节点导航', async () => {
     useNavStore.setState({ settingsScreen: 'about' });
     applyTrayScreenIntent('settings');
     expect(useNavStore.getState().settingsScreen).toBe('general');
+    expect(applyTrayScreenIntent('nodes')).toBe(true);
+    expect(useNavStore.getState()).toMatchObject({ scope: 'main', mainScreen: 'nodes' });
+
+    useNavStore.getState().navigate('home');
+    invoke.mockResolvedValue('nodes');
+    await drainTrayPendingScreen(true);
+    expect(useNavStore.getState()).toMatchObject({ scope: 'main', mainScreen: 'nodes' });
   });
 });
 

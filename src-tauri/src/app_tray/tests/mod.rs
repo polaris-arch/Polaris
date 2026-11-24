@@ -422,6 +422,10 @@ fn menu_ids_parse_to_actions() {
     );
     assert_eq!(parse_menu_action("tray_open_nodes"), None);
     assert_eq!(
+        parse_menu_action("tray_manage_nodes"),
+        Some(MenuAction::ManageNodes)
+    );
+    assert_eq!(
         parse_menu_action("tray_settings"),
         Some(MenuAction::OpenSettings)
     );
@@ -591,6 +595,32 @@ fn native_node_projection_builds_cascading_groups_without_losing_nodes() {
         ],
         "原生菜单须按自建、组网、订阅顺序级联，并保留孤儿节点；空订阅不显示"
     );
+
+    let mut servers = (0..NATIVE_TRAY_NODE_LIMIT)
+        .map(|i| serde_json::json!({ "id": format!("node-{i}") }))
+        .collect::<Vec<_>>();
+    let at_limit = tray_menu_config_projection(&serde_json::json!({ "servers": servers }));
+    assert!(!at_limit.has_more_nodes);
+    assert_eq!(at_limit.node_groups[0].nodes.len(), NATIVE_TRAY_NODE_LIMIT);
+
+    servers.push(serde_json::json!({ "id": "selected", "subscriptionId": "sub" }));
+    let overflow = tray_menu_config_projection(&serde_json::json!({
+        "selectedServerId": "selected",
+        "servers": servers,
+        "subscriptions": [{ "id": "sub", "name": "Subscription" }]
+    }));
+    assert!(overflow.has_more_nodes && overflow.has_real_nodes);
+    assert_eq!(overflow.selected_server_id.as_deref(), Some("selected"));
+    assert_eq!(
+        overflow.node_groups,
+        vec![TrayMenuGroup {
+            label: TrayMenuGroupLabel::Subscription("Subscription".into()),
+            nodes: vec![TrayMenuNode {
+                id: "selected".into(),
+                name: "selected".into(),
+            }],
+        }]
+    );
 }
 
 #[test]
@@ -607,6 +637,20 @@ fn sentinel_selection_keeps_cascading_node_groups_available() {
     );
     assert_eq!(projection.node_groups.len(), 1);
     assert_eq!(projection.node_groups[0].nodes[0].id, "node-a");
+
+    let servers = (0..=NATIVE_TRAY_NODE_LIMIT)
+        .map(|i| serde_json::json!({ "id": format!("node-{i}") }))
+        .collect::<Vec<_>>();
+    let overflow = tray_menu_config_projection(&serde_json::json!({
+        "selectedServerId": DIRECT_SERVER_ID,
+        "servers": servers
+    }));
+    assert!(overflow.has_more_nodes && overflow.has_real_nodes);
+    assert_eq!(
+        overflow.selected_server_id.as_deref(),
+        Some(DIRECT_SERVER_ID)
+    );
+    assert!(overflow.node_groups.is_empty());
 }
 
 #[test]
@@ -639,6 +683,7 @@ fn menu_model_gate_repaints_on_every_field_and_only_then() {
         mode_type: "systemProxy".into(),
         selected_server_id: Some("manual".into()),
         has_real_nodes: true,
+        has_more_nodes: false,
         node_groups: vec![TrayMenuGroup {
             label: TrayMenuGroupLabel::Manual,
             nodes: vec![TrayMenuNode {
@@ -695,6 +740,13 @@ fn menu_model_gate_repaints_on_every_field_and_only_then() {
             },
         ),
         (
+            "has_more_nodes（打开主窗节点列表）",
+            TrayMenuModel {
+                has_more_nodes: true,
+                ..base.clone()
+            },
+        ),
+        (
             "node_groups（级联出口菜单内容）",
             TrayMenuModel {
                 node_groups: vec![TrayMenuGroup {
@@ -744,6 +796,7 @@ fn menu_model_gate_invalidates_cache_when_apply_fails() {
         mode_type: "tun".into(),
         selected_server_id: None,
         has_real_nodes: false,
+        has_more_nodes: false,
         node_groups: Vec::new(),
         lang: Lang::EnUS,
     };
