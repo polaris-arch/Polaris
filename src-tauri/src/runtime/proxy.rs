@@ -387,10 +387,10 @@ pub mod code {
     pub const IOS_FOREGROUND_REQUIRED: &str = "IOS_FOREGROUND_REQUIRED";
     #[cfg(target_os = "ios")]
     pub const IOS_VPN_PERMISSION_DENIED: &str = "IOS_VPN_PERMISSION_DENIED";
-    /// iOS：本进程上一次起核没有证明已退役，后继起核被拒；彻底关闭 App 后重开即可。
+    /// iOS：本进程上一次起核没有证明已退役，后继起核被拒；先断开，仍不行再彻底关闭 App 后重开。
     #[cfg(target_os = "ios")]
     pub const IOS_RETIREMENT_UNKNOWN: &str = "IOS_RETIREMENT_UNKNOWN";
-    /// iOS：系统里的 VPN 配置留有未确认完成的上一次操作；删除该配置后重开 App 即可。
+    /// iOS：系统里的 VPN 配置留有未确认完成的上一次操作（`require_idle` 拒绝）；多数可删除该配置后重开 App 解开。
     #[cfg(target_os = "ios")]
     pub const IOS_PREVIOUS_OPERATION_UNCONFIRMED: &str = "IOS_PREVIOUS_OPERATION_UNCONFIRMED";
     /// 核**意外**退出且无法自愈（无可用配置重启）——「运行中崩了」轴。

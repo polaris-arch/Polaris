@@ -1404,7 +1404,7 @@ impl ProxyRuntime {
                 .require_idle()
                 .map_err(|error| StartError::coded(error, error_code))?;
             self.clear_exited_ios_owner(&session)
-                .map_err(|error| StartError::coded(error, error_code))?;
+                .map_err(|error| StartError::coded(error, super::code::STARTUP_FAILED))?;
             return Ok(());
         }
         let candidates = scan_running_cores();
