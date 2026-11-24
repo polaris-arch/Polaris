@@ -25,6 +25,10 @@ fn main() {
     assert_bundled_dashboard();
     embed_windows_manifest_for_msvc();
     if is_windows_msvc() {
+        if std::env::var_os("CARGO_FEATURE_NATIVE_PRODUCTION_VERIFICATION").is_some() {
+            // The debug verifier polls the full lifecycle future on its main thread.
+            println!("cargo:rustc-link-arg-bin=native-admission-verifier=/STACK:8388608");
+        }
         // The linker input below supplies the same Common Controls manifest to
         // the app and to the library unit-test executable. Keep winres' icon
         // and version resources, but do not embed a second app manifest there.
