@@ -1345,6 +1345,20 @@ impl ProxyRuntime {
         // 不能因磁盘有 hash、候选无 hash 就把每条合法广播都误判为过期。
         crate::commands::config::strip_privacy_secrets(&mut latest);
         crate::commands::config::strip_privacy_secrets(&mut candidate);
+        // Geo 落位持同一把锁，只新增或更新标记。带上已落位的版本，保留恢复出厂删除标记的过期判定。
+        if let (Some(next), Some(landed)) = (
+            candidate.as_object_mut(),
+            latest.get("builtinGeoMeta").filter(|meta| meta.is_object()),
+        ) {
+            let previous = next.get("builtinGeoMeta");
+            if previous != Some(landed)
+                && previous
+                    .and_then(Value::as_object)
+                    .is_none_or(|meta| meta.keys().all(|tag| landed.get(tag).is_some()))
+            {
+                next.insert("builtinGeoMeta".into(), landed.clone());
+            }
+        }
         if stable_stringify(&latest) != stable_stringify(&candidate) {
             log::info!("switchMode：过期配置广播已被更新磁盘版本取代 → 作废");
             return None;

@@ -4155,6 +4155,12 @@ async fn persisted_switch_discards_an_out_of_order_stale_broadcast() {
     let mut latest = running.clone();
     latest["language"] = serde_json::json!("zh-CN");
     latest["privacyPasswordHash"] = serde_json::json!("salt$hash");
+    latest["builtinGeoMeta"] = serde_json::json!({
+        "geoip-cn": {"updatedAt": "2026-11-24T12:00:00Z"},
+    });
+    let mut broadcast_view = latest.clone();
+    crate::commands::config::strip_privacy_secrets(&mut broadcast_view);
+    latest["builtinGeoMeta"]["geoip-cn"]["updatedAt"] = serde_json::json!("2026-11-24T12:00:01Z");
     rt.config.save_full(&latest).expect("落盘最新配置");
     let stale_intent = rt.register_selector_intent();
 
@@ -4170,14 +4176,17 @@ async fn persisted_switch_discards_an_out_of_order_stale_broadcast() {
         "作废腿不得把 current_config 退回旧快照"
     );
 
-    let mut broadcast_view = latest.clone();
-    crate::commands::config::strip_privacy_secrets(&mut broadcast_view);
     let current_intent = rt.register_selector_intent();
     assert_eq!(
         rt.switch_persisted_config_if_current(broadcast_view, false, current_intent, |_| {},)
             .await,
         Some(SwitchOutcome::NoOp),
-        "当前广播在隐私投影后仍必须被接受"
+        "当前广播在隐私投影和补更标记刷新后必须被接受"
+    );
+    assert_eq!(
+        rt.current_config_snapshot().unwrap()["builtinGeoMeta"],
+        latest["builtinGeoMeta"],
+        "运行态快照必须携带磁盘上已落位的标记"
     );
 
     // 内容完全相同也要按 intent 代次作废：用户可再次选择同一目标，值相等不等于所有权相同。
@@ -4188,6 +4197,31 @@ async fn persisted_switch_discards_an_out_of_order_stale_broadcast() {
             .await,
         None,
         "同值旧意图也必须作废"
+    );
+}
+
+#[tokio::test]
+async fn persisted_switch_discards_a_broadcast_superseded_by_a_builtin_geo_reset() {
+    let (rt, _dir) = test_runtime();
+    let mut candidate = two_node_config(7891, "node-a");
+    candidate["builtinGeoMeta"] = serde_json::json!({
+        "geoip-cn": {"updatedAt": "2026-11-24T12:00:00Z"},
+        "geosite-cn": {"updatedAt": "2026-11-24T12:00:00Z"},
+    });
+    rt.config.save_full(&candidate).unwrap();
+    let intent = rt.register_selector_intent();
+
+    // 恢复出厂已经写盘，其广播尚未登记新意图。
+    let mut latest = candidate.clone();
+    latest["builtinGeoMeta"]
+        .as_object_mut()
+        .unwrap()
+        .remove("geoip-cn");
+    rt.config.save_full(&latest).unwrap();
+    assert_eq!(
+        rt.switch_persisted_config_if_current(candidate, false, intent, |_| {})
+            .await,
+        None
     );
 }
 
