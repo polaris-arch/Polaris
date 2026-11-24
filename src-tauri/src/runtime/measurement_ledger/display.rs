@@ -11,7 +11,7 @@ use tauri::{AppHandle, Manager};
 
 use super::{global, ledger_stale, LedgerEntry, LedgerStale, MeasurementLedger, ReadContext};
 use crate::commands::{
-    config::config_version,
+    config::{apply_frontend_view, config_content_hash_from_canonical},
     speedtest::{CoreInstance, MeasurePath, StaleReason},
 };
 use crate::response::ApiResponse;
@@ -302,17 +302,21 @@ pub(crate) fn snapshot(app: &AppHandle) -> ApiResponse<Value> {
     } else {
         json!({})
     };
-    let mut frontend = config.clone();
-    crate::commands::config::apply_frontend_view(&mut frontend);
-    let frontend_config_digest = polaris_updater::sha256_hex(
-        polaris_config_engine::builder::orchestration::stable_stringify(&frontend).as_bytes(),
-    );
+    let (frontend_config_digest, config_version) = {
+        let mut frontend = config.clone();
+        apply_frontend_view(&mut frontend);
+        let text = polaris_config_engine::builder::orchestration::stable_stringify(&frontend);
+        (
+            polaris_updater::sha256_hex(text.as_bytes()),
+            config_content_hash_from_canonical(&text),
+        )
+    };
     let schedule = measurement_scheduler::status(app);
     let after = proxy.status();
     let consistent = runtime
         .config()
-        .current()
-        .is_ok_and(|value| value == config)
+        .with_current(|value| value == &config)
+        .unwrap_or(false)
         && before.running == after.running
         && before.start_time == after.start_time
         && generation == after.running.then(|| proxy.core_generation())
@@ -323,7 +327,7 @@ pub(crate) fn snapshot(app: &AppHandle) -> ApiResponse<Value> {
     ApiResponse::ok(json!({
         "schema": "polaris-measurement-display-v1", "process": process_identity(),
         "revision": REVISION.fetch_add(1, Ordering::AcqRel).to_string(),
-        "configVersion": config_version(&config), "consistent": consistent,
+        "configVersion": config_version, "consistent": consistent,
         "frontendConfigDigest": frontend_config_digest,
         "generation": generation, "startTime": after.start_time,
         "emissionDigest": emission_digest, "networkEpoch": network, "foregroundEpoch": foreground, "now": now,

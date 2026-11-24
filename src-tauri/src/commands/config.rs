@@ -353,7 +353,11 @@ pub(crate) fn config_version(cfg: &Value) -> String {
 /// 投影是「哪一份文档」的问题，哈希是「怎么算」的问题，两者各有各的门，混在一起会让
 /// fixture 被迫写成「已投影形」，而那个前提读者无从校验。
 fn config_content_hash(cfg: &Value) -> String {
-    let text = stable_stringify(cfg);
+    config_content_hash_from_canonical(&stable_stringify(cfg))
+}
+
+/// Compute the same content version when the caller already has the stable JSON text.
+pub(crate) fn config_content_hash_from_canonical(text: &str) -> String {
     let mut hash: u32 = 0x811c_9dc5;
     for unit in text.encode_utf16() {
         hash ^= u32::from(unit);

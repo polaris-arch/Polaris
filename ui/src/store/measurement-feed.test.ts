@@ -4,9 +4,13 @@ import { useAppStore } from './app-store';
 import { useLatencyStore, subscribeLatencyEvents } from './use-latency-store';
 import { measurementFixture, measurementServer } from './measurement-fixture.test-support';
 import { api } from '@/ipc';
+import { configBaseVersion } from '@/lib/staged-config';
 
 const handlers = vi.hoisted(() => ({ result: undefined as (() => void) | undefined, lifecycle: undefined as (() => void) | undefined }));
-vi.mock('@/lib/staged-config', async importOriginal => ({ ...await importOriginal<typeof import('@/lib/staged-config')>(), configContentDigest: async () => 'd'.repeat(64) }));
+vi.mock('@/lib/staged-config', async importOriginal => {
+  const actual = await importOriginal<typeof import('@/lib/staged-config')>();
+  return { ...actual, configBaseVersion: vi.fn(actual.configBaseVersion), configContentDigest: async () => 'd'.repeat(64) };
+});
 vi.mock('@/ipc', () => ({ api: {
   server: { speedTestResultSnapshot: vi.fn(), onSpeedTestResult: (fn: () => void) => { handlers.result = fn; return () => { handlers.result = undefined; }; },
     onSpeedTestSchedule: () => () => {} },
@@ -69,11 +73,15 @@ describe('one authoritative ledger feed', () => {
     const snapshot = measurementFixture(config, { a: 88, b: null }, '9');
     snapshot.rows.b.nativeHttp = null;
     vi.mocked(api.server.speedTestResultSnapshot).mockResolvedValue(snapshot);
+    vi.mocked(configBaseVersion).mockClear();
     cleanup = subscribeLatencyEvents(); await tick();
     expect(useLatencyStore.getState().projections.b).toEqual({ state: 'unmeasured' });
     expect(useLatencyStore.getState().latencyMap).toEqual({ a: 88 });
     const previous = useLatencyStore.getState().latencyMap;
     handlers.result?.(); await tick(); expect(useLatencyStore.getState().latencyMap).toBe(previous);
+    await vi.advanceTimersByTimeAsync(5200);
+    expect(api.server.speedTestResultSnapshot).toHaveBeenCalledTimes(3);
+    expect(configBaseVersion).toHaveBeenCalledTimes(1);
   });
   it.each(['backend-first', 'frontend-first'] as const)('normal stop is unmeasured while %s context publications converge', async order => {
     const running = measurementFixture(config, { a: 30 });

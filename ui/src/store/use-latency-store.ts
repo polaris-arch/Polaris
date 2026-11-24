@@ -31,7 +31,7 @@ import { create } from 'zustand';
 import { api } from '@/ipc';
 import { useAppStore } from './app-store';
 import { configBaseVersion, configContentDigest } from '@/lib/staged-config';
-import type { ServerConfig } from '@/contracts/types';
+import type { ServerConfig, UserConfig } from '@/contracts/types';
 import type { MeasurementProjection, MeasurementSnapshot } from '@/contracts/measurement-display';
 import { projectMeasurement, UNMEASURED_PROJECTION } from '@/domain/measurement-display';
 import { validMeasurementSnapshot } from '@/domain/measurement-snapshot';
@@ -190,8 +190,8 @@ function startMeasurementFeed(pollEnabled: boolean): () => void {
   let timer: ReturnType<typeof setTimeout> | undefined;
   let snapshotMono = 0;
   let snapshotWall = 0;
-  let hashInput: unknown;
-  let hashPromise: Promise<string> | undefined;
+  // The store replaces the published config; each publication needs its own digests.
+  let configIdentity: { config: UserConfig; version: string; digest: Promise<string> } | undefined;
   let nextExpiry = Number.POSITIVE_INFINITY;
   const offs: Array<() => void> = [];
   const refresh = async () => {
@@ -203,18 +203,22 @@ function startMeasurementFeed(pollEnabled: boolean): () => void {
     if (!config) return;
     inFlight = true;
     const ticket = epoch;
-    const version = configBaseVersion(config);
     const context = connectionKey(proxyStatus);
     try {
-      if (hashInput !== config || !hashPromise) {
-        hashInput = config; hashPromise = configContentDigest(config);
+      if (configIdentity?.config !== config) {
+        configIdentity = {
+          config,
+          version: configBaseVersion(config),
+          digest: configContentDigest(config),
+        };
       }
-      const digest = await hashPromise;
+      const { version } = configIdentity;
+      const digest = await configIdentity.digest;
       if (!alive || ticket !== epoch) return;
       const result = await api.server.speedTestResultSnapshot();
       const currentConfig = useAppStore.getState().config;
       const currentProxyStatus = useAppStore.getState().proxyStatus;
-      if (!alive || ticket !== epoch || !currentConfig || configBaseVersion(currentConfig) !== version
+      if (!alive || ticket !== epoch || currentConfig !== config
         || connectionKey(currentProxyStatus) !== context) return;
       if (!validMeasurementSnapshot(result)) {
         useLatencyStore.getState().invalidate(true); return;
@@ -236,7 +240,7 @@ function startMeasurementFeed(pollEnabled: boolean): () => void {
       snapshotMono = performance.now(); snapshotWall = Date.now();
       nextExpiry = earliestExpiry(result, result.now);
     } catch {
-      hashPromise = undefined;
+      configIdentity = undefined;
       if (alive && ticket === epoch) useLatencyStore.getState().invalidate(true);
     } finally {
       inFlight = false;
