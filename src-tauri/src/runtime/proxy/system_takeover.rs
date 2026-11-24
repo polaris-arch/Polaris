@@ -423,7 +423,7 @@ impl ProxyRuntime {
         let blocking_lease = self.config.retain_active_legacy_start_lease();
         self.system_proxy
             .clear_when(blocking_lease, move || {
-                gate.try_generation() == Some(my_generation)
+                gate.is_current_for_controller(my_generation)
             })
             .await;
     }
@@ -441,7 +441,7 @@ impl ProxyRuntime {
         let blocking_lease = self.config.retain_active_legacy_start_lease();
         self.system_proxy
             .clear_when(blocking_lease, move || {
-                gate.try_generation() == Some(generation)
+                gate.is_current_for_controller(generation)
             })
             .await;
     }
@@ -461,7 +461,7 @@ impl ProxyRuntime {
         let blocking_lease = self.config.retain_active_legacy_start_lease();
         self.system_proxy
             .clear_when(blocking_lease, move || {
-                gate.try_generation() == Some(generation)
+                gate.is_current_for_controller(generation)
             })
             .await;
     }

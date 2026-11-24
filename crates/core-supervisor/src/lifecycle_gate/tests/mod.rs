@@ -466,6 +466,7 @@ fn nonblocking_generation_observation_rejects_contention_and_poison() {
     assert_eq!(gate.try_generation(), Some(0));
     let held = gate.inner.lock().unwrap();
     assert_eq!(gate.try_generation(), None);
+    assert!(gate.is_current_for_controller(0));
     drop(held);
     assert_eq!(gate.try_generation(), Some(0));
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -473,4 +474,5 @@ fn nonblocking_generation_observation_rejects_contention_and_poison() {
         panic!("inert fixture poison");
     }));
     assert_eq!(gate.try_generation(), None);
+    assert!(!gate.is_current_for_controller(0));
 }

@@ -185,7 +185,7 @@ async fn cancelled_clear_waiter_cannot_clear_a_successor_marker() {
         let mut held = controller.lock().unwrap();
         let (checked_tx, checked_rx) = tokio::sync::oneshot::channel();
         let mut cleanup = Box::pin(takeover.clear_when(None, move || {
-            let current = observed_gate.try_generation() == Some(generation);
+            let current = observed_gate.is_current_for_controller(generation);
             let _ = checked_tx.send(current);
             current
         }));
@@ -216,7 +216,7 @@ async fn cancelled_clear_waiter_cannot_clear_a_successor_marker() {
     let current = gate.generation();
     assert!(
         takeover
-            .clear_when(None, move || gate.try_generation() == Some(current))
+            .clear_when(None, move || gate.is_current_for_controller(current))
             .await
     );
     assert_eq!(clears.load(Ordering::SeqCst), 1);

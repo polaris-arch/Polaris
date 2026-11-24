@@ -12,6 +12,7 @@
 //! 2. kind=stop（终态停止）**必须丢弃全部 pending**（停止优先，不得停后又被拉起）。
 //! 3. 去抖回调**必须先判 depth>0**（置 pending 返回），再判核是否已停（清 force-restart 快照返回）；顺序颠倒即回归。
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 /// lifecycle 操作种类（endLifecycleOp kind 参数，:1533）。
@@ -84,6 +85,8 @@ pub struct LifecycleGate {
     // event listener during that emission.
     publication: Mutex<()>,
     inner: Mutex<Inner>,
+    // Writers publish the new generation under both locks after updating Inner.
+    generation: AtomicU64,
 }
 
 /// A non-forgeable, synchronous proof that a lifecycle generation remains
@@ -101,7 +104,7 @@ impl LiveClaimGuard<'_> {
     }
 
     pub fn generation(&self) -> u64 {
-        self.inner.generation
+        self.gate.load_generation()
     }
 
     pub fn is_busy(&self) -> bool {
@@ -117,8 +120,6 @@ impl LiveClaimGuard<'_> {
 struct Inner {
     /// 引用计数（重入：restart 内嵌 stop+start 时 depth=2，:1519-1521）。
     depth: u32,
-    /// 生命周期世代（start/stop 入口 +1，:364）。u64 单调递增，不回绕（实际场景远不达上限）。
-    generation: u64,
     /// 最后一次起停世代认领者；旧 restart 收尾须沿用最新意图。
     generation_owner: Option<LifecycleKind>,
     pending: PendingSnapshot,
@@ -148,7 +149,7 @@ impl LifecycleGate {
         commit: impl FnOnce(&LiveClaimGuard<'_>) -> T,
     ) -> Option<T> {
         let inner = self.inner.lock().expect("lifecycle lock poisoned");
-        if inner.generation != expected {
+        if self.load_generation() != expected {
             return None;
         }
         let live = LiveClaimGuard { gate: self, inner };
@@ -170,23 +171,23 @@ impl LifecycleGate {
     /// depth>0（仍在更外层操作内）→ 返回 `StillBusy`，留给最外层。
     pub fn end(&self, kind: LifecycleKind) -> LifecycleEndResult {
         let mut g = self.inner.lock().expect("lifecycle lock poisoned");
-        Self::end_locked(&mut g, kind)
+        self.end_locked(&mut g, kind)
     }
 
     /// 被新起停接管的旧 restart 退出时，以最新世代的 Stop 意图决定是否丢弃 pending。
     /// 判定与 depth 归零同锁，不能让新 start 插在「读 owner → end」之间。
     pub fn end_restart_after(&self, owned_generation: Option<u64>) -> LifecycleEndResult {
         let mut g = self.inner.lock().expect("lifecycle lock poisoned");
-        let superseded = owned_generation.is_none_or(|owned| owned != g.generation);
+        let superseded = owned_generation.is_none_or(|owned| owned != self.load_generation());
         let kind = if superseded && g.generation_owner == Some(LifecycleKind::Stop) {
             LifecycleKind::Stop
         } else {
             LifecycleKind::Restart
         };
-        Self::end_locked(&mut g, kind)
+        self.end_locked(&mut g, kind)
     }
 
-    fn end_locked(g: &mut Inner, kind: LifecycleKind) -> LifecycleEndResult {
+    fn end_locked(&self, g: &mut Inner, kind: LifecycleKind) -> LifecycleEndResult {
         g.depth = g.depth.saturating_sub(1);
         if g.depth > 0 {
             return LifecycleEndResult::StillBusy(g.depth);
@@ -204,7 +205,7 @@ impl LifecycleGate {
             LifecycleKind::Start | LifecycleKind::Restart => {
                 let restart_pending = std::mem::take(&mut g.pending.restart_pending);
                 LifecycleEndResult::Drained(PendingDrain {
-                    generation: g.generation,
+                    generation: self.load_generation(),
                     replay_switch_id: g.pending.switch_id.take(),
                     // The next timer claims the exact force id; a Stop still discards it.
                     schedule_restart: restart_pending || g.pending.force_restart_id.is_some(),
@@ -217,21 +218,19 @@ impl LifecycleGate {
     pub fn bump_generation(&self) -> u64 {
         let _publication = self.lock_generation_publication();
         let mut g = self.inner.lock().expect("lifecycle lock poisoned");
-        g.generation = g.generation.wrapping_add(1);
         g.generation_owner = None;
-        g.generation
+        self.advance_generation()
     }
 
     /// 同锁认领新世代。`expected` 有值时，旧 restart 只能在旧 stop 世代仍当权时接续 start。
     pub fn claim_generation(&self, expected: Option<u64>, owner: LifecycleKind) -> Option<u64> {
         let _publication = self.lock_generation_publication();
         let mut g = self.inner.lock().expect("lifecycle lock poisoned");
-        if expected.is_some_and(|expected| expected != g.generation) {
+        if expected.is_some_and(|expected| expected != self.load_generation()) {
             return None;
         }
-        g.generation = g.generation.wrapping_add(1);
         g.generation_owner = Some(owner);
-        Some(g.generation)
+        Some(self.advance_generation())
     }
 
     /// Atomically claim a debounced restart and enter its outer lifecycle scope. A competing
@@ -244,7 +243,7 @@ impl LifecycleGate {
     ) -> Option<u64> {
         let _publication = self.lock_generation_publication();
         let mut g = self.inner.lock().expect("lifecycle lock poisoned");
-        if g.generation != expected_generation
+        if self.load_generation() != expected_generation
             || g.generation_owner == Some(LifecycleKind::Stop)
             || g.pending.force_restart_id != force_id
         {
@@ -255,33 +254,47 @@ impl LifecycleGate {
             return None;
         }
         g.pending.force_restart_id = None;
-        g.generation = g.generation.wrapping_add(1);
         // This is an owned restart, even though its first leg stops the old core. Only a
         // separate explicit Stop claim may turn its final receipt into NotRunning and discard
         // pending work; the transient stop leg remains nested under this outer restart.
         g.generation_owner = Some(LifecycleKind::Restart);
         g.depth = 1;
-        Some(g.generation)
+        Some(self.advance_generation())
+    }
+
+    fn advance_generation(&self) -> u64 {
+        self.generation
+            .fetch_add(1, Ordering::Release)
+            .wrapping_add(1)
+    }
+
+    fn load_generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
     }
 
     /// 当前世代（供 readiness/recovery 比对让位，:4522/5960）。
     pub fn generation(&self) -> u64 {
-        self.inner
-            .lock()
-            .expect("lifecycle lock poisoned")
-            .generation
+        let _inner = self.inner.lock().expect("lifecycle lock poisoned");
+        self.load_generation()
     }
 
     /// Nonblocking observation for a foreign controller's mutation guard.
     /// Contention or poison is unknown and must not authorize a stale mutation.
     pub fn try_generation(&self) -> Option<u64> {
-        self.inner.try_lock().ok().map(|inner| inner.generation)
+        let _inner = self.inner.try_lock().ok()?;
+        Some(self.load_generation())
+    }
+
+    /// Check only the generation under a controller that serializes its own mutations.
+    /// A read of lifecycle state must not prevent the current owner from restoring it.
+    pub fn is_current_for_controller(&self, expected: u64) -> bool {
+        self.load_generation() == expected && !self.inner.is_poisoned()
     }
 
     /// Observe generation and activity under the same nonblocking claim.
     pub fn try_generation_activity(&self) -> Option<(u64, bool)> {
         let inner = self.inner.try_lock().ok()?;
-        Some((inner.generation, inner.depth > 0))
+        Some((self.load_generation(), inner.depth > 0))
     }
 
     /// Observe a stable idle generation without waiting under a saved writer.
@@ -293,7 +306,7 @@ impl LifecycleGate {
     /// 世代与最后认领者须同锁读取，供异步选择回执判断是否被主动停止接管。
     pub fn generation_state(&self) -> (u64, Option<LifecycleKind>) {
         let g = self.inner.lock().expect("lifecycle lock poisoned");
-        (g.generation, g.generation_owner)
+        (self.load_generation(), g.generation_owner)
     }
 
     /// 是否有 lifecycle 操作在飞（isLifecycleBusy，:1561）。
@@ -329,7 +342,7 @@ impl LifecycleGate {
     /// selector PUT 失败可能与用户 Stop 交错，不能在旧腿失败后无条件给新世代挂重启。
     pub fn set_force_restart_if_current(&self, expected_generation: u64, config_id: u64) -> bool {
         let mut g = self.inner.lock().expect("lifecycle lock poisoned");
-        if g.generation != expected_generation || g.depth != 0 {
+        if self.load_generation() != expected_generation || g.depth != 0 {
             return false;
         }
         g.pending.force_restart_id = Some(config_id);
@@ -401,7 +414,7 @@ impl LifecycleGate {
         core_running: bool,
     ) -> Option<DebouncedDecision> {
         let mut g = self.inner.lock().expect("lifecycle lock poisoned");
-        if g.generation != expected_generation {
+        if self.load_generation() != expected_generation {
             return None;
         }
         Some(Self::debounced_restart_decision_locked(
