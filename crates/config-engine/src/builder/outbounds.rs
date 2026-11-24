@@ -594,8 +594,11 @@ pub fn build_outbounds_with_runtime_bindings(
                     apply_on_demand(&mut endpoint, server);
                     // 未设置时 MASQUE 缺省按需：内核只让被选择器选中的成员保持会话，其余挂起、
                     // 首笔流量再建，免得每次起核为全部节点建 HTTP/3 会话、对不可达节点反复重试。
-                    // 组网节点保持常连，其网段与状态上报依赖已建立的隧道。
-                    if server.on_demand.is_none() && !is_mesh_node(server) {
+                    // 高级设置中的 on_demand 也是显式配置。组网节点缺省常连。
+                    if server.on_demand.is_none()
+                        && !is_mesh_node(server)
+                        && !endpoint.extra.contains_key("on_demand")
+                    {
                         endpoint.on_demand = Some(true);
                     }
                     pending_endpoints.push(endpoint);

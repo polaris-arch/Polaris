@@ -1251,6 +1251,7 @@ fn system_mesh_interface_conflict_rejects_only_duplicate_active_system_type() {
 #[test]
 fn on_demand_reaches_every_endpoint_leg() {
     use crate::user_config::server_config::{lands_in_endpoints, ALL_PROTOCOLS};
+    use serde_json::json;
 
     let endpoint_protocols: Vec<Protocol> = ALL_PROTOCOLS
         .into_iter()
@@ -1301,6 +1302,26 @@ fn on_demand_reaches_every_endpoint_leg() {
             expected.map(serde_json::Value::Bool).as_ref(),
             "{name}：未设置时 JSON 里的 on_demand 不符 —— 会改动金样字节"
         );
+    }
+
+    for (configured, raw, expected) in [
+        (None, json!(false), json!(false)),
+        (None, json!(true), json!(true)),
+        (None, json!("invalid"), json!("invalid")),
+        (Some(false), json!(true), json!(false)),
+        (Some(true), json!(false), json!(true)),
+    ] {
+        let mut server = endpoint_node_for(Protocol::MasqueClient, configured);
+        server
+            .masque_client_settings
+            .get_or_insert_with(Default::default)
+            .extra
+            .insert("on_demand".into(), raw);
+        let result = build_single(server);
+        let wire = serde_json::to_string(&result.pending_endpoints[0]).unwrap();
+        assert_eq!(wire.matches("\"on_demand\":").count(), 1, "{wire}");
+        let endpoint: serde_json::Value = serde_json::from_str(&wire).unwrap();
+        assert_eq!(endpoint["on_demand"], expected);
     }
 }
 
