@@ -5,11 +5,11 @@
   "repository": "polaris-arch/sing-box-polaris",
   "repositoryId": 1421657509,
   "sourceURL": "https://github.com/polaris-arch/sing-box-polaris",
-  "version": "1.15.0-polaris-alpha.12.33",
-  "sourceTag": "v1.15.0-polaris-alpha.12.33",
-  "sourceTagObject": "808a855d7c8df0594344a7cc712b46891899d8d8",
-  "sourceCommit": "2e2c573f0d18db4bc002a46ac2fa7cb589e2cba2",
-  "sourceTree": "71e1f42d61ec8dd466baff29fb51a91aca9f3cb5",
+  "version": "1.15.0-polaris-alpha.12.34",
+  "sourceTag": "v1.15.0-polaris-alpha.12.34",
+  "sourceTagObject": "2d13c10f7f5ebdee2a00af8fdb01c430e1777c05",
+  "sourceCommit": "0a09f8914c89e268689e3d2f5749a93d2c90e4a9",
+  "sourceTree": "d7f46c85a87bafac9ffa17005b39648b3df94520",
   "goModSha256": "f3bb0779a94a300cd24cf82d3b04567b5683252646d18f17e2d7c960613f4762",
   "goSumSha256": "faf13e501da2c8de6a70db1f50a152f37bf875d68717631253e57a8be27cde1a",
   "goModule": "github.com/sagernet/sing-box",
@@ -71,7 +71,7 @@
       "ts_omit_synology",
       "ts_omit_bird"
     ],
-    "outputName": "polaris-box-1.15.0-polaris-alpha.12.33-android.aar",
+    "outputName": "polaris-box-1.15.0-polaris-alpha.12.34-android.aar",
     "javaPackage": "io.nekohasekai",
     "libname": "box",
     "legacyAPI21Enabled": false
@@ -120,7 +120,7 @@
     ],
     "libname": "box",
     "frameworkName": "Libbox.xcframework",
-    "outputName": "polaris-box-1.15.0-polaris-alpha.12.33-ios-xcframework.zip",
+    "outputName": "polaris-box-1.15.0-polaris-alpha.12.34-ios-xcframework.zip",
     "linkage": "static; build-time verified App and PacketTunnel link",
     "macOSTvOSIncluded": false
   },
@@ -139,8 +139,8 @@
   },
   "sourcePolicy": {
     "schema": "polaris-reviewed-kernel-source-v4",
-    "sourceCommit": "2e2c573f0d18db4bc002a46ac2fa7cb589e2cba2",
-    "sourceTree": "71e1f42d61ec8dd466baff29fb51a91aca9f3cb5",
+    "sourceCommit": "0a09f8914c89e268689e3d2f5749a93d2c90e4a9",
+    "sourceTree": "d7f46c85a87bafac9ffa17005b39648b3df94520",
     "goVersion": "1.27.4",
     "goModSha256": "f3bb0779a94a300cd24cf82d3b04567b5683252646d18f17e2d7c960613f4762",
     "goSumSha256": "faf13e501da2c8de6a70db1f50a152f37bf875d68717631253e57a8be27cde1a",
@@ -182,7 +182,7 @@
       "github.com/sagernet/cronet-go": {
         "version": "v0.0.0-20260929213745-4d18a60dc3a8",
         "replacementPath": "./third_party/cronet-go",
-        "replacementTree": "32b329a31d3afe01b64227d2d14f07d02370e655",
+        "replacementTree": "0d7be3c49c3ffd751028170b2100383d15e68eee",
         "replacementFileCount": 137
       },
       "github.com/sagernet/fswatch": {
