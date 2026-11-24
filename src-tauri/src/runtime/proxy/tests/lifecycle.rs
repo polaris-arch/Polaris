@@ -839,11 +839,9 @@ async fn replacement_start_keeps_its_refresh_when_old_stop_resumes() {
 ///
 /// # 窗口是**确定性**的，不靠 sleep 赌时序
 ///
-/// 测试先占住 `mesh.exit_route` 锁：那是 `stop_inner` 拆除段第一个必然挂起的 await
-/// （`lock().await` 拿不到就一定 Pending）⇒ 停核腿**不可能**越过它。于是「等它 bump 出自己的世代
-/// → 再 bump 一次冒充新 start → 放锁」这个序列，必然把换代插在它的某个检查点之前。
-/// （current_thread 运行时：观测到世代变化与随后的 `bump_generation()` 之间没有 await，
-/// 停核腿不可能在这两句之间推进。）
+/// 测试先占住 `mesh.exit_route` 锁，停核腿无法越过拆除段的这道锁。等 mock 确认旧会话已撤代理，
+/// 再核对其认领的世代、模拟新 start 换代并放锁。撤代理前只读原子计数，以免测试自身持有世代锁，
+/// 让 `try_generation` 误判清理资格。
 ///
 /// **变异实跑**：删掉 `stop_inner` 里任一 `stop_superseded` 早退 → 对应断言转红；
 /// 把 `stop` 里停核前那次 `clear_system_proxy_if_current` 移到 `stop_inner` 之后改为无条件清 → 第三条转红。
@@ -882,13 +880,6 @@ async fn superseded_stop_teardown_stands_down_instead_of_clobbering_the_new_sess
         let rt = Arc::clone(&rt);
         tokio::spawn(async move { rt.stop().await })
     };
-    // 等停核腿领到它自己的世代（= 已进 stop_inner），且它此刻必然堵在 exit_route 锁上。
-    let mut spins = 0;
-    while rt.gate.generation() == gen0 {
-        tokio::task::yield_now().await;
-        spins += 1;
-        assert!(spins < 10_000, "停核腿始终没 bump 世代 —— 前置假设已失效");
-    }
     // 停核腿先以旧会话世代撤系统代理、再堵在 exit_route 锁上；等它撤完再换代，断言才不赌时序。
     let mut waits = 0;
     while clears.load(Ordering::SeqCst) == 0 {
@@ -896,6 +887,7 @@ async fn superseded_stop_teardown_stands_down_instead_of_clobbering_the_new_sess
         waits += 1;
         assert!(waits < 5_000, "停核腿始终没在停核前撤系统代理");
     }
+    assert_eq!(rt.gate.generation(), gen0.wrapping_add(1));
     rt.bump_generation(); // ← 新一轮 start 接管（用户重装 helper 后点了连接）
     release.notify_one(); // 放锁：停核腿醒来，撞上换代守卫
     holder.await.expect("占位任务不得 panic");
