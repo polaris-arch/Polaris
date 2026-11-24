@@ -4767,7 +4767,9 @@ const IOS_SIDE_CENSUS: &[(&str, usize)] = &[
     // Mobile native custody, rule asset directories and SAF add 110 measured sites.
     // The old iOS-only config-file guard is now a runtime Platform match covering both mobile targets.
     // NE liveness and exited-owner bookkeeping add two net iOS-only sites.
-    ("DiffersRight", 448),
+    // The unretired-start and unconfirmed-operation refusal codes add two iOS-only
+    // constants; no debt is reclassified.
+    ("DiffersRight", 450),
     ("DiffersUndecided", 26),
     // Saved temporary-core concurrency adds three group members; no old debt is repaid.
     // Bounded connection snapshots add 15 stats transport sites to the existing stats
