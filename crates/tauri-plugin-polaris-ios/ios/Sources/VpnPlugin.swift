@@ -160,14 +160,14 @@ final class VpnPlugin: Plugin {
                 self.finish(op, error: vpnError(vpnForegroundRequired))
                 return
             }
-            if op.started || op.kind == "stop" || self.preferenceMutation.pending {
+            if op.started || op.kind == "stop" {
                 self.uncertainSession = (op.manager?.protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration?["sessionID"] as? String
                 self.uncertainReason = "A VPN operation timed out; extension completion is unknown. Stop the VPN and inspect its lifecycle report before retrying."
             }
             if op.kind == "start", let intent = op.startIntent, op.started {
                 self.stopSubmittedStart(intent, stopRequestID: freshVpnRequestID("timeout"))
             }
-            self.finish(op, error: vpnError("StartupFailed: VPN \(kind) timed out; completion and cleanup are unknown. Check system VPN status before retrying."), noStoreEligible: false)
+            self.finish(op, error: vpnError("StartupFailed: VPN \(kind) timed out; completion and cleanup are unknown. Check system VPN status before retrying."))
         }
         op.deadline = deadline
         DispatchQueue.main.asyncAfter(deadline: .now() + (kind == "start" ? 40 : 25), execute: deadline)
@@ -353,7 +353,7 @@ final class VpnPlugin: Plugin {
                 let submitted = self.submittedStart.flatMap { $0.requestID == args.expectedStartRequestID ? $0 : nil }
                 self.startAdmission.revoke(args.expectedStartRequestID, pending: pending?.startIntent ?? submitted)
                 if let op = pending {
-                    if op.started || self.preferenceMutation.requestID == op.requestID {
+                    if op.started {
                         self.uncertainSession = op.identity?["sessionID"] as? String
                         self.uncertainReason = "The start request was revoked; submitted system work and cleanup remain unknown."
                     }
