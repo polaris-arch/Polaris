@@ -926,26 +926,21 @@ pub async fn diagnostic_export(
         Ok(level) => (level, true),
         Err(_) => (configured_level.clone(), false),
     };
-    // 提示：当前级别不含连接明细且日志已现连接/DNS 类错误 → 建议把级别拨到 DEBUG 复现。
-    //
-    // **这句指引在本批被改写**：原文让用户去点「开启诊断采集」，那个按钮连同它背后整条
-    // `diagnosticCapture` 机制已删除 —— 核日志现在经 `SubscribeLog` 全级别送来、级别筛在客户端，
-    // 把日志页级别拨到 DEBUG 即刻生效，**不需要**改配置也不需要重启内核。
+    // 诊断模式抬高应用与内核实时日志的采集级别，内核上报的默认级别继续在报告中单独保留。
     let lower = app_log_tail.to_lowercase();
-    let wants_deeper = log_level != "debug"
-        && log_level != "trace"
+    let wants_deeper = log::max_level() < log::LevelFilter::Debug
         && TROUBLE_MARKERS.iter().any(|m| lower.contains(m));
     let hint = wants_deeper.then(|| {
         // 级别的来历要写进这句话本身：读回来的是事实，回落的是「我写下的值」，
         // 后者恰恰可能就是与实际不符的那个 —— 不标来历，这句提示会把读报告的人带偏。
         let origin = if level_is_runtime {
-            format!("当前内核实际运行在 {log_level} 级别")
+            format!("内核上报的默认日志级别为 {log_level}")
         } else {
             format!("配置中的日志级别为 {log_level}（内核未运行或读不到，未能核对实际级别）")
         };
         format!(
-            "{origin}，未含 DNS 解析等连接详情，但日志中已出现连接/DNS 类错误。\
-建议到 日志 页把级别切到 DEBUG（即刻生效，无需重启内核），复现问题后再次导出可获得更完整的根因数据。"
+            "{origin}。实时采集尚未达到 DEBUG，日志中已出现连接或 DNS 类错误。\
+建议在日志页开启「诊断模式」，复现后再次导出。此开关临时提高实时日志采集级别，无需保存配置或重启内核。"
         )
     });
 

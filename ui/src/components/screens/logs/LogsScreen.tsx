@@ -108,7 +108,7 @@ function matchesLog(row: LogRow, threshold: number, source: LogSource, query: st
   return (
     LVL[row.level] >= threshold &&
     (source === 'all' || row.source === source) &&
-    (!query || (row.message + row.level).toLowerCase().includes(query))
+    (!query || row.message.toLowerCase().includes(query) || row.level.includes(query))
   );
 }
 
