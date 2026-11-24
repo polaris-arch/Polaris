@@ -3286,9 +3286,9 @@ const CFG_REGISTRY: &[CfgSite] = &[
     (
         "src-tauri/src/runtime/proxy.rs",
         "target_os = \"ios\"",
-        8,
+        10,
         IosSide::DiffersRight,
-        "原 iOS 错误常量/正常 native receipt 槽及构造保留；新增 LocalStart/Observed exactly-one custody 表示与原槽方法。iOS 用自己的原 request/session/config/native 身份，Observed 无外来 MainBirthToken 且未 scoped关闭仍 occupied；Android 保原 JNI producer/booking，不消费 NE 字段。这里区分两端实际 producer 身份，不签 global NoOwner 或实际 iOS 运行验收。",
+        "原 iOS 错误常量（含未退役起核与未确认上次操作两个稳定码）/正常 native receipt 槽及构造保留；新增 LocalStart/Observed exactly-one custody 表示与原槽方法。iOS 用自己的原 request/session/config/native 身份，Observed 无外来 MainBirthToken 且未 scoped关闭仍 occupied；Android 保原 JNI producer/booking，不消费 NE 字段。这里区分两端实际 producer 身份，不签 global NoOwner 或实际 iOS 运行验收。",
     ),
     (
         "src-tauri/src/runtime/proxy/android_bridge.rs",
