@@ -159,6 +159,8 @@ const RUNTIME_PROTOCOL_METHODS: [&str; 6] = [
     "RetryRuntimePersistence",
     "AcknowledgeRuntimePersistence",
 ];
+const PLAN_PRECONDITION_CHANGED: &str = "PLAN_PRECONDITION_CHANGED";
+const RUNTIME_APPLY_REPLANS: u8 = 2;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct RuntimePairing {
@@ -2321,8 +2323,14 @@ impl ProxyRuntime {
         let mut result = match scope {
             Ok(scope) => {
                 pending.deletion_scope = scope;
-                Box::pin(self.execute_prepared_runtime_candidate(client, pending, None, false))
-                    .await
+                Box::pin(self.execute_prepared_runtime_candidate(
+                    client,
+                    pending,
+                    None,
+                    false,
+                    RUNTIME_APPLY_REPLANS,
+                ))
+                .await
             }
             Err(_) => {
                 let mut result = RuntimeApplyResult::status("conflict");
@@ -2550,6 +2558,7 @@ impl ProxyRuntime {
                     pending,
                     None,
                     offer_confirmation,
+                    RUNTIME_APPLY_REPLANS,
                 ))
                 .await
             }
@@ -2779,12 +2788,14 @@ impl ProxyRuntime {
                             && pending.candidate == candidate
                     })
             });
-            if (!superseded && !host_retry_only)
-                || self.config.current().ok().as_ref() != Some(&candidate)
+            if result.status != "rejected"
+                && ((!superseded && !host_retry_only)
+                    || self.config.current().ok().as_ref() != Some(&candidate))
             {
                 return decline(result);
             }
-            // Generic Core persistence remains owned by its original transaction.
+            // A definitive rejection released the old slot. Generic Core
+            // persistence remains owned by its original transaction.
             // A same-candidate host retry may proceed only through a fresh NoOp
             // Plan; it does not replace or replay that pending Core transaction.
             baseline = match self
@@ -3675,6 +3686,7 @@ impl ProxyRuntime {
         mut pending: PendingOperation,
         confirmation: Option<String>,
         offer_confirmation: bool,
+        replans_left: u8,
     ) -> RuntimeApplyResult {
         let generation = pending.generation;
         let intent = pending.intent;
@@ -3733,6 +3745,7 @@ impl ProxyRuntime {
             &pending.candidate,
         );
         let plan_expiry = pending.plan.expires_at_unix_milli;
+        let mut admitted_saved_revision = 0;
         let admit = |desired: &Value| {
             if desired != &pending.desired || !self.saved_revision_matches(saved_revision) {
                 return Err(RuntimeClaimError::Rejected);
@@ -3773,6 +3786,7 @@ impl ProxyRuntime {
                 }
                 pending.tailnet_suspended_token =
                     self.suspend_tailnet_context(&pending.tailnet_bindings);
+                admitted_saved_revision = self.config.saved_revision();
                 state.pending = Some(pending.clone());
                 state.restart = None;
                 state.impact = None;
@@ -3858,7 +3872,7 @@ impl ProxyRuntime {
                     Err(error) => *error,
                 }
             }
-            Err(_) => Box::pin(self.reconcile_runtime_operation(&client, pending)).await,
+            Err(_) => Box::pin(self.reconcile_runtime_operation(&client, pending.clone())).await,
         };
         log::info!(
             "runtime config apply settled: status={} reasons={:?} core={core_outcome} rpc_ms={} settle_ms={}",
@@ -3867,6 +3881,45 @@ impl ProxyRuntime {
             (rpc_finished_at - apply_started_at).as_millis(),
             rpc_finished_at.elapsed().as_millis(),
         );
+        let owner = StagedSaveOwner {
+            generation,
+            intent,
+            revision: admitted_saved_revision,
+        };
+        if replans_left > 0
+            && result.status == "rejected"
+            && result
+                .reasons
+                .iter()
+                .any(|reason| reason.code == PLAN_PRECONDITION_CHANGED)
+            && owner.is_current(self)
+        {
+            // Retry this saved edit with a fresh plan, never resend its Apply.
+            // Keep intermediate rejections out of the pending-change UI.
+            let attempt = u64::from(RUNTIME_APPLY_REPLANS - replans_left + 1);
+            tokio::time::sleep(Duration::from_millis(100 * attempt)).await;
+            return match Box::pin(self.prepare_runtime_candidate(
+                pending.candidate,
+                Some(&pending.desired),
+                Some(owner),
+                offer_confirmation,
+                false,
+            ))
+            .await
+            {
+                Ok((client, pending)) => {
+                    Box::pin(self.execute_prepared_runtime_candidate(
+                        client,
+                        pending,
+                        None,
+                        offer_confirmation,
+                        replans_left - 1,
+                    ))
+                    .await
+                }
+                Err(result) => self.remember_runtime_result(*result),
+            };
+        }
         if in_progress && result.status == "unconfirmed" {
             // Core still owns this transaction and has no completion callback.
             // Re-read only its original receipt; ABORTED_UNAPPLIED releases
@@ -3941,6 +3994,8 @@ impl ProxyRuntime {
         let Some(identity) = pending.plan.expected.as_ref() else {
             return RuntimeApplyResult::status("unconfirmed");
         };
+        let ticket_expired_before_status =
+            !runtime_plan_ticket_is_live(pending.plan.expires_at_unix_milli);
         let mut result = match client
             .get_runtime_config_status(daemon::RuntimeConfigStatusRequest {
                 contract_version: 1,
@@ -3976,19 +4031,18 @@ impl ProxyRuntime {
             }
             // Core drops only records that are no longer in flight, and every
             // commit advances applied_revision. Before plan expiry an unconsumed
-            // plan is also UNKNOWN and Core may still admit it; after expiry
-            // Core refuses it, so an unchanged expected identity proves this
-            // transaction never published.
+            // plan is also UNKNOWN and Core may still admit it. Only a Status
+            // requested after expiry can prove it never published.
             Ok(status)
                 if status.contract_version == 1
-                    && !runtime_plan_ticket_is_live(pending.plan.expires_at_unix_milli)
+                    && ticket_expired_before_status
                     && status.lookup_state
                         == daemon::RuntimeLookupState::UnknownOrExpired as i32
                     && identity_equal(status.active.as_ref(), Some(identity))
                     && status.control_revision == pending.plan.expected_control_revision =>
             {
-                self.release_unapplied_runtime_pending(&pending);
-                RuntimeApplyResult::status("rejected")
+                let released = self.release_unapplied_runtime_pending(&pending);
+                RuntimeApplyResult::status(if released { "rejected" } else { "unconfirmed" })
             }
             _ => RuntimeApplyResult::status("unconfirmed"),
         };
@@ -4327,19 +4381,31 @@ impl ProxyRuntime {
     }
 
     /// Shared by a verified unapplied receipt and a proven-unapplied expired one.
-    fn release_unapplied_runtime_pending(&self, pending: &PendingOperation) {
-        if let Some(h) = pending.api_handoff.as_ref() {
+    fn release_unapplied_runtime_pending(&self, pending: &PendingOperation) -> bool {
+        let _publication = self.gate.lock_generation_publication();
+        if self.gate.generation() != pending.generation {
+            return false;
+        }
+        let Ok(mut state) = self.runtime_config_apply.lock() else {
+            return false;
+        };
+        let Some(owner) = state.pending.take_if(|owner| {
+            !owner.published
+                && owner.generation == pending.generation
+                && owner.intent == pending.intent
+                && owner.plan.transaction_id == pending.plan.transaction_id
+                && owner.plan.plan_id == pending.plan.plan_id
+        }) else {
+            return false;
+        };
+        drop(state);
+        if let Some(h) = owner.api_handoff.as_ref() {
             h.revoke();
         }
-        let _publication = self.gate.lock_generation_publication();
-        if self.gate.generation() == pending.generation {
-            if let Some(token) = pending.tailnet_suspended_token {
-                self.resume_tailnet_context(pending.generation, token);
-            }
+        if let Some(token) = owner.tailnet_suspended_token {
+            self.resume_tailnet_context(owner.generation, token);
         }
-        if let Ok(mut state) = self.runtime_config_apply.lock() {
-            state.pending = None;
-        }
+        true
     }
 
     async fn settle_runtime_operation(
@@ -4360,11 +4426,22 @@ impl ProxyRuntime {
             ) {
                 if !identity_equal(operation.active.as_ref(), operation.before.as_ref())
                     || operation.control_revision != pending.plan.expected_control_revision
+                    || !self.release_unapplied_runtime_pending(pending)
                 {
                     return RuntimeApplyResult::status("unconfirmed");
                 }
-                self.release_unapplied_runtime_pending(pending);
                 let mut result = RuntimeApplyResult::status("rejected");
+                if operation.state == daemon::RuntimeOperationState::RejectedUnapplied as i32
+                    && operation
+                        .errors
+                        .iter()
+                        .any(|error| error.code == PLAN_PRECONDITION_CHANGED)
+                {
+                    result.reasons.push(RuntimeApplyReason {
+                        code: PLAN_PRECONDITION_CHANGED,
+                        path: "runtime.apply".into(),
+                    });
+                }
                 result.reasons.extend(
                     [
                         "PREPARATION_FAILED",

@@ -1972,6 +1972,7 @@ async fn ts_apply_unknown_stays_paused_only_proven_unapplied_resumes() {
     let mut pending = ts_pending_fixture(&rt, "https://two.example");
     pending.tailnet_suspended_token = rt.suspend_tailnet_context(&pending.tailnet_bindings);
     assert_eq!(pending.tailnet_suspended_token, Some(old.token));
+    rt.runtime_config_apply.lock().unwrap().pending = Some(pending.clone());
     let receipt = daemon::RuntimeConfigOperation {
         contract_version: 1,
         transaction_id: pending.plan.transaction_id.clone(),
@@ -2019,8 +2020,31 @@ async fn ts_apply_unknown_stays_paused_only_proven_unapplied_resumes() {
         "unconfirmed"
     );
     assert!(rt.tailnet_context().unwrap().suspended);
+    let mut replaced = pending.clone();
+    replaced.plan.transaction_id = "new-pending-operation".into();
+    rt.runtime_config_apply.lock().unwrap().pending = Some(replaced);
+    assert_eq!(
+        rt.settle_runtime_operation(&pending, receipt.clone())
+            .await
+            .status,
+        "unconfirmed"
+    );
+    assert!(rt.tailnet_context().unwrap().suspended);
+    assert_eq!(
+        rt.runtime_config_apply
+            .lock()
+            .unwrap()
+            .pending
+            .as_ref()
+            .unwrap()
+            .plan
+            .transaction_id,
+        "new-pending-operation"
+    );
+    rt.runtime_config_apply.lock().unwrap().pending = Some(pending.clone());
     let rejected = rt.settle_runtime_operation(&pending, receipt).await;
     assert_eq!(rejected.status, "rejected");
+    assert!(rt.runtime_config_apply.lock().unwrap().pending.is_none());
     assert_eq!(
         rejected.reasons,
         ["PREPARATION_FAILED", "PREPARATION_DEADLINE_EXCEEDED"].map(|code| RuntimeApplyReason {
@@ -2066,7 +2090,7 @@ async fn aborting_apply_settles_in_background_and_releases_pending() {
         .await
         .unwrap();
     let result = rt
-        .execute_prepared_runtime_candidate(client, pending.clone(), None, false)
+        .execute_prepared_runtime_candidate(client, pending.clone(), None, false, 0)
         .await;
     assert_eq!(result.status, "unconfirmed");
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -2104,7 +2128,7 @@ async fn aborting_apply_settles_in_background_and_releases_pending() {
 // admit it before expiry. Only an expired plan with the unchanged expected
 // identity proves the transaction never published.
 #[tokio::test]
-async fn unknown_receipt_keeps_pending_until_plan_expiry() {
+async fn unknown_receipt_needs_expiry_or_exact_unapplied_rejection() {
     let (rt, _dir, _calls) = crate::runtime::proxy::tests::test_runtime_recording();
     let mut pending = ts_pending_raw_fixture(&rt, runnable_config_fixture());
     pending.plan.expires_at_unix_milli = i64::try_from(
@@ -2120,13 +2144,14 @@ async fn unknown_receipt_keeps_pending_until_plan_expiry() {
         ..Default::default()
     };
     let (rpc, server) = native_retirement_rpc_peer(&rt, &pending, operation).await;
-    *rpc.status.lock().unwrap() = daemon::RuntimeConfigStatus {
+    let unknown = daemon::RuntimeConfigStatus {
         contract_version: 1,
         active: pending.plan.expected.clone(),
         lookup_state: daemon::RuntimeLookupState::UnknownOrExpired as i32,
         control_revision: pending.plan.expected_control_revision,
         ..Default::default()
     };
+    *rpc.status.lock().unwrap() = unknown.clone();
     rt.runtime_config_apply.lock().unwrap().pending = Some(pending.clone());
     let id = pending.plan.transaction_id.clone();
     assert_eq!(
@@ -2134,8 +2159,61 @@ async fn unknown_receipt_keeps_pending_until_plan_expiry() {
         "unconfirmed"
     );
     assert!(rt.runtime_config_apply.lock().unwrap().pending.is_some());
-    pending.plan.expires_at_unix_milli = 1;
+    let mut advanced = pending.plan.expected.clone().unwrap();
+    advanced.applied_revision += 1;
+    *rpc.status.lock().unwrap() = daemon::RuntimeConfigStatus {
+        contract_version: 1,
+        active: Some(advanced),
+        lookup_state: daemon::RuntimeLookupState::Found as i32,
+        operation: Some(daemon::RuntimeConfigOperation {
+            contract_version: 1,
+            transaction_id: id.clone(),
+            candidate_digest: pending.plan.candidate_digest.clone(),
+            impact_digest: pending.plan.impact_digest.clone(),
+            before: pending.plan.expected.clone(),
+            active: pending.plan.expected.clone(),
+            control_revision: pending.plan.expected_control_revision,
+            state: daemon::RuntimeOperationState::RejectedUnapplied as i32,
+            errors: vec![daemon::RuntimePlanError {
+                code: PLAN_PRECONDITION_CHANGED.into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let result = rt.runtime_apply_status(id.clone()).await;
+    assert_eq!(result.status, "rejected");
+    assert_eq!(result.reasons[0].code, PLAN_PRECONDITION_CHANGED);
+    assert!(rt.runtime_config_apply.lock().unwrap().pending.is_none());
+    *rpc.status.lock().unwrap() = unknown;
+    let ticket_lifetime = Duration::from_millis(500);
+    let expiry = i64::try_from(
+        (SystemTime::now() + ticket_lifetime)
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap();
+    pending.plan.expires_at_unix_milli = expiry;
     rt.runtime_config_apply.lock().unwrap().pending = Some(pending);
+    let (entered, entered_rx) = tokio::sync::oneshot::channel();
+    let (release, release_rx) = tokio::sync::oneshot::channel();
+    *rpc.status_hold.lock().unwrap() = Some((entered, release_rx));
+    let read_started = Instant::now();
+    let read = tokio::spawn({
+        let rt = Arc::clone(&rt);
+        let id = id.clone();
+        async move { rt.runtime_apply_status(id).await }
+    });
+    entered_rx.await.unwrap();
+    assert!(runtime_plan_ticket_is_live(expiry));
+    tokio::time::sleep(ticket_lifetime).await;
+    assert!(!runtime_plan_ticket_is_live(expiry));
+    release.send(()).unwrap();
+    assert_eq!(read.await.unwrap().status, "unconfirmed");
+    assert!(read_started.elapsed() < Duration::from_secs(2));
+    assert!(rt.runtime_config_apply.lock().unwrap().pending.is_some());
     assert_eq!(rt.runtime_apply_status(id).await.status, "rejected");
     assert!(rt.runtime_config_apply.lock().unwrap().pending.is_none());
     server.abort();
@@ -3415,7 +3493,7 @@ async fn native_unknown_survives_same_generation_baseline_recapture_until_teardo
 
 type ProbeGraphCalls = Arc<std::sync::Mutex<Vec<(String, Option<String>)>>>;
 type ProbeSelectCallback = Arc<std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>>;
-type ProbeSelectHold = Arc<
+type RuntimeRpcReplyHold = Arc<
     std::sync::Mutex<
         Option<(
             tokio::sync::oneshot::Sender<()>,
@@ -3429,11 +3507,12 @@ struct NativeRetirementRpcFixture {
     capabilities: Arc<std::sync::Mutex<daemon::RuntimeCapabilities>>,
     status: Arc<std::sync::Mutex<daemon::RuntimeConfigStatus>>,
     requests: Arc<std::sync::Mutex<Vec<daemon::RuntimeConfigStatusRequest>>>,
+    status_hold: RuntimeRpcReplyHold,
     probe_selection: Arc<std::sync::atomic::AtomicBool>,
     probe_select_first_unavailable: Arc<std::sync::atomic::AtomicBool>,
     probe_select_calls: ProbeGraphCalls,
     on_probe_select: ProbeSelectCallback,
-    probe_select_hold: ProbeSelectHold,
+    probe_select_hold: RuntimeRpcReplyHold,
     selected_group_member: Arc<std::sync::Mutex<Option<String>>>,
     capability_reads: Arc<std::sync::atomic::AtomicUsize>,
     mutations: Arc<std::sync::atomic::AtomicUsize>,
@@ -3666,6 +3745,11 @@ impl daemon::runtime_config_service_server::RuntimeConfigService for NativeRetir
         self.requests.lock().unwrap().push(request.into_inner());
         let mut reply =
             polaris_singbox_grpc::tonic::Response::new(self.status.lock().unwrap().clone());
+        let hold = self.status_hold.lock().unwrap().take();
+        if let Some((entered, release)) = hold {
+            entered.send(()).unwrap();
+            release.await.unwrap();
+        }
         if self.probe_selection.load(Ordering::SeqCst) {
             reply
                 .metadata_mut()
@@ -3724,6 +3808,7 @@ async fn native_retirement_rpc_peer(
         capabilities: Arc::new(std::sync::Mutex::new(capabilities)),
         status: Arc::new(std::sync::Mutex::new(native_retirement_status(operation))),
         requests: Arc::default(),
+        status_hold: Arc::default(),
         probe_selection: Arc::default(),
         probe_select_first_unavailable: Arc::default(),
         probe_select_calls: Arc::default(),
