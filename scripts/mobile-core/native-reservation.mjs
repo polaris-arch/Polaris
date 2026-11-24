@@ -38,6 +38,9 @@ function nativeExecutable() {
     throw new Error('could not build mobile native descriptor helper with the pinned Rust toolchain',
       { cause: result.error ?? new Error(result.stderr?.trim()) });
   }
+  // macOS assesses a new executable on its first launch; take that once here so
+  // each descriptor operation's 2 s bound only covers a steady-state launch.
+  spawnSync(executable, [], { stdio: 'ignore', timeout: 30_000, killSignal: 'SIGKILL' });
   process.once('exit', () => rmSync(directory, { recursive: true, force: true }));
   nativeTool = executable;
   return executable;
