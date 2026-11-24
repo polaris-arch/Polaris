@@ -140,15 +140,15 @@ final class VpnPlugin: Plugin {
     }
 
     private func begin(_ invoke: Invoke, kind: String, requestID: String) -> VpnOperation? {
-        guard operation == nil else { invoke.reject("A VPN operation is already in progress"); return nil }
+        guard operation == nil else { rejectUndispatched(invoke, kind: kind, requestID: requestID, "A VPN operation is already in progress"); return nil }
         guard kind != "start" || !preferenceMutation.pending else {
-            invoke.reject("A previous VPN preference write has not completed; no new profile mutation can be accepted"); return nil
+            rejectUndispatched(invoke, kind: kind, requestID: requestID, "A previous VPN preference write has not completed; no new profile mutation can be accepted"); return nil
         }
         generation += 1
         let op = VpnOperation(invoke, generation: generation, kind: kind, requestID: requestID)
         if kind == "start" {
             guard let intent = startAdmission.admit(requestID) else {
-                invoke.reject("StartCancelled: This VPN start request was revoked before dispatch"); return nil
+                rejectUndispatched(invoke, kind: kind, requestID: requestID, "StartCancelled: This VPN start request was revoked before dispatch"); return nil
             }
             op.startIntent = intent
         }
@@ -172,6 +172,13 @@ final class VpnPlugin: Plugin {
         op.deadline = deadline
         DispatchQueue.main.asyncAfter(deadline: .now() + (kind == "start" ? 40 : 25), execute: deadline)
         return op
+    }
+    /// A start refused here never reached startVPNTunnel, so it carries the
+    /// no-store proof that lets the host admit the next start.
+    private func rejectUndispatched(_ invoke: Invoke, kind: String, requestID: String, _ message: String) {
+        let intent = kind == "start" ? VpnStartIntent(requestID) : nil
+        guard let intent, intent.finish(), let terminal = intent.noStoreTerminal() else { invoke.reject(message); return }
+        invoke.resolve(["nativeNoStoreTerminal": terminal, "startError": message])
     }
     private func current(_ op: VpnOperation) -> Bool {
         operation === op && generation == op.generation && !op.completed
@@ -211,7 +218,9 @@ final class VpnPlugin: Plugin {
             guard !args.configContent.isEmpty, !args.requestID.isEmpty else { throw vpnError("VPN configuration/request identity is empty") }
             let configURL = try directory().appendingPathComponent("sing-box-config.json")
             DispatchQueue.main.async {
-                do { try self.requireForeground() } catch { invoke.reject(error.localizedDescription); return }
+                do { try self.requireForeground() } catch {
+                    self.rejectUndispatched(invoke, kind: "start", requestID: args.requestID, error.localizedDescription); return
+                }
                 guard let op = self.begin(invoke, kind: "start", requestID: args.requestID) else { return }
                 self.loadManagerForStart { result in
                     guard self.current(op) else { return }
