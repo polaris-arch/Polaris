@@ -29,6 +29,8 @@ export const PROXY_ERROR_TEXT_KEY: Readonly<Record<string, string>> = {
   IOS_SESSION_ACTIVE: 'errors.iosSessionActive',
   IOS_FOREGROUND_REQUIRED: 'prerequisite.foregroundRequired',
   IOS_VPN_PERMISSION_DENIED: 'prerequisite.permissionDenied',
+  IOS_RETIREMENT_UNKNOWN: 'errors.iosRetirementUnknown',
+  IOS_PREVIOUS_OPERATION_UNCONFIRMED: 'errors.iosPreviousOperationUnconfirmed',
   ANDROID_NATIVE_LEDGER_CAPACITY_CLOSED: 'errors.androidNativeCapacityClosed',
   PROCESS_EXITED: 'home.proxyCrashed',
   AUTO_RESTART_FAILED: 'home.proxyCrashed',

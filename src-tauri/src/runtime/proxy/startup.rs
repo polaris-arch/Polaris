@@ -2111,7 +2111,10 @@ impl ProxyRuntime {
                                 StartError::from("iOS main custody poisoned".to_owned())
                             })?;
                             if slot.as_ref().is_some_and(|owner| !owner.allows_successor()) {
-                                return Err(StartError::from("nativeRetirementUnknown".to_owned()));
+                                return Err(StartError::coded(
+                                    "nativeRetirementUnknown",
+                                    code::IOS_RETIREMENT_UNKNOWN,
+                                ));
                             }
                             let start =
                                 tauri_plugin_polaris_ios::prepare_start(&gate_config_json, my_gen)

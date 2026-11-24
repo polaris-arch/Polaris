@@ -1871,6 +1871,8 @@
     "lanGatewayForwardingUnconfirmed": "無法確認所需的區域網閘道轉送狀態，已拒絕啟動/套用。請檢查閘道設定。未修改主機網路設定。",
     "dnsDependencyInvalid": "DNS 伺服器或群組的參照無效或仍被使用。請檢查 DNS 規則、預設 DNS 和群組參照後重試。",
     "iosSessionActive": "系統中已有 Polaris VPN 工作階段，請先在 iOS 系統設定中停止該工作階段，再連線。",
+    "iosRetirementUnknown": "上一次連線尚未確認結束。請在多工處理畫面完全關閉 Polaris 後重新開啟，再連線。",
+    "iosPreviousOperationUnconfirmed": "上一次連線或中斷未能確認完成。請在 iOS 設定 › 一般 › VPN 與裝置管理中刪除 Polaris 的 VPN 設定，再完全關閉並重新開啟 Polaris 後連線。訂閱和節點不受影響。",
     "operationFailed": "操作失敗，請稍後重試",
     "systemDnsTakeoverFailed": "Linux 系統 DNS 未能接入 Polaris。代理仍在執行，但網域解析可能失敗或繞過 DNS 規則；請檢查 Helper 與 systemd-resolved 後重新連線。",
     "outboundInterfaceUnavailable": "指定的出口網卡不存在或尚未啟用。為避免改走其他網卡，本次連線未套用；請重新選擇出口網卡。",

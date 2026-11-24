@@ -1398,7 +1398,7 @@ impl ProxyRuntime {
             let error_code = if session.active {
                 super::code::IOS_SESSION_ACTIVE
             } else {
-                super::code::STARTUP_FAILED
+                super::code::IOS_PREVIOUS_OPERATION_UNCONFIRMED
             };
             session
                 .require_idle()
@@ -1565,7 +1565,10 @@ impl ProxyRuntime {
                         super::code::IOS_SESSION_ACTIVE,
                     );
                 } else if let Err(error) = session.require_idle() {
-                    self.set_nonfatal_error(&error, super::code::STARTUP_FAILED);
+                    self.set_nonfatal_error(
+                        &error,
+                        super::code::IOS_PREVIOUS_OPERATION_UNCONFIRMED,
+                    );
                 }
             }
             Err(error) => {
