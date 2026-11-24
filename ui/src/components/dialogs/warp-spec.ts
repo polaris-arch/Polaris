@@ -99,7 +99,7 @@ export function warpDraftFromNode(editNode?: ServerConfig): FormValues {
       keepalive: undefined,
       detour: DETOUR_NONE,
       bindInterface: '',
-      onDemand: false,
+      onDemand: true,
     };
   }
   return {

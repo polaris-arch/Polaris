@@ -9,13 +9,14 @@ import { buildRegisteredWarpServer, saveRegisteredWarp, type WarpRegistrationAtt
 
 const fixtureDir = new URL('../../../../crates/mesh/src/warp/tests/', import.meta.url);
 const registered = JSON.parse(readFileSync(new URL('registration-draft.json', fixtureDir), 'utf8')) as WarpWireGuardDraft;
-const expected = JSON.parse(readFileSync(new URL('registration-server.json', fixtureDir), 'utf8')) as ServerConfig;
+const existing = JSON.parse(readFileSync(new URL('registration-server.json', fixtureDir), 'utf8')) as ServerConfig;
+const expected: ServerConfig = { ...existing, onDemand: true };
 
 function attempt(): WarpRegistrationAttempt {
   return { registered: structuredClone(registered), id: expected.id, saved: false };
 }
-function build(a: WarpRegistrationAttempt): ServerConfig {
-  return buildRegisteredWarpServer(a, ' WARP ', null, warpDraftFromNode(), DETOUR_NONE, '');
+function build(a: WarpRegistrationAttempt, draft = warpDraftFromNode()): ServerConfig {
+  return buildRegisteredWarpServer(a, ' WARP ', null, draft, DETOUR_NONE, '');
 }
 
 describe('WARP registration, save and readback', () => {
@@ -24,6 +25,12 @@ describe('WARP registration, save and readback', () => {
     expect(server).toEqual(expected);
     const groups = groupServersBySubscription([server], []);
     expect(groups.find((group) => group.id === 'mesh')?.servers).toEqual([server]);
+  });
+
+  it('preserves registration opt-out and the existing disabled draft', () => {
+    expect(build(attempt(), { ...warpDraftFromNode(), onDemand: false })).toEqual(existing);
+    expect(warpDraftFromNode(existing).onDemand).toBe(false);
+    expect(warpDraftFromNode({ ...existing, onDemand: false }).onDemand).toBe(false);
   });
 
   it('retains the same identity and payload across an ambiguous save failure', async () => {

@@ -5,11 +5,11 @@
   "repository": "polaris-arch/sing-box-polaris",
   "repositoryId": 1421657509,
   "sourceURL": "https://github.com/polaris-arch/sing-box-polaris",
-  "version": "1.15.0-polaris-alpha.12.39",
-  "sourceTag": "v1.15.0-polaris-alpha.12.39",
-  "sourceTagObject": "f20cd8c3362d1d86730137b3a95a8bb58b4fb073",
-  "sourceCommit": "43aeb113ef0d7ff3ecd2511e5da6f884e0822dd2",
-  "sourceTree": "9a0b201b1a7e8ac65d03660d107098ee36a8c3bc",
+  "version": "1.15.0-polaris-alpha.12.40",
+  "sourceTag": "v1.15.0-polaris-alpha.12.40",
+  "sourceTagObject": "d53b35a5a23661533a3810f3f0d8e02b13d2b7de",
+  "sourceCommit": "cc9e5fac452e29fcab50c917dadba698510c61f9",
+  "sourceTree": "60c10c3b18ccbac453dcc42a267ed0cc2b5a78c3",
   "goModSha256": "f3bb0779a94a300cd24cf82d3b04567b5683252646d18f17e2d7c960613f4762",
   "goSumSha256": "faf13e501da2c8de6a70db1f50a152f37bf875d68717631253e57a8be27cde1a",
   "goModule": "github.com/sagernet/sing-box",
@@ -71,7 +71,7 @@
       "ts_omit_synology",
       "ts_omit_bird"
     ],
-    "outputName": "polaris-box-1.15.0-polaris-alpha.12.39-android.aar",
+    "outputName": "polaris-box-1.15.0-polaris-alpha.12.40-android.aar",
     "javaPackage": "io.nekohasekai",
     "libname": "box",
     "legacyAPI21Enabled": false
@@ -120,7 +120,7 @@
     ],
     "libname": "box",
     "frameworkName": "Libbox.xcframework",
-    "outputName": "polaris-box-1.15.0-polaris-alpha.12.39-ios-xcframework.zip",
+    "outputName": "polaris-box-1.15.0-polaris-alpha.12.40-ios-xcframework.zip",
     "linkage": "static; build-time verified App and PacketTunnel link",
     "macOSTvOSIncluded": false
   },
@@ -139,8 +139,8 @@
   },
   "sourcePolicy": {
     "schema": "polaris-reviewed-kernel-source-v4",
-    "sourceCommit": "43aeb113ef0d7ff3ecd2511e5da6f884e0822dd2",
-    "sourceTree": "9a0b201b1a7e8ac65d03660d107098ee36a8c3bc",
+    "sourceCommit": "cc9e5fac452e29fcab50c917dadba698510c61f9",
+    "sourceTree": "60c10c3b18ccbac453dcc42a267ed0cc2b5a78c3",
     "goVersion": "1.27.4",
     "goModSha256": "f3bb0779a94a300cd24cf82d3b04567b5683252646d18f17e2d7c960613f4762",
     "goSumSha256": "faf13e501da2c8de6a70db1f50a152f37bf875d68717631253e57a8be27cde1a",
@@ -206,7 +206,7 @@
       "github.com/sagernet/wireguard-go": {
         "version": "v0.0.8-0.20260929150556-ca3bc60c4ce7",
         "replacementPath": "./third_party/wireguard-go",
-        "replacementTree": "8f2e9708ac31b6453f94ce68837dca6f277c5fff",
+        "replacementTree": "c121c1873779d4e38e3dd5e1124c7b2ca2998eb3",
         "replacementFileCount": 85
       },
       "github.com/database64128/tfo-go/v2": {
