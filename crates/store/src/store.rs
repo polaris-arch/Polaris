@@ -97,12 +97,8 @@ impl ConfigStore {
         }
         // 旧规则（DomainRule）→ 新规则（Rule）迁移前先备份原配置（仅首次，便于回滚踩边界 bug）。
         // Polaris loadConfig：customRulesNeedMigration && !exists(.pre-rule-migration.bak) → copyFile。best-effort。
-        // 判据须看**原始 JSON**（未过 sanitize）——`sanitize_custom_rules` 会丢弃无 `type` 字段的条目（旧
-        // DomainRule 恰无 type），若在 sanitize 后判会永假、备份形同虚设。轻量二次 parse（config 体量小，非热路径）。
-        if serde_json::from_str::<Value>(&content)
-            .ok()
-            .is_some_and(|raw| crate::migrate::custom_rules_need_migration(&raw))
-        {
+        // 复用已解析的原始 JSON，在清洗和迁移之前判断是否需要备份。
+        if crate::migrate::custom_rules_need_migration(&raw) {
             let bak = path_buf.with_file_name(format!(
                 "{}.pre-rule-migration.bak",
                 path_buf
