@@ -609,6 +609,8 @@ pub async fn backup_import_apply(
             saved.unavailable_interface_bindings
         );
     }
+    // Release the imported tree before reloading and publishing the saved config.
+    drop(parsed);
     // 恢复后二次 load_full 重走完整迁移链（migrate_all）再广播：备份可能来自旧版本（上游/旧 Polaris），含旧 shape
     // 字段（legacy DomainRule / subscriptionUpdateViaProxy / 遗留 tunConfig.stack 等）。`save_full` 只 sanitize+validate、
     // **不跑迁移链**，直接广播已保存配置会让旧 shape 未迁移即入核/下发前端。二次 load_full 触发 migrate_all，

@@ -941,7 +941,10 @@ export function decodeStagedPayload(raw: string | null | undefined): StagedPaylo
  * 与 Rust 侧同名测试读同一个文件）。
  */
 export function configBaseVersion(config: unknown): string {
-  const text = stableStringify(config);
+  return configVersionFromText(stableStringify(config));
+}
+
+function configVersionFromText(text: string): string {
   let hash = 0x811c9dc5;
   for (let i = 0; i < text.length; i += 1) {
     hash ^= text.charCodeAt(i);
@@ -954,8 +957,17 @@ export function configBaseVersion(config: unknown): string {
 /** Content binding for read-only measurement snapshots; the FNV edit version alone
  * is not a collision-resistant identity. Uses the existing config serialization. */
 export async function configContentDigest(config: unknown): Promise<string> {
-  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(stableStringify(config)));
+  return configDigestFromText(stableStringify(config));
+}
+
+async function configDigestFromText(text: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
   return [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, '0')).join('');
+}
+
+export function configMeasurementIdentity(config: unknown): { version: string; digest: Promise<string> } {
+  const text = stableStringify(config);
+  return { version: configVersionFromText(text), digest: configDigestFromText(text) };
 }
 
 /** Exact content comparison for displayed versus saved node objects, without a short hash. */

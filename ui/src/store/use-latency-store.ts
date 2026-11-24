@@ -30,7 +30,7 @@
 import { create } from 'zustand';
 import { api } from '@/ipc';
 import { useAppStore } from './app-store';
-import { configBaseVersion, configContentDigest } from '@/lib/staged-config';
+import { configMeasurementIdentity } from '@/lib/staged-config';
 import type { ServerConfig, UserConfig } from '@/contracts/types';
 import type { MeasurementProjection, MeasurementSnapshot } from '@/contracts/measurement-display';
 import { projectMeasurement, UNMEASURED_PROJECTION } from '@/domain/measurement-display';
@@ -206,11 +206,7 @@ function startMeasurementFeed(pollEnabled: boolean): () => void {
     const context = connectionKey(proxyStatus);
     try {
       if (configIdentity?.config !== config) {
-        configIdentity = {
-          config,
-          version: configBaseVersion(config),
-          digest: configContentDigest(config),
-        };
+        configIdentity = { config, ...configMeasurementIdentity(config) };
       }
       const { version } = configIdentity;
       const digest = await configIdentity.digest;
