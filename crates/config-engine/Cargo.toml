@@ -23,3 +23,6 @@ tempfile = "3"
 
 # Match WireGuard dual-family UDP leases in runtime fixtures; already locked workspace dependency.
 socket2 = "0.6"
+
+[target.'cfg(unix)'.dev-dependencies]
+nix = { version = "0.31.3", features = ["signal"] }

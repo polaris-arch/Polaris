@@ -62,34 +62,13 @@ pub(super) struct Output {
 fn terminate_owned(child: &mut Child) {
     #[cfg(unix)]
     {
+        use nix::sys::signal::{killpg, Signal};
+        use nix::unistd::Pid;
+
         // The leader has not been reaped on an abort, so its process-group ID
         // cannot be reused. Kill the isolated metadata group, including a child
         // that inherited a pipe; never signal either WG peer or the test group.
-        if let Ok(mut signal) = Command::new("kill")
-            .args(["-KILL", "--", &format!("-{}", child.id())])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-        {
-            let until = Instant::now() + Duration::from_millis(250);
-            while Instant::now() < until {
-                if !matches!(signal.try_wait(), Ok(None)) {
-                    break;
-                }
-                thread::sleep(Duration::from_millis(5));
-            }
-            if matches!(signal.try_wait(), Ok(None)) {
-                let _ = signal.kill();
-                let reap_until = Instant::now() + Duration::from_millis(100);
-                while Instant::now() < reap_until {
-                    if !matches!(signal.try_wait(), Ok(None)) {
-                        break;
-                    }
-                    thread::sleep(Duration::from_millis(5));
-                }
-            }
-        }
+        let _ = killpg(Pid::from_raw(child.id() as i32), Signal::SIGKILL);
     }
     let _ = child.kill();
 }

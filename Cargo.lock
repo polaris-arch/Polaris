@@ -3384,6 +3384,7 @@ dependencies = [
 name = "polaris-config-engine"
 version = "1.0.0"
 dependencies = [
+ "nix",
  "polaris-helper-proto",
  "polaris-source-probe",
  "serde",
