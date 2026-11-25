@@ -49,9 +49,12 @@ Native Rust builds also need `protoc` for `crates/singbox-grpc/build.rs`. Run `n
 ```bash
 cargo build --workspace        # compile
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace         # unit tests
+POLARIS_NO_KERNEL_RUN=1 cargo test --workspace --no-fail-fast
 cargo fmt --all -- --check     # formatting
 ```
+
+Local tests skip cases that start the bundled Core. CI runs those cases. See
+[Rust CI](../.github/workflows/ci.yml) for the full checks and cross-compilation flags.
 
 ### Frontend toolchain and AST tests
 
@@ -266,7 +269,7 @@ The main workflows divide the work (`.github/workflows/`):
   - The Windows and macOS native lint and tests run on pull requests, on manual dispatch, and for releases (a release calls this workflow from `package.yml` and is not published unless all three platforms pass).
   - A change that touches platform-specific branches must have the three platforms dispatched manually before it lands: `gh workflow run ci.yml --ref <branch>`; add `-f os=windows-2022` or `-f os=macos-15` to confirm a single platform. A direct push to `main` does not run those two platforms, so a failure on a native leg stays unseen until the next manual dispatch or release.
 
-  The local mirror is `scripts/gate-rust.sh` (the cross-target gates need `--with-cross`). Setting `fmt + clippy (<os>)` and `build + test (<os>)` for the three platforms, plus `cross-target clippy + android face`, as required checks is recommended.
+  Setting `fmt + clippy (<os>)` and `build + test (<os>)` for the three platforms, plus `cross-target clippy + android face`, as required checks is recommended.
 - **`ui.yml`** — frontend gate: `pnpm run build` (tsc + vite build), vitest, and Playwright; triggered on PRs and pushes to main.
 - **`release-risk.yml`** — release-risk gate: triggered on PRs, the merge queue, and pushes to main; it classifies the changed paths inside a job and calls `package.yml`, `android.yml`, and `apple.yml` only for the affected faces. Ordinary desktop and Android risk legs use light builds: installers/APKs are not uploaded or distributable.
 - **`package.yml`** — release engineering: four legs (Linux / Windows / macOS arm64 / macOS x64) running fetch + `tauri build` + artifact verification. Triggered by tags (`v*`), manually, or by a call from `release-risk.yml`. The release profile produces distributable installers; the light risk profile validates only the packaging chain. On a tag release it creates the draft release, uploads the desktop assets, then calls `android.yml` to upload the signed APK, and publishes after reconciling the full asset set.

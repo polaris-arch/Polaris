@@ -50,9 +50,12 @@ Windows：MSVC build tools（Visual Studio Build Tools 2022 + Windows 10/11 SDK�
 ```bash
 cargo build --workspace        # 编译
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace         # 单测
+POLARIS_NO_KERNEL_RUN=1 cargo test --workspace --no-fail-fast
 cargo fmt --all -- --check     # 格式
 ```
+
+本机测试跳过启动随包 Core 的用例，这些用例由 CI 执行。完整检查与交叉编译参数见
+[Rust CI](../.github/workflows/ci.yml)。
 
 ### 前端工具链与 AST 测试
 
@@ -277,8 +280,8 @@ Windows 腿因 NSIS 无 bundle 侧副本，退化为 cargo staging 清点并在�
     `-f os=windows-2022` 或 `-f os=macos-15`。直接推送 `main` 不会跑这两个平台，原生腿上的失败要到下一次
     手动触发或发布时才会出现。
 
-  本机镜像是 `scripts/gate-rust.sh`（加 `--with-cross` 才跑交叉那几条）。建议把三平台的 `fmt + clippy (<os>)`、`build + test (<os>)`
-  与 `cross-target clippy + android face` 设为 required checks。
+  建议把三平台的 `fmt + clippy (<os>)`、`build + test (<os>)` 与
+  `cross-target clippy + android face` 设为 required checks。
 - **`ui.yml`** — 前端门禁：`pnpm run build`（tsc + vite build）、vitest、Playwright；PR / push 到 main 触发。
 - **`release-risk.yml`** — 发布风险门：PR / merge queue / push 到 main 均触发，在 job 内按改动路径分类，
   只对受影响的面调用 `package.yml`、`android.yml` 与 `apple.yml`。常规桌面与 Android 风险腿使用轻量构型，安装包 / APK 不上传、不可分发。

@@ -107,11 +107,7 @@ rustflags = ["-C", "target-feature=+crt-static"]
 #   的那条判据因此与本段无关 —— 实测改前 cronet=1201 naive=223，改后同。
 #   （判据 ⑥ 的射程**包含** libbox.so，但那是按「包里每一份 .so 都得剥过」派生出来的，
 #    与本段无关；实测 libbox.so 30 个节区、0 个 debug 节，是 gomobile 自己剥的。）
-# - `scripts/gate-rust.sh` 里本段的参与面：常规 `clippy` 步不带 `--target`（编的是宿主）且设了
-#   整体 `RUSTFLAGS="-D warnings"`（env 优先级高于本文件），两个理由各自都足以让本段不参与；
-#   `--with-cross` 的 `cross-clippy` / `cross-exempt` 两步确实带 `--target aarch64-linux-android`，
-#   本段在那里**会**参与，但那两步是 clippy / check —— 只出 metadata 不链接，`-C strip` 无从生效。
-#   与顶上 `+crt-static` 那段「clippy 步不生效」是同一条注记的两面。
+# - Android 交叉 clippy / check 只出 metadata，不链接，因此不生效。
 #
 # 四个 triple 全列：`gen/android/buildSrc` 的 RustPlugin 默认 targetList 就是
 # `aarch64 / armv7 / i686 / x86_64`（`universal` flavor 四个 ABI 一起打）。只写 aarch64

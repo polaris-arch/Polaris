@@ -7,23 +7,21 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
-const wrapper = readFileSync(join(root, 'scripts/macos-bundler-diagnostics.sh'), 'utf8');
-const linuxWrapper = readFileSync(join(root, 'scripts/linux-bundler-diagnostics.sh'), 'utf8');
+const wrapper = join(root, 'scripts/bundler-diagnostics.sh');
 const testShell = (name, fn) => test(name, {
-  skip: process.platform === 'win32' ? 'POSIX diagnostic wrappers' : false,
+  skip: process.platform === 'win32' ? 'POSIX diagnostic wrapper' : false,
 }, fn);
-function fixture({ status = 0, teeStatus = null, source = wrapper, missingLog = false,
+function fixture({ status = 0, teeStatus = null, missingLog = false,
   unusableLog = false, missingTauri = false, bytes = 0, prefixArgs = [],
   target = 'aarch64-apple-darwin' } = {}) {
   const directory = mkdtempSync(join(tmpdir(), 'polaris-dmg-log-test-'));
   const log = unusableLog ? directory : join(directory, 'full output.log');
-  const calls = join(directory, 'calls.jsonl'), script = join(directory, 'wrapper.sh');
+  const calls = join(directory, 'calls.jsonl');
   const args = ['build', '--target', target, '--config',
     'config with spaces.json', '--', 'literal;$HOME', 'line\nbreak', ''];
   const out = 'original stdout\n' + 'O'.repeat(bytes) + '\nstdout end\n';
   const err = 'original stderr\n' + 'E'.repeat(bytes) + '\nstderr end\n';
   try {
-    writeFileSync(script, source);
     writeFileSync(join(directory, 'tauri'), '#!/usr/bin/env node\n'
       + 'const fs = require("node:fs");\n'
       + 'fs.appendFileSync(process.env.FIXTURE_CALLS, JSON.stringify(process.argv.slice(2)) + "\\n");\n'
@@ -42,7 +40,7 @@ function fixture({ status = 0, teeStatus = null, source = wrapper, missingLog = 
       GITHUB_TOKEN: 'must-not-print-github-token-fixture',
       GH_TOKEN: 'must-not-print-gh-token-fixture' };
     if (missingLog) delete env.POLARIS_TAURI_LOG;
-    const result = spawnSync('bash', [script, ...args], {
+    const result = spawnSync('bash', [wrapper, ...prefixArgs, ...args], {
       env, encoding: 'utf8', timeout: 5000, maxBuffer: 4 * 1024 * 1024,
     });
     assert.ifError(result.error);
@@ -89,7 +87,7 @@ testShell('missing or unwritable destination fails before Tauri; spawn failure r
 });
 testShell('Linux explicit CLI Debug preserves full output, every product argument and the original exit', () => {
   for (const status of [0, 1, 37, 127, 143]) {
-    const result = fixture({ source: linuxWrapper, prefixArgs: ['--verbose'],
+    const result = fixture({ prefixArgs: ['--verbose'],
       target: 'x86_64-unknown-linux-gnu', status, bytes: status === 37 ? 256 * 1024 : 0 });
     assertOriginalFailure(result, status);
     assert.equal(result.log, result.stdout);
@@ -98,16 +96,16 @@ testShell('Linux explicit CLI Debug preserves full output, every product argumen
 });
 testShell('Linux evidence failure cannot make a failed bundler green or start it without a destination', () => {
   for (const status of [0, 37]) {
-    const result = fixture({ source: linuxWrapper, prefixArgs: ['--verbose'], status, teeStatus: 19 });
+    const result = fixture({ prefixArgs: ['--verbose'], status, teeStatus: 19 });
     assert.equal(result.status, status || 19);
     assert.deepEqual(result.calls, [result.expectedArgs]);
   }
   for (const options of [{ missingLog: true }, { unusableLog: true }]) {
-    const result = fixture({ source: linuxWrapper, prefixArgs: ['--verbose'], ...options });
+    const result = fixture({ prefixArgs: ['--verbose'], ...options });
     assert.notEqual(result.status, 0);
     assert.deepEqual(result.calls, []);
   }
-  const failed = fixture({ source: linuxWrapper, prefixArgs: ['--verbose'], missingTauri: true });
+  const failed = fixture({ prefixArgs: ['--verbose'], missingTauri: true });
   assert.notEqual(failed.status, 0);
   assert(failed.log.length > 0);
 });

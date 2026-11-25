@@ -10,8 +10,7 @@
 //!
 //! - `POLARIS_NO_KERNEL_RUN=1`：禁起核。起核用例入口的 `kernel_run_or_skip` 返回 `false`
 //!   并打印一行跳过说明；若设了 `POLARIS_KERNEL_RUN_SKIP_LOG=<文件>`，再往该文件追加一行用例名，
-//!   供 `scripts/gate-rust.sh` 汇总成「跳过 N 个起核用例」（`cargo test` 会吞掉通过用例的 stderr，
-//!   只靠 `eprintln!` 在门输出里看不见 —— 那就成了静默空绿）。
+//!   供本机核对实际跳过的用例（`cargo test` 默认捕获通过用例的 stderr）。
 //!   未设 / `0` / 空串 = 照常起核（CI 的语义）；其它取值当场红，不猜。
 //! - 与 `POLARIS_REQUIRE_KERNEL_GATE=1` 同时设 ⇒ 当场红：「要求内核门必须生效」与「禁起核」
 //!   互斥，放任其一胜出都会造出「要求跑却被跳过」的空跑绿。
@@ -28,7 +27,7 @@
 use std::io::Write;
 use std::process::Command;
 
-/// 禁起核开关（本机 `scripts/gate-rust.sh` 在非 CI 环境 export 为 `1`）。
+/// 本机运行 Cargo 测试时设置为 `1`，跳过起核用例。
 pub const NO_KERNEL_RUN_ENV: &str = "POLARIS_NO_KERNEL_RUN";
 /// 可选：跳过记账文件路径，每跳过一条用例追加一行。
 pub const SKIP_LOG_ENV: &str = "POLARIS_KERNEL_RUN_SKIP_LOG";

@@ -1044,12 +1044,12 @@ jobs:
         uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Pinned CLI 2.12.1 emits bundler child stdout/stderr only at Debug.
-          # This changes logging, not the Cargo arguments or DMG/Finder behavior.
+          # macOS enables bundler child output through the logger. Linux needs
+          # the CLI flag to surface linuxdeploy stdout/stderr.
           TAURI_CLI_VERBOSITY: ${{ runner.os == 'macOS' && '1' || '' }}
           POLARIS_TAURI_LOG: ${{ runner.temp }}/polaris-tauri-${{ matrix.label }}.log
         with:
-          tauriScript: ${{ runner.os == 'macOS' && 'bash scripts/macos-bundler-diagnostics.sh' || runner.os == 'Linux' && 'bash scripts/linux-bundler-diagnostics.sh' || 'tauri' }}
+          tauriScript: ${{ runner.os == 'Linux' && 'bash scripts/bundler-diagnostics.sh --verbose' || runner.os == 'macOS' && 'bash scripts/bundler-diagnostics.sh' || 'tauri' }}
           args: ${{ matrix.tauri_args }}
           retryAttempts: 0
 

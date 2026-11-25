@@ -3,7 +3,7 @@
 //! `check` 只能证明 JSON 可解码；本门还真起核心、真走 SOCKS inbound，并用受控 DNS 与上游
 //! SOCKS 观察器证明 resolve → private reject → route 的运行顺序。危险地址若抵达上游观察器即失败。
 //!
-//! **本机禁起核**：`POLARIS_NO_KERNEL_RUN=1`（本机 `scripts/gate-rust.sh` 自动设）下跳过，覆盖交给 CI。
+//! **本机禁起核**：`POLARIS_NO_KERNEL_RUN=1` 时跳过，覆盖交给 CI。
 
 #[path = "support/core_locator.rs"]
 mod core_locator;

@@ -1567,7 +1567,7 @@ fn statement_span(code: &str, pos: usize) -> (usize, usize) {
 // # 不在本面之内的（显式声明边界，否则「扫到 0 个也叫全绿」）
 //
 // - `#[cfg(target_os = "…")]` / `cfg!(target_os = "…")`：那是**编译期**平台轴，由
-//   `scripts/gate-rust.sh` 的三目标 cross-clippy 守。
+//   Rust CI 的交叉 Clippy 检查。
 //   形态上也区分得开：`cfg` 用的是单个 `=`，不落在本门的分派位判据里。
 // - 测试代码（`production_sources` 已排除）：测试里按平台串分叉是**构造输入**，不是分派点。
 // ═══════════════════════════════════════════════════════════════════════════

@@ -1218,10 +1218,10 @@ const SHARED_PACKAGE_PATHS = new Set([
   // 它挂了整条打包链就编不出 singbox-grpc。2026-08-30 前它不在任何表里 = 同一 fail-open。
   'scripts/fetch-protoc.mjs',
   'scripts/verify-packaging.mjs',
-  // package.yml 的 macOS 腿真跑它（封印前与最终 dmg 开箱各一次，逐个验包内内核与 helper 的签名）；
-  // 它的控制流合同与 NSIS 内核清扫、卸载提权清理两组判据的合同都由 gate-node-test.mjs 执行。
-  'scripts/macos-bundler-diagnostics.sh',
+  // Linux 与 macOS 打包腿共用的 Tauri 原始输出取证。
+  'scripts/bundler-diagnostics.sh',
   'scripts/macos-bundler-diagnostics.test.mjs',
+  // macOS 在封印前和最终 DMG 开箱时分别校验内核与 helper 的签名。
   'scripts/macos-nested-code.sh',
   'scripts/macos-nested-code.test.mjs',
   'scripts/nsis-core-sweep.test.mjs',

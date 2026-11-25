@@ -91,9 +91,7 @@ pub struct MeshExitRoutePlan {
 /// **净效果不是「关掉了一个平台」**：下一个变体接进来时，编译器仍旧在这里强制它显式答题（穷举
 /// `match`）；改的只是它**在答题之前**继承到哪一侧 —— 现在继承的是安全的那一侧。
 ///
-/// 今天的实际代价为零：`Other` 只由 `Platform::current()` 在 macos/windows/android/linux **四个
-/// target 之外**产生，而本仓的构建矩阵里没有第五个 target（`scripts/gate-rust.sh` 的三目标
-/// cross-clippy 与 CI 打包面均止于此）。
+/// `Other` 只由 `Platform::current()` 在受支持的 macOS、Windows、Android、Linux 和 iOS 之外产生。
 pub fn mesh_system_supported_on_platform(platform: Platform) -> bool {
     match platform {
         Platform::Mac | Platform::Linux => true,

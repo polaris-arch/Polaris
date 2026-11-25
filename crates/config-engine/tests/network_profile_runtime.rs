@@ -14,7 +14,7 @@
 //! 核文件无 file capability ⇒ 内核绑 UDP 68 必在发包之前 EACCES（spec K6，`dhcp.go` 先 listen 后发包）。
 //! 不满足：`POLARIS_REQUIRE_KERNEL_GATE=1` 下红，否则跳过。**绝不以 root 身份跑本门。**
 //!
-//! **本机禁起核**：`POLARIS_NO_KERNEL_RUN=1`（本机 `scripts/gate-rust.sh` 自动设）下全部用例跳过，覆盖交给 CI；
+//! **本机禁起核**：`POLARIS_NO_KERNEL_RUN=1` 时全部用例跳过，覆盖交给 CI；
 //! 判定与 `run` 子命令的拼接只在 `support/kernel_run.rs` 一处。
 
 mod support;

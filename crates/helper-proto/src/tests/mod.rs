@@ -162,9 +162,7 @@ fn platform_current_matches_compile_target() {
         assert_eq!(cur, Platform::Android);
     } else if cfg!(target_os = "ios") {
         // iOS 的 `target_os` 是 "ios" 而非 "macos"，与上面 macos 那支互斥。
-        // **本条今天在任何门里都跑不到**：本仓构不出 iOS 产物，`gate-rust.sh` 的三目标
-        // cross-clippy 也不含 apple-ios。它在这里是为了让「current() 缺 ios 分支」这件事至少
-        // 有一处代码写着它该是什么 —— 不是收据，是待兑现的判据。见本批报告「本批未证实」。
+        // iOS 交叉 Clippy 检查编译，本断言需要 iOS 测试运行时执行。
         assert_eq!(cur, Platform::Ios);
     } else if cfg!(target_os = "linux") {
         assert_eq!(cur, Platform::Linux);
