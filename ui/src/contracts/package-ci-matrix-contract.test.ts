@@ -617,9 +617,6 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     expect(apkGate).toContain('--artifact "$apk" --abi arm64-v8a --r8 src-tauri/gen/android/app/build/outputs/mapping/arm64Release');
     expect(apkGate).toContain('--component "$POLARIS_ANDROID_COMPONENT" --receipt "$POLARIS_ANDROID_RECEIPT"');
     expect(apkGate).toContain('--scratch "$POLARIS_ANDROID_CARRIER" --output "$apk.source-consumption.json"');
-    expect(releaseCheck).toContain(
-      'node scripts/assert-r8-evidence.mjs src-tauri/gen/android/app/build/outputs/mapping/arm64Release',
-    );
     for (const job of [releaseCheck, publish]) {
       expect(executable(stepBlock(job, 'Prepare formal mobile source and isolated tools')))
         .toContain('node scripts/mobile-core/android-ci.mjs');

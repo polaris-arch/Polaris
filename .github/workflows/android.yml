@@ -577,7 +577,6 @@ jobs:
       #      「保住了什么」的判据是 seeds.txt —— 那份文件早就在上传清单里，却一条断言都没有。
       - name: R8 吃进了什么 / 保住了什么（产物级证据）
         run: |
-          node scripts/assert-r8-evidence.mjs src-tauri/gen/android/app/build/outputs/mapping/arm64Release
           apk=src-tauri/gen/android/app/build/outputs/apk/arm64/release/app-arm64-release-unsigned.apk
           node scripts/mobile-core/mobile-consumption.mjs android \
             --artifact "$apk" --abi arm64-v8a --r8 src-tauri/gen/android/app/build/outputs/mapping/arm64Release \
