@@ -5138,6 +5138,35 @@ fn linux_dns_failure_publication_preserves_new_generation_and_unretired_identity
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_dns_cache_flush_failure_only_publishes_for_current_running_start() {
+    let (rt, _dir, events) =
+        test_runtime_errors_with_clearer(Box::new(EnableRecordingClearer::default()));
+    let stopped = rt.gate.generation();
+    rt.publish_linux_dns_cache_flush_failure(Some(stopped));
+    assert!(rt.status().error_code.is_none());
+
+    let running = rt.gate.bump_generation();
+    mark_running(&rt);
+    rt.publish_linux_dns_cache_flush_failure(None);
+    rt.publish_linux_dns_cache_flush_failure(Some(stopped));
+    assert!(rt.status().error_code.is_none());
+    assert!(events.lock().unwrap().is_empty());
+
+    rt.publish_linux_dns_cache_flush_failure(Some(running));
+    let status = rt.status();
+    assert!(status.running);
+    assert_eq!(status.pid, 424242);
+    assert_eq!(
+        status.error_code.as_deref(),
+        Some(code::SYSTEM_DNS_TAKEOVER_FAILED)
+    );
+    let events = events.lock().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].1, code::SYSTEM_DNS_TAKEOVER_FAILED);
+}
+
 #[tokio::test]
 async fn linux_dns_disable_requires_confirmed_restore() {
     let (runtime, _directory) = test_runtime();

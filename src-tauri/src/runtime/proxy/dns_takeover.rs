@@ -1339,9 +1339,25 @@ impl ProxyRuntime {
     ///
     /// **真机门**：真刷宿主 DNS 缓存**触碰宿主**（本机 Linux 会真跑 `resolvectl`）——故仅在**真跑 app** 时发生，
     /// 单测也会走 start/stop；测试执行器只记录语义结果，绝不执行宿主命令。
-    pub(super) fn flush_os_dns_cache_best_effort(self: &Arc<Self>, context: &'static str) {
+    pub(super) fn flush_os_dns_cache_best_effort(
+        self: &Arc<Self>,
+        startup_generation: Option<u64>,
+    ) {
         let this = Arc::clone(self);
         tokio::task::spawn_blocking(move || {
+            let platform = Platform::current();
+            let context = if startup_generation.is_some() {
+                "start"
+            } else {
+                "stop"
+            };
+            let log_level = if platform == Platform::Linux {
+                log::Level::Warn
+            } else {
+                log::Level::Info
+            };
+            let mut on_warn =
+                |message: &str| log::log!(log_level, "[dns-flush:{context}] {message}");
             // 特权 helper flush 通道（mac root / win SYSTEM；linux 不经此腿，见 `flush_os_dns_cache`
             // 平台分派）。helper 未装/旧 helper 不认这条命令时该调用回 `ok:false`，由分派腿就地降级。
             let helper_flush = || this.helper.flush_dns();
@@ -1354,23 +1370,34 @@ impl ProxyRuntime {
             let flushed = polaris_system_integration::production_flush_os_dns_cache(
                 Some(&helper_flush),
                 helper_ready,
-                &mut |m| log::info!("[dns-flush:{context}] {m}"),
+                &mut on_warn,
             );
             #[cfg(test)]
             let flushed = polaris_system_integration::dns_flush::flush_os_dns_cache(
-                Platform::current(),
+                platform,
                 &super::tests::TestDnsFlushExec,
                 Some(&helper_flush),
                 helper_ready,
-                &mut |m| log::info!("[dns-flush:{context}] {m}"),
+                &mut on_warn,
             );
-            if Platform::current() == Platform::Linux && !flushed {
-                this.set_nonfatal_error(
-                    "Linux 系统 DNS 缓存刷新失败；旧的失败缓存可能继续影响域名解析",
-                    code::SYSTEM_DNS_TAKEOVER_FAILED,
-                );
+            if platform == Platform::Linux && !flushed {
+                this.publish_linux_dns_cache_flush_failure(startup_generation);
             }
         });
+    }
+
+    pub(super) fn publish_linux_dns_cache_flush_failure(&self, startup_generation: Option<u64>) {
+        let Some(generation) = startup_generation else {
+            // The flush already logged the failure. Checked DNS restoration owns Stop's result.
+            return;
+        };
+        let _publication = self.gate.lock_generation_publication();
+        if self.gate.generation() == generation && self.core_running() {
+            self.set_nonfatal_error(
+                "Linux 系统 DNS 缓存刷新失败；旧的失败缓存可能继续影响域名解析",
+                code::SYSTEM_DNS_TAKEOVER_FAILED,
+            );
+        }
     }
 }
 

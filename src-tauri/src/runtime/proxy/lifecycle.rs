@@ -1681,7 +1681,7 @@ impl ProxyRuntime {
             }
         }
         // C7：停核尾刷 OS DNS 缓存（fire-and-forget，对齐 上游 `flushOsDnsCacheBestEffort('stop')`）。
-        self.flush_os_dns_cache_best_effort("stop");
+        self.flush_os_dns_cache_best_effort(None);
         let retired = {
             let _publication = self.gate.lock_generation_publication();
             if self.gate.generation() == my_gen {

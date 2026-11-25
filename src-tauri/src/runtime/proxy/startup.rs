@@ -3073,7 +3073,7 @@ impl ProxyRuntime {
         let dns_ms = t_dns.elapsed().as_millis();
         log::info!("起核耗时：DNS接管={dns_ms}ms");
         // C7：核就绪尾刷 OS DNS 缓存（fire-and-forget，对齐 上游 `flushOsDnsCacheBestEffort('start')`）。
-        self.flush_os_dns_cache_best_effort("start");
+        self.flush_os_dns_cache_best_effort(Some(my_gen));
         // **#9** 的连接 flush 已挪进 [`after_selector_reasserted`]（selector 校正的续延），不在主链上。
         // 它本身的立意没变（app 早于 TUN 建立、已泄漏成真实 IP 的旧连接若不 RST 会继续走物理网卡直出，
         // 而用户看到的是「已连接」），只是**开枪时机**必须晚于 selector 校正：被 RST 的连接会立刻重连，
