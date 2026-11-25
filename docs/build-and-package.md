@@ -265,7 +265,7 @@ Windows 腿因 NSIS 无 bundle 侧副本，退化为 cargo staging 清点并在�
 - **`ci.yml`** — Rust 门禁，职责 = 「改动是否正确」。三个并行 job：
   - `fmt + clippy (<os>)`：格式与 clippy（`-D warnings`）；Linux 腿另跑 rustdoc 与 Cronet 来源解析。
   - `cross-target clippy + android face`（只在 Linux）：对 Windows / macOS / Android / iOS 四个交叉目标跑
-    clippy，检查 `vendor/` 下随仓第三方副本在这些目标上零诊断，并核对 Android 影响面登记表与交叉豁免表。
+    clippy，并核对 Android 影响面登记表与交叉豁免表。
     带 C 依赖的包在部分目标上被豁免（见 `scripts/cross-target-exempt.json`），它不能代替原生腿。
   - `build + test (<os>)`：`cargo build` 与 `cargo test`。
 

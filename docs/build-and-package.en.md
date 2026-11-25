@@ -258,7 +258,7 @@ The main workflows divide the work (`.github/workflows/`):
 
 - **`ci.yml`** — the Rust gate; its job is "is the change correct". Three parallel jobs:
   - `fmt + clippy (<os>)`: formatting and clippy (`-D warnings`); the Linux leg also runs rustdoc and resolves the Cronet sources.
-  - `cross-target clippy + android face` (Linux only): clippy for the four cross targets (Windows / macOS / Android / iOS), a check that the vendored third-party copies under `vendor/` produce no diagnostics on those targets, and checks of the Android impact registry and the cross-target exemption table. Packages with C dependencies are exempt on some targets (see `scripts/cross-target-exempt.json`), so this job does not replace the native legs.
+  - `cross-target clippy + android face` (Linux only): clippy for the four cross targets (Windows / macOS / Android / iOS), plus checks of the Android impact registry and the cross-target exemption table. Packages with C dependencies are exempt on some targets (see `scripts/cross-target-exempt.json`), so this job does not replace the native legs.
   - `build + test (<os>)`: `cargo build` and `cargo test`.
 
   Triggers and platforms:
