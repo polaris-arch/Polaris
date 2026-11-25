@@ -11,14 +11,14 @@ import { digest } from './desktop-core/source-graph.mjs';
 import { selectedCoreManifest } from './lib/core-identity.mjs';
 
 // `macos-nested-code.sh` 只在 macOS 打包腿上真跑（那里才有 codesign）。这里测的是它的**控制流**：
-// 谁只被校验、谁可以被补签、什么时候必须失败。`file` 与 `codesign` 换成同名桩放在 PATH 最前：
+// 只读校验的分流、日志和失败传播。`file` 与 `codesign` 换成同名桩放在 PATH 最前：
 //   · 桩 `file`：内容以 `MACHO-<arch>` 开头 ⇒ 报对应架构的 Mach-O，否则报文本；
 //   · 桩 `codesign --verify`：内容含 SIGNED ⇒ 0；含 BROKEN ⇒ 1 并报「签名无效」；否则 1 并报
 //     「code object is not signed at all」（真 codesign 对未签名文件的原话）；
-//   · 桩 `codesign --sign`：往文件尾追加 SIGNED（`STUB_SIGN_NOOP=1` 时什么都不做）；
+//   · 桩 `codesign --sign`：往文件尾追加 SIGNED，供只读断言捕捉误改写；
 //   · 桩 `codesign` 把每次调用的全部参数记进 `$STUB_LOG`，一行一次；
-//   · 桩 `node`：正式发布核验需要真实消费过的发布（Go BuildInfo、收据），本文件射程外，桩直接放行；
-//     设了 `STUB_NODE_REAL` 时转交真 node，用于对实际核验入口的反向对照。
+//   · 桩 `node`：提供发布核验的模拟结果。设了 `STUB_NODE_REAL` 时转交真 node，用于核对实际入口拒绝坏清单。
+// `release-consumer.test.mjs` 覆盖正式核验入口的签名判据；本文件的桩不给出真实验签证据。
 // 真 codesign 的行为（linker-signed 签名是否过 `--strict`、`--deep` 是否触碰 Resources）不在本文件射程内。
 const SCRIPT = join(dirname(fileURLToPath(import.meta.url)), 'macos-nested-code.sh');
 const scriptText = readFileSync(SCRIPT, 'utf8');
@@ -52,8 +52,7 @@ case " $* " in
     if grep -q SIGNED "$last"; then exit 0; fi
     if grep -q BROKEN "$last"; then echo "$last: invalid signature (code or signature have been modified)" >&2; exit 1; fi
     echo "$last: code object is not signed at all" >&2; exit 1 ;;
-  *" --display "*) echo "CDHash=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" >&2 ;;
-  *" --sign "*) [ "\${STUB_SIGN_NOOP:-0}" = 1 ] || printf SIGNED >> "$last" ;;
+  *" --sign "*) printf SIGNED >> "$last" ;;
   *) exit 64 ;;
 esac
 `;
@@ -61,6 +60,7 @@ esac
 const STUB_NODE = `#!/bin/sh
 if [ -n "\${STUB_NODE_REAL:-}" ]; then exec "$STUB_NODE_REAL" "$@"; fi
 cat > /dev/null
+if [ -f "$3" ]; then printf '%s\\n' "\${STUB_RELEASE_STATE-signed}"; fi
 `;
 
 const ARM_SIGNED = 'MACHO-arm64 SIGNED';
@@ -114,19 +114,19 @@ const signCalls = (fx) => readFileSync(fx.log, 'utf8').split('\n').filter((line)
  *   · 包内内核与源内核的字节都没变；
  *   · 没有任何一次签名类调用的参数里出现内核路径。
  */
-function run(fx, mode, env = {}, shell = 'bash') {
+function run(fx, env = {}, shell = 'bash') {
   const coreBefore = existsSync(join(fx.core, 'sing-box')) ? readFileSync(join(fx.core, 'sing-box'), 'utf8') : null;
   const refBefore = readFileSync(fx.ref, 'utf8');
-  const result = spawnSync(shell, [SCRIPT, mode, fx.app, fx.ref], {
+  const result = spawnSync(shell, [SCRIPT, fx.app, fx.ref], {
     encoding: 'utf8',
     env: { ...process.env, ...env, STUB_LOG: fx.log, PATH: `${fx.bin}${delimiter}${process.env.PATH}` },
   });
   if (coreBefore !== null) {
-    assert.equal(readFileSync(join(fx.core, 'sing-box'), 'utf8'), coreBefore, `${mode}: 包内内核字节被改写`);
+    assert.equal(readFileSync(join(fx.core, 'sing-box'), 'utf8'), coreBefore, '包内内核字节被改写');
   }
-  assert.equal(readFileSync(fx.ref, 'utf8'), refBefore, `${mode}: 源内核字节被改写`);
+  assert.equal(readFileSync(fx.ref, 'utf8'), refBefore, '源内核字节被改写');
   const touched = signCalls(fx).filter((line) => line.includes('sing-box') || line.includes('source-core'));
-  assert.deepEqual(touched, [], `${mode}: 签名命令碰了内核`);
+  assert.deepEqual(touched, [], '签名命令碰了内核');
   return result;
 }
 
@@ -139,40 +139,25 @@ function withFixture(files, options, body) {
   }
 }
 
-test('seal：冻结的 helper/core 只读验签，不发签名命令', behaviour, () => {
-  withFixture({ 'sing-box': ARM_SIGNED, 'polaris-helper': ARM_SIGNED, 'notes.txt': 'plain' }, {}, (fx) => {
-    const before = snapshot(fx.core), result = run(fx, 'seal');
-    assert.equal(result.status, 0, result.stderr);
-    assert.deepEqual(snapshot(fx.core), before);
-    assert.deepEqual(signCalls(fx), []);
-    assert.match(result.stdout, /本次补签 0 份/);
-  });
-  withFixture({ 'sing-box': ARM_SIGNED, 'polaris-helper': ARM_BARE }, {}, (fx) => {
-    const before = snapshot(fx.core), result = run(fx, 'seal');
-    assert.equal(result.status, 1);
-    assert.deepEqual(snapshot(fx.core), before);
-    assert.deepEqual(signCalls(fx), []);
-  });
-});
-
 test('actual nested-code entry rejects malformed explicit release selection', behaviour, () => {
   withFixture({ 'sing-box': ARM_SIGNED, 'polaris-helper': ARM_SIGNED }, {}, (fx) => {
     const real = { STUB_NODE_REAL: process.execPath };
     writeFileSync(join(fx.root, 'src-tauri/core-manifest.json'), JSON.stringify({ desktopRelease: null }));
-    const rejected = run(fx, 'verify', real);
+    const rejected = run(fx, real);
     assert.notEqual(rejected.status, 0); assert.match(rejected.stderr, /[Ee]xplicit|selection|contract/);
+    assert.match(rejected.stderr, /包内内核未通过发布核验/);
     assert.deepEqual(signCalls(fx), []);
     rmSync(join(fx.root, 'src-tauri/core-manifest.json'));
-    const missing = run(fx, 'verify', real);
+    const missing = run(fx, real);
     assert.notEqual(missing.status, 0); assert.match(missing.stderr, /core-manifest\.json/);
     assert.deepEqual(signCalls(fx), []);
   });
 });
 
-test('seal/verify：所有架构 helper 未签或损坏均拒绝且不补签', behaviour, () => {
+test('所有架构 helper 未签或损坏均拒绝且不补签', behaviour, () => {
   for (const helper of [X64_BARE, ARM_BARE, FAT_BARE, X64_BROKEN, ARM_BROKEN]) {
-    for (const mode of ['seal', 'verify']) withFixture({ 'sing-box': ARM_SIGNED, 'polaris-helper': helper }, {}, (fx) => {
-      const before = snapshot(fx.core), result = run(fx, mode);
+    withFixture({ 'sing-box': ARM_SIGNED, 'polaris-helper': helper }, {}, (fx) => {
+      const before = snapshot(fx.core), result = run(fx);
       assert.equal(result.status, 1, result.stdout);
       assert.match(result.stderr, /helper.*签名必须在 App 编译前完成/);
       assert.deepEqual(snapshot(fx.core), before);
@@ -181,111 +166,65 @@ test('seal/verify：所有架构 helper 未签或损坏均拒绝且不补签', b
   }
 });
 
-test('seal：arm64 内核没有签名或签名无效必须失败，且不补签（一次签名命令都不发）', behaviour, () => {
-  for (const [core, why] of [[ARM_BARE, /内核没有签名/], [ARM_BROKEN, /内核带有无效签名/], [FAT_BARE, /内核没有签名/]]) {
-    withFixture({ 'sing-box': core, 'polaris-helper': ARM_SIGNED }, {}, (fx) => {
-      const result = run(fx, 'seal');
-      assert.equal(result.status, 1, `${core}: ${result.stdout}`);
-      assert.match(result.stderr, why);
-      assert.match(result.stderr, /应在内核发布产物那一步签名.*fetch-core 收据/);
-      assert.deepEqual(signCalls(fx), []);
-      assert.equal(readFileSync(join(fx.core, 'sing-box'), 'utf8'), core);
-    });
-  }
-});
+test('发布核验返回未签名状态时记录 Intel notice 和计数，缺少状态时拒绝', behaviour, () => {
+  withFixture({ 'sing-box': X64_BARE, 'polaris-helper': X64_SIGNED }, {}, (fx) => {
+    const result = run(fx, { STUB_RELEASE_STATE: 'unsigned' });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /::notice::.*没有签名的 x86_64 内核，按原字节放行/);
+    assert.match(result.stdout, /未签名的 x86_64 1 份/);
+    assert.deepEqual(signCalls(fx), []);
 
-test('纯 x86_64 内核没有签名时放行并留一条 notice；签名无效仍失败', behaviour, () => {
-  for (const mode of ['seal', 'verify']) {
-    withFixture({ 'sing-box': X64_BARE, 'polaris-helper': X64_SIGNED }, {}, (fx) => {
-      const result = run(fx, mode);
-      assert.equal(result.status, 0, result.stderr);
-      assert.match(result.stdout, /::notice::.*没有签名的 x86_64 内核，按原字节放行/);
-      assert.match(result.stdout, /未签名的 x86_64 1 份/);
-      assert.deepEqual(signCalls(fx), []);
-    });
-    withFixture({ 'sing-box': X64_BROKEN, 'polaris-helper': X64_SIGNED }, {}, (fx) => {
-      const result = run(fx, mode);
-      assert.equal(result.status, 1);
-      assert.match(result.stderr, /内核带有无效签名/);
-      assert.deepEqual(signCalls(fx), []);
-    });
-  }
+    const missing = run(fx, { STUB_RELEASE_STATE: '' });
+    assert.equal(missing.status, 1);
+    assert.match(missing.stderr, /包内内核缺少已核验的签名状态/);
+    assert.doesNotMatch(missing.stdout, /::notice::/);
+  });
 });
 
 test('包内内核与源内核字节不同必须失败（签名有效也不行）', behaviour, () => {
-  for (const mode of ['seal', 'verify']) {
-    withFixture({ 'sing-box': `${ARM_SIGNED} resigned`, 'polaris-helper': ARM_SIGNED }, { ref: ARM_SIGNED }, (fx) => {
-      const result = run(fx, mode);
-      assert.equal(result.status, 1, result.stdout);
-      assert.match(result.stderr, /包内内核与源内核字节不同/);
-      assert.deepEqual(signCalls(fx), []);
-    });
-  }
+  withFixture({ 'sing-box': `${ARM_SIGNED} resigned`, 'polaris-helper': ARM_SIGNED }, { ref: ARM_SIGNED }, (fx) => {
+    const result = run(fx);
+    assert.equal(result.status, 1, result.stdout);
+    assert.match(result.stderr, /包内内核与源内核字节不同/);
+    assert.deepEqual(signCalls(fx), []);
+  });
 });
 
-test('verify：全部有效时通过，不改任何字节，不发任何签名命令', behaviour, () => {
+test('全部核验通过时保留原字节，helper 仍在本地逐个验签', behaviour, () => {
   withFixture({ 'sing-box': ARM_SIGNED, 'polaris-helper': ARM_SIGNED, 'notes.txt': 'plain' }, {}, (fx) => {
     const before = snapshot(fx.core);
-    const result = run(fx, 'verify');
+    const result = run(fx);
     assert.equal(result.status, 0, result.stderr);
     assert.deepEqual(snapshot(fx.core), before);
     assert.deepEqual(signCalls(fx), []);
     assert.doesNotMatch(result.stdout, /::warning::|::notice::/);
-    // 反向对照：桩确实被调到了（否则「没有签名命令」只是因为桩根本没在 PATH 上）。
-    assert.match(readFileSync(fx.log, 'utf8'), /--verify --strict .*sing-box/);
-  });
-});
-
-test('verify：内核或 helper 验不过都必须失败，且只读（不补签、不改字节）', behaviour, () => {
-  for (const [files, why] of [
-    [{ 'sing-box': ARM_BARE, 'polaris-helper': ARM_SIGNED }, /内核没有签名/],
-    [{ 'sing-box': ARM_SIGNED, 'polaris-helper': ARM_BARE }, /helper.*签名必须在 App 编译前完成/],
-    [{ 'sing-box': ARM_SIGNED, 'polaris-helper': ARM_BROKEN }, /helper.*签名必须在 App 编译前完成/],
-  ]) {
-    withFixture(files, {}, (fx) => {
-      const before = snapshot(fx.core);
-      const result = run(fx, 'verify');
-      assert.equal(result.status, 1, result.stdout);
-      assert.match(result.stderr, why);
-      assert.deepEqual(snapshot(fx.core), before);
-      assert.deepEqual(signCalls(fx), []);
-    });
-  }
-});
-
-test('seal：签名桩可返回0也不能使未签 helper 进入补签路径', behaviour, () => {
-  withFixture({ 'sing-box': ARM_SIGNED, 'polaris-helper': ARM_BARE }, {}, (fx) => {
-    const result = run(fx, 'seal', { STUB_SIGN_NOOP: '1' });
-    assert.equal(result.status, 1);
-    assert.match(result.stderr, /helper.*签名必须在 App 编译前完成/);
+    const calls = readFileSync(fx.log, 'utf8');
+    assert.match(calls, /--verify --strict .*polaris-helper/);
+    assert.doesNotMatch(calls, /sing-box/);
   });
 });
 
 test('未登记的 Mach-O 验不过即失败，不替它补签', behaviour, () => {
-  for (const mode of ['seal', 'verify']) {
-    withFixture({ 'sing-box': ARM_SIGNED, 'polaris-helper': ARM_SIGNED, 'stray-tool': ARM_BARE }, {}, (fx) => {
-      const result = run(fx, mode);
-      assert.equal(result.status, 1, result.stdout);
-      assert.match(result.stderr, /未登记的 Mach-O 没有有效签名：.*stray-tool/);
-      assert.equal(readFileSync(join(fx.core, 'stray-tool'), 'utf8'), ARM_BARE);
-      assert.deepEqual(signCalls(fx), []);
-    });
-  }
+  withFixture({ 'sing-box': ARM_SIGNED, 'polaris-helper': ARM_SIGNED, 'stray-tool': ARM_BARE }, {}, (fx) => {
+    const result = run(fx);
+    assert.equal(result.status, 1, result.stdout);
+    assert.match(result.stderr, /未登记的 Mach-O 没有有效签名：.*stray-tool/);
+    assert.equal(readFileSync(join(fx.core, 'stray-tool'), 'utf8'), ARM_BARE);
+    assert.deepEqual(signCalls(fx), []);
+  });
 });
 
-test('两种模式：两个必需 Mach-O 少一个必须失败（一个都没验 ≠ 全部通过）', behaviour, () => {
-  for (const mode of ['seal', 'verify']) {
-    for (const [files, need] of [
-      [{ 'polaris-helper': ARM_SIGNED }, 'sing-box'],
-      [{ 'sing-box': 'SIGNED but plain text', 'polaris-helper': ARM_SIGNED }, 'sing-box'],
-      [{ 'sing-box': ARM_SIGNED }, 'polaris-helper'],
-    ]) {
-      withFixture(files, {}, (fx) => {
-        const result = run(fx, mode);
-        assert.equal(result.status, 1, `${mode}: 缺 ${need} 应失败`);
-        assert.match(result.stderr, new RegExp(`没有扫到 Mach-O「${need}」`));
-      });
-    }
+test('两个必需 Mach-O 少一个必须失败', behaviour, () => {
+  for (const [files, need] of [
+    [{ 'polaris-helper': ARM_SIGNED }, 'sing-box'],
+    [{ 'sing-box': 'SIGNED but plain text', 'polaris-helper': ARM_SIGNED }, 'sing-box'],
+    [{ 'sing-box': ARM_SIGNED }, 'polaris-helper'],
+  ]) {
+    withFixture(files, {}, (fx) => {
+      const result = run(fx);
+      assert.equal(result.status, 1, `缺 ${need} 应失败`);
+      assert.match(result.stderr, new RegExp(`没有扫到 Mach-O「${need}」`));
+    });
   }
 });
 
@@ -294,7 +233,7 @@ test('符号链接不被跟随：指向包外的 sing-box 链接不算包内内�
     const outside = join(fx.root, 'outside-core');
     writeFileSync(outside, ARM_BARE);
     symlinkSync(outside, join(fx.core, 'sing-box'));
-    const result = run(fx, 'seal');
+    const result = run(fx);
     assert.equal(result.status, 1, result.stdout);
     assert.match(result.stderr, /没有扫到 Mach-O「sing-box」/);
     assert.equal(readFileSync(outside, 'utf8'), ARM_BARE);
@@ -309,13 +248,15 @@ test('参数不对、缺源内核、缺工具时拒绝执行（rc=2），而不�
       env: { ...process.env, STUB_LOG: fx.log, PATH: `${fx.bin}${delimiter}${process.env.PATH}`, ...env },
     });
     assert.equal(call(['check', fx.app, fx.ref]).status, 2);
-    assert.equal(call(['verify', join(fx.root, 'nope.app'), fx.ref]).status, 2);
-    const noRef = call(['verify', fx.app]);
+    assert.equal(call([join(fx.root, 'nope.app'), fx.ref]).status, 2);
+    const noRef = call([fx.app]);
     assert.equal(noRef.status, 2);
-    assert.match(noRef.stderr, /第三个参数必须是源内核文件/);
-    assert.equal(call(['verify', fx.app, join(fx.root, 'missing-core')]).status, 2);
+    assert.match(noRef.stderr, /用法 macos-nested-code.sh <App.app> <源内核文件>/);
+    const missingRef = call([fx.app, join(fx.root, 'missing-core')]);
+    assert.equal(missingRef.status, 2);
+    assert.match(missingRef.stderr, /第二个参数必须是源内核文件/);
     // 正向对照：同一套参数在工具齐全时是通过的，下面那次 rc=2 才能归因到「缺 codesign」。
-    assert.equal(call(['verify', fx.app, fx.ref]).status, 0);
+    assert.equal(call([fx.app, fx.ref]).status, 0);
 
     // PATH 里只留脚本需要的其它工具，唯独没有 codesign。
     const lean = join(fx.root, 'lean-bin');
@@ -327,7 +268,7 @@ test('参数不对、缺源内核、缺工具时拒绝执行（rc=2），而不�
     }
     writeFileSync(join(lean, 'file'), STUB_FILE);
     chmodSync(join(lean, 'file'), 0o755);
-    const noTool = call(['verify', fx.app, fx.ref], { PATH: lean });
+    const noTool = call([fx.app, fx.ref], { PATH: lean });
     assert.equal(noTool.status, 2, noTool.stderr);
     assert.match(noTool.stderr, /找不到命令 codesign/);
   });
@@ -335,15 +276,6 @@ test('参数不对、缺源内核、缺工具时拒绝执行（rc=2），而不�
 
 // ── 以下两条不起进程，三平台都跑 ──
 
-/** 取顶层函数 `name() { … }` 的本体行（到行首的 `}` 为止）。 */
-function functionBody(name) {
-  const lines = scriptText.split(/\r?\n/);
-  const start = lines.indexOf(`${name}() {`);
-  assert.ok(start >= 0, `脚本里没有函数 ${name}`);
-  const end = lines.indexOf('}', start);
-  assert.ok(end > start, `函数 ${name} 未闭合`);
-  return lines.slice(start + 1, end);
-}
 const codeLines = (lines) => lines.filter((line) => !/^\s*#/.test(line));
 
 test('源码面：helper/core 路径均无签名或载荷改写命令', () => {
@@ -354,17 +286,6 @@ test('源码面：helper/core 路径均无签名或载荷改写命令', () => {
 
   const mutating = all.filter((line) => MUTATING.test(line)).map((line) => line.trim());
   assert.deepEqual(mutating, [], '载荷路径禁止包后補签或改写');
-
-  for (const name of ['check_core', 'check_helper', 'sig_state']) {
-    const body = codeLines(functionBody(name));
-    assert.ok(body.length > 2, `${name} 的本体取空了`);
-    assert.deepEqual(body.filter((line) => MUTATING.test(line)), [], `${name} 里出现改写命令`);
-  }
-  assert.ok(codeLines(functionBody('check_core')).some((line) => line.includes('cmp -s "$f" "$core_ref"')));
-  // 内核只经 check_core：分流点里 `sing-box)` 分支的第一条命令就是它。
-  const branch = all.findIndex((line) => line.trim() === 'sing-box)');
-  assert.ok(branch >= 0, '找不到内核分流分支');
-  assert.equal(all[branch + 1].trim(), 'check_core "$f" "$kind" "$rel"');
 });
 
 // ── bash 3.2 ──
@@ -383,7 +304,7 @@ const localBash = hasBash ? versionOf('bash') : null;
 const bash32 = posix ? ['/bin/bash', process.env.POLARIS_BASH32].find((shell) => shell && versionOf(shell) === '3.2') ?? null : null;
 
 test(
-  'bash 3.2 真跑：seal 与 verify 在 3.2 二进制上给出与默认 bash 相同的结论',
+  'bash 3.2 真跑：只读校验在 3.2 二进制上给出通过和拒绝结论',
   {
     skip: bash32
       ? false
@@ -391,16 +312,14 @@ test(
   },
   () => {
     withFixture({ 'sing-box': ARM_SIGNED, 'polaris-helper': ARM_SIGNED, 'notes.txt': 'plain' }, {}, (fx) => {
-      const sealed = run(fx, 'seal', {}, bash32);
-      assert.equal(sealed.status, 0, sealed.stderr);
-      assert.match(sealed.stdout, /内核 1 份与源内核逐字节相同.*本次补签 0 份/);
-      const verified = run(fx, 'verify', {}, bash32);
+      const verified = run(fx, {}, bash32);
       assert.equal(verified.status, 0, verified.stderr);
+      assert.match(verified.stdout, /内核 1 份与源内核逐字节相同/);
     });
-    withFixture({ 'sing-box': ARM_BARE, 'polaris-helper': ARM_SIGNED }, {}, (fx) => {
-      const result = run(fx, 'seal', {}, bash32);
+    withFixture({ 'sing-box': ARM_SIGNED, 'polaris-helper': ARM_BARE }, {}, (fx) => {
+      const result = run(fx, {}, bash32);
       assert.equal(result.status, 1, result.stdout);
-      assert.match(result.stderr, /内核没有签名/);
+      assert.match(result.stderr, /helper.*签名必须在 App 编译前完成/);
     });
   }
 );
@@ -440,7 +359,7 @@ test('bash 3.2 兼容的静态面：bash -n 通过，bash 4+ 才有的写法对�
     assert.deepEqual(all.filter((line) => pattern.test(line)), [], `用了 bash 4+ 才有的 ${what}`);
   }
   // 脚本里实际用到的 3.2 写法不该被上表误伤（表写得过宽时红在这里）。
-  for (const used of ['while IFS= read -r -d \'\' f; do', '  rel="${f:$((app_len + 1))}"', '  base="${f##*/}"', '  local f="$1" kind="$2" rel="$3"', '  exit "${2:-1}"']) {
+  for (const used of ['while IFS= read -r -d \'\' f; do', '  rel="${f:$((app_len + 1))}"', '  base="${f##*/}"', '  local f="$1" rel="$2"', '  exit "${2:-1}"']) {
     assert.ok(scriptText.includes(used), `脚本里找不到 ${used}`);
     assert.deepEqual(BASH4_ONLY.filter(([pattern]) => pattern.test(used)).map(([, what]) => what), [], used);
   }
@@ -462,22 +381,21 @@ test('bash 3.2 兼容的静态面：bash -n 通过，bash 4+ 才有的写法对�
 // 它不关掉任何 4+ 的语法，所以这条说明的是「脚本的结论不依赖那几项行为」，不是「脚本在 3.2 上能跑」。
 const compat32 = hasBash && spawnSync('bash', ['-c', 'shopt -q compat32'], { env: { ...process.env, BASH_COMPAT: '3.2' } }).status === 0;
 test(
-  'BASH_COMPAT=3.2 下 seal / verify 的结论与默认一致（只切换 bash 文档列出的兼容行为）',
+  'BASH_COMPAT=3.2 下只读校验的结论与默认一致（只切换 bash 文档列出的兼容行为）',
   { skip: compat32 ? false : hasBash ? `本机 bash ${localBash} 不接受 BASH_COMPAT=3.2` : behaviour.skip },
   () => {
     // 反向对照：不设该变量时 compat32 是关的，上面的探测不是恒真。
     assert.notEqual(spawnSync('bash', ['-c', 'shopt -q compat32'], { env: { ...process.env, BASH_COMPAT: '' } }).status, 0);
     for (const env of [{}, { BASH_COMPAT: '3.2' }]) {
       withFixture({ 'sing-box': X64_BARE, 'polaris-helper': X64_SIGNED, 'notes.txt': 'plain' }, {}, (fx) => {
-        const sealed = run(fx, 'seal', env);
-        assert.equal(sealed.status, 0, sealed.stderr);
-        assert.match(sealed.stdout, /未签名的 x86_64 1 份.*本次补签 0 份/);
-        assert.equal(run(fx, 'verify', env).status, 0);
+        const result = run(fx, { ...env, STUB_RELEASE_STATE: 'unsigned' });
+        assert.equal(result.status, 0, result.stderr);
+        assert.match(result.stdout, /未签名的 x86_64 1 份/);
       });
-      withFixture({ 'sing-box': ARM_BROKEN, 'polaris-helper': ARM_SIGNED }, {}, (fx) => {
-        const result = run(fx, 'verify', env);
+      withFixture({ 'sing-box': ARM_SIGNED, 'polaris-helper': ARM_BROKEN }, {}, (fx) => {
+        const result = run(fx, env);
         assert.equal(result.status, 1, result.stdout);
-        assert.match(result.stderr, /内核带有无效签名/);
+        assert.match(result.stderr, /helper.*签名必须在 App 编译前完成/);
       });
     }
   }

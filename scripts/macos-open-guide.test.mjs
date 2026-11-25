@@ -132,7 +132,8 @@ function runGuideStep(name, options = {}) {
     writeFileSync(join(root, 'packaging/macos-dmg-open-guide.txt'), guide);
     mkdirSync(join(root, 'scripts'));
     const nested = join(root, 'scripts/macos-nested-code.sh');
-    writeFileSync(nested, 'printf "nested:%s\\n" "$1" >> "$STUB_LOG"\n[ "${STUB_NESTED_FAIL:-0}" = 0 ]\n');
+    writeFileSync(nested, '[ "$#" -eq 2 ] && [ -d "$1" ] &&\n'
+      + 'printf "nested:%s\\n" "$2" >> "$STUB_LOG" && [ "${STUB_NESTED_FAIL:-0}" = 0 ]\n');
     chmodSync(nested, 0o700);
     const log = join(root, 'calls.log');
     writeFileSync(log, '');
@@ -172,9 +173,16 @@ test('successful guide shell steps keep positioning, seal/strict verification an
     const result = runGuideStep(name);
     assert.equal(result.status, 0, result.stderr);
     assertOwnMountCleanup(result);
-    assert.ok(result.calls.includes(`nested:${name === guideSteps[0] ? 'seal' : 'verify'}`));
-    assert.ok(result.calls.some((line) => line.startsWith('codesign:') && line.includes('--verify --deep --strict')));
-    if (name === guideSteps[0]) assert.equal(result.calls.at(-1), 'convert:UDZO');
+    const nested = result.calls.indexOf('nested:resources/mac-arm64/sing-box');
+    const strict = result.calls.findIndex((line) => line.startsWith('codesign:--verify --deep --strict'));
+    assert.ok(nested >= 0 && strict >= 0);
+    if (name === guideSteps[0]) {
+      const seal = result.calls.findIndex((line) => line.startsWith('codesign:--force --deep --sign'));
+      assert.ok(nested < seal && seal < strict);
+      assert.equal(result.calls.at(-1), 'convert:UDZO');
+    } else {
+      assert.ok(strict < nested);
+    }
   }
 });
 

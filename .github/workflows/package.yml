@@ -1354,7 +1354,8 @@ jobs:
             #   · 内核只校验、绝不改写 —— 必须与本次取用的源内核逐字节相同，且签名有效（没有签名的
             #     纯 x86_64 内核放行并留 notice）；验不过即失败，不在打包时补签；
             #   · helper 在 App 编译前签名并冻结哈希；包内必须与这一份原字节相同。
-            bash scripts/macos-nested-code.sh seal "${apps[0]}" "$core_ref"
+            echo "Checking nested code before bundle seal: $(basename "$dmg")"
+            bash scripts/macos-nested-code.sh "${apps[0]}" "$core_ref"
             codesign --force --deep --sign - --timestamp=none "${apps[0]}"
             codesign --verify --deep --strict --verbose=2 "${apps[0]}"
             detach_retry "$mnt"
@@ -1423,11 +1424,12 @@ jobs:
               echo "::error::$(basename "$dmg") 内 app 未通过最终 bundle seal 严格校验"
               exit 1
             fi
-            # 最终只读镜像里的内核与 helper 逐个判定（verify 模式不改任何字节）。bundle 级校验通过
+            # 最终只读镜像里的内核与 helper 再逐个判定。bundle 级校验通过
             # 不等于这两个文件自身有有效签名，而 arm64 上内核签名无效 = 一执行就被系统终止。
             # 同一步还断言镜像里的内核与源内核逐字节相同：上一步的 bundle 封印与 dmg 往返转换都排在
             # 封印前那次判定之后，只有这里看得到它们有没有改写内核。
-            if ! bash scripts/macos-nested-code.sh verify "${apps[0]}" "$core_ref"; then
+            echo "Checking nested code in final DMG: $(basename "$dmg")"
+            if ! bash scripts/macos-nested-code.sh "${apps[0]}" "$core_ref"; then
               echo "::error::$(basename "$dmg") 内 Contents/Resources 下的内核/helper 未通过逐个判定"
               exit 1
             fi

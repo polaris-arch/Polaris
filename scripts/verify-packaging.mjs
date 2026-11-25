@@ -1505,30 +1505,17 @@ function checkMacOpenGuide() {
   if (verifyCount !== 2) {
     fail(`package.yml 的 app strict verify 应恰好 2 次（封印后 + 最终 dmg 开箱），实为 ${verifyCount} 次`);
   }
-  // 内核与 helper 在 Contents/Resources 下，bundle 封印不替它们各自的签名作证 ⇒ 逐个判定必须
-  // 两处都在：封印前（seal：内核只校验，helper 可补签）与最终 dmg 开箱（verify，只读）。seal 必须排在
-  // bundle 封印之前 —— 反过来的话 helper 补签改掉的字节会让刚封好的资源哈希失配。两处都必须把本腿的
-  // 源内核交给脚本：脚本据此断言包内内核与它逐字节相同（打包链没有改写内核）。脚本本体的控制流由
-  // `macos-nested-code.test.mjs` 持有。
+  // 内核与 helper 在 Contents/Resources 下，bundle 封印不替它们各自的签名作证。
+  // 封印前和最终 dmg 开箱各做一次只读判定，都必须传入本腿的源内核以核对字节。
   const CORE_REF = 'core_ref="resources/${{ matrix.mac_arch_tag }}/sing-box"';
-  const NESTED_SEAL = 'bash scripts/macos-nested-code.sh seal "${apps[0]}" "$core_ref"';
-  const NESTED_VERIFY = 'if ! bash scripts/macos-nested-code.sh verify "${apps[0]}" "$core_ref"; then';
+  const NESTED_CHECK = 'bash scripts/macos-nested-code.sh "${apps[0]}" "$core_ref"';
   const nestedCalls = pkg.split('scripts/macos-nested-code.sh').length - 1;
-  const nestedSealCount = pkg.split(NESTED_SEAL).length - 1;
-  const nestedVerifyCount = pkg.split(NESTED_VERIFY).length - 1;
-  if (nestedSealCount !== 1) {
-    fail(`package.yml 封印前的内核/helper 逐个判定（seal，带源内核）应恰好 1 次，实为 ${nestedSealCount} 次`);
-  } else if (signCount === 1 && pkg.indexOf(NESTED_SEAL) > pkg.indexOf(SIGN)) {
-    fail('package.yml 的内核/helper 逐个判定（seal）排在 bundle 封印之后 —— helper 补签会让已封的资源哈希失配');
-  }
-  if (nestedVerifyCount !== 1) {
-    fail(`package.yml 最终 dmg 开箱的内核/helper 逐个判定（verify，带源内核）应恰好 1 次，实为 ${nestedVerifyCount} 次`);
-  } else if (signCount === 1 && pkg.indexOf(NESTED_VERIFY) < pkg.indexOf(SIGN)) {
-    fail('package.yml 的内核/helper 逐个判定（verify）排在 bundle 封印之前 —— 它验的不是最终产物');
-  }
-  // 不带源内核的第三种调用形态会绕开「逐字节相同」那条断言。
-  if (nestedCalls !== 2) {
-    fail(`package.yml 对 macos-nested-code.sh 的调用应恰好 2 处（seal + verify），实为 ${nestedCalls} 处`);
+  const beforeSeal = pkg.indexOf(`${NESTED_CHECK}\n`);
+  const finalOpen = pkg.indexOf(`if ! ${NESTED_CHECK}; then`);
+  if (nestedCalls !== 2 || beforeSeal < 0 || finalOpen < 0) {
+    fail('package.yml 应在封印前与最终 dmg 开箱各调用一次 macos-nested-code.sh，并传入源内核');
+  } else if (signCount === 1 && (beforeSeal > pkg.indexOf(SIGN) || finalOpen < pkg.indexOf(SIGN))) {
+    fail('package.yml 的内核/helper 逐个判定必须分别在 bundle 封印前与最终 dmg 开箱时执行');
   }
   const coreRefCount = pkg.split(CORE_REF).length - 1;
   if (coreRefCount !== 2) {
