@@ -98,7 +98,9 @@ jobs:
         run: |
           set -euo pipefail
           toolchain="$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml)"
-          rustup toolchain install "$toolchain" --profile minimal --no-self-update
+          # Install the workspace components before the Node fixtures invoke rustc in parallel.
+          rustup toolchain install "$toolchain" --profile minimal \
+            --component rustfmt --component clippy --no-self-update
 
       - name: Install SquashFS fixture tools
         run: |
