@@ -690,10 +690,6 @@ export const ANDROID_IMPACT_SCOPES = Object.freeze({
   'scripts/mobile-core/': {
     why: 'Formal zero-overlay mobile source, SDK producer, native-input/cache and final-carrier predicates feed the actual Android APK leg; host source tests also cover Apple binding/link controls.',
   },
-  'scripts/build-mobile-core.sh': {
-    why: 'The explicit formal component entry uses fixed source/tools/reservation slots and must reach the Android packaging/source checks.',
-  },
-
   'scripts/build-android-apk.sh': {
     why: '标准 Android 构建入口统一 Rust NDK 并驱动一次 Tauri/Gradle 构建；改坏它会让 APK 腿跳过或混用工具链。',
   },
@@ -1214,7 +1210,7 @@ const SHARED_PACKAGE_PATHS = new Set([
   'THIRD-PARTY-LICENSES.md',
   'scripts/mobile-core/source-contract.json',
   'scripts/classify-ci-impact.mjs',
-  'scripts/gate-node-test.sh',
+  'scripts/gate-node-test.mjs',
   'scripts/assert-pc-runtime-release.mjs',
   'scripts/assert-pc-runtime-release.test.mjs',
   'scripts/fetch-dashboard.mjs',
@@ -1223,7 +1219,7 @@ const SHARED_PACKAGE_PATHS = new Set([
   'scripts/fetch-protoc.mjs',
   'scripts/verify-packaging.mjs',
   // package.yml 的 macOS 腿真跑它（封印前与最终 dmg 开箱各一次，逐个验包内内核与 helper 的签名）；
-  // 它的控制流合同与 NSIS 内核清扫、卸载提权清理两组判据的合同都由 gate-node-test.sh 执行。
+  // 它的控制流合同与 NSIS 内核清扫、卸载提权清理两组判据的合同都由 gate-node-test.mjs 执行。
   'scripts/macos-bundler-diagnostics.sh',
   'scripts/macos-bundler-diagnostics.test.mjs',
   'scripts/macos-nested-code.sh',
@@ -1404,7 +1400,7 @@ export function classifyNativeImpact(rawDiff) {
     const path = fields[i + 1];
     if (!row || row[1] === row[2] || [row[1], row[2]].some((oid) => /^0+$/.test(oid)))
       return full('not-existing-regular-file-content-only');
-    // Match the visible, first-level gate-node-test.sh glob without normalizing
+    // Match the visible, first-level gate-node-test.mjs glob without normalizing
     // a malformed raw Git path into a different, apparently safe path.
     if (!/^scripts\/[a-z0-9][a-z0-9.-]*\.test\.mjs$/.test(path)) return full('not-node-test-only');
     paths.push(path);

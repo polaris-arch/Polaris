@@ -22,7 +22,7 @@
  *    而这期间 `unzip -t` 全绿、装得上、跑得起来，① 与 ③ 两条判据一条都不会说话：
  *    它们只问「该在的成员在不在、内容对不对」，不问「包本身是不是有一半是垃圾」。
  *
- * ③ **构建 tag 掉了**：`libbox.aar` 由 `scripts/build-mobile-core.sh android` 现场构建；已知坑：
+ * ③ **构建 tag 掉了**：`libbox.aar` 由 `node scripts/mobile-core/producer.mjs android` 现场构建；已知坑：
  *    「NDK 27 链 cronet 的预编译 .a 会报 unknown relocation ⇒ **不能靠摘掉 with_naive_outbound 绕过**」。
  *    摘掉之后一切照常：aar 出得来、APK 打得出、CI 全绿，只有真机上 naive/H3 节点静默连不上。
  *    判据形状沿用原 aar 开箱验（四 ABI + cronet/naive 计数），
@@ -898,7 +898,7 @@ function debugOwnerHint(lib) {
     return '本仓 Rust 侧：`.cargo/config.toml` 的 `[target.*-linux-android*] rustflags = ["-C", "strip=debuginfo"]` 四段是否被删/改';
   }
   if (lib === 'libbox.so') {
-    return 'sing-box 内核侧：`scripts/build-mobile-core.sh android`（scripts/mobile-core）的 gomobile/Go 链接期参数（这份不经 rustc，与上面那四段无关）';
+    return 'sing-box 内核侧：`node scripts/mobile-core/producer.mjs android`（scripts/mobile-core）的 gomobile/Go 链接期参数（这份不经 rustc，与上面那四段无关）';
   }
   return 'NDK 预编译件（由 tauri 那一步 symlink 进 jniLibs）：只能在打包侧剥，或换一份 NDK';
 }
@@ -1016,7 +1016,7 @@ export function apkViolations({
       if (count <= min) {
         fail(
           `${boxEntry} 里 '${needle}' 只出现 ${count} 次（要求 > ${min}）—— ${why}。\n` +
-            '  内核构建入口：scripts/build-mobile-core.sh android。',
+            '  内核构建入口：node scripts/mobile-core/producer.mjs android。',
         );
       }
     }

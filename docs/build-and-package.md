@@ -196,7 +196,7 @@ portable 由 `package.yml` 在 Windows 腿从 `target/release/polaris.exe` + `re
 
 - **Android 绑定组件**：API 24 AAR，Java 17（CI 固定 17.0.20+101）、稳定 NDK r30（完整来源版本 30.0.16248370）。AAR 含 ARM64、ARMv7、x86、x86_64 四种 ABI；这不扩大正式 APK 的两种 ARM ABI 范围。
 - **Android App**：Gradle 使用 JDK 21，SDK/Build Tools 当前为 36 / 36.0.0；Rust 使用 [android-rust-ndk.version](../scripts/android-rust-ndk.version) 固定的 27.3.13750724，不能与绑定组件 NDK 混用。App 最低 API 24。
-- 本地构建 Android 组件时，先运行 `bash scripts/build-mobile-core.sh android`，显式提供源码、Go、gomobile、gobind、SDK、NDK、JDK、工作目录和缓存路径。再运行 `node scripts/mobile-core/mobile-consumption.mjs materialize-android`，核验组件和收据后写入 App 输入。托管 CI 通过 `node scripts/mobile-core/android-ci.mjs` 检查源码与工具并确定缓存标识，再直接调用 Node 生产和消费入口。
+- 本地构建 Android 组件时，先运行 `node scripts/mobile-core/producer.mjs android`，显式提供源码、Go、gomobile、gobind、SDK、NDK、JDK、工作目录和缓存路径。再运行 `node scripts/mobile-core/mobile-consumption.mjs materialize-android`，核验组件和收据后写入 App 输入。托管 CI 通过 `node scripts/mobile-core/android-ci.mjs` 检查源码与工具并确定缓存标识，再直接调用 Node 生产和消费入口。
 - **iOS / iPadOS**：源构建入口、固定 Xcode/SDK、ARM64 设备与模拟器目标及个人签名条件见 [iOS 源码构建](ios-source-build.md)。没有已发布 IPA 不影响源码构建文档的提供；编译/链接、签名、真机安装和运行验收是不同阶段。
 
 ### Android 当前源码签名发布构建

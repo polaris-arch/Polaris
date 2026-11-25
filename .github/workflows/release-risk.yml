@@ -109,10 +109,7 @@ jobs:
           sudo apt-get install -y squashfs-tools
 
       - name: Test release contracts
-        # 走 gate-node-test.sh 而不是直接 `node --test`：后者指向空目录/文件被移走/错误
-        # cwd 时是 rc=0 静默判绿（scripts/gate-node-test.sh 顶部注释有实测）；本机全量门单
-        # （vault SoT §12.3c）调用的是同一份脚本，两处判据共用一份实现，不各自漂移。
-        run: test -f scripts/assert-pc-runtime-release.test.mjs && bash scripts/gate-node-test.sh
+        run: node scripts/gate-node-test.mjs
 
       - name: Classify changed paths
         id: impact

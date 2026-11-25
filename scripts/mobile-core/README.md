@@ -75,7 +75,7 @@ the scoped SDK view only under a fixed private work slot held by the caller's
 exclusive producer lease. The pure source suites exercise admission without running a native producer;
 those tests are distinct from actual component and App acceptance.
 
-The formal producer entry is `bash scripts/build-mobile-core.sh android`
+The formal producer entry is `node scripts/mobile-core/producer.mjs android`
 or `apple`, with required `--source`, `--go`, `--gomobile`, `--gobind`, `--work`
 and `--cache`. Android also requires `--sdk --ndk --jdk`; Apple requires
 `--developer`. Use Node 26 and the repository-pinned Rust toolchain, which builds
@@ -407,7 +407,7 @@ carrier verification, or sim-arm64 final verification when explicitly requested.
 are outside the current contract.
 
 Formal output controls run in Release Risk through the shared
-`scripts/gate-node-test.sh` entry. This source-only gate does not compile native
+`scripts/gate-node-test.mjs` entry. This source-only gate does not compile native
 output, sign/install Apps or publish mobile assets. Running it cannot establish
 component or App acceptance. Input-contract artifact pins/producer receipt stay
 null and AppAccepted/devicePassed/publicationEligible stay false; actual results
