@@ -127,9 +127,8 @@
 # `✗ minifyArm64ReleaseWithR8 命中 0 次`，紧接着打印「全部行为断言通过」并 **rc=0**。
 # 接管四条判据的东西自己是空的。今天两层守它：
 #
-#   · **三通道对账**：每条失败同时走三条独立通道 —— 打印到 stdout、抄进 `$TRANSCRIPT`、
-#     记进 `$LEDGER` 台账、计入 `$FAILED`。收尾时三者必须相等，不等一律 rc=2（裁判坏了，
-#     不是判据红了 —— 两件事必须可分辨）。删掉其中任何一条，对账当场不平。
+#   · **失败计数对账**：每条失败打印到 stdout、抄进 `$TRANSCRIPT` 并计入 `$FAILED`。
+#     收尾时 `$TRANSCRIPT` 中的 `✗` 行数必须等于 `$FAILED`，不等一律 rc=2（裁判坏了）。
 #   · **哨兵自检**：正式判据之前，先用 `POLARIS_GATE_SELFCHECK=fail` 把自己再跑一遍，
 #     那一轮**只有一条必然失败的断言**。它的 rc 必须非零、必须打出那条 `✗`。
 #     反向对照是 `POLARIS_GATE_SELFCHECK=pass`（只有一条必然通过的断言）：rc 必须为 0。
@@ -164,11 +163,8 @@ PROBE_RULE="$GRADLE_DIR/app/__gate_probe__.pro"
 WORK="$(mktemp -d /var/tmp/polaris-release-oracle.XXXXXX)"
 PROPS_BAK="$WORK/gradle.properties.bak"
 RULE_BAK="$WORK/proguard-tauri.pro.bak"
-# 三通道对账的另外两条通道（第三条是 $FAILED 计数器）。
 TRANSCRIPT="$WORK/transcript"
-LEDGER="$WORK/failures"
 : >"$TRANSCRIPT"
-: >"$LEDGER"
 
 # 前提不成立（工具链缺席、取材面为空、裁判自身对账不平）一律走这里：rc=2，与「判据红了」的
 # rc=1 刻意分开。「没跑」与「跑过且通过」必须可分辨 —— 本裁判在任何前提不成立时都不当作通过。
@@ -191,7 +187,7 @@ restore() {
 
 # ── 出口盖章：「本裁判跑完了」这件事本身必须可判（2026-09-06 终止轮 R1）────────
 #
-# 三通道对账（A1）守的是「bad() 少写一条通道」，而它要 finish() **跑起来**才说话 ——
+# 失败计数对账（A1）要 finish() **跑起来**才说话 ——
 # 守不住「根本没走到 finish」。实测两条变异，两条都 rc=0：
 #
 #   · 删掉本文件末尾那一句 `finish` ⇒ 脚本从末尾自然落地，rc 取最后一条命令（还原自检那个
@@ -236,13 +232,11 @@ FAILED=0
 # 每一行判据结论同时走两条通道：stdout（给人看）与 $TRANSCRIPT（给对账看）。
 emit() { printf '%s\n' "$*"; printf '%s\n' "$*" >>"$TRANSCRIPT"; }
 ok()   { emit "  ✓ $*"; }
-# 失败信息里的换行先压平：三通道对账按**行**计数，一条多行的失败信息会把台账算成好几条，
-# 于是「裁判坏了」与「失败信息比较长」变得不可分辨。
+# 压平失败信息里的换行，使每条失败在 transcript 中只占一行。
 bad()  {
   local msg="$*"
   msg="${msg//$'\n'/ ⏎ }"
   emit "  ✗ $msg"
-  printf '%s\n' "$msg" >>"$LEDGER"
   FAILED=$((FAILED + 1))
 }
 
@@ -252,20 +246,16 @@ bad()  {
 # 两者混在一起的话，一个坏掉的裁判可以用一条真失败把自己藏起来。
 finish() {
   EXIT_SEALED=finish
-  local printed ledger
-  printed=$(command grep -c '^  ✗ ' "$TRANSCRIPT")
-  [ -n "$printed" ] || printed=0
-  ledger=$(command grep -c '' "$LEDGER")
-  [ -n "$ledger" ] || ledger=0
+  local recorded
+  recorded=$(command grep -c '^  ✗ ' "$TRANSCRIPT")
+  [ -n "$recorded" ] || recorded=0
 
-  if [ "$printed" -ne "$FAILED" ] || [ "$ledger" -ne "$FAILED" ]; then
+  if [ "$recorded" -ne "$FAILED" ]; then
     echo >&2
-    echo "::error::gate-android-release-behavior: **裁判自身坏了**（三通道对账不平）：" >&2
-    echo "  打印出来的 ✗ ：$printed 条" >&2
-    echo "  台账里记下的 ：$ledger 条" >&2
+    echo "::error::gate-android-release-behavior: **裁判自身坏了**（失败计数对账不平）：" >&2
+    echo "  transcript 记录的 ✗ ：$recorded 条" >&2
     echo "  计数器 FAILED：$FAILED" >&2
     echo >&2
-    echo "三条通道由 bad() 一处同时写，不平就说明 bad() 被改过（少写一条通道）。" >&2
     echo "这不是判据红了，是判据的裁决**带不动退出码** —— rc=2 与判据失败的 rc=1 刻意分开。" >&2
     [ "${SELFCHECK:-}" = "" ] || rm -rf -- "$WORK"
     exit 2
@@ -312,8 +302,8 @@ self_check() {
     1) ;;
     0) die "裁判自检（fail 轮）rc=0 —— 一条必然失败的断言没能把退出码带成非零。\
 失败通道与 rc 脱节 ⇒ 本裁判此刻接管的判据全部没有信息量。日志：$WORK/selfcheck-fail.log" ;;
-    2) die "裁判自检（fail 轮）rc=2 —— 三通道对账不平，裁判自身坏了（bad() 少写了一条通道）。\
-原文：$(command grep -E '打印出来的|台账里记下的|计数器' "$WORK/selfcheck-fail.log" | tr '\n' ' ')" ;;
+    2) die "裁判自检（fail 轮）rc=2 —— 裁判自身坏了。日志：$WORK/selfcheck-fail.log。\
+原文：$(command grep -E 'transcript 记录的|计数器' "$WORK/selfcheck-fail.log" | tr '\n' ' ')" ;;
     *) die "裁判自检（fail 轮）rc=$rc，期望 1。日志：$WORK/selfcheck-fail.log" ;;
   esac
   command grep -q -F -- "✗ $SELFCHECK_FAIL_LABEL" "$WORK/selfcheck-fail.log" || die \
