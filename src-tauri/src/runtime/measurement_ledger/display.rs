@@ -305,7 +305,7 @@ pub(crate) fn snapshot(app: &AppHandle) -> ApiResponse<Value> {
     let (frontend_config_digest, config_version) = {
         let mut frontend = config.as_ref().clone();
         apply_frontend_view(&mut frontend);
-        let text = polaris_config_engine::builder::orchestration::stable_stringify(&frontend);
+        let text = polaris_config_engine::builder::orchestration::stable_stringify_owned(frontend);
         (
             polaris_updater::sha256_hex(text.as_bytes()),
             config_content_hash_from_canonical(&text),

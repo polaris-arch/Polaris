@@ -19,34 +19,13 @@ use std::collections::{BTreeMap, BTreeSet};
 /// 数组顺序保留（customRules/appRules 顺序具语义）。undefined 键丢弃（与 JSON.stringify 一致）。
 /// 上游 `ProxyManager.stableStringify`。
 pub fn stable_stringify(v: &serde_json::Value) -> String {
-    let canonical = canonicalize(v);
-    serde_json::to_string(&canonical).unwrap_or_else(|_| "null".to_string())
+    stable_stringify_owned(v.clone())
 }
 
-/// 递归把 serde_json::Value 转为键排序的规范形式（Object → BTreeMap-backed）。
-fn canonicalize(v: &serde_json::Value) -> serde_json::Value {
-    match v {
-        serde_json::Value::Object(map) => {
-            // 收集 (key, canonical_value) 并按 key 排序，丢弃 null 值（对齐 Polaris 丢 undefined）。
-            // 注意：Polaris stableStringify 丢 undefined，但 JSON 里 null 是合法值。
-            // Polaris 的 `v[k] !== undefined` 在 JS 对象里 undefined = 不存在的键，null = 存在。
-            // serde_json Value::Object 不含 undefined（JSON 无），故只需排序，null 保留。
-            let mut pairs: Vec<(String, serde_json::Value)> = map
-                .iter()
-                .map(|(k, v)| (k.clone(), canonicalize(v)))
-                .collect();
-            pairs.sort_by(|a, b| a.0.cmp(&b.0));
-            let mut sorted = serde_json::Map::new();
-            for (k, v) in pairs {
-                sorted.insert(k, v);
-            }
-            serde_json::Value::Object(sorted)
-        }
-        serde_json::Value::Array(arr) => {
-            serde_json::Value::Array(arr.iter().map(canonicalize).collect())
-        }
-        other => other.clone(),
-    }
+/// 原地排序对象键，序列化调用方已持有的 JSON。
+pub fn stable_stringify_owned(mut value: serde_json::Value) -> String {
+    value.sort_all_objects();
+    serde_json::to_string(&value).unwrap_or_else(|_| "null".to_string())
 }
 
 /// 节点生成指纹（剔时间戳、键序无关）。
