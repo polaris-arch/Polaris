@@ -536,10 +536,10 @@ const COMPARISON_REGISTRY: &[Comparison] = &[
     ),
     (
         "src-tauri/src/runtime/proxy/dns_takeover.rs",
-        "if Platform::current() == Platform::Linux && !flushed",
+        "let linux = platform == Platform::Linux",
         1,
-        "刷 DNS 缓存失败的告警只给 Linux 报。Android → 不报，且 flush_os_dns_cache 的 Android \
-         臂恒 true（本平台没有应用可刷的缓存），二者一致。",
+        "只有 Linux 将缓存刷新失败记为 warning，并允许当前运行的启动世代发布非终态告警。\
+         Mac/Win/Android/iOS/Other 保留原日志级别，不发布此告警。",
     ),
     (
         "src-tauri/src/runtime/proxy/startup.rs",

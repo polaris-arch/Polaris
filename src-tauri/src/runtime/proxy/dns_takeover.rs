@@ -1346,12 +1346,13 @@ impl ProxyRuntime {
         let this = Arc::clone(self);
         tokio::task::spawn_blocking(move || {
             let platform = Platform::current();
+            let linux = platform == Platform::Linux;
             let context = if startup_generation.is_some() {
                 "start"
             } else {
                 "stop"
             };
-            let log_level = if platform == Platform::Linux {
+            let log_level = if linux {
                 log::Level::Warn
             } else {
                 log::Level::Info
@@ -1380,7 +1381,7 @@ impl ProxyRuntime {
                 helper_ready,
                 &mut on_warn,
             );
-            if platform == Platform::Linux && !flushed {
+            if linux && !flushed {
                 this.publish_linux_dns_cache_flush_failure(startup_generation);
             }
         });
