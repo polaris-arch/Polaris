@@ -384,8 +384,10 @@ test('publication combines generation acceptance and cached identity/reset valid
   assert.match(provider, /lifecycle\.publishSettings\(token, publication: publication\)/);
 });
 test('reset changes identity even when cached settings were already nil', () => {
-  assert.match(platform, /pending == nil && !nativeTun\.hasSessions/);
-  assert.match(platform, /settingsReset = UUID\(\); settings = nil/);
+  const reset = section(platform, '    func reset()', '    func clearDNSCache()');
+  assert.match(reset, /let pending = settingsCallbacks\.values\.first/);
+  assert.match(reset, /let tunCustodyUncertain = nativeTun\.hasSessions/);
+  assert.match(reset, /if pending == nil && !tunCustodyUncertain \{ settingsReset = UUID\(\); settings = nil \}/);
   assert.match(platform, /try publish\(network, replacing: previous, reset: reset, token: token\)/);
 });
 test('DNS reset keeps one generation and replays the retained accepted snapshot', () => {
@@ -1029,7 +1031,9 @@ test('native transaction keeps exact custody, publication lease and sticky faile
   const abort = section(native, '    func abort(', '    func retire(');
   assert.ok(abort.indexOf('try candidate.close()') < abort.indexOf('try apply(session.snapshot'));
   assert.match(provider, /platform\.revokeNativeTun\(\)/);
-  assert.match(provider, /if let nativeFailure = platform\.reset\(\)/);
+  assert.match(provider, /return TunnelCleanupStages\(coreClose: coreClose, nativeReset: platform\.reset\(\)\)/);
+  const reset = section(platform, '    func reset()', '    func clearDNSCache()');
+  assert.match(reset, /if let failure = stages\.failure \{\s*provider\.nativeResetIncomplete\(settingsGeneration: pending\?\.0, message: failure\)/);
   const completion = section(lifecycle, 'final class TunnelSettingsCompletion', 'struct TunnelSettingsTimeout');
   assert.match(completion, /if pending \{[\s\S]*waitTimedOut = true/);
   assert.doesNotMatch(completion.slice(completion.indexOf('func wait(')), /pending = false/);

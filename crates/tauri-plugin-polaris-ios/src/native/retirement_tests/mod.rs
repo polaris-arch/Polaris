@@ -113,6 +113,12 @@ fn saved_unsubmitted_profile_allows_retry_without_confirming_stop() {
         ("active", json!(true)),
         ("running", json!(true)),
         ("status", json!(3)),
+        ("ownership", json!("ownedSessionReported")),
+        ("sessionId", json!(null)),
+        ("requestId", json!("")),
+        ("configDigest", json!(null)),
+        ("extensionGeneration", json!(8)),
+        ("uncertainSettingsGeneration", json!(7)),
         ("cleanupError", json!("close failed")),
         ("lastError", json!("A VPN preference write is pending")),
     ] {

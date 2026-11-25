@@ -296,6 +296,9 @@ struct LifecycleTests {
                                     "tailscaleStoreScope": emptyAuthExport, "tailscaleDirectoryScope": emptyDirectoryExport]
         assert(vpnMayReuseProfileAfterProviderExit(identity: exitIdentity, report: exited))
         assert(!vpnIdempotentStopIsConfirmed(evidence: exited, expectedGeneration: nil))
+        exited["runtimeStopped"] = 0
+        assert(!vpnMayReuseProfileAfterProviderExit(identity: exitIdentity, report: exited))
+        exited["runtimeStopped"] = false
         exited["operationRequestID"] = "reload"
         assert(!vpnMayReuseProfileAfterProviderExit(identity: exitIdentity, report: exited))
         exited["operationRequestID"] = "original-start"
@@ -376,14 +379,52 @@ struct LifecycleTests {
         assert(supersededSettings.report().lifecycle == "uncertain")
         do { _ = try supersededSettings.start(identity); assertionFailure("New core admitted while old OS settings may still apply") } catch {}
 
+        let localReset = TunnelNativeReset(settingsCallbackPending: false, tunCustodyUncertain: false)
+        let returned = TunnelCleanupStages(coreClose: .returned, nativeReset: localReset)
+        let lateStop = TunnelLifecycle()
+        _ = try lateStop.start(identity)
+        assert(lateStop.prepareStop(identity: identity, requestID: "stop-late"))
+        let overdue = lateStop.stop()!
+        assert(lateStop.timeout(overdue, "stop watchdog expired"))
+        assert(lateStop.complete(overdue, phase: "stopped", stopped: true, cleanup: returned))
+        assert(lateStop.report().cleanupStages == nil)
+        assert(lateStop.report().lastError == "stop watchdog expired")
+
         let heldCloseFailure = TunnelLifecycle()
         let failed = try heldCloseFailure.start(identity)
-        heldCloseFailure.retainCleanupFailure("endpoint Close failed")
+        assert(heldCloseFailure.prepareStop(identity: identity, requestID: "stop-failed"))
         let failedStop = heldCloseFailure.stop()!
-        assert(heldCloseFailure.complete(failedStop, phase: "stopped", stopped: true))
+        heldCloseFailure.retainCleanupFailure(coreClose: "Core close failed: endpoint")
+        let failedClose = TunnelCleanupStages(coreClose: .failed, nativeReset: localReset)
+        assert(!heldCloseFailure.complete(failed, phase: "failed", stopped: true, cleanup: returned))
+        assert(heldCloseFailure.report().cleanupStages == nil)
+        assert(heldCloseFailure.complete(failedStop, phase: "stopped", stopped: true, cleanup: failedClose))
         assert(!heldCloseFailure.complete(failed, phase: "running", stopped: false))
-        assert(heldCloseFailure.report().cleanupError == "endpoint Close failed")
+        let stopReport = heldCloseFailure.report()
+        assert(stopReport.operationRequestID == "stop-failed" && stopReport.stopSourceGeneration == failed)
+        assert(stopReport.generation == failedStop && stopReport.cleanupStages?.coreClose == .failed)
+        assert(stopReport.cleanupStages?.nativeReset.settingsCallbackPending == false)
+        assert(stopReport.cleanupStages?.nativeReset.tunCustodyUncertain == false)
+        assert(stopReport.cleanupError == "Core close failed: endpoint")
         assert(heldCloseFailure.report().cleanupEvidence == "CleanupUnknown")
+        assert(heldCloseFailure.prepareStop(identity: identity, requestID: "stop-retry"))
+        assert(heldCloseFailure.report().operationRequestID == "stop-retry")
+        assert(heldCloseFailure.report().cleanupStages == nil)
+        assert(!heldCloseFailure.complete(failedStop, phase: "stopped", stopped: true, cleanup: failedClose))
+        assert(heldCloseFailure.report().cleanupStages == nil)
+        let repeatStop = heldCloseFailure.stop()!
+        assert(heldCloseFailure.report().cleanupStages == nil)
+        let nativeResetDebt = TunnelNativeReset(settingsCallbackPending: true, tunCustodyUncertain: true)
+        heldCloseFailure.retainCleanupFailure(nativeReset: nativeResetDebt.failure)
+        assert(heldCloseFailure.complete(repeatStop, phase: "stopped", stopped: true,
+            cleanup: TunnelCleanupStages(coreClose: .notHeld, nativeReset: nativeResetDebt)))
+        assert(heldCloseFailure.report().cleanupStages?.coreClose == .notHeld)
+        assert(heldCloseFailure.report().cleanupStages?.nativeReset.settingsCallbackPending == true)
+        assert(heldCloseFailure.report().cleanupStages?.nativeReset.tunCustodyUncertain == true)
+        assert(heldCloseFailure.report().cleanupError == "Core close failed: endpoint; Native reset incomplete: the original NE settings callback has not joined; native TUN settings or descriptor custody remains uncertain")
+        let unpreparedStop = heldCloseFailure.stop()!
+        assert(heldCloseFailure.complete(unpreparedStop, phase: "stopped", stopped: true, cleanup: returned))
+        assert(heldCloseFailure.report().cleanupStages == nil)
         do { _ = try heldCloseFailure.start(identity); assertionFailure("New core admitted after close failure") } catch {}
 
         var calls = 0
@@ -417,6 +458,18 @@ struct LifecycleTests {
         let successfulStop = vpnSessionEvidence(profileIdentity: profile, report: report, stopRequestID: "new-stop")
         assert(vpnStopFailure(evidence: successfulStop, profileExists: true) == nil)
         assert(vpnIdleFailure(evidence: successfulStop, profileExists: true, active: false) == nil)
+        var unsettledSettings = successfulStop
+        unsettledSettings["uncertainSettingsGeneration"] = 7
+        assert(vpnIdleFailure(evidence: unsettledSettings, profileExists: true, active: false)?.contains("NE settings") == true)
+        unsettledSettings["cleanupError"] = 1
+        assert(vpnIdleFailure(evidence: unsettledSettings, profileExists: true, active: false)?.contains("unreadable") == true)
+        for (key, invalid) in ["lastError": 7, "runtimeStopped": 1, "generation": "8"] as [String: Any] {
+            var malformedReport = report
+            malformedReport[key] = invalid
+            let malformed = vpnSessionEvidence(profileIdentity: profile, report: malformedReport, stopRequestID: "new-stop")
+            assert(malformed["lastError"] as? String == "The VPN lifecycle report is unreadable; cleanup is unknown")
+            assert(vpnIdleFailure(evidence: malformed, profileExists: true, active: false) != nil)
+        }
         var disconnectedStop = successfulStop
         disconnectedStop["active"] = false; disconnectedStop["running"] = false; disconnectedStop["status"] = 1
         disconnectedStop["extensionGeneration"] = NSNumber(value: 8)
@@ -610,10 +663,32 @@ struct LifecycleTests {
         ]
         assert(vpnProfileWasNeverSubmitted(preference: savedUnsubmitted, identity: profile, report: nil))
         assert(!vpnProfileWasNeverSubmitted(preference: savedUnsubmitted, identity: replaced, report: nil))
-        assert(!vpnProfileWasNeverSubmitted(preference: savedUnsubmitted, identity: profile, report: ["identity": profile]))
+        assert(!vpnProfileWasNeverSubmitted(preference: savedUnsubmitted, identity: [:], report: nil))
+        let olderIdentity: [String: Any] = ["sessionID": "session-old", "requestID": "start-old", "configDigest": profile["configDigest"]!]
+        var olderReport: [String: Any] = ["identity": olderIdentity, "generation": 1,
+            "lifecycle": "running", "operationRequestID": "start-old"]
+        assert(vpnProfileWasNeverSubmitted(preference: savedUnsubmitted, identity: profile, report: olderReport))
+        let ambiguousIdentities: [[String: Any]] = [[:], ["sessionID": "session-old", "requestID": "start-old"], profile,
+            olderIdentity.merging(["sessionID": "session-a"]) { _, new in new },
+            olderIdentity.merging(["requestID": "start-a"]) { _, new in new }]
+        for ambiguous in ambiguousIdentities {
+            olderReport["identity"] = ambiguous
+            assert(!vpnProfileWasNeverSubmitted(preference: savedUnsubmitted, identity: profile, report: olderReport))
+        }
+        olderReport["identity"] = olderIdentity
+        olderReport["operationRequestID"] = profile["requestID"]
+        assert(!vpnProfileWasNeverSubmitted(preference: savedUnsubmitted, identity: profile, report: olderReport))
+        olderReport["operationRequestID"] = "start-old"
+        olderReport["generation"] = true
+        assert(!vpnProfileWasNeverSubmitted(preference: savedUnsubmitted, identity: profile, report: olderReport))
         var pendingUnsubmitted = savedUnsubmitted
         pendingUnsubmitted["pending"] = true
         assert(!vpnProfileWasNeverSubmitted(preference: pendingUnsubmitted, identity: profile, report: nil))
+        for invalidPending in [0, 1] {
+            pendingUnsubmitted["pending"] = NSNumber(value: invalidPending)
+            assert(vpnPreferencePending(pendingUnsubmitted) == nil)
+            assert(!vpnProfileWasNeverSubmitted(preference: pendingUnsubmitted, identity: profile, report: nil))
+        }
         var submitted = savedUnsubmitted
         submitted.removeValue(forKey: "unsubmittedIdentity")
         assert(!vpnProfileWasNeverSubmitted(preference: submitted, identity: profile, report: nil))

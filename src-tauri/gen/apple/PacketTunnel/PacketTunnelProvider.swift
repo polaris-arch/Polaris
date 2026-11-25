@@ -95,9 +95,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     self.publishReport()
                     completion.finish(nil)
                 } catch {
-                    let cleanup = self.closeCore()
+                    self.closeCore()
                     self.lifecycle.complete(token, phase: "failed", stopped: true,
-                                            error: error.localizedDescription, cleanup: cleanup)
+                                            error: error.localizedDescription)
                     self.publishReport()
                     self.logger.error("Tunnel start failed: \(error.localizedDescription, privacy: .public)")
                     completion.finish(error)
@@ -127,8 +127,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
     /// Close only the explicitly held CommandServer. Its ordinary CloseService failure
     /// remains sticky and visible even after Go detaches its Instance reference.
-    private func closeCore() -> String? {
-        var failure: String?
+    @discardableResult
+    private func closeCore() -> TunnelCleanupStages {
+        var coreClose = TunnelCleanupStages.CoreClose.notHeld
         if let pending = managedBootstrap {
             managedBootstrap = nil
             pending.completion.finish(tunnelError("Managed bootstrap was stopped before activation"))
@@ -136,9 +137,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         runtimeRestartOwner?.revoke()
         platform.revokeNativeTun()
         if let commandServer {
-            do { try commandServer.closeService() } catch {
-                failure = error.localizedDescription
-                lifecycle.retainCleanupFailure(error.localizedDescription)
+            do {
+                try commandServer.closeService()
+                coreClose = .returned
+            } catch {
+                coreClose = .failed
+                lifecycle.retainCleanupFailure(coreClose: "Core close failed: " + error.localizedDescription)
                 logger.error("Core close failed: \(error.localizedDescription, privacy: .public)")
             }
             // The Go export preserves all original runs, including failed/reloaded
@@ -152,11 +156,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         commandServer = nil
         commandIdentity = nil
         runtimeRestartOwner = nil
-        if let nativeFailure = platform.reset() {
-            lifecycle.retainCleanupFailure(nativeFailure)
-            failure = [failure, nativeFailure].compactMap { $0 }.joined(separator: "; ")
-        }
-        return failure
+        return TunnelCleanupStages(coreClose: coreClose, nativeReset: platform.reset())
     }
 
     /// Called by Go's RPC handler. Waiting here would deadlock against Go's service
@@ -207,9 +207,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         cancelTunnelWithError(error)
     }
 
-    func nativeTunCleanupUncertain(_ token: UInt64, message: String) {
-        lifecycle.settingsUncertain(token, message)
-        lifecycle.retainCleanupFailure(message)
+    func nativeResetIncomplete(settingsGeneration: UInt64?, message: String) {
+        if let settingsGeneration { lifecycle.settingsUncertain(settingsGeneration, message) }
+        lifecycle.retainCleanupFailure(nativeReset: message)
         publishReport()
     }
 
@@ -333,9 +333,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             pending.completion.finish(nil)
             reply?(try? JSONEncoder().encode(observation))
         } catch {
-            let cleanup = closeCore()
+            closeCore()
             lifecycle.complete(pending.token, phase: "failed", stopped: true,
-                error: error.localizedDescription, cleanup: cleanup)
+                error: error.localizedDescription)
             publishReport()
             pending.completion.finish(error)
             reply?(nil)

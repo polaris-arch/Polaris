@@ -842,7 +842,22 @@ impl TunnelStatus {
         }
         let never_submitted = self.cleanup_evidence == "ProfileNeverSubmitted"
             && matches!(self.status, 0 | 1)
-            && !self.running;
+            && !self.running
+            && self.ownership == "profileMatchedUnattested"
+            && self
+                .session_id
+                .as_deref()
+                .is_some_and(|value| !value.is_empty())
+            && self
+                .request_id
+                .as_deref()
+                .is_some_and(|value| !value.is_empty())
+            && self
+                .config_digest
+                .as_deref()
+                .is_some_and(|value| !value.is_empty())
+            && self.extension_generation.is_none()
+            && self.uncertain_settings_generation.is_none();
         if self.profile_exists && !self.has_confirmed_stop() && !never_submitted {
             return Err(
                 "已有 iOS VPN 配置尚无可靠的扩展停止报告；清理状态未知，请检查系统设置后再连接。"

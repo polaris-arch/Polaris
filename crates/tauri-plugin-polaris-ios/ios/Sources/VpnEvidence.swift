@@ -1,3 +1,4 @@
+import CoreFoundation
 import Foundation
 
 // Rust generations restart with the host process. A native nonce identifies the
@@ -84,12 +85,37 @@ func vpnIdentityMatches(_ expected: [String: Any], _ actual: [String: Any]?) -> 
     }
 }
 
+private func vpnEvidenceBool(_ value: Any?) -> Bool? {
+    guard let value = value as? NSNumber, CFGetTypeID(value) == CFBooleanGetTypeID() else { return nil }
+    return value.boolValue
+}
+
+private func vpnEvidenceGeneration(_ value: Any?) -> UInt64? {
+    guard let value = value as? NSNumber, CFGetTypeID(value) != CFBooleanGetTypeID() else { return nil }
+    return UInt64(value.stringValue)
+}
+
+func vpnPreferencePending(_ preference: [String: Any]?) -> Bool? {
+    vpnEvidenceBool(preference?["pending"])
+}
+
 func vpnProfileWasNeverSubmitted(preference: [String: Any]?, identity: [String: Any], report: [String: Any]?) -> Bool {
-    guard let preference, preference["pending"] as? Bool == false,
+    guard let preference, vpnPreferencePending(preference) == false,
           preference["requestID"] as? String == identity["requestID"] as? String,
           let unsubmitted = preference["unsubmittedIdentity"] as? [String: Any],
           vpnIdentityMatches(unsubmitted, identity) else { return false }
-    return !vpnIdentityMatches(unsubmitted, report?["identity"] as? [String: Any])
+    guard let report else { return true }
+    // A saved profile can follow an older report. Only a complete, unrelated
+    // identity excludes a report for this save. Config digests may repeat.
+    guard let reported = report["identity"] as? [String: Any],
+          vpnIdentityMatches(reported, reported),
+          let generation = vpnEvidenceGeneration(report["generation"]), generation > 0,
+          let lifecycle = report["lifecycle"] as? String,
+          ["starting", "running", "reloadAccepted", "stopping", "stopped", "failed", "uncertain"].contains(lifecycle),
+          let operationRequestID = report["operationRequestID"] as? String, !operationRequestID.isEmpty else { return false }
+    let requestID = identity["requestID"] as? String
+    return reported["sessionID"] as? String != identity["sessionID"] as? String
+        && reported["requestID"] as? String != requestID && operationRequestID != requestID
 }
 
 /// A live message is ordinary readiness only; cleanup evidence stays unknown.
@@ -215,8 +241,8 @@ func vpnMayReuseProfileAfterProviderExit(identity: [String: Any], report: [Strin
     guard vpnIdentityMatches(identity, report["identity"] as? [String: Any]),
           let digest = identity["configDigest"] as? String,
           report["lifecycle"] as? String == "running",
-          report["runtimeStopped"] as? Bool == false,
-          report["generation"] as? Int == 1,
+          vpnEvidenceBool(report["runtimeStopped"]) == false,
+          vpnEvidenceGeneration(report["generation"]) == 1,
           report["operationRequestID"] as? String == identity["requestID"] as? String,
           report["stopSourceGeneration"] == nil,
           report["uncertainSettingsGeneration"] == nil,
@@ -235,11 +261,15 @@ func vpnMayReuseProfileAfterProviderExit(identity: [String: Any], report: [Strin
 
 func vpnStopFailure(evidence: [String: Any], profileExists: Bool) -> String? {
     guard profileExists else { return nil }
-    if let error = evidence["cleanupError"] as? String ?? evidence["lastError"] as? String {
+    if let reportedError = evidence["cleanupError"] ?? evidence["lastError"] {
+        guard let error = reportedError as? String else { return "The VPN lifecycle report is unreadable; cleanup is unknown" }
         return "System VPN is disconnected; extension reported: " + error
     }
+    if evidence["uncertainSettingsGeneration"] != nil {
+        return "System VPN is disconnected, but the original NE settings operation remains uncertain. Inspect Settings before retrying."
+    }
     guard evidence["ownership"] as? String == "ownedSessionReported",
-          evidence["runtimeStopped"] as? Bool == true,
+          vpnEvidenceBool(evidence["runtimeStopped"]) == true,
           evidence["lifecycle"] as? String == "stopped" else {
         return "System VPN is disconnected, but this stop request has no matching completed extension report; cleanup is unknown. Inspect Settings before retrying."
     }
@@ -259,6 +289,13 @@ func vpnSessionEvidence(profileIdentity: [String: Any]?, report: [String: Any]?,
           identity["sessionID"] as? String == sessionID,
           identity["requestID"] as? String == requestID,
           identity["configDigest"] as? String == configDigest else { return result }
+    guard report["cleanupError"] == nil || report["cleanupError"] is String,
+          report["lastError"] == nil || report["lastError"] is String,
+          report["runtimeStopped"] == nil || vpnEvidenceBool(report["runtimeStopped"]) != nil,
+          report["generation"] == nil || vpnEvidenceGeneration(report["generation"]) != nil else {
+        result["lastError"] = "The VPN lifecycle report is unreadable; cleanup is unknown"
+        return result
+    }
     result["ownership"] = "ownedSessionReported"
     result["lifecycle"] = report["lifecycle"]
     result["cleanupError"] = report["cleanupError"]

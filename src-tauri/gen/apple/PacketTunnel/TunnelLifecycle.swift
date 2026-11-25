@@ -12,6 +12,25 @@ struct TunnelIdentity: Codable, Equatable {
     let configDigest: String
 }
 
+struct TunnelCleanupStages: Encodable {
+    enum CoreClose: String, Encodable { case notHeld, returned, failed }
+    let coreClose: CoreClose
+    let nativeReset: TunnelNativeReset
+}
+
+struct TunnelNativeReset: Encodable {
+    // These describe only the platform's local reset checkpoint.
+    let settingsCallbackPending: Bool
+    let tunCustodyUncertain: Bool
+
+    var failure: String? {
+        var reasons: [String] = []
+        if settingsCallbackPending { reasons.append("the original NE settings callback has not joined") }
+        if tunCustodyUncertain { reasons.append("native TUN settings or descriptor custody remains uncertain") }
+        return reasons.isEmpty ? nil : "Native reset incomplete: " + reasons.joined(separator: "; ")
+    }
+}
+
 struct TunnelReport: Encodable {
     let identity: TunnelIdentity?
     let generation: UInt64
@@ -26,6 +45,7 @@ struct TunnelReport: Encodable {
     let uncertainSettingsGeneration: UInt64?
     // Neither a nil Go instance nor NE disconnected proves resource disposal.
     let cleanupEvidence = "CleanupUnknown"
+    let cleanupStages: TunnelCleanupStages?
     let cleanupError: String?
     let lastError: String?
 }
@@ -45,7 +65,10 @@ final class TunnelLifecycle {
     private var quarantined = false
     private var runtimeStopped: Bool?
     private var runtimeAdmission: TunnelRuntimeAdmission?
-    private var cleanupError: String?
+    private var coreCloseError: String?
+    private var nativeResetError: String?
+    private var cleanupStages: TunnelCleanupStages?
+    private var cleanupTimedOut = false
     private var lastError: String?
     private var operationRequestID: String?
     private var uncertainSettingsGeneration: UInt64?
@@ -68,6 +91,8 @@ final class TunnelLifecycle {
         operationRequestID = identity.requestID
         phase = "starting"
         runtimeStopped = false
+        cleanupStages = nil
+        cleanupTimedOut = false
         stopSourceGeneration = nil
         tailscaleStoreScope = nil
         tailscaleDirectoryScope = nil
@@ -85,6 +110,8 @@ final class TunnelLifecycle {
         runtimeAdmission = nil
         stopPending = true
         phase = "stopping"
+        cleanupStages = nil
+        cleanupTimedOut = false
         return generation
     }
 
@@ -111,6 +138,7 @@ final class TunnelLifecycle {
         }
         operationRequestID = requestID
         stopSourceGeneration = generation
+        cleanupStages = nil
         // Freeze the original census before Stop, never reconstruct it from terminal data.
         stopOriginalDirectoryScope = phase == "running" && !quarantined ? tailscaleDirectoryScope : nil
         return true
@@ -175,18 +203,24 @@ final class TunnelLifecycle {
 
     @discardableResult
     func complete(_ token: UInt64, phase: String, stopped: Bool?, error: String? = nil,
-                  cleanup: String? = nil, beforeObservation: (() -> Void)? = nil) -> Bool {
+                  cleanup: TunnelCleanupStages? = nil, beforeObservation: (() -> Void)? = nil) -> Bool {
         lock.lock()
         guard generation == token else { lock.unlock(); return false }
         // The acceptance check and ready publication are atomic with Stop/timeout.
         if phase == "running" && (quarantined || stopPending || runtimeAdmission == nil) {
             lock.unlock(); return false
         }
-        if phase == "stopped" { stopPending = false }
+        if phase == "stopped" {
+            guard stopPending else { lock.unlock(); return false }
+            // Diagnostics belong only to a Stop prepared from its exact predecessor.
+            if !cleanupTimedOut, stopSourceGeneration == token - 1 {
+                cleanupStages = cleanup
+            }
+            stopPending = false
+        }
         self.phase = quarantined ? "uncertain" : phase
         runtimeStopped = stopped
         if let error { lastError = error }
-        if let cleanup { cleanupError = cleanup }
         let pending = phase == "stopped" ? stopObservation : nil
         if pending != nil { stopObservation = nil }
         let observed = pending.map { TunnelObservation(observationNonce: $0.nonce, report: reportLocked()) }
@@ -204,6 +238,8 @@ final class TunnelLifecycle {
         phase = "uncertain"
         runtimeStopped = nil
         lastError = message
+        cleanupTimedOut = true
+        cleanupStages = nil
         return true
     }
 
@@ -218,9 +254,10 @@ final class TunnelLifecycle {
         lastError = message
     }
 
-    func retainCleanupFailure(_ error: String) {
+    func retainCleanupFailure(coreClose: String? = nil, nativeReset: String? = nil) {
         lock.lock(); defer { lock.unlock() }
-        cleanupError = error
+        coreCloseError = coreCloseError ?? coreClose
+        nativeResetError = nativeResetError ?? nativeReset
         quarantined = true
     }
 
@@ -239,6 +276,7 @@ final class TunnelLifecycle {
     }
 
     private func reportLocked() -> TunnelReport {
+        let errors = [coreCloseError, nativeResetError].compactMap { $0 }
         return TunnelReport(identity: identity, generation: generation, lifecycle: phase,
                             runtimeStopped: runtimeStopped, operationRequestID: operationRequestID,
                             stopSourceGeneration: stopSourceGeneration, tailscaleStoreScope: tailscaleStoreScope,
@@ -246,7 +284,8 @@ final class TunnelLifecycle {
                             managedColdStoreCohort: managedColdStoreCohort?.generation == generation ? managedColdStoreCohort?.document : nil,
                             stopOriginalDirectoryScope: directoryTerminalRetained ? stopOriginalDirectoryScope : nil,
                             uncertainSettingsGeneration: uncertainSettingsGeneration,
-                            cleanupError: cleanupError, lastError: lastError)
+                            cleanupStages: cleanupStages,
+                            cleanupError: errors.isEmpty ? nil : errors.joined(separator: "; "), lastError: lastError)
     }
 }
 

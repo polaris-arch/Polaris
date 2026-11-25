@@ -126,13 +126,13 @@ final class VpnPlugin: Plugin {
         }
     }
 
-    private func loadManagerForStart(_ completion: @escaping (Result<(NETunnelProviderManager, [String: Any]), Error>) -> Void) {
+    private func loadManagerForStart(_ op: VpnOperation, _ completion: @escaping (Result<(NETunnelProviderManager, [String: Any]), Error>) -> Void) {
         loadManager(create: true) { result in
             do {
                 let loaded: LoadedVpnManager
                 do { loaded = try result.get() } catch { throw vpnError(vpnStartFailure(error, stage: "load")) }
                 guard let manager = loaded.manager else { throw vpnError("VPN manager is unavailable") }
-                self.readSnapshot(manager, profileExists: loaded.existing, checkDisconnect: true) {
+                self.readSnapshot(manager, profileExists: loaded.existing, checkDisconnect: true, startOperation: op) {
                     completion($0.map { (manager, $0) })
                 }
             } catch { completion(.failure(error)) }
@@ -222,7 +222,7 @@ final class VpnPlugin: Plugin {
                     self.rejectUndispatched(invoke, kind: "start", requestID: args.requestID, error.localizedDescription); return
                 }
                 guard let op = self.begin(invoke, kind: "start", requestID: args.requestID) else { return }
-                self.loadManagerForStart { result in
+                self.loadManagerForStart(op) { result in
                     guard self.current(op) else { return }
                     do {
                         let (manager, before) = try result.get()
@@ -677,9 +677,10 @@ final class VpnPlugin: Plugin {
     }
 
     private func readSnapshot(_ manager: NETunnelProviderManager?, profileExists: Bool? = nil, checkDisconnect: Bool,
+                              startOperation: VpnOperation? = nil,
                               completion: @escaping (Result<[String: Any], Error>) -> Void) {
         do {
-            let initial = try snapshot(manager, profileExists: profileExists)
+            let initial = try snapshot(manager, profileExists: profileExists, startOperation: startOperation)
             guard checkDisconnect, let manager, initial["profileExists"] as? Bool == true,
                   manager.connection.status == .disconnected, initial["lastError"] != nil,
                   let identity = (manager.protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration
@@ -692,7 +693,7 @@ final class VpnPlugin: Plugin {
                                   current.connection.status == .disconnected,
                                   vpnIdentityMatches(identity, (current.protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration)
                             else { throw vpnError("CleanupUnknown: VPN profile changed during disconnect observation") }
-                            var observed = try self.snapshot(current)
+                            var observed = try self.snapshot(current, startOperation: startOperation)
                             if let error = error as NSError?, error.domain == NEVPNConnectionErrorDomain {
                                 observed["systemDisconnectError"] = "\(error.domain) (\(error.code))"
                                 if error.code == NEVPNConnectionError.pluginFailed.rawValue,
@@ -890,7 +891,9 @@ final class VpnPlugin: Plugin {
         }
     }
 
-    private func snapshot(_ manager: NETunnelProviderManager?, stopRequestID: String? = nil, includeHostUncertainty: Bool = true, profileExists: Bool? = nil) throws -> [String: Any] {
+    private func snapshot(_ manager: NETunnelProviderManager?, stopRequestID: String? = nil,
+                          includeHostUncertainty: Bool = true, profileExists: Bool? = nil,
+                          startOperation: VpnOperation? = nil) throws -> [String: Any] {
         let ne = manager?.connection.status ?? .invalid
         let active = ne == .connecting || ne == .connected || ne == .reasserting || ne == .disconnecting
         let exists = profileExists ?? (manager != nil)
@@ -912,10 +915,12 @@ final class VpnPlugin: Plugin {
            uncertainSession == nil || values["sessionID"] as? String == uncertainSession { result["lastError"] = uncertainReason }
         if let preferenceError { result["lastError"] = preferenceError }
         if result["lastError"] == nil {
-            if vpnProfileWasNeverSubmitted(preference: preference, identity: values, report: report) {
-                if exists, operation == nil, ne == .invalid || ne == .disconnected {
-                    result["cleanupEvidence"] = "ProfileNeverSubmitted"
-                }
+            // Status observes without an operation. Start checks again within
+            // its own current transaction, before either config or preferences change.
+            if exists, !preferenceMutation.pending, ne == .invalid || ne == .disconnected,
+               startOperation.map(current) ?? (operation == nil),
+               vpnProfileWasNeverSubmitted(preference: preference, identity: values, report: report) {
+                result["cleanupEvidence"] = "ProfileNeverSubmitted"
             } else if let error = vpnIdleFailure(evidence: result, profileExists: exists, active: active) {
                 result["lastError"] = error
             }
@@ -925,8 +930,13 @@ final class VpnPlugin: Plugin {
 
     private func readLifecycleReport() throws -> [String: Any]? {
         let url = try directory().appendingPathComponent("tunnel-lifecycle.json")
-        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
-        return try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any]
+        let contents: Data
+        do { contents = try Data(contentsOf: url) }
+        catch let error as CocoaError where error.code == .fileReadNoSuchFile { return nil }
+        guard let report = (try? JSONSerialization.jsonObject(with: contents)) as? [String: Any] else {
+            throw vpnError("The VPN lifecycle report is unreadable; cleanup is unknown")
+        }
+        return report
     }
 
     private func writePreferenceIntent(_ requestID: String, pending: Bool, unsubmitted: [String: Any]? = nil) throws {
@@ -946,13 +956,15 @@ final class VpnPlugin: Plugin {
     }
     private func readPreferenceIntent() throws -> [String: Any]? {
         let url = try directory().appendingPathComponent("vpn-preference-intent.json")
-        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
-        guard let object = try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any],
-              object["pending"] is Bool else { throw vpnError("VPN preference intent is unreadable; state is unknown") }
+        let contents: Data
+        do { contents = try Data(contentsOf: url) }
+        catch let error as CocoaError where error.code == .fileReadNoSuchFile { return nil }
+        guard let object = (try? JSONSerialization.jsonObject(with: contents)) as? [String: Any],
+              vpnPreferencePending(object) != nil else { throw vpnError("VPN preference intent is unreadable; state is unknown") }
         return object
     }
     private func pendingPreferenceFailure(_ preference: [String: Any]?) -> String? {
-        preference?["pending"] as? Bool == true
+        vpnPreferencePending(preference) == true
             ? "A VPN preference write was submitted without a reconciled completion; no new profile may be created or changed." : nil
     }
     private func writeStopIntent(_ op: VpnOperation) throws {

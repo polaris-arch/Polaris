@@ -200,20 +200,21 @@ final class TunnelPlatform: NSObject, LibboxPlatformInterfaceProtocol, LibboxCom
     private func cancelMonitor(_ record: TunnelMonitorSession<NWPathMonitor, LibboxInterfaceUpdateListenerProtocol>.Record?) {
         if let record { monitors.takeCancellation(record)?.cancel() }
     }
-    func reset() -> String? {
+    func reset() -> TunnelNativeReset {
         resetMonitor()
         stateLock.lock()
         let pending = settingsCallbacks.values.first
-        if pending == nil && !nativeTun.hasSessions { settingsReset = UUID(); settings = nil }
+        let tunCustodyUncertain = nativeTun.hasSessions
+        let stages = TunnelNativeReset(settingsCallbackPending: pending != nil,
+                                       tunCustodyUncertain: tunCustodyUncertain)
+        if pending == nil && !tunCustodyUncertain { settingsReset = UUID(); settings = nil }
         stateLock.unlock()
-        if let pending {
-            let message = "The original NE settings callback has not joined"
-            provider.nativeTunCleanupUncertain(pending.0, message: message)
-            return message
+        if let failure = stages.failure {
+            provider.nativeResetIncomplete(settingsGeneration: pending?.0, message: failure)
+        } else {
+            nativeTun = TunnelNativeTunOwner<NEPacketTunnelNetworkSettings>()
         }
-        guard !nativeTun.hasSessions else { return "Native TUN settings or descriptor custody remains uncertain" }
-        nativeTun = TunnelNativeTunOwner<NEPacketTunnelNetworkSettings>()
-        return nil
+        return stages
     }
     func clearDNSCache() {
         guard settingsOperation.try() else {
