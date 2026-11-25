@@ -455,7 +455,7 @@ impl ProxyRuntime {
         self.native_status_with(&config, generation, groups)
     }
 
-    pub(crate) async fn native_auto_status(&self) -> NativeAutoStatus {
+    pub(crate) async fn refresh_native_auto_observation(&self) {
         let generation = self.core_generation();
         if self.core_running() {
             let revision = self.native_observation_revision();
@@ -469,6 +469,10 @@ impl ProxyRuntime {
                 }
             }
         }
+    }
+
+    pub(crate) async fn native_auto_status(&self) -> NativeAutoStatus {
+        self.refresh_native_auto_observation().await;
         self.native_auto_cached_status()
     }
 

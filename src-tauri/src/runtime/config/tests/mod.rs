@@ -728,6 +728,9 @@ fn current_reflects_the_write_immediately_after_save_full() {
     let dir = temp_dir("current-after-save");
     let mgr = ConfigManager::new(dir.clone());
     let mut cfg = mgr.load_full().unwrap();
+    let before = mgr.current_snapshot().unwrap();
+    let old_port = before["mixedPort"].clone();
+    assert!(Arc::ptr_eq(&before, &mgr.current_snapshot().unwrap()));
     cfg.as_object_mut()
         .unwrap()
         .insert("mixedPort".into(), Value::from(7899u64));
@@ -737,6 +740,8 @@ fn current_reflects_the_write_immediately_after_save_full() {
         7899,
         "save_full 之后 current() 必须已是新值 —— 起核载荷就是从这里取的"
     );
+    assert_eq!(mgr.current_snapshot().unwrap()["mixedPort"], 7899);
+    assert_eq!(before["mixedPort"], old_port);
 }
 
 /// `save_full` 每次都取新 tmp 后缀 → 连续保存不得残留 tmp、内容以最后一次为准。

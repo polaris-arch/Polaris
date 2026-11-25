@@ -518,7 +518,7 @@ pub(crate) struct PreparedConfigEdit {
 }
 
 struct PublishedConfig {
-    value: Value,
+    value: Arc<Value>,
     revision: u64,
 }
 
@@ -901,7 +901,7 @@ impl ConfigManager {
     fn publish_config_cache(&self, value: Option<Value>) {
         if let Ok(mut guard) = self.cache.write() {
             *guard = value.map(|value| PublishedConfig {
-                value,
+                value: Arc::new(value),
                 revision: self.saved_revision(),
             });
         }
@@ -912,7 +912,7 @@ impl ConfigManager {
         deny_inside_projection("published_config");
         let cache = self.cache.read().ok()?;
         let saved = cache.as_ref()?;
-        Some((saved.value.clone(), saved.revision))
+        Some((saved.value.as_ref().clone(), saved.revision))
     }
 
     fn mesh_marker_path(&self) -> PathBuf {
@@ -976,10 +976,21 @@ impl ConfigManager {
         deny_inside_projection("current");
         if let Ok(guard) = self.cache.read() {
             if let Some(c) = guard.as_ref() {
-                return Ok(c.value.clone());
+                return Ok(c.value.as_ref().clone());
             }
         }
         self.load_full()
+    }
+
+    /// Share one immutable configuration across scheduler ticks and a measurement round.
+    pub(crate) fn current_snapshot(&self) -> Result<Arc<Value>, StoreError> {
+        deny_inside_projection("current_snapshot");
+        if let Ok(guard) = self.cache.read() {
+            if let Some(c) = guard.as_ref() {
+                return Ok(Arc::clone(&c.value));
+            }
+        }
+        self.load_full().map(Arc::new)
     }
 
     /// currentConfig 缓存的**持锁投影入口**：读锁一直持到 `f` 返回，`f` 只取它真正要的那几个字段。
@@ -1040,7 +1051,7 @@ impl ConfigManager {
             .cache
             .read()
             .map_err(|_| StoreError::validation("runtime owner cache unavailable"))?;
-        if cache.as_ref().map(|c| &c.value) != Some(expected) {
+        if cache.as_ref().map(|c| c.value.as_ref()) != Some(expected) {
             return Err(StoreError::validation("runtime desired owner superseded"));
         }
         let (persisted, bytes) = self.read_saved_document()?;
@@ -1531,11 +1542,11 @@ impl ConfigManager {
             .deferred_delete_lock
             .lock()
             .map_err(|_| StoreError::validation("deletion scope unavailable"))?;
-        if !self
-            .cache
-            .read()
-            .is_ok_and(|cache| cache.as_ref().is_some_and(|saved| &saved.value == desired))
-        {
+        if !self.cache.read().is_ok_and(|cache| {
+            cache
+                .as_ref()
+                .is_some_and(|saved| saved.value.as_ref() == desired)
+        }) {
             return Err(StoreError::validation(
                 "deletion scope desired owner changed",
             ));

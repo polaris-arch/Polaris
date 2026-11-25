@@ -275,7 +275,9 @@ pub async fn proxy_get_status(
     state: State<'_, AppRuntime>,
 ) -> Result<ApiResponse<ProxyStatus>, ()> {
     Ok(async {
-        state.proxy().native_auto_status().await;
+        state.proxy().refresh_native_auto_observation().await;
+        // Preserve lazy configuration loading before the saved-context read.
+        let _ = state.config().with_current(|_| ());
         // The snapshot shares the config writer mutex with commit fences and other
         // status reads; wait out such a brief holder instead of surfacing it.
         let mut response = proxy_status_response(state.proxy());

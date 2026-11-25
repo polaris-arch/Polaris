@@ -1753,7 +1753,7 @@ impl MeasurementScheduler {
     async fn run(self: Arc<Self>, app: AppHandle) {
         let ledger = measurement_ledger::global();
         let platform = Platform::current();
-        let mut config = Value::Null;
+        let mut config = Arc::new(Value::Null);
         let mut config_at = None;
         loop {
             let now = self.now();
@@ -1764,7 +1764,7 @@ impl MeasurementScheduler {
                     || config_at
                         .is_none_or(|at: u64| now.mono.saturating_sub(at) >= CONFIG_REFRESH_MS)
                 {
-                    if let Ok(current) = state.config().current() {
+                    if let Ok(current) = state.config().current_snapshot() {
                         config = current;
                         config_at = Some(now.mono);
                         // 被自动选择意图指向的订阅即使没开周期测速也进计划。
@@ -1860,7 +1860,7 @@ impl MeasurementScheduler {
             if let Some((targets, scope, abort)) = targets {
                 let this = Arc::clone(&self);
                 let app = app.clone();
-                let config = config.clone();
+                let config = Arc::clone(&config);
                 tauri::async_runtime::spawn(async move {
                     let outcome = settle(async {
                         if targets.is_empty() {
