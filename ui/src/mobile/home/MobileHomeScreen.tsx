@@ -96,7 +96,7 @@ import { configSaveErrorText } from '@/domain/action-error-text';
 import type { ServiceId } from '@/contracts/unlock-detection';
 import { UNLOCK_SERVICES, unlockBadgeSrc } from './unlock-services';
 import { createRunWrite, writeErrorsFromProxyStatus } from './write-errors';
-import { EMPTY_TRAFFIC_BUFFER, pushTotals, type TrafficBuffer } from './traffic-buffer';
+import { EMPTY_TRAFFIC_BUFFER, pushTrafficStats, type TrafficBuffer } from './traffic-buffer';
 import {
   applyDetail,
   compositionOf,
@@ -234,7 +234,7 @@ export function MobileHomeScreen(): ReactElement {
   const [stats, setStats] = useState<TrafficStats | null>(null);
   const [buffer, setBuffer] = useState<TrafficBuffer>(EMPTY_TRAFFIC_BUFFER);
   const [active, setActive] = useState<ActiveTable>(EMPTY_ACTIVE_TABLE);
-  /* `pushTotals` 要读上一拍的缓冲，而 stats 帧到得比 React 提交快 —— 用 ref 串起来，
+  /* `pushTrafficStats` 要读上一拍的缓冲，而 stats 帧到得比 React 提交快 —— 用 ref 串起来，
      避免闭包捕获到一个已经过期的 buffer（那会让每一帧都基于同一个基线差分）。 */
   const bufRef = useRef(EMPTY_TRAFFIC_BUFFER);
 
@@ -247,7 +247,7 @@ export function MobileHomeScreen(): ReactElement {
       },
       (s) => {
         setStats(s);
-        bufRef.current = pushTotals(bufRef.current, s.totalUpload, s.totalDownload, performance.now(), Date.now());
+        bufRef.current = pushTrafficStats(bufRef.current, s, Date.now());
         setBuffer(bufRef.current);
       },
     );

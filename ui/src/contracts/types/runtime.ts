@@ -355,9 +355,8 @@ export interface LogEntry {
 /**
  * 流量统计快照（`EVENT_STATS_UPDATED` 载荷，'stats' topic）。
  *
- * 供数：后端一条 `SubscribeStatus` 长驻流（`runtime/stats.rs` 的 `run_stats_stream`），约 1s 一帧。
- * Rust 侧是 `polaris_stats_engine::TrafficStats`，键名由该结构的 `rename_all = "camelCase"` 保证
- * 与本接口逐字一致（两侧各有一条键名契约测试守着）。
+ * 供数：后端一条 `SubscribeStatus` 长驻流，约 1s 一帧。原生事件在
+ * `polaris_stats_engine::TrafficStats` 快照字段上附加图表采样元数据。
  */
 export interface TrafficStats {
   /** 上行速率 bytes/s。后端对 totalUpload 做跨帧差分 ÷ 实测 Δt 求得；**每条流的首帧恒为 0**（无基线）。 */
@@ -381,6 +380,14 @@ export interface TrafficStats {
    * 测速探测连接；本字段是内核未过滤的口径，测速期间可能略大。
    */
   activeConnections?: number;
+  /** null 表示核已停；缺字段的兼容快照可显示速率，但不能画采样点。 */
+  trafficSample?: {
+    /** 原生单调采样时间，单位毫秒，只在本机同一时钟上做差。 */
+    monotonicMs: number;
+    generation: number;
+    /** 当前 transport 重新建立累计基线，不能跨断流计算速率。 */
+    reprime: boolean;
+  } | null;
 }
 
 // ============================================================================

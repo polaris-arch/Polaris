@@ -154,7 +154,7 @@ fn 桌面流标识文案不变() {
     assert_eq!(stream_label(9090), "port=9090");
 }
 
-fn timed_status(total: i64, observed_at_ms: Option<u64>, reset: bool) -> StatusFrame {
+fn timed_status(total: i64, observed_at_ms: u64, reset: bool) -> StatusFrame {
     StatusFrame {
         status: SingBoxStatus {
             uplink_total: total,
@@ -168,16 +168,46 @@ fn timed_status(total: i64, observed_at_ms: Option<u64>, reset: bool) -> StatusF
 }
 
 #[test]
+fn unavailable_status_and_stopped_core_have_distinct_chart_signals() {
+    let mut meter = polaris_stats_engine::StatsAggregator::new();
+    let mut frame = timed_status(0, 1_000, false);
+    frame.status.traffic_available = false;
+    let unavailable = serde_json::to_value(frame.apply(&mut meter, 7, true)).unwrap();
+    assert_eq!(
+        unavailable,
+        serde_json::to_value(TrafficStats::zeroed()).unwrap()
+    );
+    let mut stopped = serde_json::to_value(StatsEvent::Timed {
+        stats: TrafficStats::zeroed(),
+        traffic_sample: None,
+    })
+    .unwrap();
+    assert_eq!(
+        stopped.as_object_mut().unwrap().remove("trafficSample"),
+        Some(serde_json::Value::Null)
+    );
+    assert_eq!(stopped, unavailable);
+}
+
+#[test]
 fn recovered_desktop_subscription_primes_instead_of_averaging_outage() {
     let mut meter = polaris_stats_engine::StatsAggregator::new();
-    timed_status(0, None, true).apply(&mut meter, 1_000);
-    timed_status(1_048_576, None, false).apply(&mut meter, 2_000);
+    timed_status(0, 1_000, true).apply(&mut meter, 7, true);
+    timed_status(1_048_576, 2_000, false).apply(&mut meter, 7, false);
     assert_eq!(meter.snapshot().upload_speed, 1_048_576);
     // Same core generation and port, but a new underlying subscription.
-    timed_status(11_534_336, None, true).apply(&mut meter, 12_000);
+    let event = timed_status(11_534_336, 12_000, true).apply(&mut meter, 7, true);
     assert_eq!(meter.snapshot().upload_speed, 0);
     assert_eq!(meter.snapshot().total_upload, 11_534_336);
-    timed_status(11_534_336, None, false).apply(&mut meter, 13_000);
+    assert_eq!(
+        serde_json::to_value(event).unwrap(),
+        serde_json::json!({
+            "uploadSpeed": 0, "downloadSpeed": 0, "totalUpload": 11_534_336,
+            "totalDownload": 11_534_336, "activeConnections": 0,
+            "trafficSample": { "monotonicMs": 12_000, "generation": 7, "reprime": true }
+        })
+    );
+    timed_status(11_534_336, 13_000, false).apply(&mut meter, 7, false);
     assert_eq!(meter.snapshot().upload_speed, 0);
 }
 
@@ -185,7 +215,12 @@ fn recovered_desktop_subscription_primes_instead_of_averaging_outage() {
 fn android_batch_uses_prequeue_observation_time_not_drain_time() {
     let mut meter = polaris_stats_engine::StatsAggregator::new();
     for (index, time) in [1_000, 2_000, 3_000].into_iter().enumerate() {
-        timed_status(index as i64 * 1_048_576, Some(time), false).apply(&mut meter, 90_000);
+        let event =
+            timed_status(index as i64 * 1_048_576, time, false).apply(&mut meter, 7, index == 0);
+        assert_eq!(
+            serde_json::to_value(event).unwrap()["trafficSample"],
+            serde_json::json!({ "monotonicMs": time, "generation": 7, "reprime": index == 0 }),
+        );
         assert_eq!(
             meter.snapshot().upload_speed,
             if index == 0 { 0 } else { 1_048_576 }
@@ -193,14 +228,14 @@ fn android_batch_uses_prequeue_observation_time_not_drain_time() {
     }
     assert_eq!(meter.snapshot().total_upload, 2_097_152);
     // Equal/backward observations provide no elapsed window: re-prime, no fake 1ms rate.
-    timed_status(3_145_728, Some(3_000), false).apply(&mut meter, 90_000);
+    timed_status(3_145_728, 3_000, false).apply(&mut meter, 7, false);
     assert_eq!(meter.snapshot().upload_speed, 0);
-    timed_status(4_194_304, Some(2_000), false).apply(&mut meter, 90_000);
+    timed_status(4_194_304, 2_000, false).apply(&mut meter, 7, false);
     assert_eq!(meter.snapshot().upload_speed, 0);
-    timed_status(5_242_880, Some(3_000), false).apply(&mut meter, 90_000);
+    timed_status(5_242_880, 3_000, false).apply(&mut meter, 7, false);
     assert_eq!(meter.snapshot().upload_speed, 1_048_576);
     // New Android subscription starts a separate clock baseline.
     meter.reset();
-    timed_status(10_485_760, Some(50_000), false).apply(&mut meter, 90_000);
+    timed_status(10_485_760, 50_000, false).apply(&mut meter, 7, true);
     assert_eq!(meter.snapshot().upload_speed, 0);
 }

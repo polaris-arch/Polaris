@@ -35,7 +35,7 @@ use super::projection::{
     PendingDetailUpdate,
 };
 use super::source;
-use super::source::{ConnectionFrame, ConnectionStreamFailure};
+use super::source::{ConnectionFrame, ConnectionStreamFailure, StatsEvent};
 use super::subscription::ConnectionStreamLifecycle;
 use super::{
     AGGREGATE_EMIT_MIN_INTERVAL, CLOSED_EMIT_MIN_INTERVAL, DETAIL_EMIT_MIN_INTERVAL,
@@ -902,12 +902,9 @@ pub(super) async fn run_stats_stream(
     mut gate: StreamGate,
 ) {
     let visible = visibility_source(gate.state.clone(), app.clone());
-    // 速率差分的时基必须是**单调**时钟：墙钟被 NTP 往回校一秒，Δt 就会算成负数（钳到下限后是个
-    // 天文数字速率）；往前校则把速率算低。与 `run_connections_stream` 的 `clock` 同一理由。
-    let clock = Instant::now();
     let mut meter = StatsAggregator::new();
-    // 核未运行的清零帧是否已推过（边沿触发；同 `run_connections_stream` 的 offline_sent）。
-    let mut offline_sent = false;
+    // 正在运行但管理口尚不可用时，清零快照没有可用于图表的采样。
+    let mut unavailable_running = None;
 
     while !stop.load(Ordering::Relaxed) {
         // ① 降流门：关着就在这里断流待命。
@@ -923,9 +920,18 @@ pub(super) async fn run_stats_stream(
         //    只会让渲染端白重渲）。
         let status = proxy.status();
         if !source::stream_ready(&status) {
-            if !offline_sent {
-                broadcast(&app, EVENT_STATS_UPDATED, offline_stats_frame());
-                offline_sent = true;
+            if unavailable_running != Some(status.running) {
+                let stats = offline_stats_frame();
+                let event = if status.running {
+                    StatsEvent::Snapshot(stats)
+                } else {
+                    StatsEvent::Timed {
+                        stats,
+                        traffic_sample: None,
+                    }
+                };
+                broadcast(&app, EVENT_STATS_UPDATED, event);
+                unavailable_running = Some(status.running);
             }
             meter.reset(); // 停核 = 旧基线作废（核回来是新的一条生命线，累计从 0 重来）
             tokio::time::sleep(PARK_RECHECK_INTERVAL).await;
@@ -947,7 +953,8 @@ pub(super) async fn run_stats_stream(
         }
         // 新流 = 新的一份真相：速率基线在此刻作废。
         meter.reset();
-        offline_sent = false;
+        unavailable_running = None;
+        let mut reprime = true;
         // 上一次见到的 `trafficAvailable`（`None` = 本条流还没见过帧 → 首帧必报一次）。
         // 随流而生、随流而灭：见 [`traffic_availability_changed`]。
         let mut traffic_available: Option<bool> = None;
@@ -982,11 +989,16 @@ pub(super) async fn run_stats_stream(
                                 );
                             }
                         }
-                        frame.apply(&mut meter, mono_ms(clock));
+                        let available = st.traffic_available;
+                        reprime |= frame.reset || !available;
+                        let event = frame.apply(&mut meter, generation, reprime);
                         // 门关的一瞬可能正好收到一帧（`wait_until(false, ..)` 那条腿还没被调度到）→
                         // emit 前再看一次订阅门，别把帧推给已经没人看的窗口。
                         if gate.topic_open(Topic::Stats) {
-                            broadcast(&app, EVENT_STATS_UPDATED, meter.snapshot());
+                            broadcast(&app, EVENT_STATS_UPDATED, event);
+                            if available {
+                                reprime = false;
+                            }
                         }
                     }
                     // ReconnectingStream 正常语义下不返 None；真返了说明它内部终止 → 重建。

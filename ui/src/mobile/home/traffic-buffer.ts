@@ -12,8 +12,8 @@
  *
  * 三件被这条规则一并settle 的事（原文在 spec，此处只记结论与后果）：
  *  · 速率用相邻图表采样的累计值和实测间隔计算，和时间轴的窗口一致。
- *  · 原生 Status 流约每秒一帧，WebView 收帧会有抖动。图表给略早到达的帧留出余量，
- *    并合并间隔过短的帧。
+ *  · 原生 Status 流约每秒一帧。按原生单调采样时间合并过密的采样，
+ *    WebView 收帧时间只用于显示观察时间。
  *  · **绝不读 sing-box 的 `Status.uplink` / `downlink`**：那不是速率（订阅循环往里写的是每 tick 的
  *    字节增量，首帧恒零，server 的 tick 间隔不在线上）。
  *
@@ -24,12 +24,15 @@
  * 处置是**丢掉它并重启缓冲**，不是画一根负的或一根冲天的尖峰 —— 后两者都是在断言一件没发生的事。
  */
 
+import type { TrafficStats } from '@/contracts/types';
+
 /** 一个采样点：两条序列各一个 bytes/s。 */
 export interface RateSample {
-  /** Monotonic arrival time for rate and axis spacing. */
+  /** Native monotonic observation time for rate and axis spacing. */
   readonly at?: number;
   /** Wall time captured at arrival, for the observation label. */
   readonly observedAt?: number;
+  readonly breakBefore?: boolean;
   readonly up: number;
   readonly down: number;
 }
@@ -42,25 +45,52 @@ export const TRAFFIC_INTERVAL_MS = 1000;
 const TRAFFIC_MIN_SAMPLE_INTERVAL_MS = TRAFFIC_INTERVAL_MS * 0.75;
 
 /**
- * 差分缓冲。`baseline` 是上一个**已消费**的累计值与它的时刻；
- * `null` = 还没有基线（冷启动，或刚被一次计数器归零重置过）。
+ * `baseline` 保留上一次用于差分的累计值。缺帧后暂不再用它的时间，
+ * 但下一帧仍可据它识别计数器归零。
  */
 export interface TrafficBuffer {
   /** 最新在**尾**。长度 ≤ `TRAFFIC_WINDOW`。 */
   readonly samples: readonly RateSample[];
-  readonly baseline: { readonly up: number; readonly down: number; readonly at: number } | null;
+  readonly baseline: {
+    readonly up: number;
+    readonly down: number;
+    readonly at: number | null;
+    readonly breakBefore?: boolean;
+  } | null;
+  readonly generation?: number;
+  readonly lastSeenAt?: number;
 }
 
 export const EMPTY_TRAFFIC_BUFFER: TrafficBuffer = { samples: [], baseline: null };
 
+export function pushTrafficStats(buf: TrafficBuffer, stats: TrafficStats, receivedAt: number): TrafficBuffer {
+  const sample = stats.trafficSample;
+  if (sample === null) return EMPTY_TRAFFIC_BUFFER;
+  if (sample === undefined) {
+    const base = buf.baseline;
+    return base === null || base.at === null ? buf : { ...buf, baseline: { ...base, at: null } };
+  }
+  const { generation, monotonicMs, reprime } = sample;
+  if (buf.generation !== undefined && generation < buf.generation) return buf;
+  const current = generation === buf.generation ? buf : { ...EMPTY_TRAFFIC_BUFFER, generation };
+  if (current.lastSeenAt !== undefined &&
+      (monotonicMs < current.lastSeenAt || (monotonicMs === current.lastSeenAt && !reprime))) {
+    return current;
+  }
+  return pushTotals(
+    { ...current, lastSeenAt: monotonicMs },
+    stats.totalUpload, stats.totalDownload, monotonicMs, receivedAt, reprime,
+  );
+}
+
 /**
  * 吃一帧累计值，返回新缓冲。
  *
- * 四条分支，每条对应一个真实形态：
  *  1. 无基线 ⇒ 只记基线，不出点（第一帧没有可差分的对象）。
  *  2. 累计值**变小** ⇒ 核重启了。清空样本 + 换基线，**不出点**（那个差分不是速率）。
- *  3. 距基线短于最小采样间隔 ⇒ 留待下一帧计算累计增量。
- *  4. 达到采样间隔 ⇒ 出一个点，速率 = 增量 ÷ 实测 Δt。
+ *  3. 缺帧或同一内核重订 ⇒ 换基线，保留窗口内的历史，在下一点前断开曲线。
+ *  4. 距基线短于最小采样间隔 ⇒ 留待下一帧计算累计增量。
+ *  5. 达到采样间隔 ⇒ 出一个点，速率 = 增量 ÷ 实测 Δt。
  */
 export function pushTotals(
   buf: TrafficBuffer,
@@ -68,26 +98,43 @@ export function pushTotals(
   totalDown: number,
   atMs: number,
   observedAt?: number,
+  reprime = false,
 ): TrafficBuffer {
   const base = buf.baseline;
+  const baseline = { up: totalUp, down: totalDown, at: atMs };
   if (base === null) {
-    return { samples: buf.samples, baseline: { up: totalUp, down: totalDown, at: atMs } };
+    return { ...buf, baseline };
   }
   // 计数器归零：新生命线。样本一并清掉 —— 留着会把两条生命线的速率画进同一根曲线。
   if (totalUp < base.up || totalDown < base.down) {
-    return { samples: [], baseline: { up: totalUp, down: totalDown, at: atMs } };
+    return { ...buf, samples: [], baseline };
+  }
+  if (base.at === null || reprime) {
+    return {
+      ...buf,
+      samples: withinWindow(buf.samples, atMs),
+      baseline: { ...baseline, breakBefore: true },
+    };
   }
   const dt = atMs - base.at;
   if (dt < TRAFFIC_MIN_SAMPLE_INTERVAL_MS) return buf;
   const perSec = 1000 / dt;
   const next = [
     ...buf.samples,
-    { at: atMs, observedAt, up: (totalUp - base.up) * perSec, down: (totalDown - base.down) * perSec },
+    {
+      at: atMs, observedAt, up: (totalUp - base.up) * perSec, down: (totalDown - base.down) * perSec,
+      ...(base.breakBefore ? { breakBefore: true } : {}),
+    },
   ];
   return {
-    samples: next.filter((sample) => sample.at !== undefined && sample.at >= atMs - TRAFFIC_WINDOW * 1000).slice(-TRAFFIC_WINDOW),
-    baseline: { up: totalUp, down: totalDown, at: atMs },
+    ...buf,
+    samples: withinWindow(next, atMs).slice(-TRAFFIC_WINDOW),
+    baseline,
   };
+}
+
+function withinWindow(samples: readonly RateSample[], atMs: number): RateSample[] {
+  return samples.filter(sample => sample.at !== undefined && sample.at >= atMs - TRAFFIC_WINDOW * 1000);
 }
 
 /**
@@ -158,7 +205,7 @@ export function timedTrafficPath(samples: readonly RateSample[], field: 'up' | '
   let previous: number | undefined;
   for (const sample of samples) {
     if (sample.at === undefined || sample.at < start || sample.at > end) continue;
-    if (previous === undefined || sample.at - previous > TRAFFIC_INTERVAL_MS * 2) segments.push([]);
+    if (previous === undefined || sample.breakBefore || sample.at - previous > TRAFFIC_INTERVAL_MS * 2) segments.push([]);
     segments[segments.length - 1].push(sample);
     previous = sample.at;
   }
@@ -170,7 +217,6 @@ export function timedTrafficPath(samples: readonly RateSample[], field: 'up' | '
 
 /** Right edge is the observation timestamp, never a claim of freshness. */
 export function trafficObservationLabel(samples: readonly RateSample[], format: (at: number) => string): string {
-  const last = samples[samples.length - 1];
-  const at = last?.observedAt ?? last?.at;
+  const at = samples[samples.length - 1]?.observedAt;
   return at === undefined ? '—' : format(at);
 }

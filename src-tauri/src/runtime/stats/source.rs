@@ -45,7 +45,7 @@
 //! - 「桥不回应」由 **Kotlin 侧**封顶（`MAX_WAIT_MS` 900ms 必回一帧，可能是空批），
 //!   而不是由 Rust 侧超时。超时判据搬到了不会丢弃 future 的那一侧。
 
-use polaris_stats_engine::{SingBoxConnectionEvents, SingBoxStatus};
+use polaris_stats_engine::{SingBoxConnectionEvents, SingBoxStatus, StatsAggregator, TrafficStats};
 
 #[cfg(not(target_os = "android"))]
 use crate::runtime::proxy::runtime_config::api_handoff::{relay_cancelled, ApiRelayBorrow};
@@ -231,25 +231,57 @@ impl ConnectionFrame {
     }
 }
 
-/// Transport-only timing metadata, never compared across clock domains.
-/// Android timestamps native callback observation before Kotlin queueing; desktop
-/// uses receive time and an explicit reset from the reconnecting transport.
+/// Android timestamps observation before Kotlin queueing. The gRPC transport
+/// timestamps receipt on a process-local clock that survives relay restarts.
 pub(super) struct StatusFrame {
     pub(super) status: SingBoxStatus,
-    pub(super) observed_at_ms: Option<u64>,
+    pub(super) observed_at_ms: u64,
     pub(super) reset: bool,
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(untagged)]
+pub(super) enum StatsEvent {
+    Snapshot(TrafficStats),
+    Timed {
+        #[serde(flatten)]
+        stats: TrafficStats,
+        #[serde(rename = "trafficSample")]
+        traffic_sample: Option<TrafficSample>,
+    },
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct TrafficSample {
+    monotonic_ms: u64,
+    generation: u64,
+    reprime: bool,
 }
 
 impl StatusFrame {
     pub(super) fn apply(
         self,
-        meter: &mut polaris_stats_engine::StatsAggregator,
-        received_at_ms: u64,
-    ) {
+        meter: &mut StatsAggregator,
+        generation: u64,
+        reprime: bool,
+    ) -> StatsEvent {
         if self.reset {
             meter.reset();
         }
-        meter.on_status(&self.status, self.observed_at_ms.unwrap_or(received_at_ms));
+        meter.on_status(&self.status, self.observed_at_ms);
+        let stats = meter.snapshot();
+        if !self.status.traffic_available {
+            return StatsEvent::Snapshot(stats);
+        }
+        StatsEvent::Timed {
+            stats,
+            traffic_sample: Some(TrafficSample {
+                monotonic_ms: self.observed_at_ms,
+                generation,
+                reprime,
+            }),
+        }
     }
 }
 
@@ -312,7 +344,7 @@ impl StatusStream {
             let (st, reset) = tokio::select! {_ = relay_cancelled(&self.api_borrow)=>None, v=self.inner.recv_with_reset()=>v}?;
             Some(StatusFrame {
                 status: super::relay::daemon_status_to_engine(&st),
-                observed_at_ms: None,
+                observed_at_ms: crate::runtime::proxy::mono_now_ms(),
                 reset,
             })
         }
@@ -685,7 +717,7 @@ mod android {
     impl From<BridgeStatus> for super::StatusFrame {
         fn from(s: BridgeStatus) -> Self {
             super::StatusFrame {
-                observed_at_ms: Some(s.observed_at_ms),
+                observed_at_ms: s.observed_at_ms,
                 reset: false, // outer subscription resets the meter before the first frame
                 status: SingBoxStatus {
                     memory: s.memory,
