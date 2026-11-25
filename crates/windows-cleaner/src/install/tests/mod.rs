@@ -38,6 +38,7 @@ struct Fake {
     unknown: bool,
     second_conflict: bool,
     case: &'static str,
+    fail_at: Option<&'static str>,
     trace: Vec<&'static str>,
     service_object: u64,
     creates: usize,
@@ -78,6 +79,7 @@ impl Fake {
             unknown: false,
             second_conflict: false,
             case: "pending-running",
+            fail_at: None,
             trace: vec![],
             service_object: 42,
             creates: 0,
@@ -102,7 +104,11 @@ impl Fake {
     }
     fn step(&mut self, name: &'static str) -> io::Result<()> {
         self.trace.push(name);
-        Ok(())
+        if self.fail_at == Some(name) {
+            Err(io::Error::other(format!("injected {name} failure")))
+        } else {
+            Ok(())
+        }
     }
     #[cfg(windows)]
     fn p(&self, name: &str) -> std::path::PathBuf {
@@ -192,15 +198,16 @@ impl Ops for Fake {
         self.check_policy()
     }
     fn stop(&mut self) -> io::Result<()> {
-        self.step("stop")?;
         self.state = State::Stopped;
-        Ok(())
+        self.step("stop")
     }
     fn register_user(&mut self) -> io::Result<()> {
-        self.step("register")?;
         #[cfg(windows)]
-        self.files.register_utility_effect()?;
-        Ok(())
+        let registration = self.files.register_utility_effect();
+        let step = self.step("register");
+        #[cfg(windows)]
+        registration?;
+        step
     }
     fn replace_payload(&mut self) -> io::Result<()> {
         self.step("replace")?;
@@ -233,7 +240,7 @@ impl Ops for Fake {
     fn stop_candidate(&mut self, old: Option<State>, tx: &Transaction) -> io::Result<()> {
         self.step("stop-candidate")?;
         assert!(tx.mutated);
-        assert!(tx.registration_changed);
+        assert_eq!(tx.registration_changed, self.trace.contains(&"register"));
         if self.fail_candidate_query {
             return Err(io::Error::other("candidate query unknown"));
         }
@@ -268,8 +275,8 @@ impl Ops for Fake {
         self.step("cancel")
     }
     fn finish(&mut self, keep: bool) -> io::Result<()> {
-        self.step("finish")?;
         self.keep = keep;
+        self.step("finish")?;
         #[cfg(windows)]
         self.files.finish(keep)?;
         #[cfg(not(windows))]
@@ -539,6 +546,7 @@ fn production_order_marks_mutation_and_partial_registration_before_failure() {
         "core",
         "snapshot",
         "admit",
+        "revalidate",
         "stop",
         "register",
         "replace",
@@ -552,6 +560,53 @@ fn production_order_marks_mutation_and_partial_registration_before_failure() {
     .map(|step| f.trace.iter().position(|s| s == step).unwrap())
     .collect();
     assert!(positions.windows(2).all(|p| p[0] < p[1]));
+
+    for (step, code) in [("core", 82), ("stop", 85), ("register", 83), ("finish", 88)] {
+        let mut f = Fake::new(true);
+        f.fail_at = Some(step);
+        f.fail_activation = false;
+        assert_eq!(run(&mut f), code, "{step}: {:?}", f.trace);
+        assert!(!f.keep);
+        assert_eq!(f.tx_present(), step == "finish");
+        match step {
+            "core" => assert_eq!(f.trace, ["inspect", "prepare", "core", "finish"]),
+            "stop" | "register" => {
+                assert!(f.trace.starts_with(&[
+                    "inspect",
+                    "prepare",
+                    "core",
+                    "policy",
+                    "snapshot",
+                    "admit",
+                    "revalidate",
+                    "stop",
+                ]));
+                assert!(f.trace.contains(&"stop-candidate"));
+                assert!(f.trace.contains(&"restore-previous"));
+                assert_eq!(f.state, State::Running);
+                assert_eq!(f.trace.contains(&"register"), step == "register");
+                assert_eq!(
+                    f.trace.contains(&"restore-registration"),
+                    step == "register"
+                );
+                assert!(!f.trace.contains(&"activation"));
+            }
+            "finish" => assert!(f.trace.ends_with(&["revalidate", "activation", "finish"])),
+            _ => unreachable!(),
+        }
+    }
+
+    let mut f = Fake::new(true);
+    f.fail_at = Some("register");
+    f.fail_candidate_query = true;
+    assert_eq!(run(&mut f), 87);
+    assert!(f.keep && f.tx_present());
+    f.assert_backups();
+    #[cfg(windows)]
+    assert_eq!(
+        std::fs::read_to_string(f.p("registration")).unwrap(),
+        "replacement registration"
+    );
 }
 
 fn request() -> Request {
@@ -669,7 +724,10 @@ fn core_only_retention_requires_same_registration_and_live_selected_id_ready() {
     f.ready = true;
     assert_eq!(run(&mut f), 0);
     assert!(!f.keep && !f.tx_present());
-    assert!(f.trace.contains(&"retain-probe"));
+    assert!(f
+        .trace
+        .windows(3)
+        .any(|steps| steps == ["capability", "same-registration", "retain-probe"]));
     assert!(f.trace.contains(&"finish"));
     for op in ["admit", "stop", "register", "replace", "create", "start"] {
         assert!(!f.trace.contains(&op));
@@ -685,7 +743,15 @@ fn core_only_retention_requires_same_registration_and_live_selected_id_ready() {
         f.same_user_registration = same;
         f.busy = true;
         assert_eq!(run(&mut f), 75);
-        assert!(f.trace.contains(&"admit"));
+        assert!(f.trace.starts_with(&[
+            "inspect",
+            "prepare",
+            "core",
+            "policy",
+            "capability",
+            "same-registration"
+        ]));
+        assert!(f.trace.ends_with(&["snapshot", "admit", "finish"]));
         assert_eq!(f.trace.contains(&"retain-probe"), same);
         assert!(!f.trace.contains(&"stop"));
         assert!(!f.trace.contains(&"register"));

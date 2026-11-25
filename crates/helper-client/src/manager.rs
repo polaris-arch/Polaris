@@ -56,9 +56,8 @@ pub struct InstallPaths {
     pub descriptor: Option<PathBuf>,
     /// socket / pipe 路径（client 连接目标）。
     pub socket: PathBuf,
-    /// 受保护核目录（sing-box 锁定路径）。**三平台都有消费者**：mac/linux 烧进 plist/unit 的
-    /// `--coredir`，win（P4 起）由 `build_win_install_script`（本 crate 私有）派生服务 ImagePath 的 `--singbox`
-    /// 并在此播种受保护核 —— 它是 Windows 受保护核路径在**安装脚本与 app 侧**的唯一来源。
+    /// 受保护核目录（sing-box 锁定路径）。mac/linux 写入 plist/unit 的 `--coredir`，
+    /// Windows 用于 App 定位由原生安装器维护的受保护核。
     ///
     /// **helper 侧不读它**：daemon 只拿 `--support`，核目录由它自己的 `derived_core_dir()`
     /// （`<support>\core`）独立派生。两份字面量靠 [`WIN_CORE_DIR_NAME`] 的等值门收敛，
@@ -111,22 +110,13 @@ impl InstallPaths {
     #[must_use]
     pub fn win() -> Self {
         Self {
-            // 必须与 `build_win_install_script` 的落点逐字一致 —— 二者曾各拼各的（状态探测查
-            // `C:\Program Files\Polaris\helper.exe`，脚本装到 `C:\ProgramData\Polaris\...`），
-            // 分叉导致 Windows 上 `is_installed` 恒 false。现同源于 WIN_SUPPORT_DIR/WIN_HELPER_EXE，
-            // 由 `win_install_script_targets_the_same_paths_status_probes` 钉死。
-            // 字面量拼接而非 `join`：`PathBuf::join` 用**宿主**分隔符，在 Linux/mac 上构造
-            // Windows 路径会得到 `C:\ProgramData\Polaris/polaris-helper.exe` 这种混合形态，
-            // 与脚本里的 `format!(r"{support}\{WIN_HELPER_EXE}")` 对不上。
+            // 与原生安装器的 SCM ImagePath 对账。固定 Windows 分隔符，供跨平台测试构造。
             binary: PathBuf::from(format!(r"{WIN_SUPPORT_DIR}\{WIN_HELPER_EXE}")),
             // Windows 服务定义在 SCM，磁盘无描述符文件 → is_installed 走 SysOps::service_exists
             // 单证据（W17：support 目录 ACL 锁拒未提权 stat，文件证据不可用；取舍见 is_installed 头注）。
             descriptor: None,
             socket: PathBuf::from(WIN_PIPE_NAME),
-            // P4 起有消费者：[`build_win_install_script`] 在此建目录、播种核、锁 ACL，并把
-            // `<core_dir>\sing-box.exe` 拼成服务 ImagePath 的 `--singbox`；app 侧
-            // `HelperRuntime::protected_core_dir_path` 对账的也是同一个值。同样字面量拼接
-            // 而非 `join`（理由见上面 `binary`）。
+            // `HelperRuntime::protected_core_dir_path` 使用这个值。
             core_dir: PathBuf::from(format!(r"{WIN_SUPPORT_DIR}\{WIN_CORE_DIR_NAME}")),
             service_label: WIN_SERVICE_NAME,
         }
@@ -433,9 +423,7 @@ const WIN_PIPE_NAME: &str = polaris_helper_proto::windows_helper::PIPE_NAME;
 /// win support 目录（= daemon `--support` 默认；helper.exe 外置副本 + helper.token 落此）。与 daemon 侧
 /// 共引同一份真值。
 const WIN_SUPPORT_DIR: &str = polaris_helper_proto::windows_helper::DEFAULT_SUPPORT_DIR;
-/// win helper 外置副本文件名。**单一真相源**：[`InstallPaths::win`] 与
-/// `build_win_install_script` 必须同取此常量。早先脚本用 `win_basename(src_binary)` 现算、
-/// 而 `InstallPaths::win()` 另写死一个不同路径，两者分叉即 Windows 恒判「未安装」的成因。
+/// win helper 外置副本文件名，与原生安装器的 SCM ImagePath 一致。
 const WIN_HELPER_EXE: &str = "polaris-helper.exe";
 /// win 受保护核目录名（`<support>\core`）。
 ///
@@ -839,16 +827,7 @@ impl HelperManager {
                     }
                 })
             }
-            Platform::Win => {
-                #[cfg(test)]
-                {
-                    Ok(build_win_install_script(&self.paths, params, token))
-                }
-                #[cfg(not(test))]
-                {
-                    Err(ManagerError::UnsupportedPlatform(Platform::Win))
-                }
-            }
+            Platform::Win => Err(ManagerError::UnsupportedPlatform(Platform::Win)),
         }
     }
 
@@ -1166,12 +1145,6 @@ fn xml_escape(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
-/// PowerShell 单引号字符串转义（`''` 转义单引号，移植 WindowsServiceHelper.ts:417）。
-#[cfg(test)]
-fn ps_quote(s: &str) -> String {
-    s.replace('\'', "''")
-}
-
 // `win_basename`（Windows 语义 basename）已随「安装落点单一真相源」收口删除：安装目标文件名
 // 不再从 `src_binary` 现算，而是与 `InstallPaths::win()` 同取 `WIN_HELPER_EXE`。
 
@@ -1280,20 +1253,6 @@ pub fn linux_canonical_unit() -> String {
     build_linux_unit(&InstallPaths::linux())
 }
 mod uninstall_unix;
-
-// ===== win 脚本（移植 WindowsServiceHelper.ts:429-517）=====
-
-/// win 安装脚本（PowerShell，经 UAC 提权跑）。忠实迁自 WindowsServiceHelper.ts:429-506。
-///
-/// 关键步骤：外置 helper.exe 到 `ProgramData\Polaris`（与 app 生命周期解耦）；锁目录/文件 ACL
-/// （SYSTEM/Admin 私有）；升级前快照旧服务并备份 helper/token；幂等停删与重建。任一步失败时恢复
-/// 旧文件、旧 binPath/start mode 与原运行态，避免覆盖升级把可用 helper 留成半安装态。
-/// `$ErrorActionPreference = Stop` 让失败以非零退出透出（提权 executor 归类 Failed；privilege.rs 的
-/// uac_escalation 无 上游的 flag-file 错误回写协议 —— 见报告 DESIGN-REVIEW）。
-#[cfg(test)]
-mod install_windows;
-#[cfg(test)]
-use install_windows::build_win_install_script;
 
 // ===== 默认 SysOps（生产实现，跨平台可编译）=====
 

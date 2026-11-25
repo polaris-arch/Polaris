@@ -269,9 +269,7 @@ fn file_owner(file: &File) -> io::Result<String> {
 }
 // SAFETY: descriptor/ACL owners remain live while GetAclInformation/GetAce
 // enumerate, with explicit byte ranges before dereferencing variable layouts.
-fn private_registration_parent(file: &File) -> io::Result<()> {
-    security(file, None, false)?;
-    let sd = file_descriptor(file)?;
+fn private_registration_parent(sd: &Descriptor) -> io::Result<()> {
     let mut acl = null_mut();
     let mut present = 0;
     let mut defaulted = 0;
@@ -1879,7 +1877,8 @@ impl Ops for Installer {
         ] {
             if entry_present(&p)? {
                 let chain = Chain::open(&p, None)?;
-                private_registration_parent(chain.last())?;
+                security(chain.last(), None, false)?;
+                private_registration_parent(&file_descriptor(chain.last())?)?;
             }
         }
         Ok(())

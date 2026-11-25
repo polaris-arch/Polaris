@@ -1133,8 +1133,8 @@ const KNOWN_NSIS_INSTALL_MODES = ['currentUser', 'perMachine', 'both'];
  *
  * NSIS 安装 App 与运行期安装/升级 helper 是两条路径。currentUser 的 App 目录同账户可写；
  * perMachine 默认落 Program Files、普通 Users 只读，但安装需要管理员权限。
- * helper 的运行期安装路径另有私有暂存、提权后封存及 hash 校验、安装身份和现有服务状态准入，
- * 见 crates/helper-client/src/manager/install_windows.rs；不能称为「拷贝前零校验」。
+ * helper 的运行期由原生 cleaner 封存暂存源，提权后复核 hash 和安装身份，再检查现有服务状态及准入。
+ * 实现见 crates/windows-cleaner/src/windows/install.rs。
  * 这些字节/状态校验不等于代码签名，也不证明同账户可写的整个 App 未被替换。
  * 本门只要求 installMode 显式且合法，不替代 helper 的安装准入或决定产品的权限策略。
  *

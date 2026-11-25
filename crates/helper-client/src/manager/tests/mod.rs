@@ -841,17 +841,6 @@ fn machine_service_never_contains_an_app_profile_or_a_flat_core() {
     assert!(plist.contains("<string>--coredir</string>"));
     assert!(!plist.contains("--confdir"));
     assert!(!plist.contains("--singbox"));
-    let win = build_win_install_script(
-        &InstallPaths::win(),
-        &install_params(
-            PathBuf::from("/x"),
-            PathBuf::from(r"C:\App\polaris-helper.exe"),
-        ),
-        &"a".repeat(64),
-    );
-    assert!(!win.contains("--confdir "));
-    assert!(!win.contains("--singbox"));
-    assert!(win.contains(r#"$binPath = '"C:\ProgramData\Polaris\polaris-helper.exe" --support "C:\ProgramData\Polaris"'"#));
 }
 
 #[test]
@@ -882,118 +871,6 @@ fn linux_auth_merge_retains_other_users_and_matches_private_reader_contract() {
         "rollback restores authorization before restarting the old service"
     );
     assert!(script.contains("auth.rollback"));
-}
-
-fn windows_script() -> String {
-    build_win_install_script(
-        &InstallPaths::win(),
-        &install_params(
-            PathBuf::from("/x"),
-            PathBuf::from(r"C:\App\polaris-helper.exe"),
-        ),
-        &"a".repeat(64),
-    )
-}
-
-#[test]
-fn windows_seals_helper_manifest_and_cleaner_before_any_service_mutation() {
-    fn scoped_mutation_precedes_stop(script: &str) -> bool {
-        let Some((_, replacement)) = script.split_once("function Begin-ServiceReplacement {\n")
-        else {
-            return false;
-        };
-        let Some((body, _)) = replacement.split_once("\n}\n") else {
-            return false;
-        };
-        let (Some(revalidate), Some(mutate), Some(stop)) = (
-            body.find("else { Assert-CurrentProductService }"),
-            body.find("\n  $script:mutated = $true\n"),
-            body.find("\n  Stop-ServiceChecked"),
-        ) else {
-            return false;
-        };
-        revalidate < mutate && mutate < stop && !body.contains("\n  $mutated = $true\n")
-    }
-
-    let script = windows_script();
-    let helper = script.find("Check-Hash $utility '").unwrap();
-    let manifest = script.find("Check-Hash $manifest '").unwrap();
-    let cleaner = script
-        .find("Check-Hash $cleaner $selection.core.cleanerSha256")
-        .unwrap();
-    let execute = script.find("Invoke-Utility @('core-install'").unwrap();
-    let admit = script.find("Invoke-Utility @('prepare-upgrade'").unwrap();
-    let mutate = script.find("\n  Begin-ServiceReplacement\n").unwrap();
-    let register = script.find("Invoke-Utility @('register-user'").unwrap();
-    assert!(helper < execute && manifest < execute && cleaner < execute);
-    assert!(execute < admit && admit < mutate && mutate < register);
-    assert!(scoped_mutation_precedes_stop(&script));
-    assert!(!scoped_mutation_precedes_stop(&script.replacen(
-        "$script:mutated = $true",
-        "$mutated = $true",
-        1,
-    )));
-    assert!(!scoped_mutation_precedes_stop(&script.replacen(
-        "$script:mutated = $true\n  Stop-ServiceChecked",
-        "Stop-ServiceChecked\n  $script:mutated = $true",
-        1,
-    )));
-    assert!(script.contains("    if ($mutated) {\n      Stop-CandidateServiceForRollback"));
-    assert!(script.contains("$selection.id -cne '"));
-    assert!(script.contains("--source-owner', $identity"));
-    assert!(!script.contains(".seed.new"));
-    assert!(!script.contains("$support\\helper.token"));
-    assert!(script.contains("Secure-Directory (Join-Path $users $identity) $false"));
-    assert!(script.contains("[IO.FileShare]::None"));
-}
-
-#[test]
-fn windows_replaces_the_entire_dacl_with_numeric_privileged_owners() {
-    let script = windows_script();
-    assert!(script.contains("/setowner '*S-1-5-32-544'"));
-    assert!(script.contains("Security.AccessControl.DirectorySecurity"));
-    assert!(script.contains("Security.AccessControl.FileSecurity"));
-    assert_eq!(
-        script
-            .matches("$acl.SetAccessRuleProtection($true, $false)")
-            .count(),
-        2
-    );
-    assert_eq!(
-        script
-            .matches("Set-Acl -LiteralPath $path -AclObject $acl")
-            .count(),
-        2
-    );
-    assert!(script.contains("@('S-1-5-18', 'S-1-5-32-544')"));
-    assert!(script.contains("SecurityIdentifier]::new('S-1-5-32-545'), [Security.AccessControl.FileSystemRights]::ReadAndExecute"));
-    assert!(!script.contains("Administrators:"));
-    assert!(!script.contains("Users:(F)"));
-    assert!(script.contains("[IO.FileAttributes]::ReparsePoint"));
-}
-
-#[test]
-fn windows_checks_native_exits_and_preserves_existing_service_identity() {
-    let script = windows_script();
-    for guard in [
-        "SCM stop",
-        "SCM delete",
-        "SCM start permission",
-        "SCM recovery",
-        "SCM start",
-        "SCM rollback start",
-    ] {
-        assert!(script.contains(&format!("Assert-NativeExit '{guard}'")));
-    }
-    assert!(script.contains("actions= restart/5000/restart/5000/restart/5000"));
-    assert!(script.contains("(A;;RP;;;IU)"));
-    assert!(script.contains("$policy.Command -cne $binPath"));
-    assert!(!script.contains("-BinaryPathName $old.PathName"));
-    assert!(script.contains("Restore-PreviousService"));
-    assert!(script.contains("$snapshot.Backup -Destination $snapshot.Path"));
-    assert!(script.contains("$keepRecovery = $true"));
-    assert!(script.contains("finally { if ($null -ne $lock) { $lock.Dispose() } }"));
-    assert!(script.contains("WaitForStatus([ServiceProcess.ServiceControllerStatus]::Running"));
 }
 
 #[test]
@@ -1429,17 +1306,17 @@ fn win_core_dir_name_agrees_with_the_helper_side_derivation() {
         .expect("derived_core_dir 不再是 `join(\"<字面量>\")` 形态 —— 判据失效，必须重写门");
     assert_eq!(
         joined, WIN_CORE_DIR_NAME,
-        "helper 侧派生的核目录名与安装脚本/app 侧的 WIN_CORE_DIR_NAME 分叉（{path}）：\
-         helper 会把 install-core 写进 `<support>\\{joined}`，而 ImagePath/seed/app 侧 dest 全指 \
+        "helper 侧派生的核目录名与 App 侧的 WIN_CORE_DIR_NAME 分叉（{path}）：\
+         helper 会把 install-core 写进 `<support>\\{joined}`，而 App 侧指向 \
          `<support>\\{WIN_CORE_DIR_NAME}` ⇒ 换核永久不生效且无任何报错"
     );
     // 正面断言：上面是「A == B」，两侧同时被改成同一个错值仍然全绿。故再钉一次绝对值 +
-    // 与安装路径的实际拼接结果（脚本烧进 ImagePath 的就是它）。
+    // 与安装路径的实际拼接结果。
     assert_eq!(WIN_CORE_DIR_NAME, "core");
     assert_eq!(
         InstallPaths::win().core_dir,
         PathBuf::from(format!(r"{WIN_SUPPORT_DIR}\{WIN_CORE_DIR_NAME}")),
-        "安装脚本派生受保护核路径时没走 WIN_CORE_DIR_NAME"
+        "App 派生受保护核路径时没走 WIN_CORE_DIR_NAME"
     );
 }
 
@@ -1449,22 +1326,6 @@ fn join_literal(src: &str) -> Option<&str> {
     src.split(".join(\"")
         .nth(1)
         .and_then(|r| r.split('"').next())
-}
-
-/// The immutable utility receives the exact stage directory containing both files.
-#[test]
-fn windows_payload_directory_is_absolute_even_when_rendered_on_unix() {
-    let p = install_params(
-        PathBuf::from("/x"),
-        PathBuf::from(r"C:\Users\u\Polaris\stage\polaris-helper.exe"),
-    );
-    let script = build_win_install_script(&InstallPaths::win(), &p, &"a".repeat(64));
-    assert!(script.contains(r"--source', 'C:\Users\u\Polaris\stage'"));
-    assert!(script
-        .contains(r"Copy-Item -LiteralPath 'C:\Users\u\Polaris\stage\polaris-helper-setup.exe'"));
-    assert!(script.contains("Check-Hash $cleaner $selection.core.cleanerSha256"));
-    assert!(script.contains("foreach ($path in $replaceObjects)"));
-    assert!(script.contains("$snapshot.Backup -Destination $snapshot.Path"));
 }
 
 #[test]
@@ -1478,12 +1339,6 @@ fn retained_binary_requires_live_content_receipt_or_repair_without_downgrade() {
         assert!(policy < probe && probe < admit);
         assert!(script.contains("if [ \"$KEEP_HELPER\" -eq 0 ]; then"));
     }
-    let script = windows_script();
-    assert!(script.contains("$keepHelper = $true"));
-    assert!(script.contains("'retain-probe' '--support' $support '--id'"));
-    assert!(script.contains("$replaceObjects = if ($keepHelper) { @() }"));
-    assert!(script.contains("if (-not $keepHelper) {"));
-    assert!(script.contains("New-Service -Name $service"));
 }
 
 #[test]
@@ -1926,109 +1781,6 @@ fn maintenance_identity_requires_absolute_source_and_actual_hash() {
 }
 
 #[test]
-fn windows_registration_is_transactional_and_follows_admission_and_stop() {
-    let script = windows_script();
-    let admission = script.find("Invoke-Utility @('prepare-upgrade'").unwrap();
-    let stop = script.find("  Begin-ServiceReplacement").unwrap();
-    let registration = script.find("Invoke-Utility @('register-user'").unwrap();
-    let snapshot = script
-        .find("$registrationSnapshot = @{ Path = $registration;")
-        .unwrap();
-    assert!(snapshot < admission && admission < stop && stop < registration);
-    let restore = script
-        .find("Restore-Registration $registrationSnapshot")
-        .unwrap();
-    let restart = script.rfind("      Restore-PreviousService").unwrap();
-    assert!(restore < restart);
-    assert!(script.contains("$keepHelper -and $wasRunning -and $sameRegistration"));
-    assert!(script.contains("$registrationChanged = $true"));
-    assert!(script.contains("Remove-Item -LiteralPath $snapshot.Path -Force"));
-    assert!(!script.contains("polaris-helper-core-only-ok'; return"));
-}
-
-#[test]
-fn windows_reports_controlled_install_stages_without_stderr_handoff() {
-    let script = windows_script();
-    for stage in [75, 81, 82, 83, 84, 85, 86] {
-        assert!(script.contains(&format!("$failureStage = {stage}")));
-    }
-    assert!(script.contains("$exitCode = $failureStage"));
-    assert!(script.contains("$exitCode = 87"));
-    assert!(script.contains("$exitCode = 88"));
-    assert!(script.contains("exit $exitCode"));
-    assert!(!script.contains("Start-Transcript"));
-}
-
-#[test]
-fn windows_registration_rollback_proves_atomic_bytes_and_original_security() {
-    let script = windows_script();
-    assert!(script.contains("AccessControlSections]'Owner,Group,Access'"));
-    assert!(script.contains("registration.snapshot.json"));
-    assert!(script.contains("Check-Hash $registrationBackup $registrationSnapshot.Hash"));
-    assert!(script.contains("[IO.FileMode]::CreateNew"));
-    assert!(script.contains("$output.Flush($true)"));
-    assert!(script.contains(
-        "[IO.File]::Replace($temporary, $snapshot.Path, [System.Management.Automation.Language.NullString]::Value)"
-    ));
-    assert!(script.contains("[IO.File]::Move($temporary, $snapshot.Path)"));
-    assert!(script.contains(
-        "$security.SetSecurityDescriptorSddlForm($snapshot.Sddl, $registrationSections)"
-    ));
-    assert!(script.contains("(Registration-Sddl $snapshot.Path) -cne $snapshot.Sddl"));
-    assert!(script.contains("Check-Hash $snapshot.Path $snapshot.Hash"));
-    let restore = script
-        .split("function Restore-Registration")
-        .nth(1)
-        .unwrap()
-        .split("function Stop-ServiceChecked")
-        .next()
-        .unwrap();
-    assert!(!restore.contains("Seal-File $snapshot.Path"));
-    assert!(!restore.contains("[IO.File]::Replace($temporary, $snapshot.Path, $null)"));
-}
-
-/// Runs the real restore function against synthetic files only. The existing
-/// Windows workspace test job executes this; no service, UAC or global ACL calls.
-#[test]
-fn windows_registration_rollback_native_fixture_faults() {
-    let native =
-        polaris_source_probe::repo_file!("crates/windows-cleaner/src/windows/install/tests/mod.rs");
-    assert!(native.contains("fn original_8_registration_cases_use_real_native_restore"));
-    assert!(native.contains("restore_snapshot_with_policy"));
-    for case in [
-        "present",
-        "missing-destination",
-        "original-absent",
-        "tampered-backup",
-        "blocked-replacement",
-        "invalid-security",
-        "parent-is-file",
-        "reparse-parent",
-    ] {
-        assert!(native.contains(case), "{case}");
-    }
-}
-
-#[test]
-fn windows_rejects_unsafe_registration_parents_before_reads_or_restore_eligibility() {
-    let script = windows_script();
-    let users = script
-        .find("  Assert-PrivateRegistrationDirectory $users")
-        .unwrap();
-    let identity = script
-        .find("  Assert-PrivateRegistrationDirectory (Join-Path $users $identity)")
-        .unwrap();
-    let read = script
-        .find("$sameRegistration = [IO.File]::ReadAllText")
-        .unwrap();
-    let changed = script.find("  $registrationChanged = $true").unwrap();
-    assert!(users < identity && identity < read && read < changed);
-    assert!(script.contains("untrusted registration parent owner"));
-    assert!(script.contains("NO_ACCESS_CONTROL"));
-    assert!(script.contains("registration parent grants nonprivileged access"));
-}
-
-#[test]
 fn unsupported_uninstall_never_prepares_or_escalates_maintenance() {
     let dir = tempfile::tempdir().unwrap();
     for platform in [Platform::Android, Platform::Ios, Platform::Other] {
@@ -2133,17 +1885,6 @@ fn migration_uses_real_closed_plist_renderer_before_candidate_start() {
     assert!(install_closed < start);
 }
 
-#[test]
-fn retained_windows_helper_requires_framing_before_service_or_registration_changes() {
-    let source = polaris_source_probe::crate_source!("manager/install_windows.rs");
-    let probe = source.find("Invoke-Utility @('admin-probe'").unwrap();
-    let registration = source.find("Invoke-Utility @('register-user'").unwrap();
-    let admission = source.find("Invoke-Utility @('prepare-upgrade'").unwrap();
-    assert!(probe < registration && probe < admission);
-    assert!(source.contains("retained newer helper capability unavailable while stopped"));
-    assert!(source.contains(".Hash.ToLowerInvariant() -cne '{helper_hash}'"));
-}
-
 /// Three fixtures are complete outputs from the real split Unix producers, with
 /// synthetic values only. Never execute these administrator script bytes.
 #[test]
@@ -2232,19 +1973,6 @@ fn linux_script_producer_matches_package_acceptance_fixtures() {
             assert!(!path.exists());
         }
     }
-}
-
-/// Compile the native SCM reader and run the real policy/transaction functions
-/// against inert SCM ops and temporary files; never query/mutate real services.
-#[test]
-fn windows_existing_service_identity_and_rollback_native_inert_fixture() {
-    let native =
-        polaris_source_probe::repo_file!("crates/windows-cleaner/src/install/tests/mod.rs");
-    assert!(native.contains("original_17_inert_scm_cases_use_production_transaction"));
-    assert!(native.contains("original_20_recovery_cases_use_production_catch_and_finish"));
-    assert!(native.contains("run(&mut f)"));
-    let manager = polaris_source_probe::crate_source!("manager.rs");
-    assert!(manager.contains("#[cfg(test)]\nmod install_windows;"));
 }
 
 #[test]

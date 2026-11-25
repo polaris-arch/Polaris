@@ -41,8 +41,8 @@
 # 选它是产品决策 ——「标准用户（无管理员权限）也必须能装上 App」。这不意味着无需管理员
 # 就能安装/升级 LocalSystem helper：后者由 App 的运行期 UAC 路径单独处理，不由 NSIS installMode 放行。
 # helper 安装参数包含私有暂存路径、实际 helper/manifest hash、core id 与原生用户身份；
-# 提权脚本先封存并核对字节，校验安装选择和现有 helper 策略，必要时经 prepare-upgrade 准入，
-# 再停止/替换服务（crates/helper-client/src/manager/install_windows.rs）。不能称为「拷贝前零校验」。
+# 原生 cleaner 封存暂存源并复核安装身份和实际字节，检查现有 helper 策略，必要时经
+# prepare-upgrade 准入后再停止/替换服务（crates/windows-cleaner/src/windows/install.rs）。
 # 这些校验不等于 Authenticode 签名，也不证明同账户可写的整个 App 未被替换；这仍是 per-user
 # App 目录的信任边界，不能把安装阶段的字节校验宣传为来源签名。
 #

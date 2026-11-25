@@ -358,6 +358,19 @@ fn production_source_admission_binds_ids_bytes_and_alternate_admin_read_acl() {
     wrong.stage_identity[2] ^= 1;
     assert!(Source::open(&wrong, false).is_err());
     wrong = request.clone();
+    wrong.manifest_sha256.replace_range(
+        ..1,
+        if request.manifest_sha256.starts_with('0') {
+            "1"
+        } else {
+            "0"
+        },
+    );
+    assert_eq!(
+        Source::open(&wrong, false).err().unwrap().to_string(),
+        "manifest bytes differ from App pin"
+    );
+    wrong = request.clone();
     wrong.original_sid = "S-1-5-21-1-2-3-9999".into();
     assert!(Source::open(&wrong, true).is_err());
     assert!(std::fs::write(stage.join("polaris-helper.exe"), b"foreign helper").is_err());
@@ -373,8 +386,35 @@ fn production_source_admission_binds_ids_bytes_and_alternate_admin_read_acl() {
     // Actual alternate-admin token execution is a separate UAC window. This
     // source test proves the explicit BA read ACL, not that device execution.
     drop(source);
-    std::fs::write(stage.join("libcronet.dll"), b"foreign sidecar").unwrap();
-    assert!(Source::open(&request, true).is_err());
+    for (name, reason) in [
+        ("core-manifest.json", "manifest bytes differ from App pin"),
+        ("sing-box.exe", "staged bytes differ"),
+        ("libcronet.dll", "staged bytes differ"),
+        ("polaris-helper.exe", "staged bytes differ"),
+        (IMAGE_NAME, "staged bytes differ"),
+    ] {
+        let path = stage.join(name);
+        let original = std::fs::read(&path).unwrap()[0];
+        let overwrite_first_byte = |byte| {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .write_all(&[byte])
+                .unwrap();
+        };
+        overwrite_first_byte(original ^ 1);
+        let rejection = Source::open(&request, false).err();
+        overwrite_first_byte(original);
+        assert_eq!(
+            rejection
+                .unwrap_or_else(|| panic!("{name} admitted"))
+                .to_string(),
+            reason,
+            "{name}"
+        );
+        Source::open(&request, false).unwrap();
+    }
 }
 
 #[test]
@@ -611,6 +651,12 @@ impl FixtureFiles {
 
 #[test]
 fn service_handle_access_contract_is_fresh_only_and_includes_config_change() {
+    assert_eq!(
+        BIN_PATH,
+        r#""C:\ProgramData\Polaris\polaris-helper.exe" --support "C:\ProgramData\Polaris""#
+    );
+    assert!(DACL.contains("(A;;RP;;;IU)"), "existing service Start ACE");
+    assert!(FRESH_SD.contains("(A;;RP;;;IU)"), "fresh service Start ACE");
     assert_eq!(FRESH_SERVICE_ACCESS, 0x01070037);
     assert_ne!(
         FRESH_SERVICE_ACCESS & SERVICE_CHANGE_CONFIG,
@@ -644,6 +690,19 @@ fn service_handle_access_contract_is_fresh_only_and_includes_config_change() {
 
 #[test]
 fn production_file_transaction_restores_all_payloads_sd_and_retires_actual_tx() {
+    private_registration_parent(&Descriptor::parse(PRIVATE_SD).unwrap()).unwrap();
+    assert_eq!(
+        private_registration_parent(&Descriptor::parse(PUBLIC_SD).unwrap())
+            .unwrap_err()
+            .to_string(),
+        "registration parent grants nonprivileged access"
+    );
+    assert_eq!(
+        private_registration_parent(&Descriptor::parse("O:BAG:BA").unwrap())
+            .unwrap_err()
+            .to_string(),
+        "registration parent DACL missing"
+    );
     let mut f = FixtureFiles::new();
     f.prepare().unwrap();
     f.snapshot(true).unwrap();
