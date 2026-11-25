@@ -657,6 +657,9 @@ fn effective_plan(config: &Value, platform: Platform) -> BTreeMap<String, SubPla
             .into_iter()
             .collect();
     let mut plan = plan_subscriptions(config, &auto_intent);
+    if plan.is_empty() {
+        return plan;
+    }
     // Only native-owned candidates yield. Feature ON with a manual default and no
     // Auto rule leaves ordinary HTTP periodic measurements intact.
     let native = crate::runtime::proxy::native_auto::native_owned_members(config);

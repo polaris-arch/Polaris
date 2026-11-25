@@ -242,7 +242,7 @@ impl MeasurementLedger {
 pub(crate) fn snapshot(app: &AppHandle) -> ApiResponse<Value> {
     let runtime = app.state::<AppRuntime>();
     let proxy = runtime.proxy();
-    let config = match runtime.config().current() {
+    let config = match runtime.config().current_snapshot() {
         Ok(config) => config,
         Err(error) => return ApiResponse::err(error.to_string()),
     };
@@ -303,7 +303,7 @@ pub(crate) fn snapshot(app: &AppHandle) -> ApiResponse<Value> {
         json!({})
     };
     let (frontend_config_digest, config_version) = {
-        let mut frontend = config.clone();
+        let mut frontend = config.as_ref().clone();
         apply_frontend_view(&mut frontend);
         let text = polaris_config_engine::builder::orchestration::stable_stringify(&frontend);
         (
@@ -315,7 +315,7 @@ pub(crate) fn snapshot(app: &AppHandle) -> ApiResponse<Value> {
     let after = proxy.status();
     let consistent = runtime
         .config()
-        .with_current(|value| value == &config)
+        .with_current(|value| value == config.as_ref())
         .unwrap_or(false)
         && before.running == after.running
         && before.start_time == after.start_time
