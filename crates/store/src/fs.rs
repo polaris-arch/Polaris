@@ -351,11 +351,15 @@ pub fn should_sweep_stale_tmp(base_name: &str, candidate: &str, age_secs: u64) -
 ///
 /// `suffix_hex`：12 位随机 hex（调用方提供，便于测试）。生产侧应注入 CSPRNG 输出。
 /// 纯逻辑：本函数不触碰 FS，仅返回编排好的步骤；由调用方驱动 trait 执行。
-pub fn atomic_write_plan(base: &Path, suffix_hex: &str, content: &str) -> AtomicWritePlan {
+pub fn atomic_write_plan(
+    base: &Path,
+    suffix_hex: &str,
+    content: impl Into<String>,
+) -> AtomicWritePlan {
     AtomicWritePlan {
         tmp_path: tmp_path(base, suffix_hex),
         final_path: base.to_path_buf(),
-        content: content.to_string(),
+        content: content.into(),
     }
 }
 

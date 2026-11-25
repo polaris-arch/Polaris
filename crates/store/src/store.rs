@@ -184,7 +184,7 @@ impl ConfigStore {
         // 保存前深拷贝并复跑 sanitize + validate（saveConfig 经 validateConfig 同口径）。
         let value = Self::canonicalize_for_save(config)?;
         let content = serde_json::to_string_pretty(&value).map_err(StoreError::from)?;
-        let plan: AtomicWritePlan = atomic_write_plan(path, suffix_hex, &content);
+        let plan: AtomicWritePlan = atomic_write_plan(path, suffix_hex, content);
         plan.execute(fs)
     }
 
