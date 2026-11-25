@@ -915,28 +915,20 @@ jobs:
           cargo test --locked -p polaris-helper-client "$test_name" -- --exact | tee "$RUNNER_TEMP/linux-helper-producer-test.log"
           grep -F "test $test_name ... ok" "$RUNNER_TEMP/linux-helper-producer-test.log"
           grep -F 'test result: ok. 1 passed;' "$RUNNER_TEMP/linux-helper-producer-test.log"
-          test_name=commands::config::tests::backend_authoritative_tests::ordinary_save_mirrors_auto_authority_and_returns_actual_saved_config
-          cargo test --locked -p polaris --lib "$test_name" -- --exact | tee "$RUNNER_TEMP/config-auto-authority-test.log"
-          grep -F "test $test_name ... ok" "$RUNNER_TEMP/config-auto-authority-test.log"
-          grep -F 'test result: ok. 1 passed;' "$RUNNER_TEMP/config-auto-authority-test.log"
-
-          test_name=runtime::helper::tests::installer_failure_stage_is_bounded_non_authorizing_and_preserves_recovery_unknown
-          cargo test --locked -p polaris --lib "$test_name" -- --exact | tee "$RUNNER_TEMP/helper-installer-diagnostic-test.log"
-          grep -F "test $test_name ... ok" "$RUNNER_TEMP/helper-installer-diagnostic-test.log"
-          grep -F 'test result: ok. 1 passed;' "$RUNNER_TEMP/helper-installer-diagnostic-test.log"
-
-          test_name=runtime::config::tests::saved_commit_classifies_busy_poison_and_cold_without_loading_or_committing
-          cargo test --locked -p polaris --lib "$test_name" -- --exact | tee "$RUNNER_TEMP/status-saved-fence-0.log"
-          grep -F "test $test_name ... ok" "$RUNNER_TEMP/status-saved-fence-0.log"
-          grep -F 'test result: ok. 1 passed;' "$RUNNER_TEMP/status-saved-fence-0.log"
-          test_name=runtime::proxy::tests::lifecycle::public_status_busy_envelope_never_contains_owned_stop_context
-          cargo test --locked -p polaris --lib "$test_name" -- --exact | tee "$RUNNER_TEMP/status-saved-fence-1.log"
-          grep -F "test $test_name ... ok" "$RUNNER_TEMP/status-saved-fence-1.log"
-          grep -F 'test result: ok. 1 passed;' "$RUNNER_TEMP/status-saved-fence-1.log"
-          test_name=runtime::proxy::tests::lifecycle::actual_config_writer_barrier_excludes_mixed_owned_stop_capture_and_claim
-          cargo test --locked -p polaris --lib "$test_name" -- --exact | tee "$RUNNER_TEMP/status-saved-fence-2.log"
-          grep -F "test $test_name ... ok" "$RUNNER_TEMP/status-saved-fence-2.log"
-          grep -F 'test result: ok. 1 passed;' "$RUNNER_TEMP/status-saved-fence-2.log"
+          app_tests=(
+            commands::config::tests::backend_authoritative_tests::ordinary_save_mirrors_auto_authority_and_returns_actual_saved_config
+            runtime::helper::tests::installer_failure_stage_is_bounded_non_authorizing_and_preserves_recovery_unknown
+            runtime::config::tests::saved_commit_classifies_busy_poison_and_cold_without_loading_or_committing
+            runtime::proxy::tests::lifecycle::public_status_busy_envelope_never_contains_owned_stop_context
+            runtime::proxy::tests::lifecycle::actual_config_writer_barrier_excludes_mixed_owned_stop_capture_and_claim
+          )
+          log="$RUNNER_TEMP/linux-helper-app-fixtures.log"
+          # One libtest run avoids rebuilding the App library for each filter.
+          cargo test --locked -p polaris --lib -- --exact --test-threads=1 "${app_tests[@]}" | tee "$log"
+          for test_name in "${app_tests[@]}"; do
+            grep -F "test $test_name ... ok" "$log"
+          done
+          grep -F "test result: ok. ${#app_tests[@]} passed; 0 failed; 0 ignored;" "$log"
 
       - name: Build and stage privileged helper
         shell: bash
