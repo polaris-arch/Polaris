@@ -17,17 +17,9 @@ $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $sid = $identity.User.Value
 if ($sid -eq 'S-1-5-18') { throw 'Consumer must be the owning user, not SYSTEM' }
 if (-not ([Security.Principal.WindowsPrincipal]::new($identity)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Approved elevated CI user required' }
-function Read-Artifact([string]$path,[string]$field,[string]$expected) {
-    if ($expected -cnotmatch '^[0-9a-f]{40}$') { throw 'Exact reviewed source required' }
-    $value = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
-    if ($value.$field -cne $expected -or $value.validationMode -cne $ValidationMode) { throw 'Artifact source/mode mismatch' }
-    if ($field -eq 'kernelSource' -and $value.repository -cne 'polaris-arch/sing-box-polaris') { throw 'Wrong producer repository' }
-    if (-not [IO.Path]::IsPathFullyQualified($value.path) -or $value.sha256 -cnotmatch '^[0-9a-f]{64}$') { throw 'Invalid artifact path/hash' }
-    if ((Get-FileHash -LiteralPath $value.path -Algorithm SHA256).Hash.ToLowerInvariant() -cne $value.sha256) { throw 'Artifact hash mismatch' }
-    return $value
-}
-$app = Read-Artifact $AppArtifactManifest 'appSource' $ExpectedAppSource
-$kernel = Read-Artifact $KernelArtifactManifest 'kernelSource' $ExpectedKernelSource
+$readArtifact = Join-Path $PSScriptRoot 'Read-DirectoryArtifact.ps1'
+$app = & $readArtifact $AppArtifactManifest 'appSource' $ExpectedAppSource $ValidationMode
+$kernel = & $readArtifact $KernelArtifactManifest 'kernelSource' $ExpectedKernelSource $ValidationMode
 $name = 'runtime::windows_directory::tests::interop_system_producer_user_consumer'
 $list = & $app.path --list
 if ($LASTEXITCODE -ne 0 -or -not ($list -ccontains "${name}: test")) { throw 'Missing user consumer test' }

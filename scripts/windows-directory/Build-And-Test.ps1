@@ -168,7 +168,26 @@ $required = @(
 foreach ($name in $required) { if (-not ($listing -ccontains $name)) { throw "Missing exact kernel regression: $name" } }
 & $kernelExe '-test.run=^TestWindows' '-test.v' '-test.timeout=10m'
 if ($LASTEXITCODE -ne 0) { throw 'Native kernel Windows regressions failed' }
-& (Join-Path $PSScriptRoot 'Run-WindowsDirectoryInterop.ps1') -AppArtifactManifest $appManifest -KernelArtifactManifest $kernelManifest -ExpectedAppSource $appSource -ExpectedKernelSource $source -ValidationMode $mode
+if ($env:OS -ne 'Windows_NT') { throw 'Native Windows runner required' }
+$readArtifact = Join-Path $PSScriptRoot 'Read-DirectoryArtifact.ps1'
+$app = (& $readArtifact $appManifest 'appSource' $appSource $mode).path
+$null = & $readArtifact $kernelManifest 'kernelSource' $source $mode
+$env:POLARIS_WINDOWS_KERNEL_TEST_ARTIFACT = (Resolve-Path -LiteralPath $kernelManifest).Path
+$env:POLARIS_WINDOWS_TEST_VALIDATION_MODE = $mode
+$env:POLARIS_WINDOWS_TEST_EXPECTED_SOURCE = $source
+$names = @(
+ 'runtime::windows_directory::tests::interop_writer_retirement_and_stale_intent',
+ 'runtime::windows_directory::tests::interop_crash_reopen_and_revocation',
+ 'runtime::windows_directory::tests::interop_replaced_identity_is_retained'
+)
+$listing = & $app --list
+if ($LASTEXITCODE -ne 0) { throw 'App test discovery failed' }
+foreach ($name in $names) {
+    if (-not ($listing -ccontains "${name}: test")) { throw "Missing exact App integration test: $name" }
+    & $app --exact $name --ignored --nocapture --test-threads=1
+    if ($LASTEXITCODE -ne 0) { throw "App integration failed: $name" }
+}
+Write-Output "Directory integration executed: mode=$mode source=$source"
 Assert-AppTrackedSource
 @{attemptId=$attemptId;validationMode=$mode;kernelSource=$source;appSource=$appSource;repository='polaris-arch/sing-box-polaris';result='passed';scope='directory-protocol-tests-only';formalSourceContractMatched=($mode -eq 'formal')} | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8NoBOM $validationReceipt
 @{attemptId=$attemptId;result='passed';receipt='validation-receipt.json';receiptSHA256=(Get-FileHash -LiteralPath $validationReceipt -Algorithm SHA256).Hash.ToLowerInvariant()} | ConvertTo-Json | Set-Content -Encoding utf8NoBOM $attemptPath
