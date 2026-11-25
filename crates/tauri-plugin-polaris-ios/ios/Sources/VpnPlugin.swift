@@ -911,8 +911,15 @@ final class VpnPlugin: Plugin {
         if includeHostUncertainty, uncertainReason != nil,
            uncertainSession == nil || values["sessionID"] as? String == uncertainSession { result["lastError"] = uncertainReason }
         if let preferenceError { result["lastError"] = preferenceError }
-        if result["lastError"] == nil, !vpnProfileWasNeverSubmitted(preference: preference, identity: values, report: report),
-           let error = vpnIdleFailure(evidence: result, profileExists: exists, active: active) { result["lastError"] = error }
+        if result["lastError"] == nil {
+            if vpnProfileWasNeverSubmitted(preference: preference, identity: values, report: report) {
+                if exists, operation == nil, ne == .invalid || ne == .disconnected {
+                    result["cleanupEvidence"] = "ProfileNeverSubmitted"
+                }
+            } else if let error = vpnIdleFailure(evidence: result, profileExists: exists, active: active) {
+                result["lastError"] = error
+            }
+        }
         return result
     }
 

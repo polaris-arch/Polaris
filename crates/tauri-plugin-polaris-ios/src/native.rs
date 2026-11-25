@@ -840,7 +840,10 @@ impl TunnelStatus {
                 "iOS VPN 上次操作未确认完成：{error}。请检查系统 VPN 状态。"
             ));
         }
-        if self.profile_exists && !self.has_confirmed_stop() {
+        let never_submitted = self.cleanup_evidence == "ProfileNeverSubmitted"
+            && matches!(self.status, 0 | 1)
+            && !self.running;
+        if self.profile_exists && !self.has_confirmed_stop() && !never_submitted {
             return Err(
                 "已有 iOS VPN 配置尚无可靠的扩展停止报告；清理状态未知，请检查系统设置后再连接。"
                     .into(),

@@ -95,6 +95,35 @@ fn ordinary_disconnected_and_old_disk_report_never_issue_typed_terminal() {
 }
 
 #[test]
+fn saved_unsubmitted_profile_allows_retry_without_confirming_stop() {
+    let mut value = json!({"status":1,"running":false,"active":false,"profileExists":true,
+        "ownership":"profileMatchedUnattested","sessionId":"session-a","requestId":"start-a",
+        "configDigest":digest(),"cleanupEvidence":"CleanupUnknown"});
+    let unknown: TunnelStatus = serde_json::from_value(value.clone()).unwrap();
+    assert!(unknown.require_idle().is_err());
+
+    value["cleanupEvidence"] = json!("ProfileNeverSubmitted");
+    let saved = receipt(value.clone());
+    assert!(saved.snapshot().require_idle().is_ok());
+    assert!(!saved.snapshot().has_confirmed_stop());
+    assert!(saved.retirement().is_none());
+    assert!(saved.directory_retirement().is_none());
+
+    for (key, rejection) in [
+        ("active", json!(true)),
+        ("running", json!(true)),
+        ("status", json!(3)),
+        ("cleanupError", json!("close failed")),
+        ("lastError", json!("A VPN preference write is pending")),
+    ] {
+        let mut unresolved = value.clone();
+        unresolved[key] = rejection;
+        let unresolved: TunnelStatus = serde_json::from_value(unresolved).unwrap();
+        assert!(unresolved.require_idle().is_err(), "{key}");
+    }
+}
+
+#[test]
 fn mismatched_session_config_generation_operation_and_failed_stop_are_unknown() {
     for (pointer, value) in [
         ("/sessionId", json!("session-b")),
