@@ -181,7 +181,11 @@ fn probe_stages_and_log_offsets_keep_metadata_without_content() {
     let (result, observation) =
         observe_forward_tcp_with_logs(listener.port, &listeners, &baseline, &[("a", &log)]);
     assert!(result.is_ok());
-    let attempt = &observation["attempts"][0];
+    let attempt = observation["attempts"]
+        .as_array()
+        .and_then(|attempts| attempts.last())
+        .expect("successful probe must record its terminal attempt");
+    assert_eq!(attempt.get("probeResult"), Some(&Value::Null));
     let probe = &attempt["probeStages"];
     let stages = probe["stages"].as_array().unwrap();
     assert_eq!(
