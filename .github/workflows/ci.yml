@@ -1114,7 +1114,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Private TokenOwner acceptance failed' }
           $appSource = & git rev-parse HEAD
           if ($LASTEXITCODE -ne 0) { throw 'Cannot resolve actual App source' }
-          $verified = ./scripts/ci/assert-windows-directory-acceptance.ps1 -EvidenceDirectory $root -ExpectedAppSource $appSource -ExpectedKernelSource $env:DIRECTORY_SOURCE -ValidationMode $env:DIRECTORY_MODE -PreviousAttemptId $previousAttempt
+          $verified = node scripts/windows-directory/acceptance.mjs verify --evidence-directory $root --expected-app-source $appSource --expected-kernel-source $env:DIRECTORY_SOURCE --validation-mode $env:DIRECTORY_MODE "--previous-attempt-id=$previousAttempt" | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw 'Windows directory acceptance verification failed' }
           "attempt_id=$($verified.AttemptId)" >> $env:GITHUB_OUTPUT
           "receipt_sha256=$($verified.ReceiptSHA256)" >> $env:GITHUB_OUTPUT
           "app_manifest_sha256=$($verified.AppManifestSHA256)" >> $env:GITHUB_OUTPUT
@@ -1149,18 +1150,20 @@ jobs:
           & git diff --quiet HEAD --
           if ($LASTEXITCODE -ne 0) { throw 'App tracked source changed before SYSTEM acceptance' }
           $root = Join-Path $env:RUNNER_TEMP 'windows-directory-acceptance'
-          $binding = @{
-            EvidenceDirectory = $root
-            ExpectedAppSource = $appSource
-            ExpectedKernelSource = $env:DIRECTORY_SOURCE
-            ValidationMode = $env:DIRECTORY_MODE
-            ExpectedAttemptId = $env:ACCEPTANCE_ATTEMPT
-            ExpectedReceiptSHA256 = $env:ACCEPTANCE_RECEIPT_SHA256
-            ExpectedAppManifestSHA256 = $env:APP_MANIFEST_SHA256
-            ExpectedKernelManifestSHA256 = $env:KERNEL_MANIFEST_SHA256
-            ExpectedActivationManifestSHA256 = $env:ACTIVATION_MANIFEST_SHA256
-          }
-          $null = ./scripts/ci/assert-windows-directory-acceptance.ps1 @binding
+          $binding = @(
+            'scripts/windows-directory/acceptance.mjs', 'verify'
+            '--evidence-directory', $root
+            '--expected-app-source', $appSource
+            '--expected-kernel-source', $env:DIRECTORY_SOURCE
+            '--validation-mode', $env:DIRECTORY_MODE
+            '--expected-attempt-id', $env:ACCEPTANCE_ATTEMPT
+            '--expected-receipt-sha256', $env:ACCEPTANCE_RECEIPT_SHA256
+            '--expected-app-manifest-sha256', $env:APP_MANIFEST_SHA256
+            '--expected-kernel-manifest-sha256', $env:KERNEL_MANIFEST_SHA256
+            '--expected-activation-manifest-sha256', $env:ACTIVATION_MANIFEST_SHA256
+          )
+          $null = node @binding
+          if ($LASTEXITCODE -ne 0) { throw 'Bound Windows directory acceptance verification failed' }
           $args = @{
             AppArtifactManifest = (Join-Path $root 'app-artifact.json')
             KernelArtifactManifest = (Join-Path $root 'kernel-artifact.json')
@@ -1176,8 +1179,10 @@ jobs:
             if ($previousSystemNonce -cnotmatch '^[0-9a-f]{32}$') { throw 'Malformed previous SYSTEM nonce' }
           }
           ./scripts/windows-directory/Run-SystemBootstrap.ps1 @args -ApproveTemporarySystemTask
-          $systemVerified = ./scripts/ci/assert-windows-directory-acceptance.ps1 @binding -SystemEvidenceDirectory $args.EvidenceDirectory -PreviousSystemNonce $previousSystemNonce
-          $null = ./scripts/ci/assert-windows-directory-acceptance.ps1 @binding
+          $systemVerified = node @binding --system-evidence-directory $args.EvidenceDirectory "--previous-system-nonce=$previousSystemNonce" | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw 'SYSTEM acceptance verification failed' }
+          $null = node @binding
+          if ($LASTEXITCODE -ne 0) { throw 'Bound Windows directory acceptance verification failed' }
           & git diff --quiet HEAD --
           if ($LASTEXITCODE -ne 0) { throw 'App tracked source changed during SYSTEM acceptance' }
           @{result='passed';attemptId=$systemVerified.AttemptId;receiptSHA256=$systemVerified.ReceiptSHA256;systemNonce=$systemVerified.SystemNonce;systemReceiptSHA256=$systemVerified.SystemReceiptSHA256} | ConvertTo-Json | Set-Content -Encoding utf8NoBOM (Join-Path $args.EvidenceDirectory 'ci-attempt-binding.json')
@@ -1210,18 +1215,20 @@ jobs:
           & git diff --quiet HEAD --
           if ($LASTEXITCODE -ne 0) { throw 'App tracked source changed before SYSTEM acceptance' }
           $root = Join-Path $env:RUNNER_TEMP 'windows-directory-acceptance'
-          $binding = @{
-            EvidenceDirectory = $root
-            ExpectedAppSource = $appSource
-            ExpectedKernelSource = $env:DIRECTORY_SOURCE
-            ValidationMode = $env:DIRECTORY_MODE
-            ExpectedAttemptId = $env:ACCEPTANCE_ATTEMPT
-            ExpectedReceiptSHA256 = $env:ACCEPTANCE_RECEIPT_SHA256
-            ExpectedAppManifestSHA256 = $env:APP_MANIFEST_SHA256
-            ExpectedKernelManifestSHA256 = $env:KERNEL_MANIFEST_SHA256
-            ExpectedActivationManifestSHA256 = $env:ACTIVATION_MANIFEST_SHA256
-          }
-          $null = ./scripts/ci/assert-windows-directory-acceptance.ps1 @binding
+          $binding = @(
+            'scripts/windows-directory/acceptance.mjs', 'verify'
+            '--evidence-directory', $root
+            '--expected-app-source', $appSource
+            '--expected-kernel-source', $env:DIRECTORY_SOURCE
+            '--validation-mode', $env:DIRECTORY_MODE
+            '--expected-attempt-id', $env:ACCEPTANCE_ATTEMPT
+            '--expected-receipt-sha256', $env:ACCEPTANCE_RECEIPT_SHA256
+            '--expected-app-manifest-sha256', $env:APP_MANIFEST_SHA256
+            '--expected-kernel-manifest-sha256', $env:KERNEL_MANIFEST_SHA256
+            '--expected-activation-manifest-sha256', $env:ACTIVATION_MANIFEST_SHA256
+          )
+          $null = node @binding
+          if ($LASTEXITCODE -ne 0) { throw 'Bound Windows directory acceptance verification failed' }
           $args = @{
             AppArtifactManifest = (Join-Path $root 'app-artifact.json')
             KernelArtifactManifest = (Join-Path $root 'kernel-artifact.json')
@@ -1237,8 +1244,10 @@ jobs:
             if ($previousSystemNonce -cnotmatch '^[0-9a-f]{32}$') { throw 'Malformed previous SYSTEM nonce' }
           }
           ./scripts/windows-directory/Run-SystemBootstrap.ps1 @args -ApproveTemporarySystemTask -PrebuildUserDomain
-          $systemVerified = ./scripts/ci/assert-windows-directory-acceptance.ps1 @binding -SystemEvidenceDirectory $args.EvidenceDirectory -PreviousSystemNonce $previousSystemNonce -PrebuildUserDomain
-          $null = ./scripts/ci/assert-windows-directory-acceptance.ps1 @binding
+          $systemVerified = node @binding --system-evidence-directory $args.EvidenceDirectory "--previous-system-nonce=$previousSystemNonce" --prebuild-user-domain | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw 'SYSTEM acceptance verification failed' }
+          $null = node @binding
+          if ($LASTEXITCODE -ne 0) { throw 'Bound Windows directory acceptance verification failed' }
           & git diff --quiet HEAD --
           if ($LASTEXITCODE -ne 0) { throw 'App tracked source changed during SYSTEM acceptance' }
           @{result='passed';attemptId=$systemVerified.AttemptId;receiptSHA256=$systemVerified.ReceiptSHA256;systemNonce=$systemVerified.SystemNonce;systemReceiptSHA256=$systemVerified.SystemReceiptSHA256} | ConvertTo-Json | Set-Content -Encoding utf8NoBOM (Join-Path $args.EvidenceDirectory 'ci-attempt-binding.json')

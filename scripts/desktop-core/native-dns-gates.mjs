@@ -293,8 +293,8 @@ async function verifyNativeCronet(root, key, context, env, directory, deadline) 
   for (const key of ['LD_PRELOAD', 'LD_LIBRARY_PATH', 'DYLD_LIBRARY_PATH', 'DYLD_INSERT_LIBRARIES']) delete childEnv[key];
   const steps = [];
   let last;
-  const observe = async (id, program, args, timeout) => {
-    last = await executeCommand({ id, program, args }, { root, env: childEnv, directory,
+  const observe = async (id, program, args, timeout, stepEnv = childEnv) => {
+    last = await executeCommand({ id, program, args }, { root, env: stepEnv, directory,
       timeout: Math.min(timeout, deadline - Date.now()) });
     const {status, logSha256, logBytes, stdoutSha256, stdoutBytes, stderrSha256, stderrBytes} = last;
     steps.push({ id, status, logSha256, logBytes, stdoutSha256, stdoutBytes, stderrSha256, stderrBytes });
@@ -306,8 +306,13 @@ async function verifyNativeCronet(root, key, context, env, directory, deadline) 
     if (key !== 'win') return { state: 'not-applicable' };
     const result = {};
     for (const [name, path] of [['core', core], ['library', library]]) {
-      const observed = await observe(`cronet-signature-${phase}-${name}`, 'pwsh', ['-NoProfile', '-NonInteractive',
-        '-File', join(root, 'scripts', 'observe-unsigned-windows.ps1'), '-Path', path], 30_000);
+      // The path travels in the environment, never through command-line quoting.
+      const observed = await observe(`cronet-signature-${phase}-${name}`, 'pwsh', ['-NoProfile', '-NonInteractive', '-Command',
+        `Set-StrictMode -Version Latest; $ErrorActionPreference = 'Stop'
+        $status = (Get-AuthenticodeSignature -LiteralPath $env:POLARIS_SIGNATURE_PATH).Status
+        if ($status -ne 'NotSigned') { throw "expected explicit unsigned distribution state: $status" }
+        @{ status = $status.ToString(); signerThumbprint = $null } | ConvertTo-Json -Compress`], 30_000,
+      { ...childEnv, POLARIS_SIGNATURE_PATH: path });
       requireGate(observed?.status === 'NotSigned' && observed.signerThumbprint === null, 'Expected original unsigned Windows payload');
       result[name] = observed;
     }

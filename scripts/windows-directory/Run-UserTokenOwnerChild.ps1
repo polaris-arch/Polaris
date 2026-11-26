@@ -30,7 +30,7 @@ function Convert-TokenSnapshot([hashtable]$value) {
 try {
     Save-ChildEvidence
     $native = Join-Path $PSScriptRoot 'UserTokenOwnerNative.cs'
-    $target = Join-Path $PSScriptRoot 'Build-And-Test.ps1'
+    $target = Join-Path $PSScriptRoot 'acceptance.mjs'
     foreach ($entry in @(@($native,'nativeSHA256'),@($PSCommandPath,'workerSHA256'),@($target,'targetSHA256'))) {
         if ((Get-FileHash -LiteralPath $entry[0] -Algorithm SHA256).Hash.ToLowerInvariant() -cne $config[$entry[1]]) { throw 'Fixed acceptance source hash changed before child execution' }
     }
@@ -61,7 +61,7 @@ try {
     Save-ChildEvidence
     $global:LASTEXITCODE = 0
     # First and only test/build entrypoint, after actual-token and directory probes.
-    & $target @parameters *>&1 | Tee-Object -FilePath (Join-Path $evidence 'child-output.log')
+    & node $target build-and-test --kernel-root $parameters.KernelRoot --output-directory $parameters.OutputDirectory --formal *>&1 | Tee-Object -FilePath (Join-Path $evidence 'child-output.log')
     $exitCode = $LASTEXITCODE
     $state.targetExitCode = $exitCode
     if ($exitCode -ne 0) { throw "Fixed acceptance target exited $exitCode" }

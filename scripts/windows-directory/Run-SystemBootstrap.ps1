@@ -17,9 +17,11 @@ $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $sid = $identity.User.Value
 if ($sid -eq 'S-1-5-18') { throw 'Consumer must be the owning user, not SYSTEM' }
 if (-not ([Security.Principal.WindowsPrincipal]::new($identity)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Approved elevated CI user required' }
-$readArtifact = Join-Path $PSScriptRoot 'Read-DirectoryArtifact.ps1'
-$app = & $readArtifact $AppArtifactManifest 'appSource' $ExpectedAppSource $ValidationMode
-$kernel = & $readArtifact $KernelArtifactManifest 'kernelSource' $ExpectedKernelSource $ValidationMode
+$acceptance = Join-Path $PSScriptRoot 'acceptance.mjs'
+$app = & node $acceptance read-artifact --manifest $AppArtifactManifest --source-field appSource --expected-source $ExpectedAppSource --validation-mode $ValidationMode | ConvertFrom-Json
+if ($LASTEXITCODE -ne 0) { throw 'App artifact verification failed' }
+$kernel = & node $acceptance read-artifact --manifest $KernelArtifactManifest --source-field kernelSource --expected-source $ExpectedKernelSource --validation-mode $ValidationMode | ConvertFrom-Json
+if ($LASTEXITCODE -ne 0) { throw 'Kernel artifact verification failed' }
 $name = 'runtime::windows_directory::tests::interop_system_producer_user_consumer'
 $list = & $app.path --list
 if ($LASTEXITCODE -ne 0 -or -not ($list -ccontains "${name}: test")) { throw 'Missing user consumer test' }

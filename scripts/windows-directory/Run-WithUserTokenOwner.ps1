@@ -52,7 +52,7 @@ try {
     $parameters = @{KernelRoot=(Resolve-Path -LiteralPath $KernelRoot).Path;OutputDirectory=$outputRoot;FormalContract=$true}
     $native = Join-Path $PSScriptRoot 'UserTokenOwnerNative.cs'
     $worker = Join-Path $PSScriptRoot 'Run-UserTokenOwnerChild.ps1'
-    $target = Join-Path $PSScriptRoot 'Build-And-Test.ps1'
+    $target = Join-Path $PSScriptRoot 'acceptance.mjs'
     $executable = Join-Path $PSHOME 'pwsh.exe'
     foreach ($file in @($native,$worker,$target,$executable)) {
         if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { throw "Missing fixed acceptance dependency: $file" }
