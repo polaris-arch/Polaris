@@ -639,6 +639,10 @@ export const ANDROID_IMPACT_SCOPES = Object.freeze({
     why: 'Android 独有的连接后出口 IP 探测分支进入 APK 的 Rust cdylib；'
       + '改动须触发 Android 编译和打包，自动探测时序由设备验收确认。',
   },
+  'src-tauri/src/commands/server.rs': {
+    why: 'Android 上停核状态下的节点删除不立即消费删除日志（独立 VPN 可能仍在运行），该 cfg 分支进入 APK 的 Rust cdylib；'
+      + '改动须触发 Android 编译和打包，独立 VPN 运行时的删除时序由设备验收确认。',
+  },
   'src-tauri/src/commands/misc/backup.rs': {
     why: 'Android 备份的原生选择器注册、命令载荷和文件回执进入 APK 的 Rust cdylib；'
       + '改动须触发 Android 编译和打包，SAF 回执和所有者生命周期由设备验收确认。',
