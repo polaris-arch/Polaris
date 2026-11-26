@@ -3890,13 +3890,6 @@ const CFG_REGISTRY: &[CfgSite] = &[
         "Ordinary node edits blocked by existing pending changes are persisted for the pending bar on desktop and Android, matching the Tailscale profile save. iOS returns the pending error instead; whether save-only is safe beside a running PacketTunnel needs an iOS device check before changing it.",
     ),
     (
-        "src-tauri/src/commands/server.rs",
-        "target_os = \"android\"",
-        1,
-        IosSide::DiffersUndecided,
-        "A node deletion saved while the core is stopped consumes deferred deletions immediately, except on Android where a standalone VPN may still use the old source. iOS takes the desktop side; whether PacketTunnel can outlive the stopped state reported to the app needs an iOS device check.",
-    ),
-    (
         "src-tauri/src/events.rs",
         "target_os = \"android\"",
         1,
@@ -4021,6 +4014,13 @@ const CFG_REGISTRY: &[CfgSite] = &[
         11,
         IosSide::DiffersRight,
         "Android-only planning, observation, publication and directory binding use the same original Main birth and exact candidate. They cannot grant an iOS native writer.",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/runtime_config.rs",
+        "target_os = \"android\"",
+        1,
+        IosSide::DiffersUndecided,
+        "A configuration edit saved while the core is stopped consumes deferred deletions immediately, except on Android where a standalone VPN may still use the old source. iOS takes the desktop side; whether PacketTunnel can outlive the stopped state reported to the app needs an iOS device check.",
     ),
     (
         "src-tauri/src/runtime/proxy/startup.rs",
@@ -4784,8 +4784,9 @@ const IOS_SIDE_CENSUS: &[(&str, usize)] = &[
     // The unretired-start and unconfirmed-operation refusal codes add two iOS-only
     // constants; no debt is reclassified.
     ("DiffersRight", 450),
-    // Plan-first node edits add two server.rs sites whose iOS side needs device evidence:
-    // save-only beside pending changes and immediate deferred deletions while stopped.
+    // Plan-first node edits add two sites whose iOS side needs device evidence:
+    // save-only beside pending changes (server.rs) and immediate deferred deletions
+    // while stopped, now shared by every offline edit in runtime_config.rs.
     ("DiffersUndecided", 28),
     // Saved temporary-core concurrency adds three group members; no old debt is repaid.
     // Bounded connection snapshots add 15 stats transport sites to the existing stats
@@ -4827,11 +4828,6 @@ const IOS_DEBT_SITES: &[(&str, &str, usize)] = &[
     (
         "src-tauri/src/commands/misc/backup.rs",
         "not(target_os = \"android\")",
-        1,
-    ),
-    (
-        "src-tauri/src/commands/server.rs",
-        "target_os = \"android\"",
         1,
     ),
     ("src-tauri/src/commands/server.rs", "target_os = \"ios\"", 1),
@@ -4884,6 +4880,11 @@ const IOS_DEBT_SITES: &[(&str, &str, usize)] = &[
         "src-tauri/src/runtime/proxy/lifecycle.rs",
         "target_os = \"android\"",
         7,
+    ),
+    (
+        "src-tauri/src/runtime/proxy/runtime_config.rs",
+        "target_os = \"android\"",
+        1,
     ),
     (
         "src-tauri/src/runtime/proxy/startup.rs",

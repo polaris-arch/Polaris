@@ -762,6 +762,43 @@ async fn hot_config_edit_while_stopped_saves_for_next_start_without_a_runtime_re
 }
 
 #[tokio::test]
+async fn hot_config_edit_while_stopped_consumes_deferred_deletions() {
+    let (rt, _dir) = crate::runtime::proxy::tests::test_runtime_on(Platform::Mac);
+    let mut raw = runnable_config_fixture();
+    raw["servers"] = json!([{
+        "id": "warp-1", "name": "WARP", "protocol": "wireguard",
+        "address": "engage.cloudflareclient.com", "port": 2408,
+        "wireguardSettings": {
+            "privateKey": "private", "localAddress": ["172.16.0.2/32"],
+            "peerPublicKey": "peer", "allowedIPs": ["0.0.0.0/0"],
+            "warpDevice": { "deviceId": "dev-1", "token": "tok-1" }
+        }
+    }]);
+    rt.config.save_full(&raw).unwrap();
+    let (_, edit) = rt
+        .config
+        .prepare_config_edit(|candidate| {
+            candidate["servers"] = json!([]);
+            crate::runtime::config::Decision::Write(())
+        })
+        .unwrap();
+    assert!(matches!(
+        rt.apply_hot_config_edit(&edit.unwrap()).await.unwrap(),
+        HotConfigEditOutcome::Saved {
+            saved_offline: true,
+            ..
+        },
+    ));
+    assert!(!rt
+        .config
+        .dir()
+        .join("pending-config-deletions.json")
+        .exists());
+    let queue = std::fs::read_to_string(rt.mesh.warp_queue_path()).unwrap();
+    assert!(queue.contains("dev-1"));
+}
+
+#[tokio::test]
 async fn hot_config_edit_retries_only_before_local_apply_admission() {
     let (rt, _dir, _, saved) = host_dns_restart_fixture();
     let expires = (SystemTime::now()

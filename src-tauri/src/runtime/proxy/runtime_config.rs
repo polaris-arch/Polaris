@@ -2239,11 +2239,18 @@ impl ProxyRuntime {
                 |_| {},
             )?;
             return Ok(match committed {
-                Some(revision) => HotConfigEditOutcome::Saved {
-                    runtime_apply: None,
-                    revision,
-                    saved_offline: !unchanged,
-                },
+                Some(revision) => {
+                    // 停核时磁盘即下次运行态，删除副作用沿用旧落盘腿的即时清理。Android 独立 VPN 可能仍在
+                    // 使用旧来源，journal 留给确认的 Stop 或 Apply（同启动腿）。
+                    if !unchanged && !cfg!(target_os = "android") {
+                        self.process_deferred_config_deletions().await;
+                    }
+                    HotConfigEditOutcome::Saved {
+                        runtime_apply: None,
+                        revision,
+                        saved_offline: !unchanged,
+                    }
+                }
                 None => not_committed(HotConfigEditOutcome::Retryable),
             });
         }

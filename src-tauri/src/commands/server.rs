@@ -257,13 +257,7 @@ async fn apply_prepared_server_edit<R>(
         .await
         .map_err(&store_error)?
     {
-        HotConfigEditOutcome::Saved { saved_offline, .. } => {
-            // 停核时磁盘即下次运行态，删除副作用沿用旧落盘腿的即时清理。Android 独立 VPN 可能仍在
-            // 使用旧来源，journal 留给确认的 Stop 或 Apply（同启动腿）。
-            if saved_offline && !cfg!(target_os = "android") {
-                proxy.process_deferred_config_deletions().await;
-            }
-        }
+        HotConfigEditOutcome::Saved { .. } => {}
         HotConfigEditOutcome::NeedsManual { .. } => {
             proxy
                 .commit_manual_resource_edit(&edit, owner)
