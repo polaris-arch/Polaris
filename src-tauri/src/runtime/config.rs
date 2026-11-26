@@ -2087,7 +2087,7 @@ fn removed_collection_entries<'a>(
         .unwrap_or_default()
 }
 
-fn warp_credentials(server: &Value) -> Option<(&str, &str)> {
+pub(crate) fn warp_credentials(server: &Value) -> Option<(&str, &str)> {
     let device = server.get("wireguardSettings")?.get("warpDevice")?;
     Some((
         device.get("deviceId")?.as_str()?,

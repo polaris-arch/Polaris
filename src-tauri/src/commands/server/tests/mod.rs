@@ -361,11 +361,14 @@ fn server_add_bulk_core_returns_actual_added_count() {
     let expected = nodes.len();
     {
         let mgr = ConfigManager::new(dir.clone());
-        let (_cfg, added) = server_add_bulk_core(&mgr, nodes).expect("server_add_bulk_core 应成功");
+        let (added, edit) = server_add_bulk_core(&mgr, nodes).expect("server_add_bulk_core 应成功");
         assert_eq!(
-            added, expected,
+            added,
+            Ok(expected),
             "返回实际新增数（= 入参 len），此前硬编码 0"
         );
+        mgr.commit_prepared_config_edit(&edit.unwrap(), || true, |_| {})
+            .unwrap();
     }
     // 重 load 自磁盘核实：3 条自建节点存活。
     let cfg = ConfigManager::new(dir.clone()).load_full().unwrap();
@@ -472,8 +475,8 @@ fn both_delete_commands_prune_recent_ids() {
     let src = crate_code("commands/server.rs");
     // 扫描面自检：锚点必须都在，否则函数改名 / 文件漂走会让下面的切片恒空、守卫恒绿。
     for anchor in [
-        "pub fn server_delete(",
-        "pub fn server_delete_batch(",
+        "pub async fn server_delete(",
+        "pub async fn server_delete_batch(",
         "pub async fn server_switch(",
     ] {
         assert!(src.contains(anchor), "锚点消失，守卫已失去判据: {anchor}");
@@ -485,10 +488,16 @@ fn both_delete_commands_prune_recent_ids() {
         let e = src[s..].find(end).expect("结束锚点") + s;
         &src[s..e]
     };
-    let single = body_of("pub fn server_delete(", "pub fn server_delete_batch(");
+    let single = body_of(
+        "pub async fn server_delete(",
+        "pub async fn server_delete_batch(",
+    );
     // D14：`server_get_all`（死 IPC command，D12 已删前端调用点）已退役，`server_delete_batch`
     // 之后紧邻的下一个命令签名改为 `server_switch`。
-    let batch = body_of("pub fn server_delete_batch(", "pub async fn server_switch(");
+    let batch = body_of(
+        "pub async fn server_delete_batch(",
+        "pub async fn server_switch(",
+    );
 
     assert!(
         single.contains("prune_recent_server_ids_to_existing("),
@@ -499,7 +508,7 @@ fn both_delete_commands_prune_recent_ids() {
         "server_delete_batch 必须剔除被删节点的 MRU 残留"
     );
     // 反向自检：切片确实各自独立（否则「两段都命中」可能只是因为切成了同一段整文件）。
-    assert!(!single.contains("pub fn server_delete_batch("));
+    assert!(!single.contains("pub async fn server_delete_batch("));
     assert!(!batch.contains("pub async fn server_switch("));
 }
 
@@ -950,7 +959,10 @@ fn malformed_server_updates_preserve_old_node_and_disk() {
     }
     let mut changed = before["servers"][0].clone();
     changed["name"] = json!("Updated");
-    server_update_core(&mgr, changed).unwrap();
+    let (result, edit) = server_update_core(&mgr, changed).unwrap();
+    result.unwrap();
+    mgr.commit_prepared_config_edit(&edit.unwrap(), || true, |_| {})
+        .unwrap();
     assert_eq!(mgr.load_full().unwrap()["servers"][0]["id"], "n-a");
     assert_eq!(mgr.load_full().unwrap()["servers"][0]["name"], "Updated");
 }

@@ -14,7 +14,7 @@
 //! - `warp:register` / `warp:applyLicense` → [`warp_register`] / [`warp_apply_license`]（mesh crate）
 //! - `tailscale:login` / `loginCancel` / `logout` / `stateExists` / `getStatus` → tailscale_* （mesh crate）
 //!
-//! 节点 CRUD 经 config 的 load/save（servers 数组原地改 + 原子写）+ 广播 event:configChanged。
+//! 节点 CRUD 先经 Core Plan 再按结果原子写（含 WARP 凭据的新增仍先落盘）+ 广播 event:configChanged。
 //! DIRECT_SERVER_ID 哨兵 + 删选中节点的兜底出口逻辑对齐 Polaris（D4/F-1）。
 
 #[cfg(test)]
@@ -30,12 +30,16 @@ use polaris_config_engine::user_config::server_config::ServerConfig;
 use polaris_config_engine::user_config::ProxyMode;
 use polaris_mesh::warp_http::RegisterOptions;
 
-use crate::commands::config::{broadcast_config_changed, emit_config_changed_signal};
+use crate::commands::config::{
+    broadcast_config_changed, emit_config_changed_signal, invalidate_unlock_on_exit_change,
+};
 use crate::response::{ok_void, ApiResponse};
 #[cfg(test)]
 use crate::runtime::auto_select::{self, Cause, Decision, Gate, Leg, SwitchRecord};
-use crate::runtime::config::{ConfigManager, Decision as ConfigDecision};
-use crate::runtime::proxy::runtime_config::HotConfigEditOutcome;
+use crate::runtime::config::{
+    warp_credentials, ConfigManager, Decision as ConfigDecision, PreparedConfigEdit,
+};
+use crate::runtime::proxy::runtime_config::{HotConfigEditOutcome, StagedSaveOwner};
 #[cfg(test)]
 use crate::runtime::proxy::ProxyRuntime;
 use crate::runtime::proxy::{code, SwitchOutcome};
@@ -228,6 +232,76 @@ async fn save_tailscale_login_profile(
     }))
 }
 
+/// 普通节点增删改共用：先由 Core Plan 当前候选，再按结果落盘；拒绝、冲突与待应用阻塞均不写入。
+async fn apply_prepared_server_edit<R>(
+    app: &AppHandle,
+    state: &AppRuntime,
+    prepared: Result<(Result<R, String>, Option<PreparedConfigEdit>), String>,
+) -> Result<R, String> {
+    let (result, edit) = prepared?;
+    let result = result?;
+    let Some(edit) = edit else {
+        return Ok(result);
+    };
+    let proxy = state.proxy();
+    let owner = StagedSaveOwner::capture(proxy, edit.revision);
+    let conflict = || "节点配置已变化，请重试".to_owned();
+    let store_error = |error: polaris_store::StoreError| {
+        if matches!(error, polaris_store::StoreError::CommitUncertain(_)) {
+            proxy.push_pending_changes();
+            emit_config_changed_signal(app);
+        }
+        error.to_string()
+    };
+    match Box::pin(state.proxy.apply_hot_config_edit(&edit))
+        .await
+        .map_err(&store_error)?
+    {
+        HotConfigEditOutcome::Saved { saved_offline, .. } => {
+            // 停核时磁盘即下次运行态，删除副作用沿用旧落盘腿的即时清理。Android 独立 VPN 可能仍在
+            // 使用旧来源，journal 留给确认的 Stop 或 Apply（同启动腿）。
+            if saved_offline && !cfg!(target_os = "android") {
+                proxy.process_deferred_config_deletions().await;
+            }
+        }
+        HotConfigEditOutcome::NeedsManual { .. } => {
+            proxy
+                .commit_manual_resource_edit(&edit, owner)
+                .await
+                .map_err(&store_error)?
+                .ok_or_else(conflict)?;
+        }
+        HotConfigEditOutcome::BlockedByPending if !cfg!(target_os = "ios") => {
+            state
+                .config()
+                .commit_prepared_config_edit(&edit, || true, |_| {})
+                .map_err(&store_error)?
+                .ok_or_else(conflict)?;
+        }
+        HotConfigEditOutcome::BlockedByPending => {
+            return Err("有待应用的配置变更，请先处理后重试".into());
+        }
+        HotConfigEditOutcome::Retryable => return Err("内核暂时无法更新节点，请重试".into()),
+        HotConfigEditOutcome::Rejected => return Err("内核拒绝了节点修改".into()),
+        HotConfigEditOutcome::Conflict => return Err(conflict()),
+    }
+    // A7：删当前选中 → selectedServerId 回落 viable/`__direct__` = 出口变 → 作废旧出口解锁探测缓存。
+    invalidate_unlock_on_exit_change(
+        state.unlock(),
+        &BroadcastSink::new(app),
+        proxy.status().running,
+        edit.previous
+            .get("selectedServerId")
+            .and_then(Value::as_str),
+        edit.candidate
+            .get("selectedServerId")
+            .and_then(Value::as_str),
+    );
+    proxy.push_pending_changes();
+    emit_config_changed_signal(app);
+    Ok(result)
+}
+
 /// 上游 `SERVER_ADD`：新增节点（id 缺失/空则 mint，防 sanitize 丢弃）。
 ///
 /// DESIGN-REVIEW(mesh-singleton-guard-renderer-only)：WARP 的 UI 单例槽判据在渲染端
@@ -257,6 +331,21 @@ pub async fn server_add(
     if for_tailscale_login.unwrap_or(false) {
         return Ok(Box::pin(save_tailscale_login_profile(&app, &state, server)).await);
     }
+    // 远端已注册的 WARP 设备凭据须先本地保管，沿用先落盘路径；其余节点先 Plan 再落盘。
+    if warp_credentials(&server).is_none() {
+        let prepared = normalized_add_server(ensure_server_id(server)).and_then(|server| {
+            state
+                .config()
+                .prepare_config_edit(|cfg| append_normalized_server(cfg, &server))
+                .map_err(|e| format!("{e}"))
+        });
+        return Ok(
+            match Box::pin(apply_prepared_server_edit(&app, &state, prepared)).await {
+                Ok(_) => ApiResponse::ok(None),
+                Err(e) => ApiResponse::err(e),
+            },
+        );
+    }
     Ok(match server_add_core(state.config(), server) {
         Ok(cfg) => {
             broadcast_config_changed(&app, &cfg);
@@ -272,7 +361,7 @@ pub async fn server_add(
 fn server_add_bulk_core(
     config: &ConfigManager,
     servers: Vec<Value>,
-) -> Result<(Value, usize), String> {
+) -> Result<(Result<usize, String>, Option<PreparedConfigEdit>), String> {
     let now = current_iso();
     let servers: Vec<Value> = servers
         .into_iter()
@@ -291,18 +380,15 @@ fn server_add_bulk_core(
         })
         .collect::<Result<_, _>>()?;
     let added = servers.len();
-    let (result, saved) = config
-        .update(|cfg| {
+    config
+        .prepare_config_edit(|cfg| {
             let Some(arr) = cfg.get_mut("servers").and_then(Value::as_array_mut) else {
                 return ConfigDecision::Skip(Err("节点列表不可用".to_string()));
             };
             arr.extend(servers);
-            ConfigDecision::Write(Ok(()))
+            ConfigDecision::Write(Ok(added))
         })
-        .map_err(|e| format!("{e}"))?;
-    result?;
-    let saved = saved.ok_or_else(|| "节点列表不可用".to_string())?;
-    Ok((saved, added))
+        .map_err(|e| format!("{e}"))
 }
 
 /// 上游 `SERVER_ADD_BULK`：批量新增自建节点（强制重生成 id + 剥离 subscriptionId/providerName）。
@@ -311,21 +397,21 @@ fn server_add_bulk_core(
     reason = "Tauri IPC command owns its deserialized payload across the call"
 )]
 #[tauri::command]
-pub fn server_add_bulk(
+pub async fn server_add_bulk(
     app: AppHandle,
     state: State<'_, AppRuntime>,
     servers: Vec<Value>,
-) -> ApiResponse<Value> {
+) -> Result<ApiResponse<Value>, ()> {
     if servers.is_empty() {
-        return ApiResponse::ok(json!({ "added": 0 }));
+        return Ok(ApiResponse::ok(json!({ "added": 0 })));
     }
-    match server_add_bulk_core(state.config(), servers) {
-        Ok((cfg, added)) => {
-            broadcast_config_changed(&app, &cfg);
-            ApiResponse::ok(json!({ "added": added }))
-        }
-        Err(e) => ApiResponse::err(e),
-    }
+    let prepared = server_add_bulk_core(state.config(), servers);
+    Ok(
+        match Box::pin(apply_prepared_server_edit(&app, &state, prepared)).await {
+            Ok(added) => ApiResponse::ok(json!({ "added": added })),
+            Err(e) => ApiResponse::err(e),
+        },
+    )
 }
 
 /// 上游 `SERVER_UPDATE`：更新节点（按 id）。
@@ -334,23 +420,26 @@ pub fn server_add_bulk(
     reason = "Tauri IPC command owns its deserialized payload across the call"
 )]
 #[tauri::command]
-pub fn server_update(
+pub async fn server_update(
     app: AppHandle,
     state: State<'_, AppRuntime>,
     server: Value,
-) -> ApiResponse<()> {
-    match server_update_core(state.config(), server) {
-        Ok(cfg) => {
-            broadcast_config_changed(&app, &cfg);
-            ok_void()
-        }
-        Err(error) => ApiResponse::err(error),
-    }
+) -> Result<ApiResponse<()>, ()> {
+    let prepared = server_update_core(state.config(), server);
+    Ok(
+        match Box::pin(apply_prepared_server_edit(&app, &state, prepared)).await {
+            Ok(()) => ok_void(),
+            Err(error) => ApiResponse::err(error),
+        },
+    )
 }
 
 /// Preserve the existing full-record update contract, but reject malformed records
 /// before the tolerant persistence sanitizer can turn an update into a deletion.
-fn server_update_core(config: &ConfigManager, server: Value) -> Result<Value, String> {
+fn server_update_core(
+    config: &ConfigManager,
+    server: Value,
+) -> Result<(Result<(), String>, Option<PreparedConfigEdit>), String> {
     let id = server
         .get("id")
         .and_then(Value::as_str)
@@ -358,8 +447,8 @@ fn server_update_core(config: &ConfigManager, server: Value) -> Result<Value, St
         .ok_or_else(|| "server.id required".to_string())?
         .to_string();
     let server = normalized_add_server(server)?;
-    let (result, saved) = config
-        .update(|cfg| {
+    config
+        .prepare_config_edit(|cfg| {
             let found = cfg
                 .get_mut("servers")
                 .and_then(Value::as_array_mut)
@@ -374,9 +463,7 @@ fn server_update_core(config: &ConfigManager, server: Value) -> Result<Value, St
             *existing = server;
             ConfigDecision::Write(Ok(()))
         })
-        .map_err(|error| error.to_string())?;
-    result?;
-    saved.ok_or_else(|| "节点更新未写入".to_string())
+        .map_err(|error| error.to_string())
 }
 
 /// 删选中节点后的新 `selectedServerId`（D4）：兜底出口须**存活于删除后的 `cfg.servers`** 才采用，否则回落直连
@@ -422,17 +509,14 @@ fn apply_selection_fallback(
     reason = "Tauri IPC command owns its deserialized payload across the call"
 )]
 #[tauri::command]
-pub fn server_delete(
+pub async fn server_delete(
     app: AppHandle,
     state: State<'_, AppRuntime>,
     server_id: String,
     fallback_selected_id: Option<String>,
-) -> ApiResponse<()> {
-    let result = state.config().update_deferred_cleanup(|cfg| {
-        let old_selected = cfg
-            .get("selectedServerId")
-            .and_then(Value::as_str)
-            .map(str::to_string);
+) -> Result<ApiResponse<()>, ()> {
+    let prepared = state.config().prepare_config_edit(|cfg| {
+        let was_selected = cfg.get("selectedServerId").and_then(Value::as_str) == Some(&server_id);
         let removed = cfg
             .get_mut("servers")
             .and_then(Value::as_array_mut)
@@ -444,30 +528,17 @@ pub fn server_delete(
         let Some(_removed) = removed else {
             return ConfigDecision::Skip(Err(format!("服务器不存在: {server_id}")));
         };
-        let was_selected = old_selected.as_deref() == Some(&server_id);
         apply_selection_fallback(cfg, was_selected, fallback_selected_id.as_deref());
         prune_recent_server_ids_to_existing(cfg);
-        ConfigDecision::Write(Ok(old_selected))
+        ConfigDecision::Write(Ok(()))
     });
-    match result {
-        Ok((Ok(old_selected), Some(cfg))) => {
-            broadcast_config_changed(&app, &cfg);
-            // A7：删当前选中 → selectedServerId 回落 viable/`__direct__`（恒 != 旧 id）= 出口变 →
-            // 作废旧出口解锁探测缓存（否则解锁角标最长陈旧 30min）。删非选中节点 → 出口不动、不失效。
-            if selected_exit_changed(
-                old_selected.as_deref(),
-                cfg.get("selectedServerId").and_then(Value::as_str),
-            ) {
-                let sink = BroadcastSink::new(&app);
-                let running = state.proxy().status().running;
-                state.unlock().invalidate(&sink, running, false);
-            }
-            ok_void()
-        }
-        Ok((Err(error), None)) => ApiResponse::err(error),
-        Ok(_) => unreachable!("server_delete decision and persistence must agree"),
-        Err(e) => ApiResponse::err(format!("{e}")),
-    }
+    let prepared = prepared.map_err(|e| format!("{e}"));
+    Ok(
+        match Box::pin(apply_prepared_server_edit(&app, &state, prepared)).await {
+            Ok(()) => ok_void(),
+            Err(error) => ApiResponse::err(error),
+        },
+    )
 }
 
 /// Individual-node batch actions never remove subscription-managed rows. Source
@@ -501,50 +572,35 @@ fn remove_batch_manual_nodes(
     reason = "Tauri IPC command owns its deserialized payload across the call"
 )]
 #[tauri::command]
-pub fn server_delete_batch(
+pub async fn server_delete_batch(
     app: AppHandle,
     state: State<'_, AppRuntime>,
     server_ids: Vec<String>,
     fallback_selected_id: Option<String>,
-) -> ApiResponse<u32> {
+) -> Result<ApiResponse<u32>, ()> {
     let id_set: std::collections::HashSet<&str> = server_ids.iter().map(String::as_str).collect();
-    let result = state.config().update_deferred_cleanup(|cfg| {
-        let old_selected = cfg
-            .get("selectedServerId")
-            .and_then(Value::as_str)
-            .map(str::to_string);
+    let prepared = state.config().prepare_config_edit(|cfg| {
         let removed = remove_batch_manual_nodes(cfg, &id_set);
         if removed.is_empty() {
-            return ConfigDecision::Skip((old_selected, 0u32));
+            return ConfigDecision::Skip(Ok(0u32));
         }
-        let selected_in_set = old_selected.as_deref().is_some_and(|sid| {
+        let selected = cfg.get("selectedServerId").and_then(Value::as_str);
+        let selected_in_set = selected.is_some_and(|sid| {
             removed
                 .iter()
                 .any(|server| server["id"].as_str() == Some(sid))
         });
         apply_selection_fallback(cfg, selected_in_set, fallback_selected_id.as_deref());
         prune_recent_server_ids_to_existing(cfg);
-        ConfigDecision::Write((old_selected, u32::try_from(removed.len()).unwrap_or(0)))
+        ConfigDecision::Write(Ok(u32::try_from(removed.len()).unwrap_or(0)))
     });
-    match result {
-        Ok(((_old_selected, 0), None)) => ApiResponse::ok(0u32),
-        Ok(((old_selected, removed_count), Some(cfg))) => {
-            broadcast_config_changed(&app, &cfg);
-            // A7：选中落删除集 → selectedServerId 回落 viable/`__direct__`（恒 != 旧 id）= 出口变 →
-            // 作废旧出口解锁探测缓存。选中不在删除集 → 出口不动、不失效。
-            if selected_exit_changed(
-                old_selected.as_deref(),
-                cfg.get("selectedServerId").and_then(Value::as_str),
-            ) {
-                let sink = BroadcastSink::new(&app);
-                let running = state.proxy().status().running;
-                state.unlock().invalidate(&sink, running, false);
-            }
-            ApiResponse::ok(removed_count)
-        }
-        Ok(_) => unreachable!("server_delete_batch decision and persistence must agree"),
-        Err(e) => ApiResponse::err(format!("{e}")),
-    }
+    let prepared = prepared.map_err(|e| format!("{e}"));
+    Ok(
+        match Box::pin(apply_prepared_server_edit(&app, &state, prepared)).await {
+            Ok(removed_count) => ApiResponse::ok(removed_count),
+            Err(e) => ApiResponse::err(e),
+        },
+    )
 }
 
 /// 最近连接节点入队（托盘「节点·最近」MRU，原型 `pickNode`：

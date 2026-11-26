@@ -372,10 +372,10 @@ fn retained_credentials_stay_raw_while_real_frontend_projection_and_version_are_
     assert!(!event.contains("new_value"));
     let server = crate::test_support::crate_source("commands/server.rs");
     let update = server
-        .split("pub fn server_update(")
+        .split("pub async fn server_update(")
         .nth(1)
         .unwrap()
-        .split("pub fn server_delete")
+        .split("pub async fn server_delete")
         .next()
         .unwrap();
     assert!(update.contains("ApiResponse<()>"));
