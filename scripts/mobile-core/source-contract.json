@@ -5,12 +5,12 @@
   "repository": "polaris-arch/sing-box-polaris",
   "repositoryId": 1421657509,
   "sourceURL": "https://github.com/polaris-arch/sing-box-polaris",
-  "version": "1.15.0-polaris-alpha.12.43",
-  "sourceTag": "v1.15.0-polaris-alpha.12.43",
-  "sourceTagObject": "68df596ac19ab52601febd921a2f14d39be61cdd",
-  "sourceCommit": "c2e212d6a3a47d3807d17815f77835325a99dad8",
-  "sourceTree": "51245942b73aa00dd3d022d41dd47283c235d663",
-  "goModSha256": "f3bb0779a94a300cd24cf82d3b04567b5683252646d18f17e2d7c960613f4762",
+  "version": "1.15.0-polaris-alpha.12.44",
+  "sourceTag": "v1.15.0-polaris-alpha.12.44",
+  "sourceTagObject": "b30184ff0a81a071bbb9f8c270949d6cf35ba4d8",
+  "sourceCommit": "e4558b9444a197225f255d4ed8f8a5a77a13bd26",
+  "sourceTree": "a456b9407512f37a7db365382ec179c22509a3ae",
+  "goModSha256": "2cd904091b5ed301661ab2c32cce458364bc59ecff836cc870756cedf6b54cfe",
   "goSumSha256": "faf13e501da2c8de6a70db1f50a152f37bf875d68717631253e57a8be27cde1a",
   "goModule": "github.com/sagernet/sing-box",
   "sourceOverlay": 0,
@@ -71,7 +71,7 @@
       "ts_omit_synology",
       "ts_omit_bird"
     ],
-    "outputName": "polaris-box-1.15.0-polaris-alpha.12.43-android.aar",
+    "outputName": "polaris-box-1.15.0-polaris-alpha.12.44-android.aar",
     "javaPackage": "io.nekohasekai",
     "libname": "box",
     "legacyAPI21Enabled": false
@@ -120,7 +120,7 @@
     ],
     "libname": "box",
     "frameworkName": "Libbox.xcframework",
-    "outputName": "polaris-box-1.15.0-polaris-alpha.12.43-ios-xcframework.zip",
+    "outputName": "polaris-box-1.15.0-polaris-alpha.12.44-ios-xcframework.zip",
     "linkage": "static; build-time verified App and PacketTunnel link",
     "macOSTvOSIncluded": false
   },
@@ -139,10 +139,10 @@
   },
   "sourcePolicy": {
     "schema": "polaris-reviewed-kernel-source-v4",
-    "sourceCommit": "c2e212d6a3a47d3807d17815f77835325a99dad8",
-    "sourceTree": "51245942b73aa00dd3d022d41dd47283c235d663",
+    "sourceCommit": "e4558b9444a197225f255d4ed8f8a5a77a13bd26",
+    "sourceTree": "a456b9407512f37a7db365382ec179c22509a3ae",
     "goVersion": "1.27.4",
-    "goModSha256": "f3bb0779a94a300cd24cf82d3b04567b5683252646d18f17e2d7c960613f4762",
+    "goModSha256": "2cd904091b5ed301661ab2c32cce458364bc59ecff836cc870756cedf6b54cfe",
     "goSumSha256": "faf13e501da2c8de6a70db1f50a152f37bf875d68717631253e57a8be27cde1a",
     "goDirective": "1.27.0",
     "toolchain": "go1.27.4",
@@ -164,7 +164,7 @@
       "github.com/sagernet/sing-tun": {
         "version": "v0.9.7-0.20261013140216-9ffa5391a2ad",
         "replacementPath": "./third_party/sing-tun",
-        "replacementTree": "36ebd7d82a7bb29b88833ccb7fdf0c4a22ad7eae",
+        "replacementTree": "ef86a5b3317d31cf8ce482618fa76422f70f0db9",
         "replacementFileCount": 300
       },
       "github.com/sagernet/tailscale": {
@@ -200,7 +200,7 @@
       "github.com/sagernet/sing-quic": {
         "version": "v0.7.2-0.20261002084117-75c3ac4fa12b",
         "replacementPath": "./third_party/sing-quic",
-        "replacementTree": "7ce624d709569f9e50a313d86f5c995f3e5f2c5e",
+        "replacementTree": "cfb4c65ae3172fa4a2cfcb5d5c729f739003dc81",
         "replacementFileCount": 82
       },
       "github.com/sagernet/wireguard-go": {
@@ -232,6 +232,12 @@
         "replacementPath": "./third_party/google-nftables",
         "replacementTree": "fa64b599977f4d1f2ebd62f0b486a63329a343e2",
         "replacementFileCount": 106
+      },
+      "github.com/sagernet/netlink": {
+        "version": "v0.0.0-20260814022025-64455d367bbf",
+        "replacementPath": "./third_party/netlink",
+        "replacementTree": "b8298241758006598eb17c3e777f3807f6e076d3",
+        "replacementFileCount": 125
       }
     }
   }

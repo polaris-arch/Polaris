@@ -30,6 +30,7 @@ const vendorDirectories = {
   'github.com/sagernet/sing-vmess': 'sing-vmess',
   'github.com/libp2p/go-nat': 'go-nat',
   'github.com/google/nftables': 'google-nftables',
+  'github.com/sagernet/netlink': 'netlink',
 };
 
 function demand(condition, reason) {
