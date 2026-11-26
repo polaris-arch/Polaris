@@ -218,7 +218,7 @@ export interface ConnectionsDetailUpdate {
   at: number; // 采样时刻 epoch ms
 }
 
-/** 已结束连接；closedAt 为 sing-box UnixNano。 */
+/** 已结束连接；closedAt 为 UnixNano（Core 下发毫秒，后端已换算）。 */
 export interface ClosedConnectionEntry {
   entry: ConnectionEntry;
   closedAt: number;

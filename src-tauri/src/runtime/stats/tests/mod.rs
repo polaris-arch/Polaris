@@ -104,7 +104,7 @@ fn connection_snapshot_publishes_only_on_completion_and_obeys_latest_history_cut
     )
     .unwrap()
     .is_none());
-    history.clear(10);
+    history.clear(10_000_000);
     assert!(apply_connection_frame(
         part(
             false,
@@ -189,8 +189,8 @@ fn closed_history_is_newest_first_and_capped_to_history_limit() {
         Some(ClosedHistoryChange::Reset { .. })
     ));
     assert_eq!(history.entries.len(), MAX_CLOSED_HISTORY);
-    assert_eq!(history.entries.first().unwrap().closed_at, 1_002);
-    assert_eq!(history.entries.last().unwrap().closed_at, 3);
+    assert_eq!(history.entries.first().unwrap().closed_at, 1_002_000_000);
+    assert_eq!(history.entries.last().unwrap().closed_at, 3_000_000);
 }
 
 #[test]
@@ -239,7 +239,7 @@ fn short_reset_replay_preserves_accumulated_session_history() {
 #[test]
 fn clearing_closed_history_blocks_old_reset_replay_but_keeps_new_closes() {
     let mut history = ClosedHistory::default();
-    history.clear(500);
+    history.clear(500_000_000);
     let events = SingBoxConnectionEvents {
         reset: true,
         events: vec![

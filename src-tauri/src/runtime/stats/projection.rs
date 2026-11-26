@@ -366,8 +366,9 @@ impl ClosedHistory {
             .as_ref()
             .map_or(0, |connection| connection.closed_at);
         let reported_closed_at = event.closed_at.max(payload_closed_at);
+        // Core 以 UnixMilli 下发 closedAt；历史水位与前端按纳秒处理。
         let closed_at = if reported_closed_at > 0 {
-            reported_closed_at
+            reported_closed_at.saturating_mul(1_000_000)
         } else if event.kind == ConnectionEventType::Closed {
             now_ns()
         } else {
