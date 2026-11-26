@@ -3,7 +3,7 @@
 //! 建 gRPC 管理客户端、取 Bearer secret、按节点解析管理面落点、`endpointTag ↔ serverId` 逆映射、
 //! dashboard 连接信息（供前端 `app:getSingboxDashboardConnection`）。
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
 use polaris_config_engine::builder::build_id_to_tag_map;
 use polaris_config_engine::builder::helpers::ServerLike;
@@ -14,7 +14,25 @@ use serde_json::Value;
 
 use crate::runtime::management_api::{current_clash_api_secret, GrpcManagementApi};
 
-use super::ProxyRuntime;
+use super::{runtime_config::api_handoff::ApiRelayEpoch, ProxyRuntime};
+
+pub(crate) struct UpdateProxyTarget {
+    generation: u64,
+    pub(crate) port: u16,
+    pub(crate) auth: Option<InboundUser>,
+    api_port: u16,
+    pub(crate) epoch: Arc<ApiRelayEpoch>,
+    control: Arc<SingBoxApiClient>,
+}
+
+impl UpdateProxyTarget {
+    pub(crate) fn dns_client(&self) -> SingBoxApiClient {
+        self.control
+            .as_ref()
+            .clone()
+            .retain_lifetime(self.epoch.borrow())
+    }
+}
 
 /// 经本机 http 代理入站出网的目标（[`ProxyRuntime::local_http_proxy`] 产出）。
 ///
@@ -138,6 +156,91 @@ impl ApiReadbackBinding {
 }
 
 impl ProxyRuntime {
+    pub(crate) fn update_proxy_target(
+        &self,
+        preference: Option<bool>,
+    ) -> Result<Option<UpdateProxyTarget>, String> {
+        let _publication = self.gate.lock_generation_publication();
+        let unavailable = || "update proxy owner unavailable".to_owned();
+        let status = self.status.read().map_err(|_| unavailable())?;
+        let (via_proxy, port) = crate::runtime::http::resolve_update_proxy_target(
+            status.running,
+            preference,
+            status.update_in_port,
+        );
+        if !via_proxy {
+            return Ok(None);
+        }
+        let generation = self.core_generation();
+        if self.core_lifecycle_busy() || status.main_generation != generation {
+            return Err(unavailable());
+        }
+        let api = self
+            .managed_readback_binding(None)
+            .ok()
+            .flatten()
+            .filter(|binding| binding.port == status.clash_api_port)
+            .ok_or_else(unavailable)?;
+        let ApiReadbackBinding {
+            port: api_port,
+            epoch: Some(epoch),
+            control: Some(control),
+            ..
+        } = api
+        else {
+            return Err(unavailable());
+        };
+        let snapshot = self.switch_snapshot.read().map_err(|_| unavailable())?;
+        let auth = snapshot
+            .as_ref()
+            .ok_or_else(unavailable)?
+            .loopback_auth
+            .clone();
+        if polaris_config_engine::builder::inbounds::loopback_inbounds_require_auth(
+            polaris_helper_proto::Platform::current(),
+        ) && auth.is_none()
+        {
+            return Err(unavailable());
+        }
+        Ok(Some(UpdateProxyTarget {
+            generation,
+            port,
+            auth,
+            api_port,
+            epoch,
+            control,
+        }))
+    }
+
+    pub(crate) fn update_proxy_is_current(&self, target: &UpdateProxyTarget) -> bool {
+        // The Android liveness observation enters the bridge outside publication.
+        if !self.core_running() {
+            return false;
+        }
+        let _publication = self.gate.lock_generation_publication();
+        self.core_generation() == target.generation
+            && !self.core_lifecycle_busy()
+            && self.status.read().is_ok_and(|status| {
+                status.running
+                    && status.main_generation == target.generation
+                    && status.update_in_port == target.port
+                    && status.clash_api_port == target.api_port
+            })
+            && !target.epoch.is_closed()
+            && target.control.captured_transport_live()
+    }
+
+    pub(crate) async fn update_proxy_generation_changed(&self, target: &UpdateProxyTarget) {
+        loop {
+            let mut notified = std::pin::pin!(self.gen_changed.notified());
+            notified.as_mut().enable();
+            if self.core_generation() != target.generation {
+                return;
+            }
+            notified.await;
+        }
+    }
+
     /// 建管理 API 客户端（h2c gRPC）。核未起 / 端口未解析 / 连不上 → `not_ready()`（→ 退回重启）。
     ///
     /// 每次热切换现连：tonic channel 是 lazy 的，建连成本低；持久化客户端需处理换核/换端口后的

@@ -594,15 +594,14 @@ pub(super) fn check_requested_app_release(
 /// 版本内容仍由下方的逐字对账处理，两个约束共同保证“提示哪个版本，就下载哪个版本”。
 /// 上游 `UPDATE_CHECK`：检查应用更新。
 ///
-/// ✅ **检查侧已接线**：经 `runtime/http.rs` 的真实 client（`state.http()`）走**同一条**
+/// 更新检查经 `runtime/http.rs` 的更新会话走
 /// SSRF 安全路径 [`safe_redirect_fetch`](polaris_net_stack::safe_redirect::safe_redirect_fetch)（首 URL + 每跳 Location 都过 `assert_host_allowed`）拉
 /// `polaris-arch/Polaris` 的 releases → `polaris_updater::check_app_update` 纯逻辑转换（过滤 prerelease /
 /// 按语义版本挑最高 / `compare_semver` 判新 / 平台架构资产选择 / skip 判定）→ 返
 /// `{ hasUpdate, updateInfo? }`（`updateInfo` 字段与前端 `UpdateInfo` 契约逐字对齐）。
 ///
-/// **代理策略**：本批走 `state.http()`（`no_proxy` 直连 client）。proxy 未运行时直连是合法回退
-/// （C19 `resolve_update_proxy_target`：`update-in` 端口为 0 → 强制直连，自举友好）；「经 update-in 口
-/// 拉取」需 `proxy.rs` 端口访问器（禁区，另批），而 GitHub API 公网可达，直连对「检查」已足够。
+/// 启用代理且 Core 就绪时，经 `update-in` 请求当前 Core 校验过的数字地址。Core 未运行或
+/// 开关关闭时保留原有直连启动路径。这项设置只控制检查，安装包继续经过原有独立传输校验。
 ///
 /// **失败语义**（B5 反伪造）：网络/SSRF/超时/非 2xx → `success:false`（前端 error 态显因），**绝不**
 /// 把失败伪装成「已是最新」；无更新 / 无适配资产 / 已跳过 → `{ hasUpdate:false }`（诚实无更新）。

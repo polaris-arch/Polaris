@@ -1,4 +1,7 @@
-use super::subscription_transport::{classify_transport_failure, sanitized_body_read_error};
+use super::subscription_transport::{
+    build_socks_pinned_client, canonical_public_update_address, classify_transport_failure,
+    sanitized_body_read_error,
+};
 use super::*;
 use crate::test_support::TestDir;
 use polaris_net_stack::safe_redirect::{
@@ -202,16 +205,16 @@ async fn fetch_network_error_surfaces_as_err_not_panic() {
 ///
 /// 仅支持一次连接、no-auth、CONNECT —— 够钉住「reqwest 到底说不说 socks5」这一件事。
 ///
-/// 第二个返回值把观察到的 **CONNECT 目标**（`(ATYP, 地址串)`）回传给用例：`0x03` = 域名原样
+/// 第二个返回值把观察到的 **CONNECT 目标**和隧道内的请求头回传给用例：`0x03` = 域名原样
 /// 转交代理端解析（`socks5h`），`0x01` = 客户端已在本机解析成 IP（`socks5`）。这是
 /// 「解析归属」唯一能被自动断言的地面证据 —— 见
 /// [`HttpRuntime::via_local_socks_proxy`] 的「域名解析归属」小节。
 fn spawn_socks5_server(
     body: &'static str,
-) -> (SocketAddr, std::sync::mpsc::Receiver<(u8, String)>) {
+) -> (SocketAddr, std::sync::mpsc::Receiver<(u8, String, Vec<u8>)>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind 回环端口");
     let addr = listener.local_addr().expect("取端口");
-    let (target_tx, target_rx) = std::sync::mpsc::channel::<(u8, String)>();
+    let (target_tx, target_rx) = std::sync::mpsc::channel::<(u8, String, Vec<u8>)>();
     thread::spawn(move || {
         let Ok((mut sock, _)) = listener.accept() else {
             return;
@@ -254,9 +257,10 @@ fn spawn_socks5_server(
         let observed = match req[3] {
             0x03 => String::from_utf8_lossy(&rest[..addr_len]).into_owned(),
             0x01 => format!("{}.{}.{}.{}", rest[0], rest[1], rest[2], rest[3]),
+            0x04 => std::net::Ipv6Addr::from(<[u8; 16]>::try_from(&rest[..addr_len]).unwrap())
+                .to_string(),
             _ => String::new(),
         };
-        let _ = target_tx.send((req[3], observed));
         // 4) 回成功（BND.ADDR=0.0.0.0:0，客户端不校验）。
         if sock
             .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
@@ -264,9 +268,27 @@ fn spawn_socks5_server(
         {
             return;
         }
-        // 5) 隧道内的明文 HTTP 请求 → 直接回响应。
-        let mut buf = [0u8; 8192];
-        let _ = sock.read(&mut buf);
+        // 5) 读隧道内的 HTTP 请求头或首个 TLS 记录，连同 CONNECT 目标回传给用例。
+        let _ = sock.set_read_timeout(Some(Duration::from_secs(2)));
+        let mut request = Vec::new();
+        let mut buf = [0; 1024];
+        while let Ok(n) = sock.read(&mut buf) {
+            request.extend_from_slice(&buf[..n]);
+            if n == 0 || request.ends_with(b"\r\n\r\n") || request.len() > 8192 {
+                break;
+            }
+            if request.first() == Some(&0x16) && request.len() >= 5 {
+                let record_len = u16::from_be_bytes([request[3], request[4]]) as usize;
+                if request.len() >= 5 + record_len {
+                    break;
+                }
+            }
+        }
+        let is_tls = request.first() == Some(&0x16);
+        let _ = target_tx.send((req[3], observed, request));
+        if is_tls {
+            return;
+        }
         let resp = format!(
             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             body.len(),
@@ -315,7 +337,7 @@ async fn via_local_socks_proxy_hands_the_hostname_to_the_proxy_not_the_local_res
     assert_eq!(r.status, 200);
     assert_eq!(r.body, b"OK-REMOTE-DNS");
 
-    let (atyp, target) = targets
+    let (atyp, target, _) = targets
         .recv_timeout(Duration::from_secs(5))
         .expect("mock socks server 应观测到 CONNECT 目标");
     assert_eq!(
@@ -323,6 +345,68 @@ async fn via_local_socks_proxy_hands_the_hostname_to_the_proxy_not_the_local_res
         "必须 ATYP=DOMAIN（域名交代理端解析）；实得 {atyp:#04x} 说明客户端在本机解析了"
     );
     assert_eq!(target, "sub.invalid", "域名须原样转交，不得被本机改写成 IP");
+}
+
+/// 更新会话的 SOCKS 只拨 guard 放行的数字地址，Host/SNI 仍是域名：代理端不再二次解析。
+#[tokio::test]
+async fn update_socks_client_dials_the_admitted_address_and_keeps_the_hostname() {
+    for literal in [
+        "198.18.9.9",
+        "::ffff:198.18.9.9",
+        "::ffff:127.0.0.1",
+        "100.64.0.1",
+        "224.0.0.1",
+        "192.0.2.1",
+        "ff02::1",
+        "2001:db8::1",
+        "::127.0.0.1",
+        "64:ff9b::127.0.0.1",
+    ] {
+        assert!(
+            canonical_public_update_address(literal.parse().unwrap()).is_err(),
+            "{literal}"
+        );
+    }
+    for (scheme, ip) in [
+        ("http", "93.184.216.34"),
+        ("http", "2606:4700::6810:859"),
+        ("https", "93.184.216.34"),
+    ] {
+        let (proxy, observations) = spawn_socks5_server("OK-PINNED");
+        let pinned = canonical_public_update_address(ip.parse().unwrap()).unwrap();
+        let guarded = GuardedTarget {
+            host: "updates.invalid".to_owned(),
+            addresses: vec![pinned],
+        };
+        let client = build_socks_pinned_client(&guarded, &pinned, proxy.port(), None).unwrap();
+        let response = client
+            .get(format!("{scheme}://updates.invalid/releases"))
+            .timeout(Duration::from_secs(2))
+            .send()
+            .await;
+        let (atyp, target, request) = observations.recv_timeout(Duration::from_secs(2)).unwrap();
+        match (pinned, atyp) {
+            // reqwest 把 IPv6 覆盖地址以带方括号的字面量交给 SOCKS，而不是域名。
+            (std::net::IpAddr::V6(ip), 0x03) => assert_eq!(target, format!("[{ip}]")),
+            (std::net::IpAddr::V4(_), 0x01) | (std::net::IpAddr::V6(_), 0x04) => {
+                assert_eq!(target, pinned.to_string());
+            }
+            _ => panic!("unexpected SOCKS target: {target} ({atyp})"),
+        }
+        if scheme == "https" {
+            // 夹具读到 ClientHello 后即断开。
+            assert!(response.is_err());
+            assert!(request.starts_with(&[0x16, 0x03]));
+            assert!(request
+                .windows(b"\x00\x00\x0fupdates.invalid".len())
+                .any(|field| field == b"\x00\x00\x0fupdates.invalid"));
+        } else {
+            assert_eq!(response.unwrap().text().await.unwrap(), "OK-PINNED");
+            assert!(String::from_utf8_lossy(&request)
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("Host: updates.invalid")));
+        }
+    }
 }
 
 struct StaticLookup(Vec<String>);
@@ -411,7 +495,7 @@ async fn proxied_hostname_fake_ip_still_uses_remote_domain_resolution() {
     .await
     .expect("代理域名 FakeIP 应放行并由 SOCKS5h 恢复真实域名");
     assert_eq!(response.body, b"OK-FAKEIP-REMOTE");
-    let (atyp, target) = targets.recv_timeout(Duration::from_secs(2)).unwrap();
+    let (atyp, target, _) = targets.recv_timeout(Duration::from_secs(2)).unwrap();
     assert_eq!(atyp, 0x03, "不得把本机 FakeIP pin 给 Polaris SOCKS");
     assert_eq!(target, "fake-sub.invalid");
 }

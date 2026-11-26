@@ -128,6 +128,7 @@ mod subscription_transport;
 
 use subscription_transport::HttpResolutionMode;
 pub use subscription_transport::SystemDnsLookup;
+pub(crate) use subscription_transport::UpdateHttp;
 
 // ── 传输层单点 ────────────────────────────────────────────────────────────────
 
@@ -335,14 +336,9 @@ impl HttpRuntime {
         auth: Option<&InboundUser>,
     ) -> Result<Self, String> {
         install_ring_provider();
-        let mut proxy = reqwest::Proxy::all(proxy_url)
-            .map_err(|e| format!("本机代理地址非法（port={port}）: {e}"))?;
-        if let Some(user) = auth {
-            proxy = proxy.basic_auth(&user.username, &user.password);
-        }
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
-            .proxy(proxy)
+            .proxy(loopback_proxy(proxy_url, port, auth)?)
             .user_agent(app_user_agent())
             .build()
             .map_err(|e| format!("建经代理 HTTP 客户端失败: {e}"))?;
@@ -376,6 +372,19 @@ impl HttpRuntime {
         let built = build_warp_client()?;
         Ok(self.warp_client.get_or_init(|| built))
     }
+}
+
+fn loopback_proxy(
+    proxy_url: &str,
+    port: u16,
+    auth: Option<&InboundUser>,
+) -> Result<reqwest::Proxy, String> {
+    let mut proxy = reqwest::Proxy::all(proxy_url)
+        .map_err(|e| format!("本机代理地址非法（port={port}）: {e}"))?;
+    if let Some(user) = auth {
+        proxy = proxy.basic_auth(&user.username, &user.password);
+    }
+    Ok(proxy)
 }
 
 /// 手写代理报文用的 `Proxy-Authorization` 头**整行**（含结尾 `\r\n`）；无凭据 → 空串。

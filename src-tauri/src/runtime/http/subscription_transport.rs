@@ -5,15 +5,19 @@
 
 use std::{
     future::Future,
+    net::IpAddr,
     time::{Duration, Instant},
 };
 
 use polaris_net_stack::safe_redirect::{FetchInit, GuardedTarget, HttpClient, MinimalResponse};
-use polaris_net_stack::ssrf::DnsLookup;
+use polaris_net_stack::ssrf::{is_polaris_fake_ip, is_private_ip, DnsLookup};
+use polaris_singbox_grpc::RuntimeConfigError;
+
+use crate::runtime::{proxy::UpdateProxyTarget, AppRuntime};
 
 use super::{
-    app_user_agent, collect_headers, install_ring_provider, read_body_capped, BodyReadError,
-    HttpRuntime, RESPONSE_TIMEOUT, STALL_TIMEOUT,
+    app_user_agent, collect_headers, install_ring_provider, loopback_proxy, read_body_capped,
+    BodyReadError, HttpRuntime, RESPONSE_TIMEOUT, STALL_TIMEOUT,
 };
 
 // ── DnsLookup 生产实现 ─────────────────────────────────────────────────────────
@@ -161,9 +165,17 @@ pub(super) fn sanitized_body_read_error(error: BodyReadError) -> String {
 pub(super) fn build_direct_pinned_client(
     target: &GuardedTarget,
 ) -> Result<reqwest::Client, String> {
+    pinned_client_builder(target, &target.addresses)?
+        .build()
+        .map_err(|e| format!("建 DNS-pinned HTTP 客户端失败: {e}"))
+}
+
+fn pinned_client_builder(
+    target: &GuardedTarget,
+    addresses: &[IpAddr],
+) -> Result<reqwest::ClientBuilder, String> {
     install_ring_provider();
-    let addrs: Vec<std::net::SocketAddr> = target
-        .addresses
+    let addrs: Vec<std::net::SocketAddr> = addresses
         .iter()
         .copied()
         .map(|ip| std::net::SocketAddr::new(ip, 0))
@@ -174,16 +186,38 @@ pub(super) fn build_direct_pinned_client(
             target.host
         ));
     }
-    reqwest::Client::builder()
+    Ok(reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
         .user_agent(app_user_agent())
         .pool_max_idle_per_host(1)
         .pool_idle_timeout(DIRECT_PINNED_REUSE_WINDOW)
         // URL hostname 保持不变（Host/SNI 仍是域名），只把底层 socket 解析钉到 guard 的同一组 IP。
-        .resolve_to_addrs(&target.host, &addrs)
+        .resolve_to_addrs(&target.host, &addrs))
+}
+
+pub(super) fn build_socks_pinned_client(
+    guarded: &GuardedTarget,
+    address: &IpAddr,
+    port: u16,
+    auth: Option<&polaris_config_engine::singbox::InboundUser>,
+) -> Result<reqwest::Client, String> {
+    let proxy = loopback_proxy(&format!("socks5://127.0.0.1:{port}"), port, auth)?;
+    pinned_client_builder(guarded, std::slice::from_ref(address))?
+        .proxy(proxy)
         .build()
-        .map_err(|e| format!("建 DNS-pinned HTTP 客户端失败: {e}"))
+        .map_err(|_| "cannot build guarded update transport".to_owned())
+}
+
+fn hop_request(client: &reqwest::Client, url: &str, init: &FetchInit) -> reqwest::RequestBuilder {
+    let mut req = client.get(url);
+    if !init.user_agent.is_empty() {
+        req = req.header(reqwest::header::USER_AGENT, init.user_agent.as_str());
+    }
+    for (k, v) in &init.headers {
+        req = req.header(k.as_str(), v.as_str());
+    }
+    req
 }
 
 impl HttpRuntime {
@@ -229,23 +263,31 @@ async fn fetch_one_hop(
     url: String,
     init: FetchInit,
 ) -> Result<MinimalResponse, String> {
-    let mut req = client.get(url);
-    if !init.user_agent.is_empty() {
-        req = req.header(reqwest::header::USER_AGENT, init.user_agent);
-    }
-    for (k, v) in init.headers {
-        req = req.header(k, v);
-    }
     let response_timeout = init
         .timeout_ms
         .map_or(RESPONSE_TIMEOUT, Duration::from_millis);
     let send_started = Instant::now();
-    let mut resp = tokio::time::timeout(response_timeout, req.send())
+    let resp = tokio::time::timeout(response_timeout, hop_request(&client, &url, &init).send())
         .await
         .map_err(|_| "request timeout".to_string())?
         .map_err(|e| sanitized_reqwest_error(&e))?;
     let headers_ms = send_started.elapsed().as_millis();
 
+    let body_started = Instant::now();
+    let response = read_hop_response(resp, init.max_body_bytes).await?;
+    log::debug!(
+        "guarded HTTP timing: status={} response_headers_ms={headers_ms} body_ms={} body_bytes={}",
+        response.status,
+        body_started.elapsed().as_millis(),
+        response.body.len()
+    );
+    Ok(response)
+}
+
+async fn read_hop_response(
+    mut resp: reqwest::Response,
+    max_body_bytes: Option<usize>,
+) -> Result<MinimalResponse, String> {
     let status = resp.status().as_u16();
     let headers = collect_headers(&resp);
     let location = resp
@@ -254,20 +296,14 @@ async fn fetch_one_hop(
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
 
-    let body_started = Instant::now();
     let body = if (300..400).contains(&status) {
         Vec::new()
     } else {
         // absolute deadline 由 safe_redirect_fetch_until 外包整条 future；这里保留更早的 body idle 失败。
-        read_body_capped(&mut resp, init.max_body_bytes, STALL_TIMEOUT)
+        read_body_capped(&mut resp, max_body_bytes, STALL_TIMEOUT)
             .await
             .map_err(sanitized_body_read_error)?
     };
-    log::debug!(
-        "guarded HTTP timing: status={status} response_headers_ms={headers_ms} body_ms={} body_bytes={}",
-        body_started.elapsed().as_millis(),
-        body.len()
-    );
 
     Ok(MinimalResponse {
         status,
@@ -275,6 +311,190 @@ async fn fetch_one_hop(
         headers,
         body,
     })
+}
+
+const CORE_LOOKUP_MAX_ADDRESSES: usize = 64;
+const UPDATE_PROXY_OWNER_CHANGED: &str = "update proxy owner changed";
+
+pub(super) fn canonical_public_update_address(address: IpAddr) -> Result<IpAddr, String> {
+    let address = address.to_canonical();
+    // 经代理的更新只接受普通公网单播，以及内嵌 IPv4 同样合规的知名 NAT64 前缀。
+    let supported_scope = match address {
+        IpAddr::V4(ip) => {
+            !ip.is_documentation()
+                && !matches!(
+                    ip.octets(),
+                    [224..=255, ..] | [192, 0, 0, 0..=8 | 11..=255] | [192, 88, 99, ..]
+                )
+        }
+        IpAddr::V6(ip) => match ip.segments() {
+            [0x0064, 0xff9b, 0, 0, 0, 0, high, low] => {
+                let embedded = (u32::from(high) << 16) | u32::from(low);
+                canonical_public_update_address(std::net::Ipv4Addr::from_bits(embedded).into())
+                    .is_ok()
+            }
+            // 协议分配段、文档段与 6to4。
+            [0x2001, 0..=0x01ff | 0x0db8, ..] | [0x2002, ..] | [0x3fff, 0..=0x0fff, ..] => false,
+            [0x2000..=0x3fff, ..] => true,
+            _ => false,
+        },
+    };
+    let text = address.to_string();
+    if !supported_scope || is_private_ip(&text) || is_polaris_fake_ip(&text) {
+        return Err("update target is outside the supported public address scope".into());
+    }
+    Ok(address)
+}
+
+pub(crate) struct UpdateHttp<'a> {
+    state: &'a AppRuntime,
+    target: Result<Option<UpdateProxyTarget>, String>,
+}
+
+impl<'a> UpdateHttp<'a> {
+    /// 为整次操作（含每一跳重定向）选定同一条路由。
+    pub(crate) fn new(state: &'a AppRuntime) -> Self {
+        let preference = state
+            .config()
+            .with_current(|cfg| cfg["mainSessionViaProxy"].as_bool());
+        let target = state
+            .proxy()
+            .update_proxy_target(preference.as_ref().ok().copied().flatten())
+            .and_then(|target| {
+                if target.is_some() && preference.is_err() {
+                    return Err("update proxy preference unavailable".into());
+                }
+                Ok(target)
+            });
+        Self { state, target }
+    }
+
+    fn target(&self) -> Result<Option<&UpdateProxyTarget>, String> {
+        self.target
+            .as_ref()
+            .map(Option::as_ref)
+            .map_err(Clone::clone)
+    }
+
+    async fn core_lookup(
+        &self,
+        target: &UpdateProxyTarget,
+        host: &str,
+    ) -> Result<Vec<String>, String> {
+        let proxy = self.state.proxy();
+        if !proxy.update_proxy_is_current(target) {
+            return Err(UPDATE_PROXY_OWNER_CHANGED.into());
+        }
+        let client = target.dns_client();
+        let reply = tokio::select! {
+            biased;
+            () = proxy.update_proxy_generation_changed(target) => {
+                return Err(UPDATE_PROXY_OWNER_CHANGED.into());
+            }
+            result = client.lookup_public_dns(host, RESPONSE_TIMEOUT) => result,
+        };
+        if !proxy.update_proxy_is_current(target) {
+            return Err(UPDATE_PROXY_OWNER_CHANGED.into());
+        }
+        let reply = reply.map_err(|error| match error {
+            RuntimeConfigError::Unsupported(_) => {
+                "running Core does not support guarded update DNS"
+            }
+            RuntimeConfigError::Call(_) => "update DNS lookup failed",
+        })?;
+        if reply.version != 1
+            || reply.addresses.is_empty()
+            || reply.addresses.len() > CORE_LOOKUP_MAX_ADDRESSES
+        {
+            return Err("invalid update DNS response".into());
+        }
+        reply
+            .addresses
+            .into_iter()
+            .map(|address| {
+                let address = address.parse().map_err(|_| "invalid update DNS response")?;
+                canonical_public_update_address(address).map(|address| address.to_string())
+            })
+            .collect()
+    }
+}
+
+impl DnsLookup for UpdateHttp<'_> {
+    async fn lookup_all(&self, host: &str) -> Result<Vec<String>, String> {
+        match self.target()? {
+            Some(target) => self.core_lookup(target, host).await,
+            None => SystemDnsLookup.lookup_all(host).await,
+        }
+    }
+}
+
+impl HttpClient for UpdateHttp<'_> {
+    async fn fetch(&self, _url: &str, _init: &FetchInit) -> Result<MinimalResponse, String> {
+        Err("update requests require a guarded target".into())
+    }
+
+    async fn fetch_guarded(
+        &self,
+        url: &str,
+        init: &FetchInit,
+        guarded: &GuardedTarget,
+    ) -> Result<MinimalResponse, String> {
+        let Some(target) = self.target()? else {
+            return self.state.http().fetch_guarded(url, init, guarded).await;
+        };
+        // 字面量 IP 的重定向不经 DNS，拨号前重新校验整组数字地址。
+        let addresses: Vec<_> = guarded
+            .addresses
+            .iter()
+            .copied()
+            .map(canonical_public_update_address)
+            .collect::<Result<_, _>>()?;
+        let proxy = self.state.proxy();
+        let lease = target.epoch.borrow();
+        if lease.is_closed() || !proxy.update_proxy_is_current(target) {
+            return Err(UPDATE_PROXY_OWNER_CHANGED.into());
+        }
+        let deadline = tokio::time::Instant::now()
+            + init
+                .timeout_ms
+                .map_or(RESPONSE_TIMEOUT, Duration::from_millis);
+        let fetch = async {
+            let mut failure = "update DNS returned no addresses".to_owned();
+            // reqwest SOCKS 只用第一个覆盖地址；仅在连接失败时于同一跳预算内改试其余已放行地址。
+            for address in &addresses {
+                if !proxy.update_proxy_is_current(target) {
+                    return Err(UPDATE_PROXY_OWNER_CHANGED.into());
+                }
+                let client =
+                    build_socks_pinned_client(guarded, address, target.port, target.auth.as_ref())?;
+                match tokio::time::timeout_at(deadline, hop_request(&client, url, init).send())
+                    .await
+                {
+                    Ok(Ok(response)) => {
+                        return read_hop_response(response, init.max_body_bytes).await
+                    }
+                    Ok(Err(error)) if error.is_connect() => {
+                        failure = sanitized_reqwest_error(&error)
+                    }
+                    Ok(Err(error)) => return Err(sanitized_reqwest_error(&error)),
+                    Err(_) => return Err("request timeout".into()),
+                }
+            }
+            Err(failure)
+        };
+        let result = tokio::select! {
+            biased;
+            () = proxy.update_proxy_generation_changed(target) => {
+                return Err(UPDATE_PROXY_OWNER_CHANGED.into());
+            }
+            () = lease.cancelled() => return Err(UPDATE_PROXY_OWNER_CHANGED.into()),
+            result = fetch => result,
+        };
+        if !proxy.update_proxy_is_current(target) {
+            return Err(UPDATE_PROXY_OWNER_CHANGED.into());
+        }
+        result
+    }
 }
 
 impl HttpClient for HttpRuntime {

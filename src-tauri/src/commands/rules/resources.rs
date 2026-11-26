@@ -12,7 +12,7 @@ use crate::commands::rules::new_uuid;
 use crate::events::{broadcast, channel::EVENT_RULE_RESOURCE_PROGRESS};
 use crate::response::ApiResponse;
 use crate::runtime::config::{ConfigManager, Decision, DeferredConfigDeletion};
-use crate::runtime::http::{app_user_agent, SystemDnsLookup};
+use crate::runtime::http::{app_user_agent, UpdateHttp};
 use crate::runtime::proxy::runtime_config::{HotConfigEditOutcome, StagedSaveOwner};
 use crate::runtime::subscription_scheduler::now_ms;
 use crate::runtime::AppRuntime;
@@ -626,10 +626,10 @@ pub async fn rule_resources_refresh_catalog(
     state: State<'_, AppRuntime>,
 ) -> Result<ApiResponse<RuleResourceCatalogResult>, ()> {
     let res_dir = state.config().dir().join("rule-resource");
-    let http = state.http().clone();
+    let http = UpdateHttp::new(&state);
     let gh_prefix = gh_proxy_prefix(&state);
     Ok(ApiResponse::ok(
-        refresh_catalog_core(http.as_ref(), &SystemDnsLookup, &res_dir, &gh_prefix).await,
+        refresh_catalog_core(&http, &http, &res_dir, &gh_prefix).await,
     ))
 }
 
@@ -731,12 +731,10 @@ async fn redownload_with_mode(
     };
     let plan = plan_from_resource(&existing).with_gh_proxy(&gh_proxy_prefix(state));
     let res_dir = state.config().dir().join("rule-resource");
-    let http = state.http().clone();
+    let http = UpdateHttp::new(state);
     let sink = BroadcastSink { app, mode };
     let expected = resource_record(&cfg, &id).cloned();
-    batch
-        .fetch(&sink, http.as_ref(), plan, &res_dir, expected)
-        .await;
+    batch.fetch(&sink, &http, plan, &res_dir, expected).await;
 }
 
 /// 上游 `RULE_RESOURCES_UPDATE_ALL`：更新已登记资源与随包内置 geo（**真下载**）。
@@ -757,7 +755,7 @@ pub async fn rule_resources_update_all(
         .cloned()
         .unwrap_or_default();
     let res_dir = state.config().dir().join("rule-resource");
-    let http = state.http().clone();
+    let http = UpdateHttp::new(&state);
     let gh_prefix = gh_proxy_prefix(&state);
 
     let (raw_entries, builtins) = manual_update_targets(raw_entries);
@@ -777,7 +775,7 @@ pub async fn rule_resources_update_all(
             mode: ProgressMode::Live,
         };
         batch
-            .fetch(&sink, http.as_ref(), plan, &res_dir, Some(entry.clone()))
+            .fetch(&sink, &http, plan, &res_dir, Some(entry.clone()))
             .await;
     }
     let mut results = batch.finish(&app, &state, ProgressMode::Live).await;
@@ -787,6 +785,7 @@ pub async fn rule_resources_update_all(
         let result = match update_builtin_with_mode(
             &app,
             &state,
+            &http,
             tag.clone(),
             ProgressMode::Live,
             BroadcastMode::Deferred(&mut changes),
@@ -843,7 +842,7 @@ pub async fn rule_resources_download(
     items: Vec<Value>,
 ) -> Result<ApiResponse<Vec<Value>>, ()> {
     let res_dir = state.config().dir().join("rule-resource");
-    let http = state.http().clone();
+    let http = UpdateHttp::new(&state);
     let gh_prefix = gh_proxy_prefix(&state);
     // 「刷新清单」落盘的远程全量：外置 tab 勾选的多数条目**不在**内置 33 条精选里，不带上它
     // 逐项都会 `资源库无此条目`（见 [`resolve_catalog_item`]）。无缓存 → 空切片，行为不变。
@@ -872,9 +871,7 @@ pub async fn rule_resources_download(
             mode: ProgressMode::Live,
         };
         let expected = resource_record(&initial, &plan.id).cloned();
-        batch
-            .fetch(&sink, http.as_ref(), plan, &res_dir, expected)
-            .await;
+        batch.fetch(&sink, &http, plan, &res_dir, expected).await;
     }
     let results = batch.finish(&app, &state, ProgressMode::Live).await;
     Ok(ApiResponse::ok(results))
@@ -1141,9 +1138,11 @@ pub async fn rule_resources_update_builtin(
     state: State<'_, AppRuntime>,
     tag: String,
 ) -> Result<ApiResponse<Value>, ()> {
+    let http = UpdateHttp::new(&state);
     update_builtin_with_mode(
         &app,
         &state,
+        &http,
         tag,
         ProgressMode::Live,
         BroadcastMode::Immediate,
@@ -1162,9 +1161,11 @@ pub async fn rule_resources_update_builtin_silent(
     tag: String,
     changes: &mut ResourceChanges,
 ) -> Result<ApiResponse<Value>, ()> {
+    let http = UpdateHttp::new(state);
     update_builtin_with_mode(
         app,
         state,
+        &http,
         tag,
         ProgressMode::Silent,
         BroadcastMode::Deferred(changes),
@@ -1176,6 +1177,7 @@ pub async fn rule_resources_update_builtin_silent(
 async fn update_builtin_with_mode(
     app: &AppHandle,
     state: &AppRuntime,
+    http: &UpdateHttp<'_>,
     tag: String,
     mode: ProgressMode,
     broadcast: BroadcastMode<'_>,
@@ -1189,12 +1191,11 @@ async fn update_builtin_with_mode(
         )));
     };
     let plan = plan_from_builtin(&b).with_gh_proxy(&gh_proxy_prefix(state));
-    let http = state.http().clone();
     let sink = BroadcastSink { app, mode };
     let outcome = update_builtin_resource(
         &sink,
-        http.as_ref(),
-        &SystemDnsLookup,
+        http,
+        http,
         &plan,
         &builtin_runtime_dir(state),
         async |resource, staged, operation, stage| {
@@ -2542,7 +2543,7 @@ impl RegisteredResourceBatch {
         self.items.push(RegisteredBatchItem::Report(value));
     }
 
-    async fn fetch<H: HttpClient>(
+    async fn fetch<H: HttpClient + DnsLookup>(
         &mut self,
         sink: &dyn ProgressSink,
         http: &H,
@@ -2562,7 +2563,7 @@ impl RegisteredResourceBatch {
         let outcome = download_registered_resource(
             &PendingResourceCommit(sink),
             http,
-            &SystemDnsLookup,
+            http,
             &plan,
             res_dir,
             |resource, staged| publish_download_file(old.as_ref(), resource, staged, res_dir),

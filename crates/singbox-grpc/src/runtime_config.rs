@@ -9,6 +9,7 @@ use tonic::{transport::Channel, Request};
 pub const RUNTIME_CONFIG_MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 // Core v1 bounds trace_body at 8 KiB and the identity/tag at 2 KiB combined.
 const EXIT_IP_PROBE_MAX_RESPONSE_BYTES: usize = 12 * 1024;
+const PUBLIC_DNS_MAX_RESPONSE_BYTES: usize = 8 * 1024;
 
 // Plan validates the full candidate and may fetch remote rule sources, even
 // for a small edit. This budget applies only to preparation.
@@ -102,6 +103,28 @@ impl SingBoxApiClient {
             }
             Err(error) => Err(classify(error)),
         }
+    }
+
+    /// Resolve real addresses using the active Core's DNS rules.
+    pub async fn lookup_public_dns(
+        &self,
+        domain: &str,
+        budget: Duration,
+    ) -> Result<daemon::LookupPublicDnsResponse, RuntimeConfigError> {
+        let mut client = self
+            .runtime_config_client()
+            .max_decoding_message_size(PUBLIC_DNS_MAX_RESPONSE_BYTES);
+        let request = self.runtime_config_request(
+            daemon::LookupPublicDnsRequest {
+                domain: domain.to_owned(),
+            },
+            budget,
+        );
+        Ok(self
+            .unary_with_deadline(budget, client.lookup_public_dns(request))
+            .await
+            .map_err(classify)?
+            .into_inner())
     }
 
     pub async fn probe_exit_ip(

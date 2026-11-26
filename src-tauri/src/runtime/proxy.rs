@@ -47,7 +47,7 @@ mod lifecycle;
 mod login_fallback;
 mod management_api;
 use management_api::select_local_http_proxy;
-pub(crate) use management_api::ApiReadbackBinding;
+pub(crate) use management_api::{ApiReadbackBinding, UpdateProxyTarget};
 pub use management_api::{LocalHttpProxy, LocalInbound};
 pub(crate) mod coex_observer;
 mod mesh_route_report;

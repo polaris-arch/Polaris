@@ -258,9 +258,9 @@ const PRIMITIVE_REGISTRY: &[(&str, &str, Option<&str>, &str)] = &[
     ),
     (
         "src-tauri/src/runtime/http.rs",
-        "with_local_proxy_url",
+        "loopback_proxy",
         Some("basic_auth("),
-        "HttpRuntime 经本机 http/socks 入站的唯一构造路径",
+        "构造经本机 HTTP/SOCKS 入站的代理，包括固定地址的更新会话",
     ),
     (
         "crates/unlock-transport/src/lib.rs",
@@ -417,6 +417,9 @@ fn credential_marker_in_body(source: &str, body: &str, marker: &str) -> bool {
 const CREDENTIALED_CALLEES: &[(&str, usize)] = &[
     ("via_local_proxy", 1),
     ("via_local_socks_proxy", 1),
+    ("with_local_proxy_url", 2),
+    ("loopback_proxy", 2),
+    ("build_socks_pinned_client", 3),
     ("measure_via_local_proxy", 1),
     ("measure_inbound", 3),
     ("measure_slot", 3),

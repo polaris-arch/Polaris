@@ -1,7 +1,7 @@
 //! App 更新命令共用的窄原语。
 
 use super::{GITHUB_FETCH_TIMEOUT_MS, MAX_GITHUB_JSON_BYTES};
-use crate::runtime::http::{app_user_agent, CoreDownloader, SystemDnsLookup};
+use crate::runtime::http::{app_user_agent, CoreDownloader, UpdateHttp};
 use crate::runtime::AppRuntime;
 use polaris_net_stack::safe_redirect::{
     safe_redirect_fetch_until, HttpClient, SafeRedirectFetchOptions,
@@ -223,16 +223,8 @@ pub(crate) async fn fetch_releases_json(
 ) -> Result<String, String> {
     let deadline = Instant::now() + Duration::from_millis(GITHUB_FETCH_TIMEOUT_MS);
     let fetch = async {
-        let http = state.http().clone();
-        fetch_release_pages(
-            http.as_ref(),
-            &SystemDnsLookup,
-            owner,
-            repo,
-            deadline,
-            RELEASE_FETCH_LIMITS,
-        )
-        .await
+        let http = UpdateHttp::new(state);
+        fetch_release_pages(&http, &http, owner, repo, deadline, RELEASE_FETCH_LIMITS).await
     };
     tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), fetch)
         .await
