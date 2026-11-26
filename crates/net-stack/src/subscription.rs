@@ -253,6 +253,17 @@ impl Conditional {
     fn has_any(&self) -> bool {
         self.etag.is_some() || self.last_modified.is_some()
     }
+
+    /// 追加 `If-None-Match` / `If-Modified-Since`；返回本次是否确实发了条件头（304 fail-safe 判据）。
+    pub fn append_headers(&self, headers: &mut Vec<(String, String)>) -> bool {
+        if let Some(etag) = &self.etag {
+            headers.push(("If-None-Match".to_string(), etag.clone()));
+        }
+        if let Some(lm) = &self.last_modified {
+            headers.push(("If-Modified-Since".to_string(), lm.clone()));
+        }
+        self.has_any()
+    }
 }
 
 /// 订阅拉取产出（正文 + 元数据）。上游 `fetchSubscriptionText` 返回体。
@@ -523,15 +534,7 @@ async fn fetch_core<H: HttpClient, L: DnsLookup>(
 
     // 条件 GET 头拼装（缓存验证器非凭据，逐跳携带无泄漏面）。与调用方透传头合并。
     let mut headers = extra_headers.unwrap_or_default();
-    let sent_conditional = conditional.is_some_and(Conditional::has_any);
-    if let Some(c) = conditional {
-        if let Some(etag) = &c.etag {
-            headers.push(("If-None-Match".to_string(), etag.clone()));
-        }
-        if let Some(lm) = &c.last_modified {
-            headers.push(("If-Modified-Since".to_string(), lm.clone()));
-        }
-    }
+    let sent_conditional = conditional.is_some_and(|c| c.append_headers(&mut headers));
     let headers = if headers.is_empty() {
         None
     } else {

@@ -689,6 +689,8 @@ fn rule_resource(id: &str, format: RuleResourceFormat) -> RuleResource {
         format,
         size: 3,
         downloaded_at: "2026-01-01T00:00:00Z".into(),
+        etag: None,
+        last_modified: None,
     }
 }
 

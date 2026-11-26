@@ -729,6 +729,8 @@ fn user_resource_never_collides_with_the_catalog_cache_file() {
         format: RuleResourceFormat::Source,
         size: 1,
         downloaded_at: "now".into(),
+        etag: None,
+        last_modified: None,
     };
     assert_ne!(
         plan_from_resource(&r).file_name,

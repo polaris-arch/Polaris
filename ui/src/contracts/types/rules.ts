@@ -276,6 +276,8 @@ export interface RuleResource {
   format: RuleResourceFormat;
   size: number; // 字节
   downloadedAt: string; // ISO
+  etag?: string; // 条件 GET 验证器（同订阅），只记原址响应
+  lastModified?: string;
 }
 
 /** 内置/动态资源库条目（catalog）。 */

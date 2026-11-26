@@ -723,6 +723,8 @@ fn local_source_resources_use_source_presence_and_keep_binary_magic_gate() {
         format,
         size: 0,
         downloaded_at: "test".into(),
+        etag: None,
+        last_modified: None,
     })
     .collect();
     let mut deps = deps_default();

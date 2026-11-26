@@ -303,6 +303,15 @@ pub struct RuleResource {
     pub size: u64,
     #[serde(rename = "downloadedAt")]
     pub downloaded_at: String,
+    /// 条件 GET 验证器（同订阅 `etag` / `lastModified`），只记原址 `sourceUrl` 的响应。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub etag: Option<String>,
+    #[serde(
+        rename = "lastModified",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub last_modified: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

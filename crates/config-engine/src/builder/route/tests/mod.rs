@@ -1019,6 +1019,8 @@ fn builtin_geo_falls_back_to_downloaded_rule_resource() {
         format: RuleResourceFormat::Binary,
         size: 1,
         downloaded_at: "2026-07-20T00:00:00Z".into(),
+        etag: None,
+        last_modified: None,
     }];
     let mut deps = deps_default(&[]);
     // 随包播种目录**全空**（异常打包 / 播种失败），规则资源目录里有用户下载的那一份。

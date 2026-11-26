@@ -64,6 +64,8 @@ fn resource(id: &str) -> RuleResource {
         format: RuleResourceFormat::Binary,
         size: 1,
         downloaded_at: String::new(),
+        etag: None,
+        last_modified: None,
     }
 }
 

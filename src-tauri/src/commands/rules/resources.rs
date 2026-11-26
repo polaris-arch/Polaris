@@ -27,8 +27,11 @@ use polaris_config_engine::user_config::{builtin_catalog_result, enumerate_resou
 use polaris_config_engine::user_config::{
     RefScanInput, RuleResourceCatalogItem, RuleResourceCatalogResult, UserConfig,
 };
-use polaris_net_stack::safe_redirect::{safe_redirect_fetch, HttpClient, SafeRedirectFetchOptions};
+use polaris_net_stack::safe_redirect::{
+    safe_redirect_fetch, HttpClient, MinimalResponse, SafeRedirectFetchOptions,
+};
 use polaris_net_stack::ssrf::DnsLookup;
+use polaris_net_stack::subscription::Conditional;
 use polaris_store::StoreError;
 
 const ERR_RESOURCE_BAD_ITEM: &str = "RULE_RESOURCE_BAD_ITEM";
@@ -200,6 +203,8 @@ pub fn rule_resources_list(state: State<'_, AppRuntime>) -> ApiResponse<Vec<Rule
                 format: RuleResourceFormat::Binary,
                 size: std::fs::metadata(&live).map(|m| m.len()).unwrap_or(0),
                 downloaded_at: builtin_updated_at(&geo_meta, &b.tag),
+                etag: None,
+                last_modified: None,
                 id,
             },
         }
@@ -1106,6 +1111,7 @@ fn plan_from_builtin(b: &BuiltinGeoRuleSet) -> ResourcePlan {
         url,
         file_name: b.file_name.clone(),
         format: RuleResourceFormat::Binary,
+        previous: None,
     }
 }
 
@@ -1910,6 +1916,8 @@ struct ResourcePlan {
     fetch_url: String,
     file_name: String,
     format: RuleResourceFormat,
+    /// 条件 GET 所依据的旧登记（验证器属于其 `sourceUrl`）；仅同址且本地副本仍在时才有。
+    previous: Option<RuleResource>,
 }
 
 impl ResourcePlan {
@@ -1933,6 +1941,8 @@ enum DownloadOutcome {
         message: String,
         code: &'static str,
     },
+    /// 条件 GET 命中 304：内容未变、未落盘；携带只刷新了 `downloadedAt` / 验证器的原登记。
+    NotModified(RuleResource),
     /// 用户在下载途中点了「取消」（[`rule_resources_cancel`]）→ 传输已中止，未落盘未入册。
     Cancelled,
 }
@@ -1958,6 +1968,11 @@ impl DownloadOutcome {
                 "name": resource.name,
                 "existedBefore": existed_before,
             }),
+            DownloadOutcome::NotModified(resource) => DownloadOutcome::Stored {
+                resource,
+                existed_before: true,
+            }
+            .into_value(plan),
             DownloadOutcome::Failed { message, code } => {
                 err_result(Some(&plan.id), Some(&plan.name), &message, code)
             }
@@ -2170,6 +2185,7 @@ fn plan_from_item(
             url,
             file_name,
             format: RuleResourceFormat::Binary,
+            previous: None,
         });
     }
 
@@ -2200,6 +2216,7 @@ fn plan_from_item(
             fetch_url: url.to_string(),
             file_name,
             format,
+            previous: None,
         });
     }
 
@@ -2231,6 +2248,7 @@ fn plan_from_resource(r: &RuleResource) -> ResourcePlan {
             }
         },
         format: r.format,
+        previous: None,
     }
 }
 
@@ -2347,17 +2365,22 @@ fn validate_resource_bytes(format: RuleResourceFormat, body: &[u8]) -> Result<()
 
 /// 拉取资源字节（**复用订阅同款** [`safe_redirect_fetch`]：逐跳 SSRF guard + 体积闸 + 超时 + 手动重定向）
 /// + 状态/内容 sanity。泛型注入 client/lookup 便于回环门测（真 socket，不碰宿主网络）。
+///
+/// `conditional` 复用订阅的条件 GET 头；304 **仅当本次确实发了条件头**才原样返回（同订阅 fail-safe）。
 async fn fetch_resource_bytes<H: HttpClient, L: DnsLookup>(
     client: &H,
     lookup: &L,
     url: &str,
     format: RuleResourceFormat,
-) -> Result<Vec<u8>, String> {
+    conditional: Option<&Conditional>,
+) -> Result<MinimalResponse, String> {
+    let mut headers = Vec::new();
+    let sent_conditional = conditional.is_some_and(|c| c.append_headers(&mut headers));
     let resp = safe_redirect_fetch(SafeRedirectFetchOptions {
         fetch_impl: client,
         url,
         user_agent: app_user_agent(),
-        headers: None,
+        headers: sent_conditional.then_some(headers),
         exempt_fake_ip: false,
         max_redirects: None,
         timeout_ms: Some(RULE_RESOURCE_TIMEOUT_MS),
@@ -2367,11 +2390,14 @@ async fn fetch_resource_bytes<H: HttpClient, L: DnsLookup>(
     .await
     .map_err(|e| e.message)?;
 
+    if resp.status == 304 && sent_conditional {
+        return Ok(resp);
+    }
     if !(200..300).contains(&resp.status) {
         return Err(format!("下载失败：HTTP {}", resp.status));
     }
     validate_resource_bytes(format, &resp.body)?;
-    Ok(resp.body)
+    Ok(resp)
 }
 
 /// 下载到调用方提供的暂存目录；不写 config，文件发布与配置更新由调用方事务提交。
@@ -2382,14 +2408,28 @@ async fn fetch_resource_bytes<H: HttpClient, L: DnsLookup>(
 /// 镜像挂了 / 返 HTML 错误页 / 被墙，都不该让本来能直连拿到的资源变成红行。对齐 上游
 /// `fetchSrsToFile` 的 `if (!r.ok && prefix) r = await this.fetchBuffer(sourceUrl, ...)`。
 /// 失败消息取**回退腿**的（那是用户最终没拿到东西的真实原因）。
+///
+/// 验证器只属于原址 `plan.url`：镜像腿不带条件头，镜像响应的验证器也不回写；回退直连腿照常带。
 async fn download_and_store<H: HttpClient, L: DnsLookup>(
     client: &H,
     lookup: &L,
     plan: &ResourcePlan,
     res_dir: &std::path::Path,
 ) -> DownloadOutcome {
-    let mut attempt = fetch_resource_bytes(client, lookup, &plan.fetch_url, plan.format).await;
-    if let (Err(e), true) = (&attempt, plan.fetch_url != plan.url) {
+    let conditional = plan.previous.as_ref().map(|old| Conditional {
+        etag: old.etag.clone(),
+        last_modified: old.last_modified.clone(),
+    });
+    let mut source_leg = plan.fetch_url == plan.url;
+    let mut attempt = fetch_resource_bytes(
+        client,
+        lookup,
+        &plan.fetch_url,
+        plan.format,
+        conditional.as_ref().filter(|_| source_leg),
+    )
+    .await;
+    if let (Err(e), false) = (&attempt, source_leg) {
         // 同上（`fetch_catalog_json`）：静默回退 = 用户无从知道加速腿恒挂。自建内网 gh-proxy 被
         // SSRF guard 拒是最常见的一种，且**不能**靠放行内网 host 来「修」（那是开 SSRF 面）。
         log::warn!(
@@ -2397,10 +2437,13 @@ async fn download_and_store<H: HttpClient, L: DnsLookup>(
             plan.id,
             plan.fetch_url
         );
-        attempt = fetch_resource_bytes(client, lookup, &plan.url, plan.format).await;
+        source_leg = true;
+        attempt =
+            fetch_resource_bytes(client, lookup, &plan.url, plan.format, conditional.as_ref())
+                .await;
     }
-    let bytes = match attempt {
-        Ok(b) => b,
+    let resp = match attempt {
+        Ok(r) => r,
         Err(message) => {
             return DownloadOutcome::Failed {
                 message,
@@ -2408,6 +2451,16 @@ async fn download_and_store<H: HttpClient, L: DnsLookup>(
             };
         }
     };
+    let validator = |name: &str| resp.header(name).filter(|_| source_leg).map(str::to_string);
+    // 304：内容未变 → 不写文件、不发布，只刷新检查时间；未回验证器则沿用旧值（同订阅 304）。
+    if let (304, Some(old)) = (resp.status, &plan.previous) {
+        return DownloadOutcome::NotModified(RuleResource {
+            downloaded_at: current_iso(),
+            etag: validator("etag").or_else(|| old.etag.clone()),
+            last_modified: validator("last-modified").or_else(|| old.last_modified.clone()),
+            ..old.clone()
+        });
+    }
     let dest = res_dir.join(&plan.file_name);
     let existed_before = dest.is_file();
     // **原子替换**：先写同目录临时文件再 rename（同目录 ⇒ 同文件系统 ⇒ rename 原子）。
@@ -2424,7 +2477,7 @@ async fn download_and_store<H: HttpClient, L: DnsLookup>(
         new_uuid()
     ));
     let staged = std::fs::create_dir_all(res_dir)
-        .and_then(|()| std::fs::write(&tmp, &bytes))
+        .and_then(|()| std::fs::write(&tmp, &resp.body))
         .and_then(|()| std::fs::rename(&tmp, &dest));
     if let Err(e) = staged {
         let _ = std::fs::remove_file(&tmp); // 半成品不留在盘上（它不是有效资源，也不该被误当缓存）
@@ -2440,8 +2493,10 @@ async fn download_and_store<H: HttpClient, L: DnsLookup>(
         source_url: plan.url.clone(),
         file_name: plan.file_name.clone(),
         format: plan.format,
-        size: bytes.len() as u64,
+        size: resp.body.len() as u64,
         downloaded_at: current_iso(),
+        etag: validator("etag"),
+        last_modified: validator("last-modified"),
     };
     DownloadOutcome::Stored {
         resource,
@@ -2472,7 +2527,7 @@ enum RegisteredBatchItem {
     Download {
         plan: Box<ResourcePlan>,
         expected: Option<Value>,
-        outcome: DownloadOutcome,
+        outcome: Box<DownloadOutcome>,
     },
 }
 
@@ -2491,13 +2546,19 @@ impl RegisteredResourceBatch {
         &mut self,
         sink: &dyn ProgressSink,
         http: &H,
-        plan: ResourcePlan,
+        mut plan: ResourcePlan,
         res_dir: &Path,
         expected: Option<Value>,
     ) {
         let old = expected
             .as_ref()
             .and_then(|record| serde_json::from_value::<RuleResource>(record.clone()).ok());
+        // 条件 GET 只用同址、同落盘名且本地副本仍在的旧登记；缺文件须全量补回（调度器的强制补更）。
+        plan.previous = old.clone().filter(|old| {
+            old.source_url == plan.url
+                && old.file_name == plan.file_name
+                && res_dir.join(&old.file_name).is_file()
+        });
         let outcome = download_registered_resource(
             &PendingResourceCommit(sink),
             http,
@@ -2510,7 +2571,7 @@ impl RegisteredResourceBatch {
         self.items.push(RegisteredBatchItem::Download {
             plan: Box::new(plan),
             expected,
-            outcome,
+            outcome: Box::new(outcome),
         });
     }
 
@@ -2526,10 +2587,13 @@ impl RegisteredResourceBatch {
             let mut affects_runtime = false;
             for (index, item) in self.items.iter().enumerate() {
                 let RegisteredBatchItem::Download {
-                    expected,
-                    outcome: DownloadOutcome::Stored { resource, .. },
-                    ..
+                    expected, outcome, ..
                 } = item
+                else {
+                    continue;
+                };
+                let (DownloadOutcome::Stored { resource, .. }
+                | DownloadOutcome::NotModified(resource)) = &**outcome
                 else {
                     continue;
                 };
@@ -2561,7 +2625,9 @@ impl RegisteredResourceBatch {
             .map(|(item, rejection)| match item {
                 RegisteredBatchItem::Report(value) => value,
                 RegisteredBatchItem::Download { plan, outcome, .. } => {
-                    let outcome = if let DownloadOutcome::Stored { resource, .. } = &outcome {
+                    let outcome = if let DownloadOutcome::Stored { resource, .. }
+                    | DownloadOutcome::NotModified(resource) = &*outcome
+                    {
                         if let Some(message) = rejection.or_else(|| publication.as_ref().err().cloned()) {
                             emit_resource_progress(
                                 &sink,
@@ -2581,10 +2647,10 @@ impl RegisteredResourceBatch {
                                     "percent": 100.0, "status": "done",
                                 }),
                             );
-                            outcome
+                            *outcome
                         }
                     } else {
-                        outcome
+                        *outcome
                     };
                     outcome.into_value(&plan)
                 }
@@ -2790,16 +2856,18 @@ async fn download_with_progress<H: HttpClient, L: DnsLookup>(
     unregister_cancellable(seq);
 
     match &outcome {
-        DownloadOutcome::Stored { resource, .. } => emit_resource_progress(
-            sink,
-            plan,
-            json!({
-                "received": resource.size,
-                "total": resource.size,
-                "percent": 100.0,
-                "status": "done",
-            }),
-        ),
+        DownloadOutcome::Stored { resource, .. } | DownloadOutcome::NotModified(resource) => {
+            emit_resource_progress(
+                sink,
+                plan,
+                json!({
+                    "received": resource.size,
+                    "total": resource.size,
+                    "percent": 100.0,
+                    "status": "done",
+                }),
+            )
+        }
         DownloadOutcome::Failed { message, code } => emit_resource_progress(
             sink,
             plan,

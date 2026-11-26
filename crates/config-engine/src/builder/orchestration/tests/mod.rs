@@ -165,6 +165,8 @@ fn norm_compares_referenced_rule_resource_path_and_format() {
         format: RuleResourceFormat::Binary,
         size: 128,
         downloaded_at: "previous".into(),
+        etag: None,
+        last_modified: None,
     };
     let traffic_rule = Rule {
         id: "route".into(),

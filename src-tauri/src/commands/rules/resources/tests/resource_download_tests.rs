@@ -139,6 +139,8 @@ fn upsert_replaces_by_id_and_appends_new() {
         format: RuleResourceFormat::Binary,
         size: 99,
         downloaded_at: "t2".into(),
+        etag: None,
+        last_modified: None,
     };
     let added = RuleResource {
         id: "geoip-us".into(),
@@ -149,6 +151,8 @@ fn upsert_replaces_by_id_and_appends_new() {
         format: RuleResourceFormat::Binary,
         size: 5,
         downloaded_at: "t3".into(),
+        etag: None,
+        last_modified: None,
     };
     upsert_rule_resources(&mut cfg, &[updated, added]);
     let arr = cfg["ruleResources"].as_array().unwrap();
@@ -194,6 +198,8 @@ fn plan_from_resource_sanitizes_tampered_file_name() {
         format: RuleResourceFormat::Binary,
         size: 1,
         downloaded_at: "t".into(),
+        etag: None,
+        last_modified: None,
     };
 
     // 相对穿越 `../../.bashrc`：穿越序列 + 分隔符须被清除。
@@ -320,10 +326,11 @@ mod loopback {
             &lookup,
             "http://res.example.com/geosite-cn.srs",
             RuleResourceFormat::Binary,
+            None,
         )
         .await
         .expect("回环 SRS 下载应成功");
-        assert_eq!(bytes, EMPTY_SRS_V1);
+        assert_eq!(bytes.body, EMPTY_SRS_V1);
     }
 
     #[tokio::test]
@@ -336,6 +343,7 @@ mod loopback {
             &lookup,
             "http://res.example.com/x.srs",
             RuleResourceFormat::Binary,
+            None,
         )
         .await
         .expect_err("非 SRS 内容必须被魔数校验拒");
@@ -355,6 +363,7 @@ mod loopback {
             &lookup,
             "http://res.example.com/x.srs",
             RuleResourceFormat::Binary,
+            None,
         )
         .await
         .expect_err("404 必须失败");
@@ -372,6 +381,7 @@ mod loopback {
             &lookup,
             "http://res.example.com/x.srs",
             RuleResourceFormat::Binary,
+            None,
         )
         .await
         .expect_err("内网 IP 必须被 SSRF guard 拒");
@@ -393,6 +403,7 @@ mod loopback {
             fetch_url: "http://res.example.com/geosite-test.srs".into(),
             file_name: "geosite-test.srs".into(),
             format: RuleResourceFormat::Binary,
+            previous: None,
         };
         let outcome = download_and_store(&client, &lookup, &plan, &dir).await;
         match outcome {
@@ -406,8 +417,53 @@ mod loopback {
                 assert_eq!(landed, EMPTY_SRS_V1, "落盘字节须与下载字节一致");
             }
             DownloadOutcome::Failed { message, .. } => panic!("应成功，实得: {message}"),
+            DownloadOutcome::NotModified(_) => panic!("未带验证器却报了未变化"),
             DownloadOutcome::Cancelled => panic!("未取消却报了取消"),
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 304 只在带了验证器时认作未变化：不落盘，只刷新检查时间并沿用验证器；未发条件头的 304 仍失败。
+    #[tokio::test]
+    async fn not_modified_requires_validators_and_keeps_previous_record() {
+        let dir = std::env::temp_dir().join(format!("polaris-res304-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let lookup = FixedLookup("93.184.216.34");
+        let addr = spawn_once("304 Not Modified", Vec::new());
+        let client = HttpRuntime::with_resolve_overrides(&[("res.example.com", addr)]).unwrap();
+        let mut plan = plan_for("geosite-304", addr);
+        let outcome = download_and_store(&client, &lookup, &plan, &dir).await;
+        assert!(matches!(outcome, DownloadOutcome::Failed { .. }));
+
+        let old = RuleResource {
+            id: plan.id.clone(),
+            name: plan.name.clone(),
+            category: plan.category.clone(),
+            source_url: plan.url.clone(),
+            file_name: plan.file_name.clone(),
+            format: plan.format,
+            size: 1,
+            downloaded_at: "previous".into(),
+            etag: Some("\"v1\"".into()),
+            last_modified: None,
+        };
+        plan.previous = Some(old.clone());
+        let addr = spawn_once("304 Not Modified", Vec::new());
+        let client = HttpRuntime::with_resolve_overrides(&[("res.example.com", addr)]).unwrap();
+        let DownloadOutcome::NotModified(resource) =
+            download_and_store(&client, &lookup, &plan, &dir).await
+        else {
+            panic!("带验证器的 304 应视为未变化");
+        };
+        assert_ne!(resource.downloaded_at, old.downloaded_at);
+        assert_eq!(
+            RuleResource {
+                downloaded_at: old.downloaded_at.clone(),
+                ..resource
+            },
+            old
+        );
+        assert!(!dir.join(&plan.file_name).exists(), "304 不得写文件");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -459,6 +515,7 @@ mod loopback {
             url,
             file_name: format!("{id}.srs"),
             format: RuleResourceFormat::Binary,
+            previous: None,
         }
     }
 
@@ -638,6 +695,7 @@ mod loopback {
             url,
             file_name: format!("{id}.srs"),
             format: RuleResourceFormat::Binary,
+            previous: None,
         }
     }
 

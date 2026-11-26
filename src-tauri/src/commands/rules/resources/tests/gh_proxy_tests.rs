@@ -110,6 +110,8 @@ fn registered_resource_plan_also_mirrors() {
         format: RuleResourceFormat::Binary,
         size: 1,
         downloaded_at: "t".into(),
+        etag: None,
+        last_modified: None,
     };
     let plan = plan_from_resource(&r).with_gh_proxy(PREFIX);
     assert_eq!(plan.url, RAW);

@@ -14,6 +14,8 @@ fn deleted_and_edited_records_reject_stale_staged_bytes() {
         format: RuleResourceFormat::Binary,
         size: 3,
         downloaded_at: "new".into(),
+        etag: None,
+        last_modified: None,
     };
     let mut original = downloaded.clone();
     original.source_url = "https://example.invalid/old".into();
