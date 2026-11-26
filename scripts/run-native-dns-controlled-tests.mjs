@@ -102,7 +102,7 @@ export function selectExecutable(messages, metadata, root, packageName = 'polari
   demand(artifacts.length === 1, 'Expected exactly one current polaris library test executable');
   const executable = artifacts[0].executable;
   demand(isAbsolute(executable) && inside(resolve(metadata.target_directory), executable), 'Test executable escaped the current Cargo target directory');
-  demand(lstatSync(executable).isFile() && realpathSync(executable) === executable, 'Test executable must be a regular unlinked file');
+  demand(lstatSync(executable).isFile() && realpathSync(executable) === resolve(executable), 'Test executable must be a regular unlinked file');
   demand(Array.isArray(artifacts[0].features) && artifacts[0].features.every((value) => typeof value === 'string')
     && new Set(artifacts[0].features).size === artifacts[0].features.length, 'Malformed Cargo artifact feature identity');
   return { executable, packageId: pkg.id, features: artifacts[0].features, manifest: pkg.manifest_path };
