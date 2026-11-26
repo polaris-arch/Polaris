@@ -378,8 +378,8 @@ fn sanitize_servers(obj: &mut Map<String, Value>) {
         if !crate::validate::protocol_requirement_ok(&proto_lower, &s) {
             continue;
         }
-        // 拷贝并 sanitize endpoint CIDR
-        let mut server = s.clone();
+        // 清洗绑定接口、端点 CIDR 和联网开关。
+        let mut server = s;
         if let Some(map) = server.as_object_mut() {
             string_or_remove(map, "bindInterface", true, true);
         }
