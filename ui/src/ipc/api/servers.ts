@@ -197,6 +197,11 @@ export const serverApi = {
     return invoke(IPC_CHANNELS.WARP_REGISTER, { licenseKey });
   },
 
+  /** 放弃未保存的 WARP 注册：设备凭据入待注销队列（凭据不打日志）。 */
+  async deregisterWarp(deviceId: string, token: string): Promise<void> {
+    return invoke(IPC_CHANNELS.WARP_DEREGISTER, { deviceId, token });
+  },
+
   /** 对已注册 WARP 节点原地应用 WARP+ license（升级免重建）。 */
   async applyWarpLicense(
     serverId: string,

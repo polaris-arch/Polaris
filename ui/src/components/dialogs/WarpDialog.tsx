@@ -46,7 +46,7 @@ import { applyOnDemand } from './on-demand-field';
 import { useDialogStore } from './dialog-store';
 import { InfoIcon } from '@/components/InfoIcon';
 import { buildNetworkInterfaceChoices, useNetworkInterfaces } from '@/hooks/use-network-interfaces';
-import { executeWarpRegistration, type WarpRegistrationSession } from './warp-registration';
+import { abandonWarpRegistration, executeWarpRegistration, type WarpRegistrationSession } from './warp-registration';
 
 function WarpIcon() {
   return (
@@ -114,7 +114,7 @@ function WarpForm({ instanceId, editNode, servers }: WarpFormProps) {
   };
   const requestClose = () => {
     if (submitting) return;
-    if (!dirty || done) {
+    if ((!dirty && !registration.current.draft) || done || registration.current.saved) {
       close();
       return;
     }
@@ -122,11 +122,13 @@ function WarpForm({ instanceId, editNode, servers }: WarpFormProps) {
       kind: 'confirm',
       payload: {
         title: t('warp.discardTitle'),
-        message: t('warp.discardMsg'),
+        message: t(registration.current.draft ? 'warp.discardRegisteredMsg' : 'warp.discardMsg'),
         confirmLabel: t('warp.discard'),
         danger: true,
         onConfirm: () => {
           closeInstance(confirmId);
+          void abandonWarpRegistration(registration.current, (deviceId, token) => api.server.deregisterWarp(deviceId, token))
+            .catch((e) => console.error('[WarpDialog] deregister failed:', e));
           close();
         },
       },

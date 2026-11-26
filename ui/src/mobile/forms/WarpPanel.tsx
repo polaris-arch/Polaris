@@ -67,7 +67,7 @@ import {
 } from '@/components/dialogs/warp-spec';
 import { applyDetour, endpointDetourOptions, DETOUR_NONE } from '@/components/dialogs/detour-options';
 import { buildWarpSettings, workersInputInvalid } from '@/components/dialogs/wg-logic';
-import { buildRegisteredWarpServer, saveRegisteredWarp, type WarpRegistrationAttempt } from '@/components/dialogs/warp-registration';
+import { abandonWarpRegistration, buildRegisteredWarpServer, saveRegisteredWarp, type WarpRegistrationAttempt } from '@/components/dialogs/warp-registration';
 import { findWarpNode } from '@/domain/warp';
 import { registerWarpIfSlotFree } from '@/domain/mesh-singleton-guard';
 import { editRoute, splitStagedOnly, stagedOnlyIds } from '@/lib/staged-config';
@@ -205,7 +205,7 @@ export function WarpPanel({
   };
 
   const requestClose = (): void => {
-    if (!dirty || done || registration?.saved) {
+    if ((!dirty && !registration) || done || registration?.saved) {
       closeInstance(instanceId);
       return;
     }
@@ -218,6 +218,8 @@ export function WarpPanel({
         danger: true,
         onConfirm: () => {
           closeInstance(confirmId);
+          void abandonWarpRegistration({ draft: registration?.registered }, (deviceId, token) => api.server.deregisterWarp(deviceId, token))
+            .catch((e) => console.error('[WarpPanel] deregister failed:', e));
           closeInstance(instanceId);
         },
       },

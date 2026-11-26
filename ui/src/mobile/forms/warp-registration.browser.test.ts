@@ -30,9 +30,10 @@ import '/src/mobile/forms/forms.css';
 import '/src/mobile/redesign.css';
 await i18nReady;
 const params = new URLSearchParams(location.search);
-const test = window.__warpTest = { mode: params.get('mode'), registers: 0, adds: 0, refreshes: 0, ids: [], nodes: [], release: undefined, writes: [], toasts: [] };
+const test = window.__warpTest = { mode: params.get('mode'), registers: 0, adds: 0, refreshes: 0, ids: [], nodes: [], release: undefined, writes: [], toasts: [], deregisters: [] };
 systemApi.listNetworkInterfaces = async () => [];
 api.server.registerWarp = async () => { test.registers++; return ${JSON.stringify(registered)}; };
+api.server.deregisterWarp = async (deviceId, token) => { test.deregisters.push([deviceId, token]); };
 api.server.add = async (server) => {
   test.adds++; test.ids.push(server.id); test.nodes = [server];
   if (test.mode === 'save-pending') await new Promise(resolve => { test.release = resolve; });
@@ -86,6 +87,7 @@ if (test.mode?.startsWith('edit-')) {
   }});
   const instanceId = useMobileFormStore.getState().open({ kind: 'warp' });
   test.openForms = () => useMobileFormStore.getState().stack.map(form => form.kind);
+  test.confirm = () => useMobileFormStore.getState().stack.at(-1).payload.onConfirm();
   root.render(<main className="mobile-root"><WarpPanel instanceId={instanceId} /></main>);
 }
 `;
@@ -218,6 +220,15 @@ afterAll(async () => { await browser?.close(); await server?.close(); });
         await page.locator('.m-form-foot button').first().click();
         const forms = await page.evaluate(() => (window as unknown as { __warpTest: { openForms: () => string[] } }).__warpTest.openForms());
         expect(forms).toEqual(mode === 'save-reject' ? ['warp', 'confirm'] : []);
+        if (mode === 'save-reject') {
+          const deregisters = await page.evaluate(async () => {
+            const test = (window as unknown as { __warpTest: { confirm: () => void; deregisters: string[][] } }).__warpTest;
+            test.confirm();
+            await Promise.resolve();
+            return test.deregisters;
+          });
+          expect(deregisters).toEqual([[registered.warpDevice.deviceId, registered.warpDevice.token]]);
+        }
       } finally { await page.close(); }
     }
   }, 30_000);

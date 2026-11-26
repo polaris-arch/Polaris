@@ -51,6 +51,16 @@ export async function executeWarpRegistration(
   return true;
 }
 
+/** Discarding a registration that was never saved queues its remote device for deregistration. */
+export async function abandonWarpRegistration(
+  session: WarpRegistrationSession,
+  deregister: (deviceId: string, token: string) => Promise<void>,
+): Promise<void> {
+  const device = session.draft?.warpDevice;
+  if (!device || session.saved) return;
+  await deregister(device.deviceId, device.token);
+}
+
 /** Kept by the open form: retries reuse both the remote identity and the local id. */
 export interface WarpRegistrationAttempt {
   registered: WarpWireGuardDraft;

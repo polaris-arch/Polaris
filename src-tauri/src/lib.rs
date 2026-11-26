@@ -1158,6 +1158,7 @@ pub fn run() {
             tailcat_keypair,
             // ── mesh 节点（warp + tailscale）──
             warp_register,
+            warp_deregister,
             warp_apply_license,
             tailscale_login,
             tailscale_login_prepare,

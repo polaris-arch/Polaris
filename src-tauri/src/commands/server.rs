@@ -11,7 +11,8 @@
 //!   立即切换与状态
 //! - `server:generateUrl` → [`server_generate_url`]（config-engine ProtocolParser 等价）
 //! - `tailcat_keypair` → [`tailcat_keypair`]（Tailcat 客户端密钥对：生成 / 由私钥推导公钥）
-//! - `warp:register` / `warp:applyLicense` → [`warp_register`] / [`warp_apply_license`]（mesh crate）
+//! - `warp:register` / `warp:deregister` / `warp:applyLicense` → [`warp_register`] / [`warp_deregister`] /
+//!   [`warp_apply_license`]（mesh crate）
 //! - `tailscale:login` / `loginCancel` / `logout` / `stateExists` / `getStatus` → tailscale_* （mesh crate）
 //!
 //! 节点 CRUD 先经 Core Plan 再按结果原子写（含 WARP 凭据的新增仍先落盘）+ 广播 event:configChanged。
@@ -1476,6 +1477,22 @@ pub async fn warp_register(
             Ok(ApiResponse::err_with_code(e, "WARP_REGISTER_FAILED"))
         }
     }
+}
+
+/// 添加弹窗放弃已注册但未保存的设备：凭据入既有待注销队列，drain 被唤醒后立即注销，失败留队重试。
+/// token 只在本次 IPC 中流转，不写日志（队列日志只打 deviceId 前缀）。
+#[tauri::command]
+pub async fn warp_deregister(
+    state: State<'_, AppRuntime>,
+    device_id: String,
+    token: String,
+) -> Result<ApiResponse<()>, ()> {
+    Ok(
+        match state.mesh().try_enqueue_warp_deregister(&device_id, &token) {
+            Ok(()) => ok_void(),
+            Err(e) => ApiResponse::err(e),
+        },
+    )
 }
 
 /// 上游 `WARP_APPLY_LICENSE`：对已注册 WARP 节点原地应用 WARP+ license（升级免重建）。

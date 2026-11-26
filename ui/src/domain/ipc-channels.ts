@@ -81,6 +81,7 @@ export const IPC_CHANNELS = {
   AUTO_SELECT_SWITCH_NOW: 'auto_select_switch_now', // 自动意图下按共享裁决请求换点（允许重启内核）
   AUTO_SELECT_STATUS: 'auto_select_status', // 选择状态（只读）
   WARP_REGISTER: 'warp_register', // Cloudflare WARP 设备注册 → 生成 WireGuard 草稿
+  WARP_DEREGISTER: 'warp_deregister', // 放弃未保存的注册：设备凭据入待注销队列
   WARP_APPLY_LICENSE: 'warp_apply_license', // 对已注册 WARP 节点原地应用 WARP+ license（升级免重建）
   TAILSCALE_LOGIN: 'tailscale_login', // 按需瞬态登录核：拉起登录专用 sing-box 取交互登录 URL（Phase 2）
   TAILSCALE_LOGIN_PREPARE: 'tailscale_login_prepare',

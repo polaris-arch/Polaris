@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { ServerConfig } from '@/contracts/types';
 import type { WarpWireGuardDraft } from '@/domain/warp';
-import { buildRegisteredWarpServer, executeWarpRegistration, type WarpRegistrationExecution, type WarpRegistrationSession } from './warp-registration';
+import { abandonWarpRegistration, buildRegisteredWarpServer, executeWarpRegistration, type WarpRegistrationExecution, type WarpRegistrationSession } from './warp-registration';
 
 const draft: WarpWireGuardDraft = {
   address: 'engage.cloudflareclient.com', port: 2408, privateKey: 'private', peerPublicKey: 'peer',
@@ -89,4 +89,13 @@ it('registered WARP payload applies top-level onDemand and preserves registered 
   expect(enabled.onDemand).toBe(true);
   expect(enabled.wireguardSettings?.privateKey).toBe(draft.privateKey);
   expect(buildRegisteredWarpServer(attempt, 'WARP', null, { onDemand: false }, '', '').onDemand).toBeUndefined();
+});
+
+it('abandoning an unsaved registration queues its device; saved or unregistered sessions do not', async () => {
+  const deregister = vi.fn(async () => {});
+  await abandonWarpRegistration({}, deregister);
+  await abandonWarpRegistration({ draft, saved: true }, deregister);
+  expect(deregister).not.toHaveBeenCalled();
+  await abandonWarpRegistration({ draft }, deregister);
+  expect(deregister).toHaveBeenCalledExactlyOnceWith('device', 'token');
 });

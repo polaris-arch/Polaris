@@ -596,6 +596,13 @@ const SITES: readonly ActionSite[] = [
   },
   {
     file: 'components/dialogs/WarpDialog.tsx',
+    callee: 'api.server.deregisterWarp',
+    count: 1,
+    route: 'no-staged-only-id',
+    why: '不传实体 id（只传本次未保存注册的 Cloudflare 设备 id 与 token，进注销队列）',
+  },
+  {
+    file: 'components/dialogs/WarpDialog.tsx',
     callee: 'api.server.add',
     count: 1,
     route: 'no-staged-only-id',
@@ -696,6 +703,13 @@ const SITES: readonly ActionSite[] = [
     count: 1,
     route: 'no-staged-only-id',
     why: '不传实体 id（只传 license，返回一份 WireGuard 草稿），同 WarpDialog',
+  },
+  {
+    file: 'mobile/forms/WarpPanel.tsx',
+    callee: 'api.server.deregisterWarp',
+    count: 1,
+    route: 'no-staged-only-id',
+    why: '不传实体 id（只传本次未保存注册的 Cloudflare 设备 id 与 token，进注销队列），同 WarpDialog',
   },
   {
     file: 'mobile/forms/WarpPanel.tsx',
