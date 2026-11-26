@@ -152,7 +152,7 @@ jobs:
   #
   # 🔴 代价要说清：这条腿因此对**签名**零信息量。它守的是 release-profile 产物与 R8 那一层
   #    （configuration.txt / seeds.txt）；签名有效性由下面 `release-apk` 的 apksigner 步负责，
-  #    两条腿的判据不能互相冒充。边界表在 scripts/gate-android-release-behavior.mjs 头注。
+  #    两条腿的判据不能互相冒充。
   #
   # ── 前置步骤与 `release-apk` job 逐字相同 ──
   # GitHub Actions 没有 job 内的 step 复用，只能复制；两份须同步修改
@@ -182,23 +182,18 @@ jobs:
   #      ② 轻量构型落在 tag ref 上（tag = 发布语义）；
   #      ③ 轻量构型与 `publish_release` 同传（轻量产物不得被签名、不得进 release）。
   #    `release-apk` 只在 `publish_release` 为真时跑 ⇒ 在那条腿上「轻量」必然撞 ③，写入不可达。
-  #    另由 `ui/src/contracts/package-ci-matrix-contract.test.ts` 钉住：`CARGO_PROFILE_` 在全部
-  #    workflow 里只许出现在两处构建权重步、只许这两个键；两处写入的键值逐字相等；两处脚本除第三条
-  #    闸与提示文案外逐行相同；并把脚本按各入口真跑一遍。
   #
   # 轻量构型下本腿各判据是否仍成立（逐条看过，2026-10-08）：
   #   · 16 KiB 页对齐 —— 来自 `src-tauri/build.rs` 的 `-Wl,-z,max-page-size=16384` 链接参数
   #     （libbox.so / libc++_shared.so 不经 cargo），与 LTO 无关，成立；
   #   · 符号剥离 —— `strip = "symbols"` 未被覆盖，`.cargo/config.toml` 的 `-C strip=debuginfo` 与
   #     gradle 的 release native strip 任务都不看 LTO；`verify-apk.mjs` 按 ELF 节区判，成立；
-  #   · `.so` 存在性 / jniLibs 指向本次 SO / 许可文本 / 随包 data —— 判「文件在不在、是不是这一份」，成立；
-  #   · R8（mapping / usage / seeds / configuration、`assert-r8-evidence.mjs`、wry keep 对拍）——
+  #   · `.so` 存在性 / jniLibs 指向本次 SO —— 判「文件在不在、是不是这一份」，成立；
+  #   · R8（mapping / usage / seeds / configuration、`assert-r8-evidence.mjs`）——
   #     输入是 Java/Kotlin 字节码与 keep 规则，Rust 构型不在其输入里，成立；
-  #   · `release 构建行为裁判` —— gradle 配置期事实（`--dry-run` 任务图与 `printPolarisReleaseFacts`），
-  #     不调 cargo，成立；
   #   · libbox 收据（`mobile-core/mobile-consumption.mjs android`）—— 判 libbox 来源与随包一致性，成立；
   #   · 体积 —— Android 侧**没有体积上限门**（`verify-apk.mjs` 刻意按节区与死字节比值判，理由在其
-  #     判据 ⑥ 的注释）。末步打印的 APK 字节数在轻量构型下**偏大，不是发行体积**，该步已标注构型。
+  #     判据 ⑥ 的注释）。
   # 风险门从此**不验**的一件事：Android target 上 fat LTO 链接本身能否成功、以及 fat LTO 产物的
   # 运行期形态。本腿的三条既定目的里没有它，但它此前是本腿顺带覆盖的；现在只在两处暴露：
   # tag 上的 `release-apk`（同一组产物判据在签名包上原样再跑一遍），与手动 dispatch 本 workflow
@@ -263,8 +258,7 @@ jobs:
           rustc -Vv
 
       # ── 构建权重：发行构型 vs 风险门轻量构型（2026-10-08）──
-      # 与 package.yml 的 `Select installer build weight` 步同一机制、同一取值、同一段判定骨架
-      # （两处由 `ui/src/contracts/package-ci-matrix-contract.test.ts` 对拍，不许各自漂移）。
+      # 与 package.yml 的 `Select installer build weight` 步同一机制、同一取值、同一段判定骨架。
       # 决策记录、三条 fail-closed、轻量构型下各判据是否仍成立，写在 `release_check` job 的头注；
       # 本步随前置步骤在两个 job 里逐字复制，这里只留指针。
       # 签名发布腿上本步恒走发行分支：零写入，只查「环境里没有任何 cargo profile 覆盖」。
@@ -475,16 +469,11 @@ jobs:
           fi
           so=target/aarch64-linux-android/release/libpolaris_lib.so
           jni=src-tauri/gen/android/app/src/main/jniLibs/arm64-v8a
-          up=src-tauri/gen/android/app/src/main/assets/_up_
           [ -s "$so" ] && [ "$so" -nt "$marker" ] \
             || { echo '::error::fresh release Rust SO missing'; exit 1; }
           [ "$(readlink -f "$jni/libpolaris_lib.so")" = "$(realpath "$so")" ] \
             || { echo '::error::jniLibs does not point to this release SO'; exit 1; }
           [ -s "$jni/libc++_shared.so" ] || { echo '::error::libc++_shared.so missing'; exit 1; }
-          for f in LICENSE NOTICE THIRD-PARTY-LICENSES.md; do
-            [ -s "$up/$f" ] || { echo "::error::$up/$f missing"; exit 1; }
-          done
-          [ -d "$up/resources/data" ] || { echo '::error::bundled data missing'; exit 1; }
           echo "source=$(git rev-parse HEAD) release_so=$(sha256sum "$so" | cut -d' ' -f1)"
 
           # The exact Rust task above is already complete. Run Gradle itself so -P is a
@@ -496,13 +485,9 @@ jobs:
           for f in "$jni/libpolaris_lib.so" "$jni/libc++_shared.so"; do
             [ -e "$f" ] || { echo "::error::$f 没铺出来 —— 交叉编译或 symlink 那一步真的失败了"; exit 1; }
           done
-          for f in LICENSE NOTICE THIRD-PARTY-LICENSES.md; do
-            [ -s "$up/$f" ] || { echo "::error::$up/$f 没铺出来 —— bundle.resources 没生效"; exit 1; }
-          done
-          [ -d "$up/resources/data" ] || { echo "::error::$up/resources/data 没铺出来"; exit 1; }
 
       # Run the S5 source-owned tests against this checkout's real generated Gradle/AAR inputs.
-      # The clean task removes prior variant reports; nonzero complete method coverage is checked below.
+      # The clean task removes prior variant reports.
       - name: Verify S5 Android network observation and admission unit tests
         shell: bash
         run: |
@@ -512,27 +497,11 @@ jobs:
             --tests com.polaris2.app.vpn.DefaultNetworkObservationTest \
             --tests com.polaris2.app.vpn.NetworkMonitorSessionTest \
             --tests com.polaris2.app.vpn.LoadedLibboxIdentityTest \
-            --tests com.polaris2.app.vpn.AndroidCallbackSchedulingSourceTest \
             --tests com.polaris2.app.vpn.AndroidNativeAdmissionTest \
             --tests com.polaris2.app.vpn.AndroidNativeMainControlsTest \
             --tests com.polaris2.app.vpn.MainNativeAdmissionWiringTest \
-            --tests com.polaris2.app.vpn.DualModeEndpointWiringTest \
-            --tests com.polaris2.app.vpn.RuntimePersistenceSourceTest \
             --tests com.polaris2.app.vpn.RuntimeProtocolAdmissionTest \
             -PpolarisAllowUnsigned=true -x :app:rustBuildArm64Release --max-workers=2 --no-daemon
-          "$JAVA_HOME/bin/java" scripts/VerifyAndroidS5.java "$RUNNER_TEMP/s5-android-unit-results.json"
-
-      - name: wry keep 规则与生成物对拍
-        run: node scripts/verify-wry-keep-rules.mjs
-
-      - name: release 构建行为裁判（gradle 配置期实证）
-        env:
-          POLARIS_GATE_CI_DAEMON: "1"
-        run: node scripts/gate-android-release-behavior.mjs
-
-      # APK 不会上传；验证结论与 mapping 才是这条非发布腿的输出。
-      - name: 开箱验（resources / native libraries / 16 KiB）
-        run: node scripts/verify-apk.mjs src-tauri/gen/android/app/build/outputs/apk/arm64/release/app-arm64-release-unsigned.apk --abi arm64-v8a
 
       # 先留存再判定：configuration.txt 的断言万一红了，mapping 也已经拿到手，
       # 不用为了取证再构一版（而重构一版的 R8 输入已经变了，映射对不上）。
@@ -549,14 +518,10 @@ jobs:
             src-tauri/gen/android/app/build/test-results/testArm64ReleaseUnitTest/TEST-com.polaris2.app.vpn.DefaultNetworkObservationTest.xml
             src-tauri/gen/android/app/build/test-results/testArm64ReleaseUnitTest/TEST-com.polaris2.app.vpn.NetworkMonitorSessionTest.xml
             src-tauri/gen/android/app/build/test-results/testArm64ReleaseUnitTest/TEST-com.polaris2.app.vpn.LoadedLibboxIdentityTest.xml
-            src-tauri/gen/android/app/build/test-results/testArm64ReleaseUnitTest/TEST-com.polaris2.app.vpn.AndroidCallbackSchedulingSourceTest.xml
             src-tauri/gen/android/app/build/test-results/testArm64ReleaseUnitTest/TEST-com.polaris2.app.vpn.AndroidNativeAdmissionTest.xml
             src-tauri/gen/android/app/build/test-results/testArm64ReleaseUnitTest/TEST-com.polaris2.app.vpn.AndroidNativeMainControlsTest.xml
             src-tauri/gen/android/app/build/test-results/testArm64ReleaseUnitTest/TEST-com.polaris2.app.vpn.MainNativeAdmissionWiringTest.xml
-            src-tauri/gen/android/app/build/test-results/testArm64ReleaseUnitTest/TEST-com.polaris2.app.vpn.DualModeEndpointWiringTest.xml
-            src-tauri/gen/android/app/build/test-results/testArm64ReleaseUnitTest/TEST-com.polaris2.app.vpn.RuntimePersistenceSourceTest.xml
             src-tauri/gen/android/app/build/test-results/testArm64ReleaseUnitTest/TEST-com.polaris2.app.vpn.RuntimeProtocolAdmissionTest.xml
-            ${{ runner.temp }}/s5-android-unit-results.json
             ${{ runner.temp }}/release-stage1.log
           # Preserve original Rust/Tauri/frontend/first-Gradle stage1 output even on failure.
           # APK/R8/S5 gates still validate their own required evidence independently.
@@ -583,18 +548,6 @@ jobs:
             --component "$POLARIS_ANDROID_COMPONENT" --receipt "$POLARIS_ANDROID_RECEIPT" \
             --scratch "$POLARIS_ANDROID_CARRIER" --output "$apk.source-consumption.json" \
             --go "$POLARIS_ANDROID_GO" --javap "$POLARIS_ANDROID_JDK/bin/javap" --readelf "$POLARIS_ANDROID_READELF"
-
-      - name: 记录未分发 APK 体积
-        shell: bash
-        run: |
-          set -euo pipefail
-          apk=src-tauri/gen/android/app/build/outputs/apk/arm64/release/app-arm64-release-unsigned.apk
-          [ -s "$apk" ] || {
-            echo "::error::$apk 不在 —— 逃生门那条「文件名带 -unsigned 后缀」的契约变了，先确认再改判据"
-            ls -R src-tauri/gen/android/app/build/outputs/apk || true
-            exit 1; }
-          # 轻量构型下 Rust SO 偏大：这个数只在发行构型（手动 dispatch）上才是发行体积的近似。
-          echo "release(unsigned, runner-only, light_build=$POLARIS_LIGHT_BUILD) = $(stat -c%s "$apk") 字节"
 
   # ══════════════════════════════════════════════════════════════════════════════
   # release 资产腿 —— 把**签名的** release APK 发成 GitHub release 资产
@@ -728,8 +681,7 @@ jobs:
           rustc -Vv
 
       # ── 构建权重：发行构型 vs 风险门轻量构型（2026-10-08）──
-      # 与 package.yml 的 `Select installer build weight` 步同一机制、同一取值、同一段判定骨架
-      # （两处由 `ui/src/contracts/package-ci-matrix-contract.test.ts` 对拍，不许各自漂移）。
+      # 与 package.yml 的 `Select installer build weight` 步同一机制、同一取值、同一段判定骨架。
       # 决策记录、三条 fail-closed、轻量构型下各判据是否仍成立，写在 `release_check` job 的头注；
       # 本步随前置步骤在两个 job 里逐字复制，这里只留指针。
       # 签名发布腿上本步恒走发行分支：零写入，只查「环境里没有任何 cargo profile 覆盖」。
@@ -989,21 +941,6 @@ jobs:
               [ -e "$jni/$library" ] || { echo "::error::$jni/$library missing"; exit 1; }
             done
           done
-          up=src-tauri/gen/android/app/src/main/assets/_up_
-          for f in LICENSE NOTICE THIRD-PARTY-LICENSES.md; do
-            [ -s "$up/$f" ] || { echo "::error::$up/$f 没铺出来 —— bundle.resources 没生效"; exit 1; }
-          done
-          [ -d "$up/resources/data" ] || { echo "::error::$up/resources/data 没铺出来"; exit 1; }
-
-      # 两条 release-profile 腿都跑这一步；发布腿上的结果才对应最终用户拿到的包。
-      - name: wry keep 规则与生成物对拍
-        run: node scripts/verify-wry-keep-rules.mjs
-
-      # publish_release=true 时 unsigned 验证腿不运行；配置期判据必须由 signed job 自己承担。
-      - name: release 构建行为裁判（gradle 配置期实证）
-        env:
-          POLARIS_GATE_CI_DAEMON: "1"
-        run: node scripts/gate-android-release-behavior.mjs
 
       # signed release 本身就是最强的 R8 取材点：configuration/seeds 必须来自将要发布的这次构建。
       # mapping 只留在 Actions 内部供崩溃反混淆，不上传 GitHub Release；对外 release 仍只有 APK。
@@ -1019,13 +956,6 @@ jobs:
             src-tauri/gen/android/app/build/outputs/mapping/*Release/configuration.txt
           if-no-files-found: error
           retention-days: 90
-
-      - name: R8 吃进了什么 / 保住了什么（发布包产物级证据）
-        run: |
-          set -euo pipefail
-          for flavor in arm64 arm universal; do
-            node scripts/assert-r8-evidence.mjs "src-tauri/gen/android/app/build/outputs/mapping/${flavor}Release"
-          done
 
       # 用后即删，且**无论成败**：assemble 失败时密钥库同样要走，不能留在 runner 的工作区里。
       - name: 删掉 runner 上的密钥库

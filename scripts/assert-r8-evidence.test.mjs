@@ -57,6 +57,16 @@ function goodConfiguration() {
     "-keep @app.tauri.annotation.TauriPlugin public class * {",
     "  @app.tauri.annotation.Command public <methods>;",
     "}",
+    "# The proguard configuration file for the following section is app/proguard-tauri.pro",
+    "-keep class com.polaris2.app.MainActivity { *; }",
+    "# End of content from app/proguard-tauri.pro",
+    "# The proguard configuration file for the following section is " +
+      "app/src/main/java/com/polaris2/app/generated/proguard-wry.pro",
+    "-keep class com.polaris2.app.Ipc { *; }",
+    "# End of content from app/src/main/java/com/polaris2/app/generated/proguard-wry.pro",
+    "# The proguard configuration file for the following section is " +
+      "app/build/intermediates/default_proguard_files/global/proguard-android-optimize.txt-8.11.0",
+    "-keepclasseswithmembernames,includedescriptorclasses class * { native <methods>; }",
   ].join("\n");
 }
 
@@ -238,6 +248,16 @@ test("外部来源的针被抄进本仓自己那一段 ⇒ 不算数，必须红
   assert.equal(problems.length, 1, problems.join("\n"));
   assert.match(problems[0], /io\.nekohasekai/);
   assert.match(problems[0], /别的段里/);
+});
+
+test("configuration.txt 缺少 proguard-tauri.pro 来源段 ⇒ 红", () => {
+  const missing = goodConfiguration()
+    .split("\n")
+    .filter((line) => !line.includes("proguard-tauri.pro"))
+    .join("\n");
+  const { problems } = run({ configuration: missing });
+  assert.equal(problems.length, 1, problems.join("\n"));
+  assert.match(problems[0], /proguard-tauri\.pro/);
 });
 
 test("configuration.txt 没有段落标记 ⇒ 归不了因，当场红（不退化成全文匹配）", () => {

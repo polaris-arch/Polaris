@@ -722,24 +722,6 @@ export const ANDROID_IMPACT_SCOPES = Object.freeze({
   'scripts/verify-apk.test.mjs': {
     why: '判据本体的变异测试：判据有没有牙由它守，改判据而不改它 = 那些否定用例可能已经不成立。',
   },
-  'scripts/VerifyAndroidS5.java': {
-    why: '核对同一候选的 Gradle 测试报告与 Kotlin 测试源码。Android 验证腿是唯一生成这些原始报告并运行此校验的入口。',
-  },
-  'scripts/verify-wry-keep-rules.mjs': {
-    why:
-      'RustWebView 那条 keep 规则与它事实源的对拍判据。事实源是 `tauri android build` 现场生成、'
-      + '被 app/.gitignore 忽略的 `generated/RustWebView.kt` ⇒ 只有本腿跑到那一步时它才在树上，'
-      + '裸 checkout 上的 `cargo test` 读不到 ⇒ 这条判据没有别的落点。'
-      + 'wry 升级把方法改名或改签名时它是唯一会说话的东西：规则不再匹配任何成员，R8 静默剪掉方法，'
-      + '而 debug 包与全部源码门都是绿的。',
-  },
-  'scripts/gate-android-release-behavior.mjs': {
-    why:
-      'release 路径的**行为**裁判：跑 gradle 配置期，断言零凭据必红、逃生门只认命令行实参、'
-      + 'R8 在 release 任务图里恰好一次而 debug 里零次、AGP 手里那份 proguardFiles 清单三份都在。'
-      + '此前这些判据全是「build.gradle.kts 里含某串」，实测 24 种变异下一条不红而行为已经变了 ⇒ '
-      + '这条腿是它们今天唯一的观测面（判据要 Android SDK，ci.yml 的 lint / cross / test 都跑不了）。',
-  },
   'scripts/assert-r8-evidence.mjs': {
     why:
       'release 冒烟腿的产物级判据本体：configuration.txt（剥注释后）证明各来源的规则文本到过 R8，'

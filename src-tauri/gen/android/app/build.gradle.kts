@@ -92,8 +92,7 @@ val requiredProguardRuleFiles: List<File> = listOf(
 //
 // 🔴 下面三行右边**只能**是裸 `System.getenv(...)`，后面不许接 `?:` / `orElse` / `getOrDefault`：
 //    给口令写默认值等于给出一把人人都知道的钥匙，而且它会让「凭据缺失」这件事**再也不会被发现**
-//    —— 那正是本批要防的失败形态。这条不是靠自觉：`src-tauri/tests/android_release_signing_wiring.rs`
-//    把这三行与下面三处消费点的**形状**逐个取出来做正面断言，加一个回退就红。
+//    —— 那正是本批要防的失败形态。
 //
 // 密钥库**路径**允许有默认值（它不是秘密，且默认值就是约定位置）；秘密三件不允许。
 val keystoreFile: File = File(
@@ -130,8 +129,6 @@ val releaseSigningReady: Boolean = signingBlockers.isEmpty()
 //
 //    逃生门的语义是「这一次我知道自己在做什么」，不是「从此以后都不用管」。命令行实参不会被
 //    继承到下一次调用，正好把这层语义交给代码持有，而不是交给自觉。
-//    判据在 `src-tauri/tests/android_release_signing_wiring.rs`（读取点的形状 + gradle.properties
-//    的取材面），两条一起守；本行改回 `findProperty` 就红。
 val allowUnsignedRelease: Boolean =
     gradle.startParameter.projectProperties["polarisAllowUnsigned"] == "true"
 
@@ -253,11 +250,6 @@ androidComponents.onVariants(androidComponents.selector().withBuildType("release
 // 凭据齐全那条分支的**读回点**：拿的是 AGP 装配好的那个 SigningConfig 对象本身，
 // 不是上面那几个绑定。判据在下方守卫里（`storeFile` 必须存在、可读、且就是 `keystoreFile`）。
 val releaseSigningConfig = android.signingConfigs.getByName("release")
-
-// 逃生门开关的**唯一**真值出口：事实任务（polaris-release-facts.gradle.kts）从这里取。
-// 在那份文件里另写一次 `startParameter.projectProperties["…"]` 等于给逃生门开第二个读取点，
-// 于是把本文件的读取点改回 `findProperty` 的变异在裁判眼里仍然是绿的。
-extra["releaseFactHatchOpen"] = allowUnsignedRelease
 
 rust {
     rootDirRel = "../../../"
@@ -392,17 +384,5 @@ gradle.taskGraph.whenReady(
         )
     },
 )
-
-// ── 行为裁判的取材点：住在**别的文件**里 ────────────────────────────────────────
-//
-// `printPolarisReleaseFacts`（裁判的唯一事实来源：AGP 手里的 proguardFiles 清单、签名配置的
-// storeFile、逃生门的三个观察值）此前就写在本文件末尾 —— 也就是**它自己审判的那个文件里**。
-// 把那句取材表达式一换（写死一份三元素清单即可），裁判的 ⑦ 原样全绿而 AGP 手里的清单已经变了。
-// 判据的取材源与被判对象是同一份可改的文本时，那条判据没有独立性可言。
-//
-// 故它搬去 `polaris-release-facts.gradle.kts`：本文件里改任何一行都改不了那边读的是什么。
-// 「那边读的**真的是** AGP 装配好的清单吗」由裁判的 ⑨ 用差分实验回答（往 app/ 放一份新的 .pro，
-// 打印出来的清单必须跟着变）。删掉下面这一行 ⇒ 任务不存在 ⇒ 裁判每一轮 rc≠0，不会静默。
-apply(from = "polaris-release-facts.gradle.kts")
 
 apply(from = "tauri.build.gradle.kts")

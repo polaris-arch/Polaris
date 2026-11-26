@@ -273,6 +273,12 @@ export function assertR8Evidence({ configuration, seeds, ownRules }) {
   notes.push(
     `configuration.txt 的来源段：${attributed.map((section) => section.source).join(" | ")}`,
   );
+  // 本仓三份规则与 AGP 默认档必须各有一段：少一份 = 那份规则整体没进 R8，构建照常绿。
+  for (const name of [...OWN_RULE_FILE_NAMES, "proguard-android-optimize.txt"]) {
+    if (!attributed.some((section) => section.source.includes(name))) {
+      problems.push(`configuration.txt 的来源段里没有 \`${name}\` —— 这份规则整体没进 R8。`);
+    }
+  }
   for (const [needle, expectedSource, why] of CONFIGURATION_NEEDLES) {
     const matching = attributed.filter((section) => sourceMatches(section.source, expectedSource));
     const hits = matching.filter((section) => section.body.includes(needle));

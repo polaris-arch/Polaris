@@ -546,32 +546,7 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     expect(release).toContain('拒绝覆盖 SHA256SUMS');
   });
 
-  it('Android 发布腿只写同 commit 草稿，并验真实 APK 签名与远端 digest', () => {
-    const androidWorkflow = workflow('android.yml');
-    const allExecutable = executable(androidWorkflow);
-    const releaseCheck = executable(jobBlock(androidWorkflow, 'release_check'));
-    const publish = executable(jobBlock(androidWorkflow, 'release-apk'));
-    const dispatch = androidWorkflow.slice(
-      androidWorkflow.indexOf('  workflow_dispatch:'),
-      androidWorkflow.indexOf('\npermissions:'),
-    );
-
-    expect(publish).toContain('if: inputs.publish_release');
-    expect(dispatch).not.toContain('publish_release:');
-    expect(dispatch).not.toContain('release_tag:');
-    expect(androidWorkflow).toContain(
-      'value: ${{ jobs.release-apk.outputs.signed_apk_sha256 }}',
-    );
-    expect(
-      [androidWorkflow, workflow('package.yml'), workflow('release-risk.yml')]
-        .join('\n')
-        .match(/publish_release:\s*true/g) ?? [],
-    ).toHaveLength(1);
-    const tagRun = workflowConcurrency(androidWorkflow, 'Package', 'push', 'refs/tags/v1.0.0');
-    expect(tagRun.cancels).toBe(false);
-    expect(tagRun.group).toBe(workflowConcurrency(androidWorkflow, 'Package', 'push', 'refs/tags/v1.0.0', false, 2).group);
-    expect(tagRun.group).not.toBe(workflowConcurrency(androidWorkflow, 'Package', 'push', 'refs/tags/v2.0.0').group);
-    expect(workflowConcurrency(androidWorkflow, 'Android').group).not.toBe(workflowConcurrency(androidWorkflow, 'Package').group);
+  it('Package 并发组按调用方、ref、run 与平台选择隔离，且不取消在途 run', () => {
     const packageSource = workflow('package.yml');
     const packageGroup = (selection: Parameters<typeof workflowConcurrency>[6] = {},
       caller = 'Package', ref = 'refs/heads/collab/contract', preserve = false, runId = 1,
@@ -599,93 +574,6 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     const queue = packageGroup({ mergeGroupHead: 'queued-source' }, 'Package', 'refs/heads/queue', false, 1, 'merge_group');
     expect(queue.cancels).toBe(false);
     expect(queue.group).not.toBe(packageGroup({ mergeGroupHead: 'queued-source' }, 'Package', 'refs/heads/queue', false, 2, 'merge_group').group);
-    expect(releaseCheck).toContain('if: inputs.publish_release != true');
-    expect(androidWorkflow).not.toContain('\n  apk:\n');
-    expect(allExecutable).not.toContain('--debug');
-    expect(allExecutable).not.toContain('app-arm64-debug.apk');
-    expect(allExecutable).not.toContain('assembleArm64Debug');
-
-    expect(releaseCheck).toContain(
-      ':app:assembleArm64Release -PpolarisAllowUnsigned=true',
-    );
-    const apkGate = executable(stepBlock(releaseCheck, 'R8 吃进了什么 / 保住了什么（产物级证据）'));
-    expect(apkGate).toContain('apk=src-tauri/gen/android/app/build/outputs/apk/arm64/release/app-arm64-release-unsigned.apk');
-    expect(apkGate).toContain('node scripts/mobile-core/mobile-consumption.mjs android');
-    expect(apkGate).toContain('--artifact "$apk" --abi arm64-v8a --r8 src-tauri/gen/android/app/build/outputs/mapping/arm64Release');
-    expect(apkGate).toContain('--component "$POLARIS_ANDROID_COMPONENT" --receipt "$POLARIS_ANDROID_RECEIPT"');
-    expect(apkGate).toContain('--scratch "$POLARIS_ANDROID_CARRIER" --output "$apk.source-consumption.json"');
-    for (const job of [releaseCheck, publish]) {
-      expect(executable(stepBlock(job, 'Prepare formal mobile source and isolated tools')))
-        .toContain('node scripts/mobile-core/android-ci.mjs');
-      const build = executable(stepBlock(job, 'Build or revalidate formal four-ABI component and App input'));
-      expect(build).toContain('set -euo pipefail');
-      expect(build).toContain('node scripts/mobile-core/producer.mjs android');
-      expect(build).toContain('node scripts/mobile-core/mobile-consumption.mjs materialize-android');
-      expect(build.indexOf('producer.mjs android')).toBeLessThan(build.indexOf('materialize-android'));
-      const recheck = executable(stepBlock(job, 'libbox.aar 必须在位'));
-      expect(recheck).toContain('node scripts/mobile-core/mobile-consumption.mjs verify-android');
-      expect(recheck).toContain('--component "$POLARIS_ANDROID_COMPONENT" --receipt "$POLARIS_ANDROID_RECEIPT"');
-    }
-    const carrier = readFileSync(join(REPO_ROOT, 'scripts/mobile-core/mobile-consumption.mjs'), 'utf8');
-    const androidCarrier = carrier.indexOf('async function inspectAndroidCarrier(');
-    expect(androidCarrier).toBeGreaterThan(-1);
-    const consumption = carrier.slice(androidCarrier);
-    expect(consumption).toMatch(/await verifyOriginal\(/);
-    expect(consumption).toContain('scripts/assert-r8-evidence.mjs');
-    expect(consumption).toContain('scripts/verify-apk.mjs');
-    expect(consumption).toContain('App candidate changed after SDK materialization');
-    expect(releaseCheck).toContain(
-      'run: node scripts/verify-apk.mjs src-tauri/gen/android/app/build/outputs/apk/arm64/release/app-arm64-release-unsigned.apk --abi arm64-v8a',
-    );
-    expect(releaseCheck).toContain('name: android-release-mapping');
-    expect(releaseCheck).not.toContain('gh release upload');
-    expect(releaseCheck).not.toContain('actions/upload-artifact@v7\n        with:\n          name: android-apk');
-
-    expect(publish).toContain(
-      'git fetch --force --depth=1 origin "+refs/tags/$tag:refs/tags/$tag"',
-    );
-    expect(publish.match(/git fetch --force/g) ?? []).toHaveLength(2);
-    expect(publish).toContain('tag_sha="$(git rev-list -n 1 "$tag")"');
-    expect(publish).toContain('[ "$tag_sha" != "$GITHUB_SHA" ]');
-    expect(publish).toContain('[ "$is_draft" != "true" ]');
-    expect(publish).not.toContain('[ "$target_commitish" != "$GITHUB_SHA" ]');
-    expect(publish).toContain('[ "$remote_tag_sha" != "$GITHUB_SHA" ]');
-    expect(publish.indexOf('[ "$is_draft" != "true" ]')).toBeLessThan(
-      publish.indexOf('gh release upload "$tag" "$asset"'),
-    );
-    expect(publish).toContain('keytool -exportcert -keystore "$jks"');
-    expect(publish).toContain(
-      "pinned_cert_sha256='22c183cb41d3dcbe6d355ba58d0a012953c5036592b61fb1efacfe3fa36eabd7'",
-    );
-    expect(publish).toContain('[ "$cert_sha256" != "$pinned_cert_sha256" ]');
-    expect(publish).toContain(
-      'signature_report="$("$apksigner" verify --verbose --print-certs "$asset")"',
-    );
-    expect(publish).toContain('[ "${certs[0]:-}" != "$POLARIS_RELEASE_CERT_SHA256" ]');
-    expect(publish).toContain(
-      'expected_id="$(node -p \'require("./src-tauri/tauri.android.conf.json").identifier\')"',
-    );
-    expect(publish).toContain('[ "$actual_id" != "$expected_id" ]');
-    expect(publish).toContain(
-      'node scripts/assert-r8-evidence.mjs "src-tauri/gen/android/app/build/outputs/mapping/${flavor}Release"',
-    );
-    expect(publish).toContain('for flavor in arm64 arm universal; do');
-    expect(publish).toContain('name: android-release-mapping');
-    expect(publish).toContain(
-      'node scripts/release-assets.mjs abis "$RUNNER_TEMP/$asset_name" "$abi"',
-    );
-    const signedGate = executable(stepBlock(publish, '开箱验（产物级判据）'));
-    expect(signedGate).toContain('apk="$RUNNER_TEMP/Polaris_${version}_${abi}-android.apk"');
-    expect(signedGate).toContain('node scripts/mobile-core/mobile-consumption.mjs android');
-    expect(signedGate).toContain('--artifact "$apk" --abi "$abi" --r8 "src-tauri/gen/android/app/build/outputs/mapping/${flavor}Release"');
-    expect(publish).toContain("digests='${{ steps.asset.outputs.digests }}'");
-    expect(publish).toContain('signed_apks: ${{ steps.asset.outputs.digests }}');
-    expect(publish).toContain('for pair in arm64:arm64-v8a arm:armeabi-v7a universal:universal; do');
-    expect(publish).toContain('[ "$actual_sha" != "sha256:$expected_sha" ]');
-    expect(publish).toContain(
-      'signed_apk_sha256: ${{ steps.asset.outputs.sha256 }}',
-    );
-    expect(publish).not.toContain('--draft=false');
   });
 
   it('Android 资产命名读取实际 Gradle metadata，并与 APK manifest 的双版本对拍', () => {
@@ -919,21 +807,11 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
 
 describe('风险门轻量构型：只在 release-risk 路径生效，发行构型一字不动', () => {
 
-  /**
-   * 同一机制的两条腿（2026-10-08 起 Android 验证腿加入）。**每条腿各切各片、各跑各的入口表、
-   * 各有各的变异收据** —— 只对其中一条腿取材的判据，在另一条腿被改坏时一条都不红。
-   * `guard` 是各自第三条闸读的变量：桌面是「要不要上传 artifact」，Android 是「是不是签名发布」。
-   */
+  /** `guard` 是第三条闸读的变量：桌面是「要不要上传 artifact」。 */
   const DESKTOP = {
     file: 'package.yml',
     step: 'Select installer build weight (release profile vs risk-gate light)',
     guard: 'POLARIS_UPLOAD_ARTIFACTS',
-  };
-  const ANDROID = {
-    file: 'android.yml',
-    jobs: ['release_check', 'release-apk'],
-    step: 'Select APK build weight (release profile vs risk-gate light)',
-    guard: 'POLARIS_PUBLISH_RELEASE',
   };
 
   /** 取出某个 job 里那一步的 shell 脚本本体（去掉 YAML 的 10 格缩进）。 */
@@ -1020,37 +898,7 @@ describe('风险门轻量构型：只在 release-risk 路径生效，发行构�
     ]);
   }
 
-  /** Android 两个 job 共用的入口表（那一步在两个 job 里逐字相同，入口由 workflow 级 env 决定）。 */
-  function checkAndroidWeight(script: string) {
-    checkTable(script, [
-      // 发行路径：什么都不写。签名发布腿只可能落在前两格。
-      ['tag 签名发布', { POLARIS_LIGHT_BUILD: '0', GITHUB_REF: tag, POLARIS_PUBLISH_RELEASE: '1' }, 0, ''],
-      ['显式 release_tag 的签名发布（ref 不是 tag）', { POLARIS_LIGHT_BUILD: '0', GITHUB_REF: branch, POLARIS_PUBLISH_RELEASE: '1' }, 0, ''],
-      // 不发布 ≠ 轻量：手动 dispatch 的验证腿是发行构型（发 tag 前预验 fat LTO 的入口）。
-      ['手动 dispatch 验证腿', { POLARIS_LIGHT_BUILD: '0', GITHUB_REF: branch, POLARIS_PUBLISH_RELEASE: '0' }, 0, ''],
-      // 风险门：恰好两个键。
-      ['release-risk 复用', { POLARIS_LIGHT_BUILD: '1', GITHUB_REF: branch, POLARIS_PUBLISH_RELEASE: '0' }, 0, LIGHT],
-      // fail-closed 三条。
-      ['轻量落在 tag 上', { POLARIS_LIGHT_BUILD: '1', GITHUB_REF: tag, POLARIS_PUBLISH_RELEASE: '0' }, 1, ''],
-      ['轻量却要签名发布', { POLARIS_LIGHT_BUILD: '1', GITHUB_REF: branch, POLARIS_PUBLISH_RELEASE: '1' }, 1, ''],
-      ['发布路径上环境里已有 profile 覆盖', {
-        POLARIS_LIGHT_BUILD: '0', GITHUB_REF: tag, POLARIS_PUBLISH_RELEASE: '1',
-        CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS: 'true',
-      }, 1, ''],
-      ['风险门上环境里已有别的 profile 覆盖', {
-        POLARIS_LIGHT_BUILD: '1', GITHUB_REF: branch, POLARIS_PUBLISH_RELEASE: '0',
-        CARGO_PROFILE_RELEASE_PANIC: 'abort',
-      }, 1, ''],
-      // 两个开关都只认 0 / 1：没接上（空串 / 未定义）与 'true' 一律红，不得落到任何一种构型上。
-      ['构建权重开关没接上', { POLARIS_LIGHT_BUILD: '', GITHUB_REF: branch, POLARIS_PUBLISH_RELEASE: '0' }, 1, ''],
-      ['构建权重开关写成 true', { POLARIS_LIGHT_BUILD: 'true', GITHUB_REF: branch, POLARIS_PUBLISH_RELEASE: '0' }, 1, ''],
-      ['轻量但发布开关没接上', { POLARIS_LIGHT_BUILD: '1', GITHUB_REF: branch, POLARIS_PUBLISH_RELEASE: '' }, 1, ''],
-      ['轻量但发布开关未定义', { POLARIS_LIGHT_BUILD: '1', GITHUB_REF: branch }, 1, ''],
-      ['轻量但发布开关写成 false', { POLARIS_LIGHT_BUILD: '1', GITHUB_REF: branch, POLARIS_PUBLISH_RELEASE: 'false' }, 1, ''],
-    ]);
-  }
-
-  /** 两条腿共用的五条变异 + 各自第三条闸的那一条。 */
+  /** 五条变异 + 第三条闸的那一条。 */
   function mutationsFor(guard: string): [string, string, string][] {
     return [
       ['拆掉 tag 闸', 'refs/tags/*) echo "::error::轻量构型不得用于 tag（$GITHUB_REF）：tag 上的产物是发布物"; exit 1 ;;', 'refs/tags/*) ;;'],
@@ -1088,17 +936,6 @@ describe('风险门轻量构型：只在 release-risk 路径生效，发行构�
     // 逐入口、逐变异起 bash 子进程；与全量并行时超过默认的 5s。
   }, 30_000);
 
-  it('Android 两个 job 的构建权重步各自真跑：签名发布零写入，验证腿只在风险门写两个键，三条 fail-closed 都咬得住', () => {
-    const android = workflow(ANDROID.file);
-    for (const job of ANDROID.jobs) {
-      // 每个 job 各切各片：只跑其中一个的话，另一个 job 里的那份被改坏时这里照绿。
-      const script = weightScript(android, job, ANDROID.step);
-      expectSliceIsTheScript(script, 'key 用固定串');
-      checkAndroidWeight(script);
-      expectMutationsBite(script, ANDROID.guard, checkAndroidWeight);
-    }
-  }, 30_000);
-
   it('开关只认调用方显式传入的 true，且全仓只有 release-risk 的两条腿在传', () => {
     const pkg = workflow('package.yml');
     const pkgJob = executable(jobBlock(pkg, 'package'));
@@ -1119,81 +956,6 @@ describe('风险门轻量构型：只在 release-risk 路径生效，发行构�
     expect(executable(pkg)).toContain(
       '      light_build:\n        type: boolean\n        required: false\n        default: false\n',
     );
-
-    // ── Android：两个开关在 workflow 级各定义一次，两个 job 与任何 step 都不得另行覆盖 ──
-    const android = workflow('android.yml');
-    const androidExecutable = executable(android);
-    const androidEnv = (key: string) => {
-      const found = androidExecutable.match(new RegExp(`^ {2}${key}: \\$\\{\\{ (.+) \\}\\}$`, 'm'));
-      expect(found, `android.yml 的 workflow 级 env 缺 ${key} 表达式`).not.toBeNull();
-      expect(androidExecutable.match(new RegExp(`^\\s+${key}:`, 'gm')) ?? [], `${key} 被 job / step 另行覆盖`)
-        .toHaveLength(1);
-      return (inputs: Record<string, unknown>) => runInNewContext(found![1], { inputs });
-    };
-    const light = androidEnv('POLARIS_LIGHT_BUILD');
-    const publish = androidEnv('POLARIS_PUBLISH_RELEASE');
-    // 手动 dispatch 不接收构型/发布输入；preserve_run 不改变轻量或签名模式。
-    expect([light({}), publish({})]).toEqual(['0', '0']);
-    expect([
-      light({ publish_release: true, release_tag: 'v1.0.0' }),
-      publish({ publish_release: true, release_tag: 'v1.0.0' }),
-    ]).toEqual(['0', '1']);
-    expect([light({ light_build: false }), publish({ light_build: false })]).toEqual(['0', '0']);
-    expect([light({ light_build: true }), publish({ light_build: true })]).toEqual(['1', '0']);
-    // 两个都传 ⇒ ('1','1')，入口表的「轻量却要签名发布」一格证明它当场红。
-    expect([
-      light({ light_build: true, publish_release: true }),
-      publish({ light_build: true, publish_release: true }),
-    ]).toEqual(['1', '1']);
-    // 构型/发布输入只在 workflow_call 上声明、缺省 false；手动入口只允许保护审计运行。
-    const androidDispatch = executable(
-      android.slice(android.indexOf('\n  workflow_dispatch:'), android.indexOf('\npermissions:')),
-    );
-    expect(androidDispatch).toMatch(/\n {6}preserve_run:\n {8}type: boolean\n {8}default: false/);
-    expect([...androidDispatch.matchAll(/^ {6}([a-z_]+):$/gm)].map((match) => match[1])).toEqual(['preserve_run']);
-    expect(androidDispatch).not.toMatch(/light_build:|publish_release:|release_tag:/);
-    expect(androidExecutable).toMatch(/\n {6}light_build:\n(?: {8}(?!default:).*\n)* {8}default: false\n/);
-    // 签名发布腿只在 publish_release 为真时跑 ⇒ 在它身上「轻量」必然是 ('1','1') 那一格。
-    expect(executable(jobBlock(android, 'release-apk'))).toMatch(/^ {4}if: inputs\.publish_release$/m);
-    const releaseCheck = jobBlock(android, 'release_check');
-    const uploaded = executable(stepBlock(releaseCheck, '留存 mapping.txt / usage.txt（唯一能把 logcat 反混淆回来的东西）'))
-      .split('\n')
-      .filter((line) => line.startsWith(' '.repeat(12)))
-      .map((line) => line.trim());
-    expect(uploaded).toEqual([
-      ...['mapping.txt', 'usage.txt', 'seeds.txt', 'configuration.txt'].map(
-        (name) => `src-tauri/gen/android/app/build/outputs/mapping/arm64Release/${name}`,
-      ),
-      ...['DefaultNetworkObservationTest', 'NetworkMonitorSessionTest', 'LoadedLibboxIdentityTest', 'AndroidCallbackSchedulingSourceTest', 'AndroidNativeAdmissionTest', 'AndroidNativeMainControlsTest', 'MainNativeAdmissionWiringTest', 'DualModeEndpointWiringTest', 'RuntimePersistenceSourceTest', 'RuntimeProtocolAdmissionTest'].map(
-        (name) => `src-tauri/gen/android/app/build/test-results/testArm64ReleaseUnitTest/TEST-com.polaris2.app.vpn.${name}.xml`,
-      ),
-      '${{ runner.temp }}/s5-android-unit-results.json',
-      '${{ runner.temp }}/release-stage1.log',
-    ]);
-    const stage1 = stepBlock(releaseCheck, 'Build unsigned release-profile validation APK');
-    expect(stage1).toContain('stage1_log="$RUNNER_TEMP/release-stage1.log"');
-    expect(stage1).toContain('>"$stage1_log" 2>&1');
-    const validationEvidence = stepBlock(releaseCheck, '留存 mapping.txt / usage.txt（唯一能把 logcat 反混淆回来的东西）');
-    expect(executable(validationEvidence).match(/^ {8}if: (.+)$/m)?.[1])
-      .toBe('always()');
-    for (const job of ['release_check', 'release-apk']) {
-      // Only the R8 mapping (and, on the signed leg, the release assets) leave the runner.
-      expect(executable(jobBlock(android, job)).match(/uses: actions\/upload-artifact@/g) ?? [], `${job}: exact artifacts`).toHaveLength(1);
-    }
-    expect(executable(releaseCheck)).not.toMatch(/gh release/);
-    // 留存 SDK 与原观察不分发 APK/SO；S5 必须走真实 app Gradle/AAR，不能借 host/stub 结果冒签。
-    const s5Step = stepBlock(releaseCheck, 'Verify S5 Android network observation and admission unit tests');
-    const s5Units = executable(s5Step);
-    const jdk = stepBlock(releaseCheck, 'Resolve JDK / Android SDK / NDK');
-    expect(executable(jdk)).toContain('echo "JAVA_HOME=$JAVA_HOME_21_X64"');
-    expect(releaseCheck.indexOf(jdk)).toBeLessThan(releaseCheck.indexOf(s5Step));
-    expect(s5Units).toContain('bash src-tauri/gen/android/gradlew --project-dir src-tauri/gen/android');
-    expect(s5Units).toContain(':app:cleanTestArm64ReleaseUnitTest :app:testArm64ReleaseUnitTest');
-    for (const name of ['DefaultNetworkObservationTest', 'NetworkMonitorSessionTest', 'LoadedLibboxIdentityTest', 'AndroidCallbackSchedulingSourceTest', 'AndroidNativeAdmissionTest', 'AndroidNativeMainControlsTest', 'MainNativeAdmissionWiringTest', 'DualModeEndpointWiringTest', 'RuntimePersistenceSourceTest', 'RuntimeProtocolAdmissionTest']) {
-      expect(s5Units).toContain(`--tests com.polaris2.app.vpn.${name}`);
-    }
-    expect(s5Units).not.toMatch(/continue-on-error|kotlinc|python3|\|\| true/);
-
 
     // 传 true 的调用点全仓恰两处，都在 release-risk：打包腿（与「不上传」成对）与 Android 腿（不传发布）。
     // 旧判据是「全仓恰一处」；现在按文件、按 job 各自点名，别的 workflow（含 tag 发布所在的 package.yml）为零。

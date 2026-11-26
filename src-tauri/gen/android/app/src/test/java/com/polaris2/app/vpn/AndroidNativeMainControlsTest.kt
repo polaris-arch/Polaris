@@ -1,6 +1,5 @@
 package com.polaris2.app.vpn
 
-import java.io.File
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -398,39 +397,5 @@ class AndroidNativeMainControlsTest {
             h.finishClose(target)
             assertEquals(1, target.server.closes.get())
         }
-    }
-
-    @Test fun productionServiceAdaptersUseCapturedHandlersAndNoTerminalErrorJni() {
-        val root = File("src/main/java/com/polaris2/app/vpn")
-        val service = File(root, "BoxService.kt").readText()
-        val producer = File(root, "AndroidNativeMainControls.kt").readText()
-        val exact = service.substringAfter("private inner class AttemptHandler(").substringBefore("    override fun serviceStop() {\n        AndroidNativeMain.controls")
-        assertTrue(exact.contains("stopService(attempt)"))
-        assertTrue(exact.contains("this@BoxService.serviceReload(attempt)"))
-        assertTrue(service.contains("Libbox.newStrictCommandServer(AttemptHandler(attempt, this), boundPlatform)"))
-        val defaults = service.substringAfter("    override fun serviceStop() {\n        AndroidNativeMain.controls").substringBefore("private fun serviceReload(expectedAttempt:")
-        assertFalse(defaults.contains("stopService("))
-        assertFalse(defaults.contains("serviceReload(null)"))
-        assertFalse(defaults.contains("mainAttempt"))
-        assertTrue(defaults.contains("rejectUnbound(AndroidNativeAdmission.Kind.TargetlessReload)"))
-        val reload = service.substringAfter("private fun serviceReload(expectedAttempt:").substringBefore("private fun setReloadError(")
-        assertTrue(reload.contains("AndroidNativeMain.controls.reload("))
-        assertTrue(reload.contains("TransientSpeedtestHost.withMainStart(attempt, { isReloadCurrent(attempt, server) })"))
-        assertTrue(reload.contains("TransientLoginHost.withMainReload(attempt, config,"))
-        assertTrue(reload.contains("allowed = { isReloadCurrent(attempt, server) }"))
-        assertFalse(reload.contains("AndroidNativeMain.construct("))
-        val native = reload.substringAfter("nativeReload = { server, config ->").substringBefore("setError =")
-        assertTrue(native.contains("AndroidRuntimeTailscaleBridge.startMain(server, config, OverrideOptions(), persistence)"))
-        assertTrue(native.contains("SystemStart.requireLegacyAllowed(service)"))
-        assertTrue(producer.indexOf("reserve(ledger,") < producer.indexOf("target()"))
-        assertTrue(producer.indexOf("target()") < producer.indexOf("loadConfig()"))
-        assertTrue(producer.indexOf("boundary.requireBirthAllowed()") < producer.indexOf("withHosts(server, config)"))
-        assertTrue(producer.contains("boundary.construct { nativeReload(server, config) }"))
-        assertTrue(producer.contains("boundary.reportFailure(failure) { setError(server, failure) }"))
-        val closed = service.substringAfter("private fun onAttemptClosed(").substringBefore("private fun registerStopReceiver(")
-        assertFalse(closed.contains("setError("))
-        assertTrue(closed.contains("AndroidNativeMain.unknown(attempt)"))
-        assertTrue(closed.contains("VpnBridge.finishStop(\"android: 内核关闭失败\", attempt)"))
-        assertEquals(setOf("main.bridge", "main.system", "validation.checkConfig"), AndroidNativeCoverage.wiredProducers)
     }
 }

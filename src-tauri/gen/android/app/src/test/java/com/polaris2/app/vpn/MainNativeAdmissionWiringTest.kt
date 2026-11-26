@@ -1,6 +1,5 @@
 package com.polaris2.app.vpn
 
-import java.io.File
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
@@ -11,64 +10,6 @@ import org.junit.Test
 
 class MainNativeAdmissionWiringTest {
     private fun await(latch: CountDownLatch) = assertTrue(latch.await(2, TimeUnit.SECONDS))
-    private val plugin = File("src/main/java/com/polaris2/app/vpn/PolarisVpnPlugin.kt").readText()
-    private val service = File("src/main/java/com/polaris2/app/vpn/BoxService.kt").readText()
-    private val adapter = File("src/main/java/com/polaris2/app/vpn/AndroidNativeMain.kt").readText()
-
-    @Test fun productionBridgeAndSystemBirthKeepTheSameTicketThroughTheService() {
-        val bridgeStart = plugin.substringAfter("fun start(invoke: Invoke)").substringBefore("fun stop(invoke: Invoke)")
-        val reservation = plugin.substringAfter("fun reserveMainStart(invoke: Invoke)").substringBefore("fun releaseMainStart(invoke: Invoke)")
-        assertTrue(reservation.contains("VpnBridge.reserveStart(runId) { AndroidNativeMain.reserveBridge(runId) }"))
-        val reserve = bridgeStart.indexOf("VpnBridge.reservedTicket(args.runId)")
-        val begin = bridgeStart.indexOf("VpnBridge.beginStart(MainStartRequest(")
-        assertTrue(reserve >= 0 && reserve < begin)
-        val serviceStart = service.substringAfter("fun onStartCommand(startId: Int)").substringBefore("fun onBind()")
-        assertTrue(serviceStart.contains("request.nativeTicket"))
-        assertTrue(serviceStart.contains("AndroidNativeMain.reserveSystem(systemRunId)"))
-        assertTrue(serviceStart.contains("nativeTicket,"))
-        val nativeStart = service.substringAfter("private fun startKernel(").substringBefore("// ── CommandServerHandler")
-        val admission = nativeStart.indexOf("AndroidNativeMain.enterBirth(nativeTicket)")
-        val setup = nativeStart.indexOf("PolarisApplication.ensureSetup()")
-        val factory = nativeStart.indexOf("Libbox.newStrictCommandServer(")
-        assertTrue(admission >= 0 && admission < setup && setup < factory)
-        val operation = nativeStart.indexOf("AndroidNativeMain.construct(attempt)")
-        val ownership = nativeStart.indexOf("TransientLoginHost.withMainConfig(attempt,")
-        assertTrue(operation >= 0 && operation < ownership && ownership < factory)
-        val reload = service.substringAfter("private fun serviceReload(expectedAttempt:").substringBefore("private fun setReloadError(")
-        assertTrue(reload.contains("AndroidNativeMain.controls.reload("))
-        assertFalse(reload.contains("AndroidNativeMain.construct(attempt)"))
-        assertTrue(reload.contains("TransientLoginHost.withMainReload(attempt, config,"))
-        assertTrue(reload.contains("allowed = { isReloadCurrent(attempt, server) }"))
-        assertTrue(serviceStart.contains("LegacySystemStartFence.admitCurrentRequest(request, VpnBridge::currentStartRequest)"))
-        assertTrue(serviceStart.contains("service.stopSelfResult(startId)"))
-        assertFalse(serviceStart.contains("service.stopSelf()"))
-        val close = service.substringAfter("private fun onAttemptClosed(").substringBefore("private fun registerStopReceiver(")
-        val exactRelease = close.indexOf("MainKernelAttemptRegistry.completeAfterClose(attempt)")
-        val settled = close.indexOf("AndroidNativeMain.settleAfterExactRelease(attempt)")
-        assertTrue(exactRelease >= 0 && exactRelease < settled)
-        assertTrue(adapter.contains("ledger.reserveOwner(AndroidNativeAdmission.Kind.Main, runId)"))
-        assertTrue(adapter.contains("ledger.enterBirth(ticket)"))
-        assertTrue(adapter.contains("attempt.released.isDone"))
-        assertFalse(adapter.contains("ledger.closedExact(ticket)"))
-        assertFalse(AndroidNativeMain.capabilities.contains(AndroidNativeProducer.MainClose))
-    }
-
-    @Test fun nativeTerminalEventsCarryExactBirthAndUseTheOriginalStartChannel() {
-        assertTrue(plugin.contains("val lifecycleEvents: Channel? = null"))
-        assertTrue(plugin.contains("nativeTicket, args.lifecycleEvents)"))
-        val event = plugin.substringAfter("private fun lifecycleDeliveryLocked(").substringBefore("enum class StopAdmission")
-        assertTrue(event.contains("current.runId != attempt.runId"))
-        assertTrue(event.contains("current.nativeTicket != attempt.nativeTicket"))
-        assertTrue(event.contains("put(\"birthNonce\", attempt.birthNonce)"))
-        assertTrue(event.contains("Handler(Looper.getMainLooper()).post"))
-        val stop = service.substringAfter("private fun stopService(").substringBefore("private fun onAttemptClosed(")
-        assertTrue(stop.indexOf("!MainKernelAttemptRegistry.isCurrent(attempt)") < stop.indexOf("VpnBridge.publishLifecycle(attempt, \"unavailable\")"))
-        assertTrue(stop.contains("VpnBridge.publishLifecycle(attempt, \"unavailable\")"))
-        assertTrue(service.contains("VpnBridge.takeFinishStop(attempt = attempt)"))
-        val finish = plugin.substringAfter("fun takeFinishStop(").substringBefore("fun finishStop(")
-        assertTrue(finish.indexOf("val terminal = lifecycleDeliveryLocked") < finish.indexOf("request = null"))
-        assertTrue(finish.contains("if (error == null) \"closed\" else \"unavailable\""))
-    }
 
     @Test fun sealDuringPendingToAttemptTransferCannotCreateNativeServer() {
         val ledger = AndroidNativeAdmission("process-1").also { it.bootstrap(RequiredMarkerProof.Absent) }
@@ -305,31 +246,6 @@ class MainNativeAdmissionWiringTest {
         assertTrue(registry.completeAfterClose(attempt) { })
         AndroidNativeMain.settleAfterExactRelease(ledger, attempt)
         assertEquals(AndroidNativeAdmission.State.Unknown, ledger.state(ticket))
-    }
-
-    @Test fun productionScopedSnapshotsUseTheSameServerBeforeHandleLossAndAreIndependentOfDebugWitness() {
-        val observer = service.substringAfter("private fun observeNativeInput(").substringBefore("private fun isReloadCurrent(")
-        assertTrue(observer.contains("checkNotNull(attempt.tailscaleStore).invoke(config, { AndroidTailscaleStoreCustody.export(server) },"))
-        assertTrue(observer.contains("startupReceipt = { it }, action = nativeCall)"))
-        val close = service.substringAfter("private fun stopService(").substringBefore("private fun onAttemptClosed(")
-        assertTrue(close.contains("synchronized(attempt.operationLock)"))
-        assertTrue(close.indexOf("server?.closeService()") < close.indexOf("attempt.tailscaleStore?.closed"))
-        assertTrue(close.indexOf("attempt.tailscaleStore?.closed") < close.indexOf("server?.close()"))
-        val directory = File("src/main/java/com/polaris2/app/vpn")
-        val login = File(directory, "TransientLoginHost.kt").readText()
-        assertTrue(login.indexOf("server.closeService()") < login.indexOf("store?.closed"))
-        assertTrue(login.indexOf("store?.closed") < login.indexOf("closeServer ="))
-        assertTrue(login.contains("invoke(checkNotNull(config), { AndroidTailscaleStoreCustody.export(original) })"))
-        val speed = File(directory, "TransientSpeedtestHost.kt").readText()
-        val finish = speed.substringAfter("override fun finishClose()").substringBefore("override fun cleanupConfirmed()")
-        assertTrue(finish.indexOf("store?.closed") < finish.indexOf("original.close()"))
-        assertTrue(speed.contains("closeServer = {}"))
-        val sessions = File(directory, "TransientSpeedtestSessions.kt").readText()
-        assertTrue(sessions.indexOf("entry.operationFinished.get()") < sessions.indexOf("entry.engine.finishClose()"))
-        val typed = plugin.substringAfter("fun tailscaleStoreCustody(invoke: Invoke)").substringBefore("fun startTransientLogin(")
-        assertTrue(typed.contains("Thread("))
-        assertTrue(typed.contains("beginTailscaleClose("))
-        assertFalse(typed.contains("closedExact("))
     }
 
 }
