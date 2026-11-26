@@ -35,12 +35,12 @@ permissions:
 #    job 重新求值 `if`，恒真的不取消，四条打包腿（各 14–25 分钟）照跑到底，新跑在本并发组里干等。
 #    已在那边改成 `!cancelled()`（实证与 run 号写在该 job 的 `if` 上方）。只改本段修不了那个现象。
 #
-# Automatic PR/main tips and dispatches without preserve_run are replaceable.
+# Automatic PR/main tips and dispatches without preserve_run are replaceable by the same event only.
 # Explicit fixed audits and merge groups use independent run IDs throughout reusable calls;
 # publishing tag paths remain outside this workflow. Cancellation must reach
 # nested installer/mobile jobs without bypassing their required result gates.
 concurrency:
-  group: release-risk-${{ github.workflow }}-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.ref }}${{ (inputs.preserve_run || github.event.inputs.preserve_run == 'true' || github.event_name == 'merge_group') && format('-fixed-{0}', github.run_id) || '' }}
+  group: release-risk-${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.ref }}${{ (inputs.preserve_run || github.event.inputs.preserve_run == 'true' || github.event_name == 'merge_group') && format('-fixed-{0}', github.run_id) || '' }}
   cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') && github.event_name != 'merge_group' && !inputs.preserve_run && github.event.inputs.preserve_run != 'true' }}
 
 jobs:

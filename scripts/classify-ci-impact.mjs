@@ -127,6 +127,11 @@ export const PACKAGE_IMPACT_SCOPES = Object.freeze({
     platforms: ['windows'],
     why: 'Windows 打包用该 action 安装 btls-sys 原生构建所需的 NASM。',
   },
+  'scripts/mobile-core/source-contract.json': {
+    kernel: false,
+    platforms: ALL,
+    why: 'NOTICE 的内核段落与该移动端发布合同对拍（verify-packaging confs），改它须重验全部桌面包。',
+  },
   'scripts/mobile-core/': {
     kernel: false,
     platforms: NO_LEG,
@@ -594,7 +599,6 @@ const SHARED_PACKAGE_PATHS = new Set([
   'LICENSE',
   'NOTICE',
   'THIRD-PARTY-LICENSES.md',
-  'scripts/mobile-core/source-contract.json',
   'scripts/classify-ci-impact.mjs',
   'scripts/gate-node-test.mjs',
   'scripts/assert-pc-runtime-release.mjs',

@@ -177,8 +177,9 @@ esac
     expect(cancels('merge_group', 'refs/heads/gh-readonly-queue/main/pr-7')).toBe(false);
     expect(cancels('workflow_dispatch', 'refs/heads/collab/audit', true)).toBe(false);
     expect(cancels('push', 'refs/tags/v1.0.0')).toBe(false);
-    expect(group('pull_request', 'refs/pull/7/merge')).toBe('release-risk-Release Risk-7');
+    expect(group('pull_request', 'refs/pull/7/merge')).toBe('release-risk-Release Risk-pull_request-7');
     expect(group('push', 'refs/heads/main')).toBe(group('push', 'refs/heads/main', false, 2));
+    expect(group('workflow_dispatch', 'refs/heads/main')).not.toBe(group('push', 'refs/heads/main'));
     expect(group('workflow_dispatch', 'refs/heads/collab/audit', true)).not.toBe(
       group('workflow_dispatch', 'refs/heads/collab/audit', true, 2));
     expect(group('workflow_dispatch', 'refs/heads/collab/audit')).toBe(

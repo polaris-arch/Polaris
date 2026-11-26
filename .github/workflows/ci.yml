@@ -105,10 +105,10 @@ on:
 # `workflow_call` 里的 `github.workflow` 取**调用方**名称（GitHub 官方语义），故把它纳入组：
 # 独立 CI 与 Package 内复用的 CI 门互不取消；同一调用方/ref 的旧跑仍会被新跑顶掉。
 # tag ref 是 refs/tags/*，走不进下面的 cancel 条件。
-# Automatic and manual tips replace only tips of the same caller/ref. Fixed audits and
+# Automatic and manual tips replace only tips of the same caller/event/ref. Fixed audits and
 # merge queue groups have run-specific identities; tags never cancel.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.ref }}${{ (inputs.preserve_run || github.event.inputs.preserve_run == 'true' || github.event_name == 'merge_group') && format('-fixed-{0}', github.run_id) || '' }}
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.ref }}${{ (inputs.preserve_run || github.event.inputs.preserve_run == 'true' || github.event_name == 'merge_group') && format('-fixed-{0}', github.run_id) || '' }}
   cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') && github.event_name != 'merge_group' && !inputs.preserve_run && github.event.inputs.preserve_run != 'true' }}
 
 jobs:
@@ -195,7 +195,7 @@ jobs:
 
   native_dns_candidate_gates:
     needs: cheap_format
-    # Committed formal defaults use the same caller/App SHA and four-host gate plan.
+    # Committed formal defaults use the same caller/App SHA and three-host gate plan.
     if: >-
       ${{ needs.cheap_format.outputs.native_required != 'false'
           && needs.cheap_format.outputs.native_dns_formal == 'true' }}
