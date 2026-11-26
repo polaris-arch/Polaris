@@ -5,11 +5,11 @@
   "repository": "polaris-arch/sing-box-polaris",
   "repositoryId": 1421657509,
   "sourceURL": "https://github.com/polaris-arch/sing-box-polaris",
-  "version": "1.15.0-polaris-alpha.12.42",
-  "sourceTag": "v1.15.0-polaris-alpha.12.42",
-  "sourceTagObject": "d8fc80819dec921e1d0c3aa3572e111c51192ac2",
-  "sourceCommit": "551f42bc503cc883190645f450d88bdada27304e",
-  "sourceTree": "d349bf0ed05b9742cf5502377905a4d62cd8c67b",
+  "version": "1.15.0-polaris-alpha.12.43",
+  "sourceTag": "v1.15.0-polaris-alpha.12.43",
+  "sourceTagObject": "68df596ac19ab52601febd921a2f14d39be61cdd",
+  "sourceCommit": "c2e212d6a3a47d3807d17815f77835325a99dad8",
+  "sourceTree": "51245942b73aa00dd3d022d41dd47283c235d663",
   "goModSha256": "f3bb0779a94a300cd24cf82d3b04567b5683252646d18f17e2d7c960613f4762",
   "goSumSha256": "faf13e501da2c8de6a70db1f50a152f37bf875d68717631253e57a8be27cde1a",
   "goModule": "github.com/sagernet/sing-box",
@@ -71,7 +71,7 @@
       "ts_omit_synology",
       "ts_omit_bird"
     ],
-    "outputName": "polaris-box-1.15.0-polaris-alpha.12.42-android.aar",
+    "outputName": "polaris-box-1.15.0-polaris-alpha.12.43-android.aar",
     "javaPackage": "io.nekohasekai",
     "libname": "box",
     "legacyAPI21Enabled": false
@@ -120,7 +120,7 @@
     ],
     "libname": "box",
     "frameworkName": "Libbox.xcframework",
-    "outputName": "polaris-box-1.15.0-polaris-alpha.12.42-ios-xcframework.zip",
+    "outputName": "polaris-box-1.15.0-polaris-alpha.12.43-ios-xcframework.zip",
     "linkage": "static; build-time verified App and PacketTunnel link",
     "macOSTvOSIncluded": false
   },
@@ -139,8 +139,8 @@
   },
   "sourcePolicy": {
     "schema": "polaris-reviewed-kernel-source-v4",
-    "sourceCommit": "551f42bc503cc883190645f450d88bdada27304e",
-    "sourceTree": "d349bf0ed05b9742cf5502377905a4d62cd8c67b",
+    "sourceCommit": "c2e212d6a3a47d3807d17815f77835325a99dad8",
+    "sourceTree": "51245942b73aa00dd3d022d41dd47283c235d663",
     "goVersion": "1.27.4",
     "goModSha256": "f3bb0779a94a300cd24cf82d3b04567b5683252646d18f17e2d7c960613f4762",
     "goSumSha256": "faf13e501da2c8de6a70db1f50a152f37bf875d68717631253e57a8be27cde1a",
@@ -200,7 +200,7 @@
       "github.com/sagernet/sing-quic": {
         "version": "v0.7.2-0.20261002084117-75c3ac4fa12b",
         "replacementPath": "./third_party/sing-quic",
-        "replacementTree": "28b6a8d1f3ecc5d5a9e5a0d4c89ad1866f0efb07",
+        "replacementTree": "7ce624d709569f9e50a313d86f5c995f3e5f2c5e",
         "replacementFileCount": 82
       },
       "github.com/sagernet/wireguard-go": {
