@@ -216,11 +216,14 @@ export function WarpPanel({
         message: t(registration ? 'warp.discardRegisteredMsg' : 'warp.discardMsg'),
         confirmLabel: t('warp.discard'),
         danger: true,
-        onConfirm: () => {
+        onConfirm: async () => {
           closeInstance(confirmId);
-          void abandonWarpRegistration({ draft: registration?.registered }, (deviceId, token) => api.server.deregisterWarp(deviceId, token))
-            .catch((e) => console.error('[WarpPanel] deregister failed:', e));
           closeInstance(instanceId);
+          try {
+            await abandonWarpRegistration({ draft: registration?.registered, saved: registration?.saved }, (deviceId, token) => api.server.deregisterWarp(deviceId, token));
+          } catch {
+            toast.error(t('warp.deregisterQueueFailed'));
+          }
         },
       },
     });

@@ -2872,6 +2872,7 @@
     "registeredPending": "Cloudflare 注册已完成，表单已锁定。重试只会保存或刷新同一节点，不会重新注册。",
     "registeredSaveFailed": "Cloudflare 注册已完成，但节点保存尚未确认。请保持此面板打开并重试保存。",
     "registeredRefreshFailed": "节点已保存，但列表刷新未完成。请重试刷新，不会重新注册。",
+    "deregisterQueueFailed": "WARP 设备未能加入注销队列，Cloudflare 上可能残留这台匿名设备。",
     "discardRegisteredMsg": "Cloudflare 设备已注册，但本地保存尚未确认。关闭将丢弃本面板的凭据；若节点尚未落盘，将无法继续保存。"
   },
   "wg": {

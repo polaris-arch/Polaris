@@ -2872,6 +2872,7 @@
     "registeredPending": "Cloudflare registration is complete and the form is locked. Retry only saves or refreshes this node; it does not register again.",
     "registeredSaveFailed": "Cloudflare registration is complete, but saving the node has not been confirmed. Keep this panel open and retry saving.",
     "registeredRefreshFailed": "The node was saved, but the list has not refreshed. Retry refreshing; registration will not run again.",
+    "deregisterQueueFailed": "The WARP device could not be queued for deregistration; the anonymous device may remain on Cloudflare.",
     "discardRegisteredMsg": "The Cloudflare device is registered, but local saving has not been confirmed. Closing discards this panel’s credentials; if the node was not saved to disk, you cannot finish saving it."
   },
   "wg": {

@@ -511,8 +511,9 @@ const FEEDBACK: readonly ScreenFeedback[] = [
     dir: 'mobile/forms/',
     shape: 'reporter',
     mechanism: 'setNotice',
-    // The panel is already closed when an unauthorized node from Add is removed.
-    reporterByCall: { 'api.server.delete': 'toast.error' },
+    // The panel is already closed when an unauthorized node from Add is removed or an
+    // abandoned WARP registration is queued for deregistration.
+    reporterByCall: { 'api.server.delete': 'toast.error', 'api.server.deregisterWarp': 'toast.error' },
     teeth: {
       file: 'mobile/forms/NodeFormPanel.tsx',
       decl: 'submit',

@@ -2872,6 +2872,7 @@
     "registeredPending": "Cloudflare 註冊已完成，表單已鎖定。重試只會儲存或重新整理同一節點，不會重新註冊。",
     "registeredSaveFailed": "Cloudflare 註冊已完成，但節點儲存尚未確認。請保持此面板開啟並重試儲存。",
     "registeredRefreshFailed": "節點已儲存，但清單更新未完成。請重試更新，不會重新註冊。",
+    "deregisterQueueFailed": "WARP 裝置未能加入註銷佇列，Cloudflare 上可能殘留這台匿名裝置。",
     "discardRegisteredMsg": "Cloudflare 裝置已註冊，但本機儲存尚未確認。關閉將丟棄本面板的憑證；若節點尚未儲存至磁碟，將無法繼續儲存。"
   },
   "wg": {

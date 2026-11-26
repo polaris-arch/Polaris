@@ -128,7 +128,7 @@ function WarpForm({ instanceId, editNode, servers }: WarpFormProps) {
         onConfirm: () => {
           closeInstance(confirmId);
           void abandonWarpRegistration(registration.current, (deviceId, token) => api.server.deregisterWarp(deviceId, token))
-            .catch((e) => console.error('[WarpDialog] deregister failed:', e));
+            .catch(() => toast.error(t('warp.deregisterQueueFailed')));
           close();
         },
       },
