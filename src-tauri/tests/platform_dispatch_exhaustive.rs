@@ -3883,6 +3883,20 @@ const CFG_REGISTRY: &[CfgSite] = &[
         "iOS Tailscale browser authorization retains the original managed VPN generation. Android uses its own login producer.",
     ),
     (
+        "src-tauri/src/commands/server.rs",
+        "target_os = \"ios\"",
+        1,
+        IosSide::DiffersUndecided,
+        "Ordinary node edits blocked by existing pending changes are persisted for the pending bar on desktop and Android, matching the Tailscale profile save. iOS returns the pending error instead; whether save-only is safe beside a running PacketTunnel needs an iOS device check before changing it.",
+    ),
+    (
+        "src-tauri/src/commands/server.rs",
+        "target_os = \"android\"",
+        1,
+        IosSide::DiffersUndecided,
+        "A node deletion saved while the core is stopped consumes deferred deletions immediately, except on Android where a standalone VPN may still use the old source. iOS takes the desktop side; whether PacketTunnel can outlive the stopped state reported to the app needs an iOS device check.",
+    ),
+    (
         "src-tauri/src/events.rs",
         "target_os = \"android\"",
         1,
@@ -4770,7 +4784,9 @@ const IOS_SIDE_CENSUS: &[(&str, usize)] = &[
     // The unretired-start and unconfirmed-operation refusal codes add two iOS-only
     // constants; no debt is reclassified.
     ("DiffersRight", 450),
-    ("DiffersUndecided", 26),
+    // Plan-first node edits add two server.rs sites whose iOS side needs device evidence:
+    // save-only beside pending changes and immediate deferred deletions while stopped.
+    ("DiffersUndecided", 28),
     // Saved temporary-core concurrency adds three group members; no old debt is repaid.
     // Bounded connection snapshots add 15 stats transport sites to the existing stats
     // debt family: relay.rs (1 + 8 + 2) and source.rs (2 + 2). No old debt is repaid
@@ -4813,6 +4829,12 @@ const IOS_DEBT_SITES: &[(&str, &str, usize)] = &[
         "not(target_os = \"android\")",
         1,
     ),
+    (
+        "src-tauri/src/commands/server.rs",
+        "target_os = \"android\"",
+        1,
+    ),
+    ("src-tauri/src/commands/server.rs", "target_os = \"ios\"", 1),
     (
         "src-tauri/src/commands/speedtest.rs",
         "not(target_os = \"android\")",
