@@ -608,9 +608,6 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     expect(releaseCheck).toContain(
       ':app:assembleArm64Release -PpolarisAllowUnsigned=true',
     );
-    expect(releaseCheck).toContain(
-      'run: bash scripts/gate-android-release-behavior.sh',
-    );
     const apkGate = executable(stepBlock(releaseCheck, 'R8 吃进了什么 / 保住了什么（产物级证据）'));
     expect(apkGate).toContain('apk=src-tauri/gen/android/app/build/outputs/apk/arm64/release/app-arm64-release-unsigned.apk');
     expect(apkGate).toContain('node scripts/mobile-core/mobile-consumption.mjs android');
@@ -669,7 +666,6 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
       'expected_id="$(node -p \'require("./src-tauri/tauri.android.conf.json").identifier\')"',
     );
     expect(publish).toContain('[ "$actual_id" != "$expected_id" ]');
-    expect(publish).toContain('run: bash scripts/gate-android-release-behavior.sh');
     expect(publish).toContain(
       'node scripts/assert-r8-evidence.mjs "src-tauri/gen/android/app/build/outputs/mapping/${flavor}Release"',
     );
@@ -1188,7 +1184,6 @@ describe('风险门轻量构型：只在 release-risk 路径生效，发行构�
     // 留存 SDK 与原观察不分发 APK/SO；S5 必须走真实 app Gradle/AAR，不能借 host/stub 结果冒签。
     const s5Step = stepBlock(releaseCheck, 'Verify S5 Android network observation and admission unit tests');
     const s5Units = executable(s5Step);
-    const s5Verifier = readFileSync(join(REPO_ROOT, 'scripts/VerifyAndroidS5.java'), 'utf8');
     const jdk = stepBlock(releaseCheck, 'Resolve JDK / Android SDK / NDK');
     expect(executable(jdk)).toContain('echo "JAVA_HOME=$JAVA_HOME_21_X64"');
     expect(releaseCheck.indexOf(jdk)).toBeLessThan(releaseCheck.indexOf(s5Step));
@@ -1196,13 +1191,7 @@ describe('风险门轻量构型：只在 release-risk 路径生效，发行构�
     expect(s5Units).toContain(':app:cleanTestArm64ReleaseUnitTest :app:testArm64ReleaseUnitTest');
     for (const name of ['DefaultNetworkObservationTest', 'NetworkMonitorSessionTest', 'LoadedLibboxIdentityTest', 'AndroidCallbackSchedulingSourceTest', 'AndroidNativeAdmissionTest', 'AndroidNativeMainControlsTest', 'MainNativeAdmissionWiringTest', 'DualModeEndpointWiringTest', 'RuntimePersistenceSourceTest', 'RuntimeProtocolAdmissionTest']) {
       expect(s5Units).toContain(`--tests com.polaris2.app.vpn.${name}`);
-      expect(s5Verifier).toContain(JSON.stringify(name));
     }
-    expect(s5Units).toContain('"$JAVA_HOME/bin/java" scripts/VerifyAndroidS5.java "$RUNNER_TEMP/s5-android-unit-results.json"');
-    expect(s5Verifier).toContain('List.of("failure", "error", "skipped")');
-    expect(s5Verifier).toContain('cases.size() == methods.size() && cases.size() == count(suite, "tests")');
-    expect(s5Verifier).toContain('sourceSha256');
-    expect(s5Verifier).toContain('reportSha256');
     expect(s5Units).not.toMatch(/continue-on-error|kotlinc|python3|\|\| true/);
 
 

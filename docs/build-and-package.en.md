@@ -217,8 +217,8 @@ Build the mobile bindings with the pinned sing-box-polaris source, Go and gomobi
 After desktop draft checks, `android.yml` builds three signed release APKs:
 
 ```bash
-bash scripts/build-android-apk.sh --apk --split-per-abi --target aarch64 armv7 --ci
-bash scripts/build-android-apk.sh --apk --target aarch64 armv7 --ci
+node scripts/build-android-apk.mjs --apk --split-per-abi --target aarch64 armv7 --ci
+node scripts/build-android-apk.mjs --apk --target aarch64 armv7 --ci
 ```
 
 These build `arm64Release` / `armRelease` and `universalRelease`. Every flavor uses the full Rust release

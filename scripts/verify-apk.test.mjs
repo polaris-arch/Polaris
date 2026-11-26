@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdirSync, mkdtempDisposableSync, readFileSync, readdirSync, realpathSync, renameSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempDisposableSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { delimiter, join } from 'node:path';
 import test from 'node:test';
@@ -251,7 +251,7 @@ test('Android build entry passes the verified launcher and preserves config over
   skip: process.platform !== 'linux',
 }, () => {
   using fixture = mkdtempDisposableSync(join(tmpdir(), 'polaris-android-config-'));
-  const script = fileURLToPath(new URL('./build-android-apk.sh', import.meta.url));
+  const script = fileURLToPath(new URL('./build-android-apk.mjs', import.meta.url));
   const config = fileURLToPath(new URL('../src-tauri/tauri.android.conf.json', import.meta.url));
   const ndk = join(fixture.path, 'ndk');
   const revision = readFileSync(new URL('./android-rust-ndk.version', import.meta.url), 'utf8').trim();
@@ -264,6 +264,7 @@ if [[ "$1" == --version ]]; then
   printf '%s\n' "tauri-cli $TEST_TAURI_VERSION"
 else
   printf '%s\n' "$POLARIS_TAURI_CLI" "$@"
+  exit "\${TEST_TAURI_STATUS:-0}"
 fi
 `, { mode: 0o700 });
   const env = { ...process.env, PATH: fixture.path + delimiter + process.env.PATH,
@@ -276,13 +277,37 @@ fi
     [[...args, '-c', 'custom.json'], [...args, '-c', 'custom.json']],
     [[...args, '--', override], ['--config', config, ...args, '--', override]],
   ]) {
-    const child = spawnSync('bash', [script, ...input], { env, cwd: fixture.path, encoding: 'utf8', timeout: 5000 });
+    const child = spawnSync(process.execPath, [script, ...input], { env, cwd: fixture.path, encoding: 'utf8', timeout: 5000 });
     assert.ifError(child.error);
     assert.equal(child.status, 0, child.stderr);
     assert.deepEqual(child.stdout.trimEnd().split('\n'), [
       realpathSync(join(fixture.path, 'tauri')), 'android', 'build', ...expected,
     ]);
   }
+  // CI's unsigned stage1 relies on the build's failure status reaching the caller.
+  const failed = spawnSync(process.execPath, [script, ...args],
+    { env: { ...env, TEST_TAURI_STATUS: '7' }, cwd: fixture.path, encoding: 'utf8', timeout: 5000 });
+  assert.equal(failed.status, 7, failed.stderr);
+});
+
+test('Android release gate keeps verdict, broken-judge and not-run exit codes apart', {
+  skip: process.platform !== 'linux',
+}, () => {
+  const gate = fileURLToPath(new URL('./gate-android-release-behavior.mjs', import.meta.url));
+  const runGate = (env) => spawnSync(process.execPath, [gate], { env: { ...process.env, ...env }, encoding: 'utf8', timeout: 20_000 });
+  for (const [mode, status, line] of [['fail', 1, '✗ 哨兵断言'], ['pass', 0, '全部行为断言通过']]) {
+    const child = runGate({ POLARIS_GATE_SELFCHECK: mode });
+    assert.equal(child.status, status, child.stderr);
+    assert.match(child.stdout, new RegExp(line));
+  }
+  // A missing SDK is a prerequisite failure (2), reached only after the judge's own self-check.
+  const work = () => new Set(readdirSync('/var/tmp').filter((name) => name.startsWith('polaris-release-oracle.')));
+  const before = work();
+  const missing = runGate({ ANDROID_HOME: '/nonexistent', ANDROID_SDK_ROOT: '', POLARIS_GATE_SELFCHECK: '' });
+  for (const name of work()) if (!before.has(name)) rmSync(join('/var/tmp', name), { recursive: true, force: true });
+  assert.equal(missing.status, 2, missing.stderr);
+  assert.match(missing.stdout, /⓪ 裁判自检/);
+  assert.match(missing.stderr, /前提不成立/);
 });
 
 /**

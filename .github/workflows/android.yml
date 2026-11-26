@@ -7,7 +7,7 @@ name: Android
 # 面 A（本机实测的构建面，见 `polaris-android-first-apk-2026-09-04.md`）：
 #   NDK 交叉编译 aarch64-linux-android → JDK 21 跑 AGP 8.11 → gradle assemble；
 #   `libbox.aar` 117 MiB 且 **gitignored**，须由固定 Go/gomobile/JDK/NDK 与 sing-box 源码现建；
-#   Android 构建由 scripts/build-android-apk.sh 统一选择 Rust NDK 并调用全局 Tauri CLI。
+#   Android 构建由 scripts/build-android-apk.mjs 统一选择 Rust NDK 并调用全局 Tauri CLI。
 # 面 B（GitHub runner 能给什么）：
 #   预装 Android SDK / cmdline-tools / 多版本 JDK / Go；NDK 预装但版本随镜像漂；
 #   `actions/cache` 按「内核版本 × builder/manifest/patch 哈希」缓存 AAR 与构建收据。
@@ -152,7 +152,7 @@ jobs:
   #
   # 🔴 代价要说清：这条腿因此对**签名**零信息量。它守的是 release-profile 产物与 R8 那一层
   #    （configuration.txt / seeds.txt）；签名有效性由下面 `release-apk` 的 apksigner 步负责，
-  #    两条腿的判据不能互相冒充。边界表在 scripts/gate-android-release-behavior.sh 头注。
+  #    两条腿的判据不能互相冒充。边界表在 scripts/gate-android-release-behavior.mjs 头注。
   #
   # ── 前置步骤与 `release-apk` job 逐字相同 ──
   # GitHub Actions 没有 job 内的 step 复用，只能复制；两份须同步修改
@@ -463,7 +463,7 @@ jobs:
           marker="$RUNNER_TEMP/release-stage1-start"
           touch "$marker"
           stage1_log="$RUNNER_TEMP/release-stage1.log"
-          if bash scripts/build-android-apk.sh --apk --split-per-abi --target aarch64 --ci >"$stage1_log" 2>&1; then
+          if node scripts/build-android-apk.mjs --apk --split-per-abi --target aarch64 --ci >"$stage1_log" 2>&1; then
             echo '::error::unsigned release validation stage1 unexpectedly bypassed the signing guard'
             exit 1
           fi
@@ -528,7 +528,7 @@ jobs:
       - name: release 构建行为裁判（gradle 配置期实证）
         env:
           POLARIS_GATE_CI_DAEMON: "1"
-        run: bash scripts/gate-android-release-behavior.sh
+        run: node scripts/gate-android-release-behavior.mjs
 
       # APK 不会上传；验证结论与 mapping 才是这条非发布腿的输出。
       - name: 开箱验（resources / native libraries / 16 KiB）
@@ -980,8 +980,8 @@ jobs:
         run: |
           set -euo pipefail
           # Split APKs and the ARM-only universal are separate AGP flavors, all with full release settings.
-          bash scripts/build-android-apk.sh --apk --split-per-abi --target aarch64 armv7 --ci
-          bash scripts/build-android-apk.sh --apk --target aarch64 armv7 --ci
+          node scripts/build-android-apk.mjs --apk --split-per-abi --target aarch64 armv7 --ci
+          node scripts/build-android-apk.mjs --apk --target aarch64 armv7 --ci
 
           for abi in arm64-v8a armeabi-v7a; do
             jni="src-tauri/gen/android/app/src/main/jniLibs/$abi"
@@ -1003,7 +1003,7 @@ jobs:
       - name: release 构建行为裁判（gradle 配置期实证）
         env:
           POLARIS_GATE_CI_DAEMON: "1"
-        run: bash scripts/gate-android-release-behavior.sh
+        run: node scripts/gate-android-release-behavior.mjs
 
       # signed release 本身就是最强的 R8 取材点：configuration/seeds 必须来自将要发布的这次构建。
       # mapping 只留在 Actions 内部供崩溃反混淆，不上传 GitHub Release；对外 release 仍只有 APK。

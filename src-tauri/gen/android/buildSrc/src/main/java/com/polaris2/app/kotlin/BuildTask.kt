@@ -25,7 +25,7 @@ open class BuildTask : DefaultTask() {
         } else {
             val cli = File(tauriDir, "../ui/node_modules/@tauri-apps/cli/tauri.js").canonicalFile
             if (!cli.isFile) {
-                throw GradleException("Tauri CLI is missing at $cli; use scripts/build-android-apk.sh or install the IDE CLI")
+                throw GradleException("Tauri CLI is missing at $cli; use scripts/build-android-apk.mjs or install the IDE CLI")
             }
             listOf("node", cli.absolutePath)
         }

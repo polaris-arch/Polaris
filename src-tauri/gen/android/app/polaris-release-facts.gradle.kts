@@ -2,7 +2,7 @@
 //
 // ── 为什么它不住在 `build.gradle.kts` 里（2026-09-05 收官轮 A2）────────────────────
 //
-// 这个任务是 `scripts/gate-android-release-behavior.sh` 的唯一事实来源：R8 手里到底有几份
+// 这个任务是 `scripts/gate-android-release-behavior.mjs` 的唯一事实来源：R8 手里到底有几份
 // 规则文件、签名配置里 `storeFile` 指向哪儿、逃生门开没开，四条判据全靠它打出来的行。
 //
 // 上一版把它写在 `app/build.gradle.kts` 的末尾 —— 也就是**它自己审判的那个文件里**。

@@ -16,7 +16,7 @@
 //! | | 它证明的事 | 它证明不了的事 |
 //! |---|---|---|
 //! | 本门（源码级） | 那些**只有源码这一个观察面**的事：签名接线那一行在 release 块里**出现且恰好一次**、口令只经环境变量、逃生门**那一条绑定**的右值逐字是哪一条、密钥模式在 `.gitignore` 里 | 构建**跑起来是什么行为**（R8 到底跑不跑、AGP 手里到底有几份规则、逃生门实际开没开）；以及「出现了」之后**有没有被后一句盖掉**（在那行接线后补一句 `signingConfig = null`，本门不红） |
-//! | `scripts/gate-android-release-behavior.sh`（**行为裁判**，android.yml 的 apk 腿） | 跑一次 gradle **配置期**：零凭据必红且点名、逃生门**在它枚举得到的四个来源上**只认命令行实参、`minifyArm64ReleaseWithR8` 在 release 图里恰好 1 次而 debug 图里 0 次、AGP 装配好的 `proguardFiles` 在 release **构建类型**那一处与登记的三份**集合恰等**（多一份少一份都红）且 `defaultConfig`/`productFlavor` 两处为空、凭据在场时 `signingConfigs` **容器**里那份配置的 `storeFile` 存在可读且就是本工程认的那一份 | **执行期**发生的一切：`onlyIf`/`enabled=false` 让任务在图里却不跑、`doFirst` 改文件、R8 剪完之后包里还剩什么；以及配置期里它**没枚举到**的两条缝：逃生门换一个新变量名、release 构建类型有没有真把 signingConfig 接上 |
+//! | `scripts/gate-android-release-behavior.mjs`（**行为裁判**，android.yml 的 apk 腿） | 跑一次 gradle **配置期**：零凭据必红且点名、逃生门**在它枚举得到的四个来源上**只认命令行实参、`minifyArm64ReleaseWithR8` 在 release 图里恰好 1 次而 debug 图里 0 次、AGP 装配好的 `proguardFiles` 在 release **构建类型**那一处与登记的三份**集合恰等**（多一份少一份都红）且 `defaultConfig`/`productFlavor` 两处为空、凭据在场时 `signingConfigs` **容器**里那份配置的 `storeFile` 存在可读且就是本工程认的那一份 | **执行期**发生的一切：`onlyIf`/`enabled=false` 让任务在图里却不跑、`doFirst` 改文件、R8 剪完之后包里还剩什么；以及配置期里它**没枚举到**的两条缝：逃生门换一个新变量名、release 构建类型有没有真把 signingConfig 接上 |
 //! | `android_platform_verifier_wiring.rs` | rustls 校验器那条腿的三侧符号对得上、keep 规则**覆盖得到**那个类全名 | 运行期真的执行了 |
 //! | `scripts/verify-wry-keep-rules.mjs`（CI 上跑） | RustWebView 那条 keep 的成员签名与生成物**同一个类里**对得上 | 裸 checkout 上跑不了（取材点 gitignored） |
 //! | `scripts/assert-r8-evidence.mjs`（release-profile 验证腿） | R8 的 configuration.txt（**剥注释后**）里各来源的规则文本都到过、seeds.txt 里那些 keep 真的**命中**了类与成员 | 只能由 CI 的真实 release 构建证明 |
@@ -60,7 +60,7 @@
 //!    `if (System.getenv("POLARIS_XXX") == "true") return@Action`，绑定一字未动、名字不在
 //!    枚举表里 ⇒ 两侧同时全绿，而那是一个从环境继承、永久生效的逃生门。这一形今天没有门。
 //!
-//! 完整的边界表在 `scripts/gate-android-release-behavior.sh` 的头注里，只此一份，本处不复写。
+//! 完整的边界表在 `scripts/gate-android-release-behavior.mjs` 的头注里，只此一份，本处不复写。
 //!
 //! # 取材与自污染
 //!
@@ -344,7 +344,7 @@ fn gradle_source() -> String {
 ///    `requiredProguardRuleFiles`，与消费侧无关）—— 而另外两份规则整体失效，产物白屏。
 /// 3. debug 侧那条 `isMinifyEnabled = false` 同理。
 ///
-/// 这三件的真值由 `scripts/gate-android-release-behavior.sh` 持有（⑤ release 图里 R8 恰好 1 次 /
+/// 这三件的真值由 `scripts/gate-android-release-behavior.mjs` 持有（⑤ release 图里 R8 恰好 1 次 /
 /// ⑥ debug 图里 0 次 / ⑦ AGP 装配好的 `proguardFiles` 清单三份都在且逐份非空）。
 /// 那条腿要 Android SDK 与两份 `tauri android build` 生成物，只在 `android.yml` 的 apk job 上跑得动。
 /// 本条留着的理由是**便宜且早**：`cargo test` 在裸 checkout 上就能跑。两条腿是「早说」与
@@ -359,7 +359,7 @@ fn the_release_build_type_is_minified_and_requires_every_keep_rule_file() {
         "{GRADLE_APP}：release 构建类型没有 `isMinifyEnabled = true` —— \
          R8 不跑，本文件其余全部 keep 规则一条都不生效，而构建照样绿。\n\
          （本条只问这一串在不在。后面再追一行 `isMinifyEnabled = false` 它照样绿 —— \
-         那一形由 scripts/gate-android-release-behavior.sh 的 ⑤/⑥ 守。）"
+         那一形由 scripts/gate-android-release-behavior.mjs 的 ⑤/⑥ 守。）"
     );
     assert!(
         release.contains("proguardFiles("),
@@ -376,7 +376,7 @@ fn the_release_build_type_is_minified_and_requires_every_keep_rule_file() {
         "{GRADLE_APP}：release 的 `proguardFiles(...)` 不再消费那份收敛后的规则文件清单 —— \
          取材面换了对象，下面那条「三份必到」的断言就管不到真正生效的集合了。\n\
          （本条只问这个标识符出没出现在实参里。给它接一个 `.filter {{ … }}` 本条照样绿 —— \
-         「实际喂进 R8 的到底是哪几份」由 scripts/gate-android-release-behavior.sh 的 ⑦ 守。）"
+         「实际喂进 R8 的到底是哪几份」由 scripts/gate-android-release-behavior.mjs 的 ⑦ 守。）"
     );
 
     for rel in REQUIRED_PROGUARD_FILES {
@@ -389,7 +389,7 @@ fn the_release_build_type_is_minified_and_requires_every_keep_rule_file() {
              缺席时 R8 会在零 wry/Tauri keep 的情况下跑完 —— 构建全绿、产物白屏。\n\
              （本条守的是「谁被点名要求到场」，不是「谁真的被喂给了 R8」：\
              这三行属于 requiredProguardRuleFiles，与 proguardFiles 的实参无关。\
-             后者由 scripts/gate-android-release-behavior.sh 的 ⑦ 守。）"
+             后者由 scripts/gate-android-release-behavior.mjs 的 ⑦ 守。）"
         );
     }
 
@@ -484,7 +484,7 @@ fn the_release_build_type_actually_attaches_the_signing_config() {
 ///
 /// # 根因（2026-09-05 收官轮 A2）
 ///
-/// `printPolarisReleaseFacts` 是 `scripts/gate-android-release-behavior.sh` 的唯一事实来源：
+/// `printPolarisReleaseFacts` 是 `scripts/gate-android-release-behavior.mjs` 的唯一事实来源：
 /// AGP 手里有几份规则文件、storeFile 指向哪儿、逃生门开没开，四条判据全靠它打出来的行。
 /// 而它此前就写在 `app/build.gradle.kts` 的末尾 —— 也就是它自己审判的那个文件里。
 /// 把取材表达式一换（写死一份三元素清单即可），裁判的 ⑦ 原样全绿而 AGP 手里的清单已经变了。
@@ -657,7 +657,7 @@ fn the_signing_secrets_come_only_from_environment_variables() {
 ///    `if (System.getenv("CI") == null || true) return@Action`：被断言的串一个不少，
 ///    守卫既不判也不报。
 ///
-/// 两者的真值都由 `scripts/gate-android-release-behavior.sh` 的 ①（零凭据跑 release 必须 rc≠0
+/// 两者的真值都由 `scripts/gate-android-release-behavior.mjs` 的 ①（零凭据跑 release 必须 rc≠0
 /// 且失败信息逐条点名三个环境变量）持有 —— 那是「守卫到底开不开口」唯一说得清的地方。
 /// 本条留着的是「谁被点名了」这一层：`assemble` / `bundle` / `package` 少一个的时候，
 /// 行为裁判只跑 `assemble` 那条路，看不见另外两条出包路径。两条腿互补，谁也替不了谁。
@@ -729,7 +729,7 @@ fn missing_credentials_fail_loudly_instead_of_yielding_an_unsigned_apk() {
         "{GRADLE_APP}：守卫不再检查「有没有多出来一份没登记的规则文件」。\
          规则集是集合：往 app/ 放一份 `-keep class ** {{ *; }}` 就把整包混淆关掉了，\
          而「三份都在」这条 membership 判定对它是瞎的。\
-         （行为面由 scripts/gate-android-release-behavior.sh 的 ⑨ 守。）"
+         （行为面由 scripts/gate-android-release-behavior.mjs 的 ⑨ 守。）"
     );
     // ── 凭据齐全那条分支的**读回**：storeFile 必须被看一眼 ──
     //
@@ -746,7 +746,7 @@ fn missing_credentials_fail_loudly_instead_of_yielding_an_unsigned_apk() {
         guard.contains("assembled.canonicalFile != keystoreFile.canonicalFile"),
         "{GRADLE_APP}：守卫没有把 `storeFile` 与 `keystoreFile` 逐字比对。\
          只判「存在且可读」时，指向另一份**存在的**密钥库照样全绿。\
-         （行为面由 scripts/gate-android-release-behavior.sh 的 ⑩ 守。）"
+         （行为面由 scripts/gate-android-release-behavior.mjs 的 ⑩ 守。）"
     );
     assert!(
         guard.contains("signingBlockers"),
@@ -822,7 +822,7 @@ fn missing_credentials_fail_loudly_instead_of_yielding_an_unsigned_apk() {
          写在守卫**体内别处**（例如在逃生门分支之前多插一句 \
          `if (System.getenv(\"POLARIS_XXX\") == \"true\") return@Action`）本条一字不红，\
          而行为裁判的 ④/④b 只试它枚举得到的四个名字，同样不红 —— 那条缝两侧都没人守，\
-         登记在 gate-android-release-behavior.sh 头注天花板表的「看不见 ⑤」。"
+         登记在 gate-android-release-behavior.mjs 头注天花板表的「看不见 ⑤」。"
     );
 
     let hits = gradle.matches(hatch_read).count();

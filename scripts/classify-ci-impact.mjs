@@ -699,7 +699,7 @@ export const ANDROID_IMPACT_SCOPES = Object.freeze({
   'scripts/mobile-core/': {
     why: 'Formal zero-overlay mobile source, SDK producer, native-input/cache and final-carrier predicates feed the actual Android APK leg; host source tests also cover Apple binding/link controls.',
   },
-  'scripts/build-android-apk.sh': {
+  'scripts/build-android-apk.mjs': {
     why: '标准 Android 构建入口统一 Rust NDK 并驱动一次 Tauri/Gradle 构建；改坏它会让 APK 腿跳过或混用工具链。',
   },
   'scripts/android-rust-ndk.version': {
@@ -733,7 +733,7 @@ export const ANDROID_IMPACT_SCOPES = Object.freeze({
       + 'wry 升级把方法改名或改签名时它是唯一会说话的东西：规则不再匹配任何成员，R8 静默剪掉方法，'
       + '而 debug 包与全部源码门都是绿的。',
   },
-  'scripts/gate-android-release-behavior.sh': {
+  'scripts/gate-android-release-behavior.mjs': {
     why:
       'release 路径的**行为**裁判：跑 gradle 配置期，断言零凭据必红、逃生门只认命令行实参、'
       + 'R8 在 release 任务图里恰好一次而 debug 里零次、AGP 手里那份 proguardFiles 清单三份都在。'
