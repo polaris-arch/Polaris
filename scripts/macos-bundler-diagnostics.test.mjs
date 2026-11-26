@@ -7,15 +7,17 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
-const wrapper = join(root, 'scripts/bundler-diagnostics.sh');
-const testShell = (name, fn) => test(name, {
-  skip: process.platform === 'win32' ? 'POSIX diagnostic wrapper' : false,
+const wrapper = join(root, 'scripts/bundler-diagnostics.mjs');
+const testShell = (name, fn, skip = false) => test(name, {
+  skip: process.platform === 'win32' ? 'POSIX diagnostic wrapper' : skip,
 }, fn);
-function fixture({ status = 0, teeStatus = null, missingLog = false,
+// Writes to /dev/full fail after a successful open, modelling a log that breaks mid-build.
+const fullLog = existsSync('/dev/full') ? false : 'needs /dev/full to fail log writes';
+function fixture({ status = 0, logFull = false, missingLog = false,
   unusableLog = false, missingTauri = false, bytes = 0, prefixArgs = [],
   target = 'aarch64-apple-darwin' } = {}) {
   const directory = mkdtempSync(join(tmpdir(), 'polaris-dmg-log-test-'));
-  const log = unusableLog ? directory : join(directory, 'full output.log');
+  const log = unusableLog ? directory : logFull ? '/dev/full' : join(directory, 'full output.log');
   const calls = join(directory, 'calls.jsonl');
   const args = ['build', '--target', target, '--config',
     'config with spaces.json', '--', 'literal;$HOME', 'line\nbreak', ''];
@@ -28,24 +30,22 @@ function fixture({ status = 0, teeStatus = null, missingLog = false,
       + 'process.stdout.write(' + JSON.stringify(out) + ', () => {\n'
       + 'process.stderr.write(' + JSON.stringify(err) + ', () => { process.exitCode = ' + status + '; });\n'
       + '});\n', { mode: 0o700 });
-    if (teeStatus !== null) writeFileSync(join(directory, 'tee'),
-      '#!/bin/sh\ncat\nexit ' + teeStatus + '\n', { mode: 0o700 });
     if (missingTauri) {
-      // A nonexistent shebang interpreter deterministically models launch failure,
-      // even if the test host has a real Tauri installation elsewhere on PATH.
+      // A nonexistent shebang interpreter models launch failure. PATH holds only this
+      // directory, because the PATH search moves past it to any real Tauri installation.
       writeFileSync(join(directory, 'tauri'), '#!/polaris-nonexistent-interpreter\n', { mode: 0o700 });
     }
-    const env = { ...process.env, PATH: directory + ':' + process.env.PATH,
+    const env = { ...process.env, PATH: missingTauri ? directory : directory + ':' + process.env.PATH,
       FIXTURE_CALLS: calls, POLARIS_TAURI_LOG: log,
       GITHUB_TOKEN: 'must-not-print-github-token-fixture',
       GH_TOKEN: 'must-not-print-gh-token-fixture' };
     if (missingLog) delete env.POLARIS_TAURI_LOG;
-    const result = spawnSync('bash', [wrapper, ...prefixArgs, ...args], {
+    const result = spawnSync(process.execPath, [wrapper, ...prefixArgs, ...args], {
       env, encoding: 'utf8', timeout: 5000, maxBuffer: 4 * 1024 * 1024,
     });
     assert.ifError(result.error);
     return { ...result, args, expectedArgs: [...prefixArgs, ...args], out, err,
-      log: !unusableLog && existsSync(log) ? readFileSync(log, 'utf8') : '',
+      log: !unusableLog && !logFull && existsSync(log) ? readFileSync(log, 'utf8') : '',
       calls: existsSync(calls) ? readFileSync(calls, 'utf8').trim().split('\n').map(JSON.parse) : [] };
   } finally { rmSync(directory, { recursive: true, force: true }); }
 }
@@ -66,14 +66,15 @@ testShell('every failing status retains complete output and is preserved instead
     assertOriginalFailure(fixture({ status, bytes: status === 37 ? 256 * 1024 : 0 }), status);
   }
 });
-testShell('tee failure is fatal but cannot replace a simultaneous original Tauri failure', () => {
-  const success = fixture({ teeStatus: 19 });
-  assert.equal(success.status, 19);
+testShell('log write failure is fatal but cannot replace a simultaneous original Tauri failure', () => {
+  const success = fixture({ logFull: true });
+  assert.equal(success.status, 1);
   assert.deepEqual(success.calls, [success.args]);
-  const failed = fixture({ status: 37, teeStatus: 19 });
+  assert(success.stdout.includes(success.out) && success.stdout.includes(success.err), 'job output keeps the child bytes');
+  const failed = fixture({ status: 37, logFull: true });
   assert.equal(failed.status, 37);
   assert.deepEqual(failed.calls, [failed.args]);
-});
+}, fullLog);
 testShell('missing or unwritable destination fails before Tauri; spawn failure remains nonzero and logged', () => {
   for (const options of [{ missingLog: true }, { unusableLog: true }]) {
     const result = fixture(options);
@@ -96,8 +97,8 @@ testShell('Linux explicit CLI Debug preserves full output, every product argumen
 });
 testShell('Linux evidence failure cannot make a failed bundler green or start it without a destination', () => {
   for (const status of [0, 37]) {
-    const result = fixture({ prefixArgs: ['--verbose'], status, teeStatus: 19 });
-    assert.equal(result.status, status || 19);
+    const result = fixture({ prefixArgs: ['--verbose'], status, logFull: true });
+    assert.equal(result.status, status || 1);
     assert.deepEqual(result.calls, [result.expectedArgs]);
   }
   for (const options of [{ missingLog: true }, { unusableLog: true }]) {
@@ -108,4 +109,4 @@ testShell('Linux evidence failure cannot make a failed bundler green or start it
   const failed = fixture({ prefixArgs: ['--verbose'], missingTauri: true });
   assert.notEqual(failed.status, 0);
   assert(failed.log.length > 0);
-});
+}, fullLog);

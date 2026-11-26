@@ -79,12 +79,12 @@ if (platform === 'win') {
 }
 if (platform === 'mac-arm64') {
   const app = `${bundle}/Polaris.app`;
-  const nested = ['scripts/macos-nested-code.sh', app, `${res}/sing-box`];
+  const nested = ['scripts/macos-nested-code.mjs', app, `${res}/sing-box`];
   console.log('Checking nested code before bundle seal');
-  run('bash', nested);
+  run('node', nested);
   run('codesign', ['--force', '--deep', '--sign', '-', '--timestamp=none', app]);
   run('codesign', ['--verify', '--deep', '--strict', app]);
   console.log('Checking nested code after bundle seal');
-  run('bash', nested);
+  run('node', nested);
 }
 for (const name of readdirSync(join(root, bundle))) console.log(`${bundle}/${name}`);

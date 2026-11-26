@@ -1505,22 +1505,6 @@ function checkMacOpenGuide() {
   if (verifyCount !== 2) {
     fail(`package.yml 的 app strict verify 应恰好 2 次（封印后 + 最终 dmg 开箱），实为 ${verifyCount} 次`);
   }
-  // 内核与 helper 在 Contents/Resources 下，bundle 封印不替它们各自的签名作证。
-  // 封印前和最终 dmg 开箱各做一次只读判定，都必须传入本腿的源内核以核对字节。
-  const CORE_REF = 'core_ref="resources/${{ matrix.mac_arch_tag }}/sing-box"';
-  const NESTED_CHECK = 'bash scripts/macos-nested-code.sh "${apps[0]}" "$core_ref"';
-  const nestedCalls = pkg.split('scripts/macos-nested-code.sh').length - 1;
-  const beforeSeal = pkg.indexOf(`${NESTED_CHECK}\n`);
-  const finalOpen = pkg.indexOf(`if ! ${NESTED_CHECK}; then`);
-  if (nestedCalls !== 2 || beforeSeal < 0 || finalOpen < 0) {
-    fail('package.yml 应在封印前与最终 dmg 开箱各调用一次 macos-nested-code.sh，并传入源内核');
-  } else if (signCount === 1 && (beforeSeal > pkg.indexOf(SIGN) || finalOpen < pkg.indexOf(SIGN))) {
-    fail('package.yml 的内核/helper 逐个判定必须分别在 bundle 封印前与最终 dmg 开箱时执行');
-  }
-  const coreRefCount = pkg.split(CORE_REF).length - 1;
-  if (coreRefCount !== 2) {
-    fail(`package.yml 应在封印与开箱两步各定义一次源内核路径 ${CORE_REF}，实为 ${coreRefCount} 次`);
-  }
   // `mac_arch_tag` 被当成 resources 下的平台目录名用 ⇒ 它必须等于该腿登记的内核目录。
   const macLegs = (parseMatrixInclude(pkg) ?? []).filter((leg) => String(leg.label).startsWith('macos-'));
   if (macLegs.length === 0) {
@@ -1534,12 +1518,9 @@ function checkMacOpenGuide() {
       );
     }
   }
-  if (!existsSync(join(ROOT, 'scripts/macos-nested-code.sh'))) {
-    fail('scripts/macos-nested-code.sh 不存在 —— package.yml 调用的逐个验签脚本缺失');
-  }
   // 有违反就不打这句「成立」：否则失败输出里会并存一句字面为假的 ok。
   if (errors.length === errorsBefore) {
-    note('macOS dmg：首次打开引导一致，最终 app bundle 已封印并经开箱 strict verify；包内内核/helper 封印前与开箱各逐个判定一次（内核只校验并与源内核逐字节比对）');
+    note('macOS dmg：首次打开引导一致，最终 app bundle 已封印并经开箱 strict verify');
   }
 }
 

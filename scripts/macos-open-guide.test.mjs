@@ -131,10 +131,11 @@ function runGuideStep(name, options = {}) {
     mkdirSync(join(root, 'packaging'));
     writeFileSync(join(root, 'packaging/macos-dmg-open-guide.txt'), guide);
     mkdirSync(join(root, 'scripts'));
-    const nested = join(root, 'scripts/macos-nested-code.sh');
-    writeFileSync(nested, '[ "$#" -eq 2 ] && [ -d "$1" ] &&\n'
-      + 'printf "nested:%s\\n" "$2" >> "$STUB_LOG" && [ "${STUB_NESTED_FAIL:-0}" = 0 ]\n');
-    chmodSync(nested, 0o700);
+    writeFileSync(join(root, 'scripts/macos-nested-code.mjs'), "import { appendFileSync, statSync } from 'node:fs';\n"
+      + "const [app, ref] = process.argv.slice(2);\n"
+      + "if (process.argv.length !== 4 || !statSync(app, { throwIfNoEntry: false })?.isDirectory()) process.exit(1);\n"
+      + "appendFileSync(process.env.STUB_LOG, `nested:${ref}\\n`);\n"
+      + "process.exitCode = (process.env.STUB_NESTED_FAIL ?? '0') === '0' ? 0 : 1;\n");
     const log = join(root, 'calls.log');
     writeFileSync(log, '');
     const result = spawnSync('bash', ['-c', `${stubCommands}\n${guideStep(name)}`], {

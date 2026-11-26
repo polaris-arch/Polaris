@@ -1029,7 +1029,7 @@ jobs:
           TAURI_CLI_VERBOSITY: ${{ runner.os == 'macOS' && '1' || '' }}
           POLARIS_TAURI_LOG: ${{ runner.temp }}/polaris-tauri-${{ matrix.label }}.log
         with:
-          tauriScript: ${{ runner.os == 'Linux' && 'bash scripts/bundler-diagnostics.sh --verbose' || runner.os == 'macOS' && 'bash scripts/bundler-diagnostics.sh' || 'tauri' }}
+          tauriScript: ${{ runner.os == 'Linux' && 'node scripts/bundler-diagnostics.mjs --verbose' || runner.os == 'macOS' && 'node scripts/bundler-diagnostics.mjs' || 'tauri' }}
           args: ${{ matrix.tauri_args }}
           retryAttempts: 0
 
@@ -1335,7 +1335,7 @@ jobs:
             #     纯 x86_64 内核放行并留 notice）；验不过即失败，不在打包时补签；
             #   · helper 在 App 编译前签名并冻结哈希；包内必须与这一份原字节相同。
             echo "Checking nested code before bundle seal: $(basename "$dmg")"
-            bash scripts/macos-nested-code.sh "${apps[0]}" "$core_ref"
+            node scripts/macos-nested-code.mjs "${apps[0]}" "$core_ref"
             codesign --force --deep --sign - --timestamp=none "${apps[0]}"
             codesign --verify --deep --strict --verbose=2 "${apps[0]}"
             detach_retry "$mnt"
@@ -1409,7 +1409,7 @@ jobs:
             # 同一步还断言镜像里的内核与源内核逐字节相同：上一步的 bundle 封印与 dmg 往返转换都排在
             # 封印前那次判定之后，只有这里看得到它们有没有改写内核。
             echo "Checking nested code in final DMG: $(basename "$dmg")"
-            if ! bash scripts/macos-nested-code.sh "${apps[0]}" "$core_ref"; then
+            if ! node scripts/macos-nested-code.mjs "${apps[0]}" "$core_ref"; then
               echo "::error::$(basename "$dmg") 内 Contents/Resources 下的内核/helper 未通过逐个判定"
               exit 1
             fi

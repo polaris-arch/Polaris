@@ -1228,10 +1228,10 @@ const SHARED_PACKAGE_PATHS = new Set([
   'scripts/fetch-protoc.mjs',
   'scripts/verify-packaging.mjs',
   // Linux 与 macOS 打包腿共用的 Tauri 原始输出取证。
-  'scripts/bundler-diagnostics.sh',
+  'scripts/bundler-diagnostics.mjs',
   'scripts/macos-bundler-diagnostics.test.mjs',
   // macOS 在封印前和最终 DMG 开箱时分别校验内核与 helper 的签名。
-  'scripts/macos-nested-code.sh',
+  'scripts/macos-nested-code.mjs',
   'scripts/macos-nested-code.test.mjs',
   'scripts/nsis-core-sweep.test.mjs',
   'scripts/nsis-helper-cleanup.test.mjs',
