@@ -29,6 +29,7 @@ use polaris_config_engine::user_config::app_config::UserConfig;
 use polaris_config_engine::user_config::dns_constants::BLOCK_SERVER_ID;
 use polaris_config_engine::user_config::server_config::ServerConfig;
 use polaris_config_engine::user_config::ProxyMode;
+use polaris_mesh::warp::WarpWireGuardDraft;
 use polaris_mesh::warp_http::RegisterOptions;
 
 use crate::commands::config::{
@@ -1434,7 +1435,7 @@ fn decode_tailcat_key(s: &str) -> Option<[u8; 32]> {
 pub async fn warp_register(
     state: State<'_, AppRuntime>,
     license_key: Option<String>,
-) -> Result<ApiResponse<Value>, ()> {
+) -> Result<ApiResponse<WarpWireGuardDraft>, ()> {
     let seed = match crate::runtime::mesh::generate_warp_seed() {
         Ok(s) => s,
         Err(e) => {
@@ -1444,18 +1445,17 @@ pub async fn warp_register(
     };
     let svc = crate::runtime::mesh::warp_service(state.http().clone(), seed);
     match svc.register(RegisterOptions { license_key }).await {
-        Ok(draft) => match serde_json::to_value(&draft) {
-            Ok(v) => Ok(ApiResponse::ok(v)),
-            Err(e) => Ok(ApiResponse::err_with_code(
-                {
-                    log::error!("WARP 注册成功但草稿序列化失败");
-                    format!("WARP 草稿序列化失败: {e}")
-                },
-                "WARP_DRAFT_SERIALIZE",
-            )),
-        },
-        Err(e) => {
+        Ok(draft) => Ok(ApiResponse::ok(draft)),
+        Err((e, device)) => {
             log::error!("WARP 注册命令失败");
+            if let Some(device) = device {
+                if let Err(error) = state
+                    .mesh()
+                    .try_enqueue_warp_deregister(&device.device_id, &device.token)
+                {
+                    log::warn!("{error}");
+                }
+            }
             Ok(ApiResponse::err_with_code(e, "WARP_REGISTER_FAILED"))
         }
     }

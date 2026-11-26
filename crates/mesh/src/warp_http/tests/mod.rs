@@ -185,8 +185,37 @@ async fn register_non2xx_errors() {
         outcome: MockOutcome::JsonErr("WARP API 403: error 1020".to_string()),
     });
     let svc = WarpService::new(http, FixedKeypair, NoopWarpLog);
-    let err = svc.register(RegisterOptions::default()).await.unwrap_err();
+    let (err, device) = svc.register(RegisterOptions::default()).await.unwrap_err();
     assert!(err.contains("403"));
+    assert!(device.is_none());
+}
+
+#[tokio::test]
+async fn register_2xx_missing_config_returns_device_for_rollback() {
+    let http = MockHttp::default();
+    http.push_json_ok(
+        "/reg",
+        WarpHttpMethod::Post,
+        r#"{"id":"devid","token":"secret-token"}"#,
+    );
+    let svc = WarpService::new(http, FixedKeypair, NoopWarpLog);
+    let (_, device) = svc.register(RegisterOptions::default()).await.unwrap_err();
+    assert_eq!(
+        device,
+        Some(warp::WarpDeviceCreds {
+            device_id: "devid".to_string(),
+            token: "secret-token".to_string(),
+        })
+    );
+}
+
+#[tokio::test]
+async fn register_2xx_non_json_returns_no_device() {
+    let http = MockHttp::default();
+    http.push_json_ok("/reg", WarpHttpMethod::Post, "<html>portal</html>");
+    let svc = WarpService::new(http, FixedKeypair, NoopWarpLog);
+    let (_, device) = svc.register(RegisterOptions::default()).await.unwrap_err();
+    assert!(device.is_none());
 }
 
 #[tokio::test]
@@ -203,7 +232,7 @@ async fn lifecycle_logs_keep_stage_but_never_copy_http_credentials_or_body() {
     let captured = CaptureLog::default();
     let svc = WarpService::new(http, FixedKeypair, captured.clone());
 
-    let err = svc.register(RegisterOptions::default()).await.unwrap_err();
+    let (err, _) = svc.register(RegisterOptions::default()).await.unwrap_err();
     assert!(err.contains("SUPER_TOKEN"), "调用方仍应拿到原始业务错误");
     let logs = captured.joined();
     assert!(logs.contains("WARP 注册中"));

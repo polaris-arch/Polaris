@@ -169,7 +169,11 @@ where
 
     /// 注册一台匿名 WARP 设备并产出 WG 草稿。licenseKey 非空则注册后应用 WARP+ license（失败不阻断，降级免费）。
     /// token 仅本流程内存使用，随 warpDevice 落节点。上游 `WarpService.register`。
-    pub async fn register(&self, opts: RegisterOptions) -> Result<WarpWireGuardDraft, String> {
+    /// 2xx 响应不完整但已带 deviceId+token 时，错误携带该凭据，调用方据此注销远端已建设备。
+    pub async fn register(
+        &self,
+        opts: RegisterOptions,
+    ) -> Result<WarpWireGuardDraft, (String, Option<warp::WarpDeviceCreds>)> {
         let (private_key, public_key) = self.keypair.generate_keypair();
         let base = format!("{}/{}", WARP_API_BASE, self.api_version);
         let headers = default_headers();
@@ -178,7 +182,7 @@ where
             Ok(body) => body,
             Err(e) => {
                 self.log.log("error", "WARP 注册请求体构建失败");
-                return Err(format!("WARP body 序列化失败: {e}"));
+                return Err((format!("WARP body 序列化失败: {e}"), None));
             }
         };
         self.log.log(
@@ -199,21 +203,14 @@ where
                     "error",
                     &format!("WARP 注册请求失败（version={}）", self.api_version),
                 );
-                return Err(e);
+                return Err((e, None));
             }
         };
         let reg_json: Value = match serde_json::from_str(&reg_text) {
             Ok(value) => value,
             Err(_) => {
                 self.log.log("error", "WARP 注册响应不是有效 JSON");
-                return Err("WARP API 返回非 JSON".to_string());
-            }
-        };
-        let mut result = match parse_register_response(&reg_json) {
-            Ok(result) => result,
-            Err(e) => {
-                self.log.log("error", "WARP 注册响应缺少必要隧道字段");
-                return Err(e);
+                return Err(("WARP API 返回非 JSON".to_string(), None));
             }
         };
         let token = reg_json
@@ -221,6 +218,20 @@ where
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
             .unwrap_or_default();
+        let mut result = match parse_register_response(&reg_json) {
+            Ok(result) => result,
+            Err(e) => {
+                self.log.log("error", "WARP 注册响应缺少必要隧道字段");
+                // 有 id 说明远端设备已建成；无 id（如门户页）则无可回滚。
+                let device_id = reg_json.get("id").and_then(Value::as_str).unwrap_or("");
+                let device =
+                    (!device_id.is_empty() && !token.is_empty()).then(|| warp::WarpDeviceCreds {
+                        device_id: device_id.to_string(),
+                        token,
+                    });
+                return Err((e, device));
+            }
+        };
 
         let license_key = opts
             .license_key
