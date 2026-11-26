@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn durable_managed_write_distinguishes_pre_and_post_replace_failure() {
+fn durable_managed_write_rejects_pre_replace_failure() {
     let dir = std::env::temp_dir().join(format!("polaris-managed-durable-{}", random_tmp_suffix()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("config.json");
@@ -26,17 +26,6 @@ fn durable_managed_write_distinguishes_pre_and_post_replace_failure() {
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "old");
     assert!(!tmp_path(&path, "abcdef012345").exists());
 
-    let after = durable_atomic_write_with_hook(&path, "new", "abcdef012345", |stage| {
-        if stage == DurableWriteStage::AfterReplace {
-            Err(crate::StoreError::Io(
-                "injected directory sync failure".into(),
-            ))
-        } else {
-            Ok(())
-        }
-    });
-    assert!(matches!(after, Err(crate::StoreError::CommitUncertain(_))));
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
     let guarantee = durable_atomic_write(&path, "newer", "abcdef012345").unwrap();
     #[cfg(unix)]
     assert_eq!(guarantee, DurableWriteGuarantee::FileAndDirectory);
@@ -44,6 +33,15 @@ fn durable_managed_write_distinguishes_pre_and_post_replace_failure() {
     assert_eq!(guarantee, DurableWriteGuarantee::FileOnly);
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "newer");
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn directory_sync_failure_is_saved_file_only() {
+    let missing = std::env::temp_dir().join(format!("polaris-missing-dir-{}", random_tmp_suffix()));
+    assert_eq!(
+        sync_parent_after_publish(&missing).unwrap(),
+        DurableWriteGuarantee::FileOnly
+    );
 }
 
 #[test]

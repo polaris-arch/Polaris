@@ -232,36 +232,13 @@ impl ConfigManager {
             return Err(StoreError::Io("injected config persistence failure".into()));
         }
         let content = serde_json::to_string_pretty(&incoming).map_err(StoreError::from)?;
-        let result = durable_atomic_write(&self.path, &content, &random_tmp_suffix());
-        #[cfg(test)]
-        let result = match result {
-            Ok(_)
-                if self
-                    .test_uncertain_after_mesh_publish_once
-                    .swap(false, Ordering::SeqCst) =>
-            {
-                Err(StoreError::CommitUncertain(
-                    "injected after identity repair publish".into(),
-                ))
-            }
-            other => other,
-        };
-        match result {
-            Ok(_) => {
-                self.saved_revision.fetch_add(1, Ordering::SeqCst);
-                // Readers see the usual normalized view, while the repair preserves
-                // the disk's unrelated legacy fields byte-for-value. The next ordinary
-                // config transaction retains its existing migration semantics.
-                self.publish_config_cache(Some(canonical));
-                Ok(incoming)
-            }
-            Err(error @ StoreError::CommitUncertain(_)) => {
-                self.saved_revision.fetch_add(1, Ordering::SeqCst);
-                self.clear_cached_config();
-                Err(error)
-            }
-            Err(error) => Err(error),
-        }
+        durable_atomic_write(&self.path, &content, &random_tmp_suffix())?;
+        self.saved_revision.fetch_add(1, Ordering::SeqCst);
+        // Readers see the usual normalized view, while the repair preserves
+        // the disk's unrelated legacy fields byte-for-value. The next ordinary
+        // config transaction retains its existing migration semantics.
+        self.publish_config_cache(canonical);
+        Ok(incoming)
     }
 }
 

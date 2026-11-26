@@ -1171,7 +1171,6 @@ async fn perform_subscription_update_inner(
     };
     let commit_started = std::time::Instant::now();
     let (revision, receipt) = match commit_subscription_refresh(
-        app,
         state,
         &token,
         &edit,
@@ -1229,7 +1228,6 @@ async fn perform_subscription_update_inner(
 }
 
 async fn commit_subscription_refresh(
-    app: &AppHandle,
     state: &AppRuntime,
     token: &SubscriptionRefreshToken,
     edit: &PreparedConfigEdit,
@@ -1238,13 +1236,7 @@ async fn commit_subscription_refresh(
     if !token.is_current() {
         return Ok(None);
     }
-    let store_error = |error: polaris_store::StoreError| {
-        if matches!(error, polaris_store::StoreError::CommitUncertain(_)) {
-            state.proxy().push_pending_changes();
-            super::config::emit_config_changed_signal(app);
-        }
-        update_failure(error.to_string())
-    };
+    let store_error = |error: polaris_store::StoreError| update_failure(error.to_string());
     if !content_changed {
         return Ok(state
             .config()

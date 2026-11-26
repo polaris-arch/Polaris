@@ -556,10 +556,6 @@ pub struct ConfigManager {
     /// available so update/CAS tests can reach the write leg without changing D.
     #[cfg(test)]
     test_fail_before_config_persist_once: AtomicBool,
-    /// Test-only post-publication failure: the file is already replaced, but
-    /// the caller receives CommitUncertain and must withhold action rights.
-    #[cfg(test)]
-    test_uncertain_after_mesh_publish_once: AtomicBool,
 }
 
 impl ConfigManager {
@@ -612,8 +608,6 @@ impl ConfigManager {
             }),
             #[cfg(test)]
             test_fail_before_config_persist_once: AtomicBool::new(false),
-            #[cfg(test)]
-            test_uncertain_after_mesh_publish_once: AtomicBool::new(false),
         }
     }
 
@@ -868,7 +862,7 @@ impl ConfigManager {
             }
         }
         // 刷缓存（持有写锁）。
-        self.publish_config_cache(Some(config.clone()));
+        self.publish_config_cache(config.clone());
         Ok(config)
     }
 
@@ -894,13 +888,9 @@ impl ConfigManager {
         Ok(Some(marker))
     }
 
-    fn clear_cached_config(&self) {
-        self.publish_config_cache(None);
-    }
-
-    fn publish_config_cache(&self, value: Option<Value>) {
+    fn publish_config_cache(&self, value: Value) {
         if let Ok(mut guard) = self.cache.write() {
-            *guard = value.map(|value| PublishedConfig {
+            *guard = Some(PublishedConfig {
                 value: Arc::new(value),
                 revision: self.saved_revision(),
             });
@@ -1342,13 +1332,11 @@ impl ConfigManager {
                 }
             }
         }
-        self.publish_config_cache(Some(canonical.clone()));
+        self.publish_config_cache(canonical.clone());
         Ok(canonical)
     }
 
     /// The managed branch has stronger durability than legacy atomic saves.
-    /// An uncertain directory sync invalidates the old cache even though this
-    /// method returns Err and callers must not continue Apply side effects.
     fn persist_canonical_under_write_lock(&self, canonical: &Value) -> Result<(), StoreError> {
         #[cfg(test)]
         if self
@@ -1363,36 +1351,9 @@ impl ConfigManager {
             return Ok(());
         }
         let content = serde_json::to_string_pretty(canonical).map_err(StoreError::from)?;
-        let result = durable_atomic_write(&self.path, &content, &random_tmp_suffix());
-        #[cfg(test)]
-        let result = match result {
-            Ok(_)
-                if self
-                    .test_uncertain_after_mesh_publish_once
-                    .swap(false, Ordering::SeqCst) =>
-            {
-                Err(StoreError::CommitUncertain(
-                    "injected after managed publish".into(),
-                ))
-            }
-            other => other,
-        };
-        match result {
-            Ok(_) => {
-                self.saved_revision.fetch_add(1, Ordering::SeqCst);
-                Ok(())
-            }
-            Err(error @ StoreError::CommitUncertain(_)) => {
-                self.saved_revision.fetch_add(1, Ordering::SeqCst);
-                let actual = self
-                    .raw_disk_for_mesh_under_write_lock()
-                    .ok()
-                    .filter(|raw| matches!(mesh_guard::validate_raw(raw), Ok(true)));
-                self.publish_config_cache(actual);
-                Err(error)
-            }
-            Err(error) => Err(error),
-        }
+        durable_atomic_write(&self.path, &content, &random_tmp_suffix())?;
+        self.saved_revision.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
 
     fn deferred_deletions_path(&self) -> PathBuf {
@@ -1423,16 +1384,7 @@ impl ConfigManager {
         let path = self.deferred_deletions_path();
         if journal.entries.is_empty() {
             match std::fs::symlink_metadata(&path) {
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    // Retry a prior unlink whose parent fsync was uncertain.
-                    #[cfg(unix)]
-                    if let Some(parent) = path.parent() {
-                        std::fs::File::open(parent)
-                            .and_then(|directory| directory.sync_all())
-                            .map_err(|error| StoreError::CommitUncertain(error.to_string()))?;
-                    }
-                    return Ok(());
-                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
                 Err(error) => return Err(StoreError::Io(error.to_string())),
                 Ok(_) => return durable_remove(&path).map(|_| ()),
             }

@@ -3549,6 +3549,7 @@ dependencies = [
 name = "polaris-store"
 version = "1.0.0"
 dependencies = [
+ "log",
  "polaris-config-engine",
  "polaris-source-probe",
  "scrypt",

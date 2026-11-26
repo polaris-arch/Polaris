@@ -75,12 +75,9 @@ pub enum DurableWriteGuarantee {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DurableWriteStage {
     BeforeReplace,
-    AfterReplace,
 }
 
 /// Publish a managed document only after syncing its private temporary file.
-/// A failure after rename is deliberately different from a pre-rename error:
-/// callers must re-read the on-disk document under their transaction lock.
 pub fn durable_atomic_write(
     path: &Path,
     content: &str,
@@ -130,13 +127,10 @@ fn durable_atomic_write_with_hook(
         }
         return Err(error);
     }
-    hook(DurableWriteStage::AfterReplace)
-        .map_err(|error| crate::StoreError::CommitUncertain(error.to_string()))?;
     sync_parent_after_publish(parent)
 }
 
-/// Deleting an opt-in marker also changes authority. If unlink succeeds but
-/// syncing the directory fails, the caller cannot claim cancellation finished.
+/// Deleting an opt-in marker also changes authority.
 pub fn durable_remove(path: &Path) -> Result<DurableWriteGuarantee, crate::StoreError> {
     let parent = path
         .parent()
@@ -146,14 +140,16 @@ pub fn durable_remove(path: &Path) -> Result<DurableWriteGuarantee, crate::Store
 }
 
 /// Sync the containing directory after a namespace change where supported.
+/// The change is already published, so a failed directory sync still saved it.
 pub fn sync_parent_after_publish(
     parent: &Path,
 ) -> Result<DurableWriteGuarantee, crate::StoreError> {
     #[cfg(unix)]
     {
-        std::fs::File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|e| crate::StoreError::CommitUncertain(e.to_string()))?;
+        if let Err(error) = std::fs::File::open(parent).and_then(|directory| directory.sync_all()) {
+            log::warn!("directory sync failed for {}: {error}", parent.display());
+            return Ok(DurableWriteGuarantee::FileOnly);
+        }
         Ok(DurableWriteGuarantee::FileAndDirectory)
     }
     #[cfg(not(unix))]

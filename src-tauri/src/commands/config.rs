@@ -590,13 +590,6 @@ async fn config_save_hot_only(
                 saved_offline: saved_offline && config.saved_revision() == revision,
             })
         }
-        Err(error @ polaris_store::StoreError::CommitUncertain(_)) => {
-            // A post-rename storage failure may already have changed D. Publish
-            // the actual cache/pending state without authorizing an Apply.
-            state.proxy().push_pending_changes();
-            emit_config_changed_signal(app);
-            config_store_error(error)
-        }
         Err(error) => config_store_error(error),
     }
 }
@@ -961,13 +954,6 @@ pub(crate) async fn apply_takeover_edit(
     let proxy = &state.proxy;
     let owner = StagedSaveOwner::capture(proxy, edit.revision);
     let changed = edit.previous != edit.candidate;
-    let store_error = |error| {
-        if matches!(error, polaris_store::StoreError::CommitUncertain(_)) {
-            proxy.push_pending_changes();
-            emit_config_changed_signal(app);
-        }
-        config_store_error(error)
-    };
     let pending_apply = match Box::pin(proxy.apply_hot_config_edit(&edit)).await {
         Ok(HotConfigEditOutcome::Saved {
             runtime_apply,
@@ -988,7 +974,7 @@ pub(crate) async fn apply_takeover_edit(
             match proxy.commit_manual_resource_edit(&edit, owner).await {
                 Ok(Some(_)) => true,
                 Ok(None) => return takeover_conflict(),
-                Err(error) => return store_error(error),
+                Err(error) => return config_store_error(error),
             }
         }
         Ok(HotConfigEditOutcome::BlockedByPending) => {
@@ -1004,7 +990,7 @@ pub(crate) async fn apply_takeover_edit(
         Ok(HotConfigEditOutcome::Rejected) => {
             return ApiResponse::err("内核拒绝了接管方式配置");
         }
-        Err(error) => return store_error(error),
+        Err(error) => return config_store_error(error),
     };
     if changed {
         emit_config_changed_signal(app);

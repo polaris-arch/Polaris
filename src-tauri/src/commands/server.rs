@@ -210,19 +210,7 @@ async fn save_tailscale_login_profile(
                 "readyUnknown",
             );
         }
-        Err(error) => {
-            if matches!(error, polaris_store::StoreError::CommitUncertain(_)) {
-                proxy.push_pending_changes();
-                emit_config_changed_signal(app);
-                if config
-                    .with_current(|saved| saved == &edit.candidate)
-                    .unwrap_or(false)
-                {
-                    return ApiResponse::ok(Some(RuntimePending));
-                }
-            }
-            return ApiResponse::err(error.to_string());
-        }
+        Err(error) => return ApiResponse::err(error.to_string()),
     };
     proxy.push_pending_changes();
     emit_config_changed_signal(app);
@@ -247,13 +235,7 @@ async fn apply_prepared_server_edit<R>(
     let proxy = state.proxy();
     let owner = StagedSaveOwner::capture(proxy, edit.revision);
     let conflict = || "节点配置已变化，请重试".to_owned();
-    let store_error = |error: polaris_store::StoreError| {
-        if matches!(error, polaris_store::StoreError::CommitUncertain(_)) {
-            proxy.push_pending_changes();
-            emit_config_changed_signal(app);
-        }
-        error.to_string()
-    };
+    let store_error = |error: polaris_store::StoreError| error.to_string();
     match Box::pin(state.proxy.apply_hot_config_edit(&edit))
         .await
         .map_err(&store_error)?

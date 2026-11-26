@@ -190,7 +190,7 @@ fn repair_preserves_legacy_raw_defaults_and_unrelated_tailscale_fields() {
 }
 
 #[test]
-fn persistence_failure_and_uncertain_commit_never_retry() {
+fn persistence_failure_never_writes() {
     let (directory, manager, raw) = fixture();
     let choice = request(&manager, 0);
     manager
@@ -202,19 +202,6 @@ fn persistence_failure_and_uncertain_commit_never_retry() {
     let disk: Value =
         serde_json::from_slice(&std::fs::read(directory.join("config.json")).unwrap()).unwrap();
     assert_eq!(disk, raw);
-    manager
-        .test_uncertain_after_mesh_publish_once
-        .store(true, Ordering::SeqCst);
-    assert!(matches!(
-        manager.repair_server_identities(&choice, || "new".into()),
-        Err(StoreError::CommitUncertain(_))
-    ));
-    assert!(manager.cache.read().unwrap().is_none());
-    assert!(manager
-        .repair_server_identities(&choice, || "another".into())
-        .unwrap_err()
-        .to_string()
-        .contains("serverIdentityRevisionChanged"));
 }
 
 #[test]

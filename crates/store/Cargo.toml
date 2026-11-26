@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+log = "0.4"
 polaris-config-engine = { path = "../config-engine" }
 # scrypt = 隐私锁密码哈希的 memory-hard KDF（对齐 上游 main/utils/privacy-lock.ts 的 Node 内建 scrypt）。
 # 手搓 KDF 是安全反模式 → 走成熟 crate（RustCrypto）。default-features=false 只取核心 scrypt() 派生函数，

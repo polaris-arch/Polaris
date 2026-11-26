@@ -1819,13 +1819,7 @@ fn persist_builtin_geo_updated(
     }
     let owner = StagedSaveOwner::capture(state.proxy(), 0);
     let saved = save_resource_change(state.config(), tag, updated_at, paths, operation, owner)
-        .map_err(|error| {
-            if matches!(error, StoreError::CommitUncertain(_)) {
-                state.proxy().push_pending_changes();
-                emit_config_changed_signal(app);
-            }
-            format!("保存规则资源配置失败: {error}")
-        })?;
+        .map_err(|error| format!("保存规则资源配置失败: {error}"))?;
     broadcast.record(app, saved);
     Ok(())
 }
@@ -1858,11 +1852,6 @@ fn save_resource_change(
             Decision::Write(Ok((previous, change)))
         },
         |result, error| {
-            // The managed config rename already happened on CommitUncertain.
-            // Keep its resource and withhold Apply until saved state is read back.
-            if matches!(error, StoreError::CommitUncertain(_)) {
-                return error;
-            }
             let Ok((_, change)) = result else {
                 return error;
             };
@@ -2667,13 +2656,7 @@ async fn commit_registered_batch(
     affects_runtime: bool,
 ) -> Result<(), String> {
     let conflict = || "规则资源配置已变化，请重试".to_owned();
-    let store_error = |error: polaris_store::StoreError| {
-        if matches!(error, polaris_store::StoreError::CommitUncertain(_)) {
-            state.proxy().push_pending_changes();
-            emit_config_changed_signal(app);
-        }
-        error.to_string()
-    };
+    let store_error = |error: polaris_store::StoreError| error.to_string();
     if affects_runtime {
         let owner = StagedSaveOwner::capture(state.proxy(), edit.revision);
         match Box::pin(state.proxy.apply_hot_config_edit(edit))
