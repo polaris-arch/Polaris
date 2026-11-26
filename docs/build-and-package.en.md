@@ -261,7 +261,7 @@ The main workflows divide the work (`.github/workflows/`):
 
 - **`ci.yml`** — the Rust gate; its job is "is the change correct". Three parallel jobs:
   - `fmt + clippy (<os>)`: formatting and clippy (`-D warnings`); the Linux leg also runs rustdoc and resolves the Cronet sources.
-  - `cross-target clippy + android face` (Linux only): clippy for the four cross targets (Windows / macOS / Android / iOS), plus checks of the Android impact registry and the cross-target exemption table. Packages with C dependencies are exempt on some targets (see `scripts/cross-target-exempt.json`), so this job does not replace the native legs.
+  - `cross-target clippy + android face` (Linux only): clippy for the four cross targets (Windows / macOS / Android / iOS), plus `cargo check -p polaris` for the Android target. Packages with C dependencies are exempt on some targets (see `scripts/cross-target-exempt.json`), so this job does not replace the native legs.
   - `build + test (<os>)`: `cargo build` and `cargo test`.
 
   Triggers and platforms:
@@ -272,7 +272,8 @@ The main workflows divide the work (`.github/workflows/`):
   Setting `fmt + clippy (<os>)` and `build + test (<os>)` for the three platforms, plus `cross-target clippy + android face`, as required checks is recommended.
 - **`ui.yml`** — frontend gate: `pnpm run build` (tsc + vite build), vitest, and Playwright; triggered on PRs and pushes to main.
 - **`release-risk.yml`** — release-risk gate: triggered on PRs, the merge queue, and pushes to main; it classifies the changed paths inside a job and calls `package.yml`, `android.yml`, and `apple.yml` only for the affected faces. Ordinary desktop and Android risk legs use light builds: installers/APKs are not uploaded or distributable.
-- **`package.yml`** — release engineering: four legs (Linux / Windows / macOS arm64 / macOS x64) running fetch + `tauri build` + artifact verification. Triggered by tags (`v*`), manually, or by a call from `release-risk.yml`. The release profile produces distributable installers; the light risk profile validates only the packaging chain. On a tag release it creates the draft release, uploads the desktop assets, then calls `android.yml` to upload the signed APK, and publishes after reconciling the full asset set.
+  A manual run does not call `package.yml`: before a branch candidate is frozen, CI (push), Package (manual), and Release Risk (manual) must all be green on the same SHA. A newer manual run on the same branch cancels an older one in all three workflows; pass `preserve_run` to keep a run.
+- **`package.yml`** — release engineering: four legs (Linux / Windows / macOS arm64 / macOS x64) running fetch + `tauri build` + artifact verification. Triggered by tags (`v*`), manually, or by a call from `release-risk.yml`; its built-in `ci` gate runs only on tags and main. The release profile produces distributable installers; the light risk profile validates only the packaging chain. On a tag release it creates the draft release, uploads the desktop assets, then calls `android.yml` to upload the signed APK, and publishes after reconciling the full asset set.
 - **`android.yml`** — call-only or manual: builds a release-profile APK and runs artifact-level checks; release calls produce three formally signed APKs.
 - **`apple.yml`** — selected by the risk gate or manually dispatched: by default verifies unsigned device-ARM64 App / PacketTunnel compilation and linkage; simulator App compilation is explicit opt-in. It does not publish an IPA or establish device installation, NE authorization or VPN runtime acceptance. See the [mobile core guide](../scripts/mobile-core/README.md) for component and evidence constraints.
 

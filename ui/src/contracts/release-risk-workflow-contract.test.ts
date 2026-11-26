@@ -151,7 +151,7 @@ esac
   });
 
   it('并发组：同一 PR / 分支上新提交取消旧运行，merge queue 不取消，且被取消的腿里没有写 release 的任务', () => {
-    // 自动 tip 可替代；手动、固定审计与 merge queue 独立、tag 不取消。求实际表达式语义。
+    // 自动与手动 tip 可替代；固定审计与 merge queue 独立、tag 不取消。求实际表达式语义。
     const match = risk.match(
       /^concurrency:\n  group: (.+)\n  cancel-in-progress: \$\{\{ (.+) \}\}\n/m,
     );
@@ -172,7 +172,7 @@ esac
         String(runInNewContext(expression, context(eventName, ref, preserve, runId))));
     expect(cancels('pull_request', 'refs/pull/7/merge')).toBe(true);
     expect(cancels('push', 'refs/heads/main')).toBe(true);
-    expect(cancels('workflow_dispatch', 'refs/heads/ci/shorten-pipelines')).toBe(false);
+    expect(cancels('workflow_dispatch', 'refs/heads/ci/shorten-pipelines')).toBe(true);
     // 队列里的每一组都必须跑完才能出结论。
     expect(cancels('merge_group', 'refs/heads/gh-readonly-queue/main/pr-7')).toBe(false);
     expect(cancels('workflow_dispatch', 'refs/heads/collab/audit', true)).toBe(false);
@@ -181,9 +181,9 @@ esac
     expect(group('push', 'refs/heads/main')).toBe(group('push', 'refs/heads/main', false, 2));
     expect(group('workflow_dispatch', 'refs/heads/collab/audit', true)).not.toBe(
       group('workflow_dispatch', 'refs/heads/collab/audit', true, 2));
-    expect(group('workflow_dispatch', 'refs/heads/collab/audit')).not.toBe(
+    expect(group('workflow_dispatch', 'refs/heads/collab/audit')).toBe(
       group('workflow_dispatch', 'refs/heads/collab/audit', false, 2));
-    expect(group('workflow_dispatch', 'refs/heads/collab/audit', true)).toBe(
+    expect(group('workflow_dispatch', 'refs/heads/collab/audit', true)).not.toBe(
       group('workflow_dispatch', 'refs/heads/collab/audit'));
     expect(group('merge_group', 'refs/heads/queue')).not.toBe(group('merge_group', 'refs/heads/queue', false, 2));
     expect(group('push', 'refs/tags/v1.0.0')).not.toBe(group('push', 'refs/tags/v2.0.0'));
@@ -355,15 +355,15 @@ esac
     expect(risk).toMatch(/\npermissions:\n  contents: read/);
   });
 
-  it('Package 的 tag 与直接手动入口保留强制门，Release Risk 复用尊重 false 输入', () => {
+  it('Package 的 tag 与直接手动入口保留上传，Release Risk 复用尊重 false 输入', () => {
     const packageJob = jobSection(pkg, 'package', 'package.yml');
-    for (const key of ['POLARIS_RUN_KERNEL_GATES', 'POLARIS_UPLOAD_ARTIFACTS']) {
+    for (const key of ['POLARIS_UPLOAD_ARTIFACTS']) {
       const match = packageJob.match(new RegExp(`^      ${key}: \\$\\{\\{ (.+) \\}\\}$`, 'm'));
       expect(match, `package job 缺 ${key} 表达式`).not.toBeNull();
       const evaluate = (ref: string, eventName: string, skipQualityGates: boolean) =>
         runInNewContext(match![1], {
           github: { ref, event_name: eventName },
-          inputs: { skip_quality_gates: skipQualityGates, run_kernel_gates: false, upload_artifacts: false },
+          inputs: { skip_quality_gates: skipQualityGates, upload_artifacts: false },
           startsWith: (value: string, prefix: string) => value.startsWith(prefix),
         });
       expect(evaluate('refs/tags/v1.0.0', 'push', false)).toBe('1');

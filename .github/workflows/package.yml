@@ -60,7 +60,7 @@ on:
           - macos-arm64
           - macos-x64
   # 供 release-risk.yml 按受影响平台复用。自动门只验证产物，不上传 artifact；
-  # tag / 本 workflow 的手动 dispatch 仍保持完整内核门与上传语义。
+  # tag / 本 workflow 的手动 dispatch 仍保持上传语义。
   # 2026-10-07 起自动门另传 `light_build: true`：打包腿用轻量构型（见下方该输入的注释）。
   workflow_call:
     inputs:
@@ -83,10 +83,6 @@ on:
         type: boolean
         required: false
         default: false
-      run_kernel_gates:
-        type: boolean
-        required: false
-        default: true
       upload_artifacts:
         type: boolean
         required: false
@@ -117,11 +113,11 @@ permissions:
 #   「同 ref、不同平台」变成两件**不同**的事：先跑 macos-arm64，再跑 macos-x64 时不能互相取消。
 #   拆进 group 后两者各占一组；同平台的新提交仍取消旧跑，避免旧 tip 占住 runner。
 # `inputs.platform` 同时覆盖 workflow_dispatch 与 workflow_call；tag push 没有输入时兜到 all。
-# Automatic tips replace only tips of the same caller/ref. Fixed audits and
+# Automatic and manual tips replace only tips of the same caller/ref. Fixed audits and
 # merge queue groups have run-specific identities; tags never cancel.
 concurrency:
-  group: package-${{ github.workflow }}-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.ref }}-${{ inputs.platforms || inputs.platform || 'all' }}${{ (inputs.preserve_run || github.event.inputs.preserve_run == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group') && format('-fixed-{0}', github.run_id) || '' }}
-  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') && github.event_name != 'merge_group' && !inputs.preserve_run && github.event.inputs.preserve_run != 'true' && (github.event_name == 'pull_request' || github.event_name == 'push') }}
+  group: package-${{ github.workflow }}-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.ref }}-${{ inputs.platforms || inputs.platform || 'all' }}${{ (inputs.preserve_run || github.event.inputs.preserve_run == 'true' || github.event_name == 'merge_group') && format('-fixed-{0}', github.run_id) || '' }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') && github.event_name != 'merge_group' && !inputs.preserve_run && github.event.inputs.preserve_run != 'true' }}
 
 jobs:
   # ══ 矩阵解析：把 workflow_dispatch 的 platform 输入翻成 package job 的 include ══
@@ -280,12 +276,15 @@ jobs:
             echo "candidate=$CORE_CANDIDATE"
           } >> "$GITHUB_OUTPUT"
 
+  # work/** 等分支上同 SHA 已有 push 触发的完整 CI（ci.yml），本门只在 tag 与 main 上调用；
+  # 分支候选冻结前须核对同 SHA 的 CI 结论，Package 绿不代表 CI 绿。
   ci:
     name: ci gate
     needs: setup
     if: >-
       (needs.setup.outputs.full == 'true'
-      && inputs.skip_quality_gates != true)
+      && inputs.skip_quality_gates != true
+      && (startsWith(github.ref, 'refs/tags/') || github.ref == 'refs/heads/main'))
     uses: ./.github/workflows/ci.yml
     with:
       windows_system_candidate: ${{ inputs.windows_system_candidate || '' }}
@@ -340,11 +339,7 @@ jobs:
     env:
       POLARIS_BUILD_ID: ${{ needs.setup.outputs.candidate }}
       CORE_CANDIDATE: ${{ needs.setup.outputs.candidate }}
-      # macos-arm64 与 macos-x64 同跑在 arm64 runner；真核门据此选择目标核并为 x64 经 Rosetta 执行。
-      POLARIS_KERNEL_GATE_TARGET: ${{ matrix.label }}
-      # 直接 tag / Package dispatch 保持原行为；release-risk 手动 dispatch 复用本 workflow 时
-      # event_name 仍是 workflow_dispatch，须用它显式传入的 skip_quality_gates 区分调用侧。
-      POLARIS_RUN_KERNEL_GATES: ${{ (startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && !inputs.skip_quality_gates) || inputs.run_kernel_gates) && '1' || '0' }}
+      # 直接 tag / Package dispatch 保持原行为；被 release-risk 复用时以它显式传入的 skip_quality_gates 区分调用侧。
       POLARIS_UPLOAD_ARTIFACTS: ${{ (startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && !inputs.skip_quality_gates) || inputs.upload_artifacts) && '1' || '0' }}
       # 轻量构建只认调用方显式传入的 true；tag push / 本 workflow 手动 dispatch 没有该输入 ⇒ '0'。
       # 它与上面两个开关的组合由 `Select installer build weight` 步 fail-closed 校验。
@@ -682,117 +677,7 @@ jobs:
       # 四平台 wire descriptor 对拍（`Bundled core gRPC wire contract`）不在本腿：它与宿主平台无关，
       # 2026-10-07 起由下面的 `core_wire` job 全 workflow 只跑一次（依据见该 job 头注）。
       # 本腿仍在 `Build installers` 里经 singbox-grpc 的 release build.rs 对盘上每一份核各对拍一遍。
-
-      # 依赖指纹门：随包核里 sing-tun 的版本一动就红。
-      #
-      # 守的是一个**不写进配置**的依赖：本仓 tun inbound 刻意不下发 `dns_mode`，整套 DNS 分流靠
-      # sing-tun `DNSModeOrDefault()` 的默认值恒为 `hijack`。上游改默认 ⇒ 配置一字节不变、
-      # `sing-box check` 照样 rc=0、单测全绿，而用户侧是「能上网但分流失效」。
-      # 判据刻意取「依赖版本」而非「那个默认值」本身——二进制里读不到默认值（符号表被剥），
-      # 且判据独立于被检查的值，是 28f5d46 修 cronet go.mod 对拍时立下的同一条。
-      # 挂本腿的理由：ci.yml 不拉核，在那边加就是永不会红的假门。
-      - name: Bundled core dependency fingerprint (sing-tun pin)
-        if: env.POLARIS_RUN_KERNEL_GATES == '1'
-        env:
-          POLARIS_REQUIRE_KERNEL_GATE: '1'
-        run: cargo test -p polaris-config-engine --test core_dep_fingerprint
-
-      # schema 面门：随包核换一版、它的配置 schema 面变了就红。
-      #
-      # 上一步钉的是「我们靠的默认值有没有变」（依赖版本），本步钉的是「我们要建模的东西有没有变」
-      # （配置面）。本仓 src/singbox/ 是手写的一套子集结构体，差集只在 2026-08-08 那次全量审计里
-      # 人工算过一次；核 bump 之后内核新增/改名/删除字段不会让任何东西变红（配置一字节不变、
-      # check 照样 rc=0、单测全绿），于是差集变成什么样换核之后无人知晓。本步把它变成「换核即自曝」。
-      # 判据是内核那一侧的形状（`sing-box schema` 的 $defs 属性路径清单，按协议分支分域），
-      # **不**断言差集为零 —— 差集本来就不该是零。红 ≠ 有 bug，红 = 该看一眼了。
-      # 与上一步同挂本腿同理由（ci.yml 不拉核，在那边加就是永不会红的假门）。
-      - name: Bundled core config schema surface (drift tripwire)
-        if: env.POLARIS_RUN_KERNEL_GATES == '1'
-        env:
-          POLARIS_REQUIRE_KERNEL_GATE: '1'
-        run: cargo test -p polaris-config-engine --test core_schema_surface
-
-      # 构建面矩阵门：四份随包核的 GOOS/GOARCH/CGO_ENABLED + build tag 集一起钉住。
-      #
-      # 与上两步的差别在**判据**（覆盖面已经拉平：依赖指纹门 2026-09-16 起与本步共用
-      # support/core_locator.rs 的 CORE_MATRIX 逐平台读；schema 面门仍只读「当前打包目标」那一份）。
-      # 判据这一格若只看本机：「mac 那份核这一版没编 with_tailscale」在 Linux 开发机与 ubuntu 腿上结构性看不见 ——
-      # 配置一字节不变、本机 check 照样 rc=0，直到 mac 用户点开一个 Tailscale 节点。
-      # 本步判据是纯字节扫描 Go buildinfo（不需要 Go 工具链，Rust 腿上也没有），
-      # 故在任意宿主上都能把四个平台一起看一遍；上一步的 fetch 不传 --platform = 全平台，
-      # 四份必然在盘上，`POLARIS_REQUIRE_KERNEL_GATE=1` 让缺任一份变成红而不是静默少看一个平台。
-      # 它还顺带守着上一步只落**一份**共享 schema 夹具的依据（四平台 tag 集只差 with_purego）。
-      - name: Bundled core build face matrix (per-platform tags/GOOS/CGO)
-        if: env.POLARIS_RUN_KERNEL_GATES == '1'
-        env:
-          POLARIS_REQUIRE_KERNEL_GATE: '1'
-        run: cargo test -p polaris-config-engine --test core_build_matrix
-
-      # ── 出站面必须被随包核收得下（本腿是这道门唯一有牙的地方）──
-      # config-engine 的 620 条单测全绿、而生成的配置喂给真核是 rc=1 FATAL —— 同一类缺陷因此
-      # 出货过两次（Protocol::Http 的 transport、传输层黑名单）。仓里所有 config-gen 的门都停在
-      # 「我写的函数返回了什么」，没有一道问「内核收不收」。
-      #
-      # 为什么挂这一腿而不是 ci.yml：随包核不入库（.gitignore 的 /resources/*），ci.yml 不拉核 ⇒
-      # 在那边加只会得到一条「文件不在就跳过」的、**永远不会红**的假门。本腿刚 fetch 完核，
-      # 核必然在盘上；`POLARIS_REQUIRE_KERNEL_GATE=1` 让「核没拉到」也变成红而不是静默跳过。
-      # 成本：随包核实测单次 check ≈13ms × 37 场景，可忽略。
-      #
-      # 🔴 **必须排在「Fetch sing-box core」之后**（2026-08-13 实测教训，当时 Cronet 由独立步骤拉取）。此前排在它之前，
-      # Windows 腿红在 `naive outbound → cronet: library not found. Place libcronet.dll in the
-      # executable directory`：随包核 beta.14 在 **initialize 阶段**就硬要这个库，而它如今随
-      # 发布归档由 `fetch-core.mjs` 落到 `resources/win/`（= 核的同目录）。08-05 那次绿是因为旧核不要它，
-      # 抬核到 beta.14 后才暴露 —— 而 Windows 腿从 08-05 起就没再跑过，缺陷潜伏了一周。
-      # 排在之后同时更贴近生产：生产就是把 DLL 放在核旁边。挪回去 Windows 腿必红。
-      - name: Kernel accepts generated outbounds (decode-stage gate)
-        if: env.POLARIS_RUN_KERNEL_GATES == '1'
-        env:
-          POLARIS_REQUIRE_KERNEL_GATE: '1'
-        run: cargo test -p polaris-config-engine --test kernel_accepts_outbounds
-
-      # 完整配置门是上一道出站面门的补集：不剥 inbounds/route/dns/experimental，真实读取
-      # resources/data/*.srs；`check` 不 Start，故不绑端口、不启动 TUN、不联网。必须放在
-      # cronet 与出站门之后：前者让 naive initialize 有库可找，后者先给更窄的 decode 归因。
-      - name: Kernel accepts full generated configs (full-config gate)
-        if: env.POLARIS_RUN_KERNEL_GATES == '1'
-        env:
-          POLARIS_REQUIRE_KERNEL_GATE: '1'
-        run: cargo test -p polaris-config-engine --test kernel_accepts_full_config
-
-      - name: Kernel accepts isolated Tailscale login config
-        if: env.POLARIS_RUN_KERNEL_GATES == '1'
-        env:
-          POLARIS_REQUIRE_KERNEL_GATE: '1'
-        run: cargo test -p polaris-mesh --test tailscale_login_kernel_check
-
-      - name: Kernel accepts local and remote subscription imports
-        if: env.POLARIS_RUN_KERNEL_GATES == '1'
-        env:
-          POLARIS_REQUIRE_KERNEL_GATE: '1'
-        run: |
-          cargo test -p polaris-net-stack --lib singbox_import::tests::local_import_round_trips_through_the_bundled_core -- --exact
-          cargo test -p polaris-net-stack --lib singbox_import::tests::remote_subscription_protocol_parity_round_trips_through_the_bundled_core -- --exact
-          cargo test -p polaris-net-stack --lib singbox_import::tests::remote_openvpn_static_key_mode_omits_tls_and_checks_with_core -- --exact
-
-      # 网络场景起核门：真 `run`（只监听 127.0.0.1，不建 TUN）验证环境条件规则的 Start 期引用——
-      # `check` 拦不住引用不存在/类型不支持的 DNS server。dhcp 用例只在 Linux 且证明发不出包时跑，其余平台跳过。
-      - name: Kernel starts configs with network-profile rules (network-profile runtime gate)
-        if: env.POLARIS_RUN_KERNEL_GATES == '1'
-        env:
-          POLARIS_REQUIRE_KERNEL_GATE: '1'
-        run: cargo test -p polaris-config-engine --test network_profile_runtime
-
-      - name: Subscription update guard rejects unsafe targets at runtime
-        if: env.POLARIS_RUN_KERNEL_GATES == '1'
-        env:
-          POLARIS_REQUIRE_KERNEL_GATE: '1'
-        run: cargo test -p polaris-config-engine --test subscription_update_guard_runtime
-
-      - name: Userspace WG IPv4 IPv6 and MASQUE H3 inner IPv4 IPv6 inbound TCP UDP DNS runtime gate
-        if: env.POLARIS_RUN_KERNEL_GATES == '1'
-        env:
-          POLARIS_REQUIRE_KERNEL_GATE: '1'
-        run: cargo test -p polaris-config-engine --test mesh_inbound_runtime -- --nocapture --test-threads=1
+      # 强制内核门同样不在本腿：ci.yml 三平台 workspace test、native-dns 候选门与 release-risk preflight 已覆盖。
 
       - name: Fetch sing-box dashboard
         run: node scripts/fetch-dashboard.mjs

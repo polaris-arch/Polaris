@@ -170,11 +170,9 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
   });
 
   it('ci.yml 格式前置门与三个并行 job：Linux 专属检查恰在 ubuntu 腿存在时运行，且不能静默关闭', () => {
-    // 背景：2026-10-07 之前交叉 clippy / Android dep-info 对差 / 豁免反腐烂是矩阵 job 里
-    // `if: runner.os == 'Linux'` 的三步 —— 「ubuntu 腿在跑」⇔「这三步在跑」由构造保证。
-    // 独立成 `cross` job 后这个等价关系要靠 job 级 `if` 维持，而 android-impact-coverage-contract
-    // 的 D2 / D4 只查**步级** `if` / continue-on-error：job 级写一个 `if: false` 它们全绿。
-    // 本条补的就是这条新路径。
+    // 背景：2026-10-07 之前交叉 clippy 是矩阵 job 里 `if: runner.os == 'Linux'` 的步骤 ——
+    // 「ubuntu 腿在跑」⇔「这一步在跑」由构造保证。独立成 `cross` job 后这个等价关系要靠
+    // job 级 `if` 维持，本条补的就是这条新路径。
     const ci = workflow('ci.yml');
 
     // Committed formal validation reuses the same App commit; ordinary gates remain mandatory.
@@ -215,14 +213,12 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     const cross = executable(jobBlock(ci, 'cross'));
     const test = executable(jobBlock(ci, 'test'));
 
-    // ① 归属：每条门恰好住在一个 job 里（检查类与构建测试类分开；Linux 专属三步都在 cross）。
+    // ① 归属：每条门恰好住在一个 job 里（检查类与构建测试类分开；Linux 专属交叉检查在 cross）。
     const home: [string, string][] = [
       ['- name: Check workspace formatting before native compilation', 'cheap_format'],
       ['- name: Clippy (deny warnings)', 'lint'],
       ['- name: Rustdoc documentation invariants (deny four lints)', 'lint'],
       ['- name: Cross-check platform targets', 'cross'],
-      ['- name: Android impact face must be registered', 'cross'],
-      ['- name: Cross-target exemptions must still be necessary', 'cross'],
       ['- name: Build\n', 'test'],
       ['- name: Test\n', 'test'],
     ];
@@ -310,11 +306,6 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     expect(skipped).toBe(2);
     // 求值器自身的牙：把条件改成常量假，必须被上面那套逐入口比对判红。
     expect(evaluateActions('!(true)', CI_ENTRIES[0])).toBe(false);
-
-    // ④ 豁免反腐烂步的 PR 排除原样保留（去掉的只是在 ubuntu 专属 job 里恒真的 runner.os 那一半）。
-    expect(cross).toContain(
-      "- name: Cross-target exemptions must still be necessary\n        if: github.event_name != 'pull_request'\n",
-    );
   });
 
   it('package 的 dispatch 输入确实只有 platform，并复用 ci.yml 作全平台门', () => {
@@ -329,16 +320,18 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
 
   it('独立门与 Package 复用门必须按调用方隔离并发组，不能互相取消制造假红', () => {
     for (const name of ['ci.yml', 'ui.yml']) {
+      // CI 的手动运行可被同组新运行取消；UI 只随调用方取消。
+      const manual = name === 'ci.yml';
       const source = workflow(name);
       const direct = workflowConcurrency(source, name);
       const called = workflowConcurrency(source, 'Package');
-      expect(direct.cancels).toBe(false);
-      expect(called.cancels).toBe(false);
+      expect(direct.cancels).toBe(manual);
+      expect(called.cancels).toBe(manual);
       expect(direct.group).not.toBe(called.group);
-      expect(called.group).not.toBe(workflowConcurrency(source, 'Package', undefined, undefined, false, 2).group);
+      expect(called.group === workflowConcurrency(source, 'Package', undefined, undefined, false, 2).group).toBe(manual);
       const fixed = workflowConcurrency(source, 'Package', undefined, undefined, true, 1);
       expect(fixed.cancels).toBe(false);
-      expect(fixed.group).toBe(called.group);
+      expect(fixed.group === called.group).toBe(!manual);
       expect(fixed.group).not.toBe(workflowConcurrency(source, 'Package', undefined, undefined, true, 2).group);
       for (const event of ['push', 'pull_request']) {
         const automatic = workflowConcurrency(source, 'Package', event);
@@ -546,14 +539,14 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     expect(release).toContain('拒绝覆盖 SHA256SUMS');
   });
 
-  it('Package 并发组按调用方、ref、run 与平台选择隔离，且不取消在途 run', () => {
+  it('Package 并发组按调用方、ref 与平台选择隔离，手动 tip 可被同组新运行取消', () => {
     const packageSource = workflow('package.yml');
     const packageGroup = (selection: Parameters<typeof workflowConcurrency>[6] = {},
       caller = 'Package', ref = 'refs/heads/collab/contract', preserve = false, runId = 1,
       event = 'workflow_dispatch') => workflowConcurrency(packageSource, caller, event, ref, preserve, runId, selection);
     const tip = packageGroup();
-    expect(tip.cancels).toBe(false);
-    expect(tip.group).not.toBe(packageGroup({}, 'Package', undefined, false, 2).group);
+    expect(tip.cancels).toBe(true);
+    expect(tip.group).toBe(packageGroup({}, 'Package', undefined, false, 2).group);
     expect(tip.group).not.toBe(packageGroup({}, 'Release Risk').group);
     expect(tip.group).not.toBe(packageGroup({}, 'Package', 'refs/heads/collab/other').group);
     expect(packageGroup({ platform: 'linux' }).group).not.toBe(packageGroup({ platform: 'windows' }).group);
@@ -562,7 +555,7 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
       packageGroup({ platforms: '["linux"]' }).group);
     const fixed = packageGroup({}, 'Package', undefined, true);
     expect(fixed.cancels).toBe(false);
-    expect(fixed.group).toBe(tip.group);
+    expect(fixed.group).not.toBe(tip.group);
     expect(fixed.group).not.toBe(packageGroup({}, 'Package', undefined, true, 2).group);
     const inherited = packageGroup({ eventPreserveRun: true }, 'Release Risk');
     expect(inherited.cancels).toBe(false);

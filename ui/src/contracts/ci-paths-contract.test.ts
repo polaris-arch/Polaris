@@ -71,8 +71,10 @@ const KNOWN_CI = ['**.md', 'docs/**', 'LICENSE', 'NOTICE'];
 const KNOWN_UI = ['**.md', 'docs/**', 'LICENSE', 'NOTICE'];
 
 describe('CI 触发面对称契约（判据面横跨两侧 ⇒ 过滤器不得 ignore 对侧树）', () => {
-  it('自动分支运行替换旧运行，手动与固定审计独立分组，tag与复用调用保持保护', () => {
+  it('自动分支运行替换旧运行，固定审计独立分组，tag与复用调用保持保护', () => {
     for (const workflow of ['ci.yml', 'ui.yml']) {
+      // CI 的手动运行与自动 tip 同样可被同组新运行取消；UI 只随调用方取消。
+      const manual = workflow === 'ci.yml';
       const source = read(workflow);
       const match = source.match(/^  group: (.+)\n  cancel-in-progress: \$\{\{ (.+) \}\}$/m);
       expect(match).not.toBeNull();
@@ -86,7 +88,7 @@ describe('CI 触发面对称契约（判据面横跨两侧 ⇒ 过滤器不得 i
       });
       const evaluate = (event: string, ref: string, preserve = false) =>
         runInNewContext(match![2], context(event, ref, preserve, 1));
-      expect(evaluate('workflow_dispatch', 'refs/heads/collab/test')).toBe(false);
+      expect(evaluate('workflow_dispatch', 'refs/heads/collab/test')).toBe(manual);
       expect(evaluate('workflow_dispatch', 'refs/heads/main', true)).toBe(false);
       expect(evaluate('workflow_dispatch', 'refs/tags/v1.0.0')).toBe(false);
       expect(evaluate('pull_request', 'refs/pull/1/merge')).toBe(true);
@@ -97,8 +99,8 @@ describe('CI 触发面对称契约（判据面横跨两侧 ⇒ 过滤器不得 i
         (_text, expression: string) => String(runInNewContext(expression, context(
           'workflow_dispatch', 'refs/heads/collab/test', preserve, runId))),
       );
-      expect(group(false, 1)).not.toBe(group(false, 2));
-      expect(group(true, 1)).toBe(group(false, 1));
+      expect(group(false, 1) === group(false, 2)).toBe(manual);
+      expect(group(true, 1) === group(false, 1)).toBe(!manual);
       expect(group(true, 1)).not.toBe(group(true, 2));
       // A reusable workflow inherits its caller's event and workflow name;
       // github.event_name is not "workflow_call" at runtime.
@@ -117,8 +119,8 @@ describe('CI 触发面对称契约（判据面横跨两侧 ⇒ 过滤器不得 i
       const directTag = called('workflow_dispatch', 'refs/tags/v1.0.0', 'Package', 1);
       expect(directTag.cancels).toBe(false);
       const ordinaryCall = called('workflow_dispatch', 'refs/heads/collab/test', 'Package', 1);
-      expect(ordinaryCall.cancels).toBe(false);
-      expect(ordinaryCall.group).not.toBe(called('workflow_dispatch', 'refs/heads/collab/test', 'Package', 2).group);
+      expect(ordinaryCall.cancels).toBe(manual);
+      expect(ordinaryCall.group === called('workflow_dispatch', 'refs/heads/collab/test', 'Package', 2).group).toBe(manual);
       expect(ordinaryCall.group).not.toBe(group(false, 1));
       for (const [event, ref] of [['pull_request', 'refs/pull/1/merge'], ['push', 'refs/heads/main']]) {
         const automatic = called(event, ref, 'Package', 1);

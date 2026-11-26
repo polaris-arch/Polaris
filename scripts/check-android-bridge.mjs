@@ -123,9 +123,8 @@ function collect(dir, ext) {
  * `src-tauri/src/tray/*.rs` 与 `window_health.rs` 里的内联 JS 就是多行 raw string，
  * 按行切会把它们腰斩、连带把针一起切掉（那是**静默少取**，比假红更坏）。
  *
- * 这是 `crates/source-probe` 的 `mask_comments()` 的第三份移植（另两份：那个 crate 本体、
- * `ui/src/contracts/android-impact-coverage-contract.test.ts` 的 `maskRust(…, 'keep-literals')`）。
- * 三份的档位语义必须一致；哪天要合并，合并点是 source-probe。
+ * 这是 `crates/source-probe` 的 `mask_comments()` 的移植，两份的档位语义必须一致；哪天要合并，
+ * 合并点是 source-probe。
  *
  * 已知上限（如实登记）：
  *  · Kotlin 的 `"""…"""` 三引号串不认（`command grep '"""'` 确认本仓 Kotlin 树今天一处都没有）；

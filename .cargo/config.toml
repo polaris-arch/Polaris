@@ -96,8 +96,7 @@ rustflags = ["-C", "target-feature=+crt-static"]
 # 故新增判据 ⑥（`scripts/verify-apk.mjs`）：`lib/<ABI>/` 下每一份 `.so` 的 ELF 节表里
 # `.debug_*` / `.zdebug_*` 必须为 0。删掉下面四段中的 aarch64 那段、重建重打，实测该条判红并
 # 点名 8 个节区、387858433 字节与本文件路径。
-# 另：本文件已登记进 `scripts/classify-ci-impact.mjs` 的 `ANDROID_IMPACT_SCOPES` —— 此前它只在
-# 桌面面上登记，改它**不会**拉起 Android 腿，等于「唯一会量这件事的门恰好不跑」。
+# 另：本文件在 `scripts/classify-ci-impact.mjs` 的共享打包面上，改它会拉起 Android 腿。
 #
 # # 刻意的不生效面
 #

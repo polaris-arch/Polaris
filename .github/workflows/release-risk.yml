@@ -35,13 +35,13 @@ permissions:
 #    job 重新求值 `if`，恒真的不取消，四条打包腿（各 14–25 分钟）照跑到底，新跑在本并发组里干等。
 #    已在那边改成 `!cancelled()`（实证与 run 号写在该 job 的 `if` 上方）。只改本段修不了那个现象。
 #
-# Automatic PR/main/ordinary dispatch tips are replaceable. Explicit fixed
-# audits and merge groups use independent run IDs throughout reusable calls;
+# Automatic PR/main tips and dispatches without preserve_run are replaceable.
+# Explicit fixed audits and merge groups use independent run IDs throughout reusable calls;
 # publishing tag paths remain outside this workflow. Cancellation must reach
 # nested installer/mobile jobs without bypassing their required result gates.
 concurrency:
-  group: release-risk-${{ github.workflow }}-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.ref }}${{ (inputs.preserve_run || github.event.inputs.preserve_run == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group') && format('-fixed-{0}', github.run_id) || '' }}
-  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') && github.event_name != 'merge_group' && !inputs.preserve_run && github.event.inputs.preserve_run != 'true' && (github.event_name == 'pull_request' || github.event_name == 'push') }}
+  group: release-risk-${{ github.workflow }}-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.ref }}${{ (inputs.preserve_run || github.event.inputs.preserve_run == 'true' || github.event_name == 'merge_group') && format('-fixed-{0}', github.run_id) || '' }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') && github.event_name != 'merge_group' && !inputs.preserve_run && github.event.inputs.preserve_run != 'true' }}
 
 jobs:
   classify:
@@ -281,7 +281,9 @@ jobs:
   package:
     name: package selected platforms
     needs: [classify, preflight]
-    if: needs.classify.outputs.has_package == 'true' && needs.preflight.result == 'success'
+    # 手动 dispatch 不打包：打包证据由同 SHA 的 Package 手动运行（发行构型）提供，
+    # 冻结前须同 SHA 的 CI、Package、Release Risk 三者都绿。
+    if: github.event_name != 'workflow_dispatch' && needs.classify.outputs.has_package == 'true' && needs.preflight.result == 'success'
     # package.yml 内含一个仅 v* tag 才会运行的 publish job。GitHub 会在启动前校验整张复用图，
     # 即使本次 ref 不可能发布，也要求调用 job 提供它声明的 contents: write 权限上限。
     # 权限只给这一个复用 job；被调 workflow 的构建 job 仍由其顶层 permissions 收窄为 contents: read。
@@ -293,7 +295,6 @@ jobs:
       preserve_run: ${{ inputs.preserve_run || github.event.inputs.preserve_run == 'true' }}
       platforms: ${{ needs.classify.outputs.platforms }}
       skip_quality_gates: true
-      run_kernel_gates: false
       upload_artifacts: false
       # 轻量构型（不做 fat LTO、并行 codegen）：风险门验的是「打包链通不通、包里齐不齐」，
       # 不是发行二进制的体积。产物不是可分发物；与 `upload_artifacts: false` 必须成对出现
@@ -305,7 +306,7 @@ jobs:
 
   # ══ Android release-profile 产物腿 ══
   # 与 preflight / package 并列的第三条选择性腿，判据同源（scripts/classify-ci-impact.mjs 的
-  # ANDROID_IMPACT_SCOPES）。它构建一份未签名 release-profile APK，只在 runner 内守桌面三条腿
+  # 打包 / 内核判定）。它构建一份未签名 release-profile APK，只在 runner 内守桌面三条腿
   # 结构性看不见的东西：R8 证据、资源、原生库与 16 KiB alignment。APK 不上传、不分发。
   #
   # 不与 package job 合并、也不进 package.yml 的矩阵：步骤面完全不相交，理由写在 android.yml 顶部。
@@ -349,7 +350,7 @@ jobs:
       CLASSIFY_RESULT: ${{ needs.classify.result }}
       PREFLIGHT_REQUIRED: ${{ needs.classify.outputs.preflight }}
       PREFLIGHT_RESULT: ${{ needs.preflight.result }}
-      PACKAGE_REQUIRED: ${{ needs.classify.outputs.has_package }}
+      PACKAGE_REQUIRED: ${{ github.event_name != 'workflow_dispatch' && needs.classify.outputs.has_package }}
       PACKAGE_RESULT: ${{ needs.package.result }}
       ANDROID_REQUIRED: ${{ needs.classify.outputs.android }}
       ANDROID_RESULT: ${{ needs.android.result }}
@@ -387,7 +388,7 @@ jobs:
             exit 1
           fi
           # Android 腿与上面两条同形：被选中就必须 success，skipped/failure/cancelled 一律红。
-          # 「没被选中」由分类器的登记表负责，而登记根内的未登记 scope 已 fail-closed 成 android=true。
+          # 「没被选中」由分类器负责：登记根内的改动与打包表 / 内核门 / 安装包腿命中都给 android=true。
           if [ "$ANDROID_REQUIRED" = true ] && [ "$ANDROID_RESULT" != success ]; then
             echo "::error::Android APK 腿未通过：$ANDROID_RESULT"
             exit 1

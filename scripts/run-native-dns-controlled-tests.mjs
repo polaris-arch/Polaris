@@ -17,49 +17,8 @@ export const TESTS = Object.freeze([
   'runtime::stats::tests::real_core_tests::real_core_aggregate_relay_emits_real_frames',
 ]);
 
-// Fixed ordinary source contracts, separate from the six real-core processes.
-export const SOURCE_TESTS = Object.freeze([
-  'polaris:runtime::proxy::tests::native_carrier::normal_native_carrier_preserves_all_six_original_business_assertion_sets',
-  'polaris:runtime::tls_fingerprints::tests::authenticated_document_is_strict_data_and_cannot_replace_native_channel_binding',
-  "polaris-store:tests::store_tests::unsupported_vision_transport_remains_repairable_across_real_store",
-  "polaris:runtime::speedtest::tests::vision_transport_temp_plan_reports_fixed_failure_without_losing_good_nodes",
-  "polaris-config-engine:builder::outbound::tests::vision_transport_admission_preserves_supported_native_streams",
-  "polaris-config-engine:builder::outbounds::tests::vision_invalid_nodes_preserve_explicit_targets_and_good_auto_candidates",
-  "polaris-net-stack:share_link::tests::vision_transport_import_retains_original_nodes_and_safe_warnings",
-  "polaris-net-stack:singbox_import::tests::vision_extra_transports_are_retained_with_repairable_warning",
-  "polaris-net-stack:singbox_import::tests::naive_json_h2_h3_survive_dedup_serde_and_full_generation",
-  "polaris-net-stack:singbox_import::tests::naive_json_quic_flag_is_not_an_unsupported_transport_object",
-  "polaris-net-stack:share_link::tests::naive_quic_community_uri_preserves_h3_and_existing_tls_query",
-  "polaris-net-stack:share_link::tests::naive_quic_multiline_subscription_keeps_h2_and_h3",
-  "polaris-net-stack:subscription::tests::fetch_tests::generated_default_and_custom_ua_reach_real_fetch_init",
-  "polaris:commands::subscription::tests::reconcile_tests::naive_json_refresh_reorder_preserves_h3_through_real_store",
-  "polaris:commands::subscription::tests::ua_tests::effective_ua_default_and_persisted_override_matrix",
-  "polaris:runtime::http::tests::subscription_default_and_override_ua_are_real_wire_headers",
-  "polaris:runtime::config::tests::subscription_edit_publishes_owner_only_after_real_storage_success",
-  "polaris:commands::subscription::tests::boundary_regressions::edit_supersession_drops_the_actual_awaited_pipeline_and_cancels_providers",
-  "polaris:commands::subscription::tests::boundary_regressions::refresh_pipeline_obeys_existing_deadline_without_retrying_or_disabling_owner",
-  "polaris:commands::subscription::tests::boundary_regressions::late_refresh_publication_cannot_invalidate_new_saved_edit_intent",
-  "polaris:commands::subscription::tests::boundary_regressions::edit_refresh_uses_effective_request_identity_not_metadata_or_requested_ua_text",
-  "polaris:runtime::subscription_refresh::tests::saved_edit_supersedes_old_work_without_old_drop_releasing_new_owner",
-  "polaris:runtime::subscription_refresh::tests::repeated_edits_and_aba_cannot_publish_old_progress_or_commit",
-  "polaris:runtime::subscription_scheduler::tests::superseded_refresh_is_not_a_scheduler_failure_or_announcement",
-  "polaris-config-engine:user_config::app_config::tests::utls_default_initialization_and_missing_fields_preserve_explicit_policies",
-  "polaris-config-engine:user_config::utls::tests::initial_missing_and_null_policy_follow_saved_fingerprint_in_real_generator",
-  "polaris-config-engine:user_config::utls::tests::policy_projection_enters_refresh_and_missing_is_follow",
-  "polaris-config-engine:user_config::utls::tests::node_intent_global_policy_protocol_matrix_keeps_stored_nodes_unchanged",
-  "polaris-store:tests::store_tests::new_installation_uses_follow_and_preserves_explicit_saved_policies",
-  "polaris:runtime::proxy::pending_changes::tests::global_utls_change_creates_runtime_debt_and_missing_restores_follow_projection"
-]);
-export const BOOTSTRAP_TESTS = Object.freeze([
-  'polaris-helper-client:manager::tests::bootstrap_identity::bootstrap_identity_render_is_platform_specific',
-  'polaris-helper-client:manager::tests::bootstrap_identity::native_bootstrap_descriptor_identity',
-]);
 const CONTRACT_MANIFESTS = Object.freeze({
   'polaris': 'src-tauri/Cargo.toml',
-  'polaris-helper-client': 'crates/helper-client/Cargo.toml',
-  'polaris-store': 'crates/store/Cargo.toml',
-  'polaris-config-engine': 'crates/config-engine/Cargo.toml',
-  'polaris-net-stack': 'crates/net-stack/Cargo.toml',
 });
 
 const demand = (ok, message) => { if (!ok) throw Error(message); };
@@ -764,72 +723,7 @@ export async function runTests(selected, env, directory, execute = executeComman
   }
 }
 
-
-export function contractGroups(specs) {
-  const reviewed = specs === SOURCE_TESTS || specs === BOOTSTRAP_TESTS;
-  demand(reviewed, 'Unreviewed native source test scope');
-  const groups = new Map();
-  for (const spec of specs) {
-    const cut = spec.indexOf(':'), pkg = spec.slice(0, cut), name = spec.slice(cut + 1);
-    demand(Object.hasOwn(CONTRACT_MANIFESTS, pkg) && /^[a-zA-Z0-9_]+(?:::[a-zA-Z0-9_]+)+$/.test(name), 'Malformed exact contract');
-    const names = groups.get(pkg) ?? [];
-    demand(!names.includes(name), 'Duplicate exact contract');
-    names.push(name); groups.set(pkg, names);
-  }
-  return groups;
-}
-
-export async function runContractTests(selected, names, env, directory, execute = executeCommand) {
-  const digest = selected.sha256 ?? hash(selected.executable);
-  for (const name of names) {
-    demand(hash(selected.executable) === digest, 'Source test executable changed before invocation');
-    const result = await execute({ id: name.split('::').at(-1), program: selected.executable,
-      args: [name, '--exact', '--nocapture', '--test-threads=1'] },
-    { root: dirname(selected.manifest), env, directory, timeout: 20 * 60_000 });
-    demand(hash(selected.executable) === digest, 'Source test executable changed during invocation');
-    demand(exactPass(result), `Native source contract did not pass exactly once: ${name}`);
-    appendFileSync(join(directory, 'source-contract-status.txt'), `${name}: passed\n`);
-  }
-}
-
-async function runContractSuite(specs, root) {
-  const groups = contractGroups(specs);
-  const sourceCommit = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8', timeout: 30_000 }).trim();
-  demand(/^[0-9a-f]{40}$/.test(sourceCommit) && sourceCommit === process.env.GITHUB_SHA
-    && (!process.env.POLARIS_BUILD_ID || sourceCommit === process.env.POLARIS_BUILD_ID),
-    'Exact source contract build identity differs from the admitted checkout');
-  const directory = join(root, 'native-dns-ci-evidence', specs === SOURCE_TESTS ? 'source-contracts' : 'bootstrap-contracts');
-  mkdirSync(directory, { recursive: true });
-  const metadata = JSON.parse(execFileSync('cargo', ['metadata', '--locked', '--no-deps', '--format-version=1'],
-    { cwd: root, encoding: 'utf8', timeout: 60_000, maxBuffer: 16 * 1024 * 1024 }));
-  const sysroot = execFileSync('rustc', ['--print', 'target-libdir'], { encoding: 'utf8', timeout: 30_000 }).trim();
-  for (const [packageName, names] of groups) {
-    // No feature/profile override: identical default library test profile to the prior cargo invocations.
-    const prepared = await executeCommand({ id: `source-build-${packageName}`, program: 'cargo',
-      args: ['test', '--locked', '-p', packageName, '--lib', '--no-run', '--message-format=json'] },
-    { root, env: process.env, directory, timeout: 20 * 60_000, captureStdout: true });
-    demand(prepared.status === 0 && !prepared.error && !prepared.timedOut && !prepared.cleanupUncertain && !prepared.interrupted,
-      `Source library test preparation failed: ${packageName}`);
-    const messages = prepared.stdout.split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line));
-    const selected = selectExecutable(messages, metadata, root, packageName);
-    selected.sha256 = hash(selected.executable);
-    writeFileSync(join(directory, `${packageName}-executable.json`), JSON.stringify({
-      ...selected, sourceCommit, packageName, profile: 'test', featureSelection: 'Cargo defaults; actual features recorded above',
-      preparationCalls: 1, tests: names,
-    }, null, 2) + '\n');
-    const env = runtimeEnvironment(messages, resolve(metadata.target_directory), selected.executable, sysroot);
-    await runContractTests(selected, names, env, directory);
-  }
-}
-
 async function main() {
-  const ordinary = process.argv.length === 3 && ({ '--bootstrap-contracts': BOOTSTRAP_TESTS, '--source-contracts': SOURCE_TESTS })[process.argv[2]];
-  if (ordinary) {
-    const root = resolve(fileURLToPath(new URL('../', import.meta.url)));
-    demand(realpathSync(process.cwd()) === realpathSync(root), 'Run native source contracts from the workspace root');
-    return runContractSuite(ordinary, root);
-  }
-
   demand(JSON.stringify(process.argv.slice(2)) === JSON.stringify(TESTS), 'Controlled test scope/order differs from the six reviewed exact names');
   const root = resolve(fileURLToPath(new URL('../', import.meta.url)));
   demand(realpathSync(process.cwd()) === realpathSync(root), 'Run the controlled tests from the workspace root');

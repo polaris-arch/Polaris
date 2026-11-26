@@ -33,8 +33,8 @@
  *    `libpolaris_lib.so` 从 127652816 弹回 515511872、APK 从 219011984 弹回 606871040 ——
  *    而上面 ①②③ 与死字节那条**全绿**：死字节判据看的是「文件大小 vs 条目压缩和」的比值，
  *    这两个数是**一起**变大的，比值纹丝不动。整包翻三倍，没有一条判据说话。
- *    （`.cargo/config.toml` 已登记进 `classify-ci-impact.mjs` 的 `ANDROID_IMPACT_SCOPES`，
- *      改它会正确地把本腿拉起来 —— 但那只解决「被看见」，「被量」由本文件的判据 ⑥ 负责。）
+ *    （`.cargo/config.toml` 在 `classify-ci-impact.mjs` 的共享打包面上，改它会把本腿拉起来 ——
+ *      但那只解决「被看见」，「被量」由本文件的判据 ⑥ 负责。）
  *
  * ⑤ **出厂权限集与本仓写的不是一回事**（2026-09-06 实证）：源码侧那道权限门读的是
  *    `src-tauri/gen/android/app/src/main/AndroidManifest.xml`（本仓自有 8 条），而 APK 带的是

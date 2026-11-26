@@ -268,7 +268,7 @@ Windows 腿因 NSIS 无 bundle 侧副本，退化为 cargo staging 清点并在�
 - **`ci.yml`** — Rust 门禁，职责 = 「改动是否正确」。三个并行 job：
   - `fmt + clippy (<os>)`：格式与 clippy（`-D warnings`）；Linux 腿另跑 rustdoc 与 Cronet 来源解析。
   - `cross-target clippy + android face`（只在 Linux）：对 Windows / macOS / Android / iOS 四个交叉目标跑
-    clippy，并核对 Android 影响面登记表与交叉豁免表。
+    clippy，并对 Android 目标 `cargo check -p polaris`。
     带 C 依赖的包在部分目标上被豁免（见 `scripts/cross-target-exempt.json`），它不能代替原生腿。
   - `build + test (<os>)`：`cargo build` 与 `cargo test`。
 
@@ -285,8 +285,10 @@ Windows 腿因 NSIS 无 bundle 侧副本，退化为 cargo staging 清点并在�
 - **`ui.yml`** — 前端门禁：`pnpm run build`（tsc + vite build）、vitest、Playwright；PR / push 到 main 触发。
 - **`release-risk.yml`** — 发布风险门：PR / merge queue / push 到 main 均触发，在 job 内按改动路径分类，
   只对受影响的面调用 `package.yml`、`android.yml` 与 `apple.yml`。常规桌面与 Android 风险腿使用轻量构型，安装包 / APK 不上传、不可分发。
+  手动触发时不调用 `package.yml`：分支候选冻结前须同一 SHA 的 CI（push）、Package（手动）与 Release Risk（手动）都为绿。
+  三者的手动运行都会被同分支上更新的手动运行取消，需要保留时传 `preserve_run`。
 - **`package.yml`** — 发布工程：Linux / Windows / macOS arm64 / macOS x64 四条腿跑 fetch + `tauri build` + 产物校验。
-  触发 = tag（`v*`）/ 手动 / 被 `release-risk.yml` 调用。发行构型用于构建可分发安装包；风险门轻量构型只验证打包链。tag 发布时建草稿 release、
+  触发 = tag（`v*`）/ 手动 / 被 `release-risk.yml` 调用；内置的 `ci` gate 只在 tag 与 main 上运行。发行构型用于构建可分发安装包；风险门轻量构型只验证打包链。tag 发布时建草稿 release、
   上传桌面资产，再调用 `android.yml` 上传签名 APK，全量对账后公开。
 - **`android.yml`** — 只被调用或手动触发：构建 release-profile APK 并做产物级检查；发布调用时产出三份正式签名 APK。
 - **`apple.yml`** — 由风险门选择或手动触发：默认核验设备 ARM64 App / PacketTunnel 的无签名编译与链接，模拟器 App 为显式选项；不发布 IPA，不证明设备安装、NE 授权或 VPN 运行。完整组件与证据约束见 [移动内核说明](../scripts/mobile-core/README.md)。

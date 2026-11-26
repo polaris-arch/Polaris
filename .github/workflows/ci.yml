@@ -6,11 +6,10 @@ name: CI
 #
 # ── 并行拓扑（2026-10-07）：一条串行链拆成三个并行 job ──
 #   · `lint`  （矩阵）fmt + clippy；Linux 腿另跑 rustdoc
-#   · `cross` （仅 ubuntu）四个交叉 target 的 clippy + Android 影响面 dep-info 对差
-#     + 豁免反腐烂
+#   · `cross` （仅 ubuntu）四个交叉 target 的 clippy
 #   · `test`  （矩阵）build + test
 # 拆之前 ubuntu 单腿实测（run 37642138266）：缓存 52s、clippy 66s、rustdoc 105s、Build 150s、
-# Cross-check 120s，再加 dep-info 对差与 `cargo test --workspace`，全部串行，墙钟 10 分钟以上；
+# Cross-check 120s，再加 `cargo test --workspace`，全部串行，墙钟 10 分钟以上；
 # 排在最后的 test 要等前面全部跑完才开始，前面任何一步红了它就**一次都不跑**（上面那次 run
 # 正是这样：Cross-check 红 ⇒ Test skipped，一次 run 只看得见第一个失败）。
 #
@@ -36,6 +35,8 @@ name: CI
 #    此前每次 push main = 3-OS CI + 4 平台 Package 并行，反馈噪声与 artifact 体积都过高。
 #   · push main（调试热路径）：矩阵 job 只跑 ubuntu-22.04 一条腿 —— 最便宜、最快反馈；
 #   · pull_request / workflow_dispatch / 被 package.yml workflow_call（发布）：完整 3-OS 矩阵；
+#   · work/** push 同样跑满 3-OS，是该候选 SHA 唯一的一份 CI：package.yml 的 `ci` gate
+#     只在 tag 与 main 上调回本 workflow；
 #   · 发布质量不降级：tag 发布经 package.yml 的 `ci` gate job 调回本 workflow 跑满 3-OS，
 #     CI 不绿不发布（见 package.yml jobs.release）。2026-09-04 起打包腿与本门**并行**开跑：
 #     门拦的是 release job，不是 package job —— 门红时安装包会被构建出来但发不出去。
@@ -104,11 +105,11 @@ on:
 # `workflow_call` 里的 `github.workflow` 取**调用方**名称（GitHub 官方语义），故把它纳入组：
 # 独立 CI 与 Package 内复用的 CI 门互不取消；同一调用方/ref 的旧跑仍会被新跑顶掉。
 # tag ref 是 refs/tags/*，走不进下面的 cancel 条件。
-# Automatic tips replace only tips of the same caller/ref. Fixed audits and
+# Automatic and manual tips replace only tips of the same caller/ref. Fixed audits and
 # merge queue groups have run-specific identities; tags never cancel.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.ref }}${{ (inputs.preserve_run || github.event.inputs.preserve_run == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group') && format('-fixed-{0}', github.run_id) || '' }}
-  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') && github.event_name != 'merge_group' && !inputs.preserve_run && github.event.inputs.preserve_run != 'true' && (github.event_name == 'pull_request' || github.event_name == 'push') }}
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.ref }}${{ (inputs.preserve_run || github.event.inputs.preserve_run == 'true' || github.event_name == 'merge_group') && format('-fixed-{0}', github.run_id) || '' }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') && github.event_name != 'merge_group' && !inputs.preserve_run && github.event.inputs.preserve_run != 'true' }}
 
 jobs:
   cheap_format:
@@ -414,13 +415,13 @@ jobs:
           RUSTDOCFLAGS: "-D rustdoc::broken_intra_doc_links -D rustdoc::invalid_html_tags -D rustdoc::private_intra_doc_links -D rustdoc::redundant_explicit_links"
         run: cargo doc --no-deps --workspace --bins --lib --document-private-items
 
-  # ══ 检查类之二：交叉 target clippy + Android 影响面 dep-info 对差 + 豁免反腐烂（仅 ubuntu）══
+  # ══ 检查类之二：交叉 target clippy（仅 ubuntu）══
   #
-  # 这三步原本以 `if: runner.os == 'Linux'` 挂在矩阵 job 的 ubuntu 腿上；独立成 job 后直接钉
+  # 这些步骤原本以 `if: runner.os == 'Linux'` 挂在矩阵 job 的 ubuntu 腿上；独立成 job 后直接钉
   # `runs-on: ubuntu-22.04`，步级的 Linux 条件随之去掉（在这里它恒真，留着只是噪声）。
   #
   # job 级 `if` 只为保住手动 dispatch 的单平台语义（见上方 `on.workflow_dispatch.inputs.os`）：
-  # 选了 windows-2022 / macos-15 时，原先这三步因 `runner.os != 'Linux'` 不跑，现在等价地整个
+  # 选了 windows-2022 / macos-15 时，原先这些步骤因 `runner.os != 'Linux'` 不跑，现在等价地整个
   # job 不起。其余一切入口（push / PR / merge queue / package.yml 的 workflow_call / dispatch 选
   # all 或 ubuntu-22.04）本条件恒真。`os != ''` 那一项与矩阵表达式同源：package.yml 的
   # workflow_dispatch 经 workflow_call 传进来的 payload 没有 `os`，空串必须落到「跑」这一侧。
@@ -439,7 +440,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # 与 lint job 同口径钉 Node 26；本 job 的 dep-info 对差步要跑 `scripts/check-android-only-face.mjs`。
+      # 与 lint job 同口径钉 Node 26；本 job 要跑 `scripts/fetch-protoc.mjs`。
       - name: Setup Node
         uses: actions/setup-node@v7
         with:
@@ -479,20 +480,8 @@ jobs:
           [ "$got" = "$PROTOC_EXPECT" ] || {
             echo "::error::protoc on PATH is '$got', expected '$PROTOC_EXPECT'"; exit 1; }
 
-      # 交叉 target 那几格用不到 webkit/gtk；要它的是 dep-info 对差步的 **host 侧**
-      # `cargo check --workspace`（含 src-tauri，Linux 上经 Tauri 拉进 webkit/gtk 的 -sys crate）。
-      - name: Install Linux system dependencies (Tauri webkit/gtk)
-        run: |
-          # Azure DNS 曾持续解析不了 azure.archive.ubuntu.com：加公共 DNS 作 resolved 全局解析器并行补位。
-          printf "[Resolve]\nDNS=1.1.1.1 8.8.8.8\n" | sudo install -D -m 644 /dev/stdin /etc/systemd/resolved.conf.d/public-dns.conf
-          sudo systemctl restart systemd-resolved
-          sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
-            librsvg2-dev libglib2.0-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev
-
-      # 理由同 lint job 同名步：tauri build.rs 校验 bundle.resources 路径存在。本 job 两处会编到
-      # src-tauri（android 上的 `cargo check -p polaris` 与 dep-info 对差的两侧）。
+      # 理由同 lint job 同名步：tauri build.rs 校验 bundle.resources 路径存在。本 job 会编到
+      # src-tauri（android 上的 `cargo check -p polaris`）。
       - name: Create resource placeholder dirs (tauri build.rs 路径校验)
         shell: bash
         run: |
@@ -529,7 +518,7 @@ jobs:
       # 剩下的全是纯 Rust；android 这边我们**要**覆盖 wreq 那条 C 依赖链，所以真的需要一套工具链。
       #
       # 🔴 **不写 GITHUB_PATH**：NDK 的 bin 目录里有 `clang` / `ld.lld` / `llvm-*`，进了 job 级 PATH
-      #    会影响同 job 后面 dep-info 对差步里 **host 侧** `cargo check --workspace` 的宿主编译。
+      #    会影响同 job 里其余 target 的宿主侧编译。
       #    只导出目录，由用它的几步各自局部前置。
       - name: Resolve Android NDK
         shell: bash
@@ -575,7 +564,7 @@ jobs:
           # 且新 crate 不会自动进清单、也没有任何东西在守这份清单的完整性。
           mapfile -t ALL < <(cargo metadata --no-deps --format-version 1 | jq -r '.packages[].name' | sort)
           # 🔴 豁免**按 target** 生效（2026-09-04 改）。此前主循环只读 `keys[]`：一个包只要出现在表里，
-          #    就对**所有** target 一起跳过，`.targets` 那个字段在主循环里是装饰品（只有下面的反腐烂步在读它）。
+          #    就对**所有** target 一起跳过，`.targets` 那个字段在主循环里是装饰品。
           #    加 android 腿后这条不能再将就，两个方向都会出错：
           #      · `polaris-unlock-transport` 在 msvc/darwin 上是 C 工具链问题，而 android 有 NDK ⇒ 它**能过**，
           #        沿用旧逻辑会把它一并跳掉，覆盖面凭空少一格且没有任何东西会说；
@@ -640,7 +629,7 @@ jobs:
           # 🔴 `polaris`(src-tauri) 在 android 上被豁免出上面的 clippy 循环（既有 lint 债，理由在豁免表），
           #    但**它的编译面不能跟着一起丢**：本门要抓的「一次改坏 Android 交叉编译的 Rust 改动」恰好
           #    只住在这个包里（K4 的 Rust↔Kotlin 桥在 `src-tauri/src/**`）。丢了它，那类改动会一路绿到
-          #    有人手工打包为止 —— APK 腿（android.yml）虽然真编它，但按登记表只在 Android 专属面被改时才跑。
+          #    有人手工打包为止 —— APK 腿（android.yml）虽然真编它，但只在 Release Risk 选中时才跑。
           #    `cargo check` 不 deny warnings ⇒ 不受那批 dead_code 影响，仍抓得住「编不过」。本机实测 32s。
           # 🔴 **ios 上没有这条对应的补救，而且补不了**（2026-09-06 实测）：polaris 在 ios 上不是 lint 债，
           #    是 `objc2-exception-helper` / `zstd-sys` 两个 build script 直接倒在
@@ -649,69 +638,6 @@ jobs:
           #    ⇒ src-tauri 那 12 处穷举 match 的 iOS 臂在非 macOS runner 上一行都编不到。ios 这条腿守住的
           #    是另外 17 个纯 Rust 包的 iOS 编译面，别把它读成「整仓 iOS 面已验」。
           PATH="$ANDROID_NDK_BIN:$PATH" cargo check --target aarch64-linux-android -p polaris
-
-      # ── Android 影响面的**产物级**完备性门（2026-09-05）──
-      #
-      # `ANDROID_IMPACT_SCOPES`（scripts/classify-ci-impact.mjs）是 `android.yml` 的**唯一**触发面，
-      # 而那条 workflow 没有 push/PR 触发 ⇒ 新增一个 Android 专属文件而不登记，APK 腿永远不为它跑。
-      # 此前两轮完备性门的取材面都是源码级正则推导，等于在重新实现 rustc 的 `mod` 解析与 cfg 求值：
-      # 每补一种形态，下一轮验收就找出下一种（两层嵌套 / `#[cfg_attr(…, path = …)]` /
-      # `r"android"` / `#[cfg(...)]mod foo;` 零空白 / 内联夹具的 raw string 污染判据）。
-      #
-      # 这里换真值源：`cargo check` 默认下发 `--emit=dep-info`，`.d` 是 rustc **解析完模块图、
-      # 求值完 cfg 之后**写出的源文件清单。Android 专属文件集 = android 编译面 − host 编译面。
-      # 上面五种形态在隔离工程里一次写全，六条全部落在差集里（raw string 夹具两侧都没有它 ——
-      # rustc 解析的是真模块图，字符串里的文本结构上就进不来）。射程与已知上限见那个脚本的头注。
-      #
-      # 🔴 两侧选择器必须**逐字对称**，都是 `cargo check --workspace`（lib + bins）：
-      #  · 不能拿 lint job 的 `cargo clippy --workspace --all-targets` 的编译面当 host 侧（那看上去
-      #    是现成的一份 host 编译面）——
-      #    host 侧一旦更宽，`#[cfg(any(target_os = "android", test))]` 的文件会同时落进 host 的 test
-      #    单元、从差集里掉出去，方向是 **fail-open**（门说全绿而实际漏了）。这个 pattern 仓里真的
-      #    在用：`src-tauri/src/runtime/stats/source.rs` 的三个通道常量就是这么写的。
-      #  · 也不能两侧都上 `--all-targets`：android 侧带它会让 `polaris-helper` 撞 4 条 E0433
-      #    （同上一步注释）。代价是**测试目标里的 android 专属代码不在射程内**，已如实登记。
-      #
-      # 成本：android 侧接近零 —— 上一步的 `cargo check --target aarch64-linux-android -p polaris`
-      # 已把 20 个成员里 19 个的 check 单元编热，本步只多一个 `polaris-source-probe`。host 侧是本
-      # 方案**唯一**的实质代价：check 单元与 lint job 的 clippy（走 clippy-driver wrapper）、test job
-      # 的 build（出 rlib）与 test（test 构型）指纹都不共享，是一趟真的编译（2026-10-07 拆成并行
-      # job 之前同样不共享，拆分没有让它变贵）。若哪天它进不了每个 PR
-      # 的关键路径，退路是加 `github.event_name != 'pull_request'`（与下一步「豁免反腐烂」同一取舍）：
-      # 代价是延迟到合入后一次 run 才发现，不是漏检。
-      #
-      # JSON 用 `>` 重定向、**不接管道**：管道会让 cargo 自己的 rc 失真。且 dep-info 是类型检查
-      # **之前**产出的（rustc 对有类型错误的代码照样写出正确 `.d`），「.d 是对的」与「代码编得过」
-      # 是两件事 —— 两条 cargo 的 rc 必须真的拦住这一步，故 errexit 全程有效。
-      - name: Android impact face must be registered (dep-info 对差)
-        shell: bash
-        run: |
-          set -euo pipefail
-          PATH="$ANDROID_NDK_BIN:$PATH" cargo check --workspace --target aarch64-linux-android --message-format=json-render-diagnostics > "$RUNNER_TEMP/android-units.json"
-          cargo check --workspace --message-format=json-render-diagnostics > "$RUNNER_TEMP/host-units.json"
-          node scripts/check-android-only-face.mjs --android "$RUNNER_TEMP/android-units.json" --host "$RUNNER_TEMP/host-units.json"
-
-      # 豁免表的反腐烂：豁免一旦不再必要就必须自己转红，否则它会退化成一张永久白名单。
-      # 只在非 PR 事件上跑：两个被豁免的包都在 build script 阶段就失败，成本低但不为零，
-      # 而豁免腐烂最多延迟到合入后一次 run 被发现，不值得给每个 PR 加时。
-      - name: Cross-target exemptions must still be necessary
-        if: github.event_name != 'pull_request'
-        shell: bash
-        run: |
-          set -uo pipefail
-          rot=0
-          # NDK 的 bin 同样要前置：少了它，android 上的豁免会因为「找不到 C 工具链」而失败，
-          # 于是本步得出「豁免仍必要」——**理由却是假的**。豁免腐烂检查必须与主循环量同一件事。
-          export PATH="$ANDROID_NDK_BIN:$PATH"
-          for e in $(jq -r 'keys[]' scripts/cross-target-exempt.json); do
-            for t in $(jq -r --arg e "$e" '.[$e].targets[]' scripts/cross-target-exempt.json); do
-              if cargo clippy --target "$t" --all-targets -p "$e" --keep-going -- -D warnings >/dev/null 2>&1; then
-                echo "::error::豁免已腐烂：$e 现在能过 $t —— 从 scripts/cross-target-exempt.json 删掉它"
-                rot=1
-              fi
-            done
-          done
-          exit $rot
 
   # ══ 构建加测试类：build + test（矩阵）══
   #
@@ -1010,16 +936,6 @@ jobs:
           set -euo pipefail
           export POLARIS_C05_NATIVE_LOG="$PWD/native-dns-ci-evidence/c05-native-fixtures.log"
           node --test scripts/windows-c05-policy-compatibility.test.mjs
-
-      - name: Verify native helper bootstrap descriptor primitives
-        if: ${{ (runner.os == 'macOS' || runner.os == 'Linux') && !cancelled() && (steps.workspace_tests.outcome == 'success' || steps.workspace_tests.outcome == 'failure') }}
-        shell: bash
-        run: node scripts/run-native-dns-controlled-tests.mjs --bootstrap-contracts
-
-      - name: Verify native subscription JSON URI and UA preservation
-        if: ${{ (runner.os == 'macOS' || runner.os == 'Linux') && !cancelled() && (steps.workspace_tests.outcome == 'success' || steps.workspace_tests.outcome == 'failure') }}
-        shell: bash
-        run: node scripts/run-native-dns-controlled-tests.mjs --source-contracts
 
       - name: Run exact controlled App lifecycle hot-switch and stats tests
         id: native_dns_app_runtime

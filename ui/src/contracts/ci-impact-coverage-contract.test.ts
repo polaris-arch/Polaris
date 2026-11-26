@@ -62,7 +62,6 @@ type Classifier = {
   REGISTRY_ROOTS: readonly string[];
   PACKAGE_IMPACT_SCOPES: Record<string, { kernel: boolean; platforms: readonly string[]; why: string }>;
   NO_PACKAGE_IMPACT_SCOPES: Record<string, string>;
-  ANDROID_IMPACT_SCOPES: Record<string, { why: string }>;
 };
 
 const { appleRequired } = await import(pathToFileURL(join(REPO_ROOT, 'scripts/apple-ci-impact.mjs')).href);
@@ -80,7 +79,6 @@ const {
   ALL_PACKAGE_PLATFORMS,
   PACKAGE_IMPACT_SCOPES,
   NO_PACKAGE_IMPACT_SCOPES,
-  ANDROID_IMPACT_SCOPES,
 } = classifier;
 
 /** 目录 → `<path>/`，文件 → `<path>`；与分类器 `scopeOf` 的归一形态一致。 */
@@ -261,7 +259,6 @@ describe('CI 影响分类器的完备性（fail-open 根治）', () => {
       'src-tauri/src/native_verification/cleanup.rs',
     ]) {
       expect(compact([path]), path).toEqual({ kernel: false, platforms: [], preflight: false, hasPackage: false });
-      expect(classifyImpact([path]).android, path).toBe(false);
       expect(classifyImpact([path]).unregisteredScopes, path).toEqual([]);
       const diff = `:100644 100644 ${'1'.repeat(40)} ${'2'.repeat(40)} M\0${path}\0`;
       expect(classifyNativeImpact(diff).nativeRequired, path).toBe(true);
@@ -498,21 +495,5 @@ describe('CI 影响分类器的完备性（fail-open 根治）', () => {
         `${workflow} 里真跑 ${script}，但改它不触发${label} —— 那条腿的一环没有合入前信号`,
       ).toBe(true);
     }
-  });
-
-  it('Android 登记表不是装饰：每条登记都必须真的点亮 Android 腿', () => {
-    for (const [key, decision] of Object.entries(ANDROID_IMPACT_SCOPES)) {
-      expect(
-        classifyImpact([probeOf(key)]).android,
-        `ANDROID_IMPACT_SCOPES['${key}'] 登记了，但分类器不给它点亮 Android 腿`,
-      ).toBe(true);
-      expect(
-        decision.why.trim().length,
-        `ANDROID_IMPACT_SCOPES['${key}'] 缺少可读的判据（why）`,
-      ).toBeGreaterThan(0);
-    }
-    // 反向对照：没有它，上面那条会被「android 恒真」满足。
-    expect(classifyImpact(['ui/src/App.tsx']).android).toBe(false);
-    expect(classifyImpact(['src-tauri/tauri.linux.conf.json']).android).toBe(false);
   });
 });

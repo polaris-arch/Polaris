@@ -23,7 +23,7 @@ name: Android
 #   [不选带 `paths:` 过滤的独立 workflow：本仓已实测过「带路径过滤的 workflow 在某些推送形态下一次都不跑」，
 #    release-risk.yml 顶部注释也明写「workflow 永远触发，路径分类发生在 job 内」。本腿跟随同一条纪律：
 #    自己不带任何路径过滤，由 release-risk 的 classify job 按 `scripts/classify-ci-impact.mjs` 的
-#    ANDROID_IMPACT_SCOPES 登记表决定要不要调用]
+#    打包 / 内核判定决定要不要调用]
 #   [选独立可复用 workflow：步骤面不相交、触发面对（PR/merge_group/push main 都覆盖）、
 #    将来 release 要出 APK 时 package.yml 一行 `uses:` 就能接上]
 #
