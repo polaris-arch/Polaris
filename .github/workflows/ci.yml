@@ -333,44 +333,10 @@ jobs:
       - name: Install protoc (pinned URL + sha256)
         run: node scripts/fetch-protoc.mjs
 
-      # ── NASM（Windows）：固定 URL + sha256（2026-08-17，替掉 ilammy/setup-nasm@v1）──
-      # 被替掉的 action 实际只做三件事（读它的 index.js 得到）：从
-      # `github.com/ilammy/setup-nasm/raw/mirror/...` 取 nasm-<ver>-win64.zip（取不到再退 www.nasm.us）、
-      # 解出 nasm.exe/ndisasm.exe、addPath —— **全程零校验**（一个 hash 都没有）。
-      # 版本取 nasm.us 官方 releasebuilds 当前最新稳定版 3.02；实际下载 win64 zip 后计算 sha256，
-      # 与本文件 test job、package.yml 的同名步同常量对拍。
-      # 代价说清楚：镜像那条腿去掉了，现在只有 www.nasm.us 一个源（本机实测那个 GitHub 镜像
-      # 当时正好也在 429，拿不到字节 ⇒ 无法核对它的 sha256，不写未验证的常量进来）。
-      # curl 带重试兜瞬时抖动；真下不来会红，不会静默跳过。
-      #
-      # 本步 **Windows-only**（`if: runner.os == 'Windows'`），所以校验器不写平台分支 ——
-      # 写了另一条也是死代码。「Git Bash 是否自带 `sha256sum`」已由 CI-1 的 windows-2022
-      # 真跑实证（当初六条不确定项里唯一「明确未证实」的那条）。
-      # 解压器用 System32 的 bsdtar 绝对路径，不用 `7z`：
-      # 两者都合乎「按平台写死」那条 🔴，但 `7z` 多押一个「它在 Git Bash 的 PATH 上」——
-      # runner 镜像清单只说装了 7zip、没说在不在 PATH（它对 Miniconda / MSYS2 才显式标注了
-      # 「不在 PATH」，对 7-Zip 的沉默是推断不是证据）。绝对路径把 PATH 这一维整个去掉，
-      # 于是 windows 腿（2x 计费）在「解压」这件事上只需要验证一个机制而不是两个。
+      # lint、原生测试和打包共用 Windows NASM 的官方 URL、SHA-256 和解包步骤。
       - name: Install NASM (Windows — pinned URL + sha256)
         if: runner.os == 'Windows'
-        shell: bash
-        env:
-          NASM_VERSION: '3.02'
-        run: |
-          set -euo pipefail
-          sha256='161d0bfaff53c2f9e9f3e69fd0672323ebabafd1268976a5cec11be92a19aee7'
-          tmp="$(cygpath -u "$RUNNER_TEMP")"
-          zip="${tmp}/nasm-${NASM_VERSION}-win64.zip"
-          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 --connect-timeout 20 -o "$zip" \
-            "https://www.nasm.us/pub/nasm/releasebuilds/${NASM_VERSION}/win64/nasm-${NASM_VERSION}-win64.zip"
-          echo "${sha256}  ${zip}" | sha256sum -c -
-          rm -rf "${tmp}/nasm-${NASM_VERSION}"
-          # zip 内已带 `nasm-<ver>/` 顶层目录，解到 tmp 即得 `<tmp>/nasm-<ver>/nasm.exe`。
-          # 落点是 `$tmp`（= RUNNER_TEMP，runner 保证存在；bsdtar 的 -C 要求目录已在，故成立）。
-          echo 'extractor: /c/Windows/System32/tar.exe (bsdtar)'
-          /c/Windows/System32/tar.exe -xf "$(cygpath -w "$zip")" -C "$(cygpath -w "$tmp")"
-          cygpath -w "${tmp}/nasm-${NASM_VERSION}" >> "$GITHUB_PATH"
-          echo "NASM_EXPECT=${NASM_VERSION}" >> "$GITHUB_ENV"
+        uses: $/.github/actions/install-windows-nasm
 
       # 装完必须断言，而且要断言 **PATH 上解析到的那一个** —— 一个静默 no-op 的安装步骤比没有这
       # 一步更坏：构建会悄悄用 runner 上碰巧存在的另一份 protoc，或者把「根本没装上」推迟到
@@ -816,24 +782,7 @@ jobs:
 
       - name: Install NASM (Windows — pinned URL + sha256)
         if: runner.os == 'Windows'
-        shell: bash
-        env:
-          NASM_VERSION: '3.02'
-        run: |
-          set -euo pipefail
-          sha256='161d0bfaff53c2f9e9f3e69fd0672323ebabafd1268976a5cec11be92a19aee7'
-          tmp="$(cygpath -u "$RUNNER_TEMP")"
-          zip="${tmp}/nasm-${NASM_VERSION}-win64.zip"
-          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 --connect-timeout 20 -o "$zip" \
-            "https://www.nasm.us/pub/nasm/releasebuilds/${NASM_VERSION}/win64/nasm-${NASM_VERSION}-win64.zip"
-          echo "${sha256}  ${zip}" | sha256sum -c -
-          rm -rf "${tmp}/nasm-${NASM_VERSION}"
-          # zip 内已带 `nasm-<ver>/` 顶层目录，解到 tmp 即得 `<tmp>/nasm-<ver>/nasm.exe`。
-          # 落点是 `$tmp`（= RUNNER_TEMP，runner 保证存在；bsdtar 的 -C 要求目录已在，故成立）。
-          echo 'extractor: /c/Windows/System32/tar.exe (bsdtar)'
-          /c/Windows/System32/tar.exe -xf "$(cygpath -w "$zip")" -C "$(cygpath -w "$tmp")"
-          cygpath -w "${tmp}/nasm-${NASM_VERSION}" >> "$GITHUB_PATH"
-          echo "NASM_EXPECT=${NASM_VERSION}" >> "$GITHUB_ENV"
+        uses: $/.github/actions/install-windows-nasm
 
       # These crates use source/mock/local HTTP fixtures, never the selected core.
       # btls-sys uses the runner C/C++/CMake/Clang toolchain and pinned Windows NASM above.
@@ -924,7 +873,6 @@ jobs:
           node scripts/fetch-core.mjs 2>&1 | tee native-dns-ci-evidence/acquisition.log
 
       # protoc 的钉扎真值与实证见 lint；Windows NASM 已为前面的无核测试安装。
-      # NASM 常量现在全仓三处内联（本文件 lint / test 两处 + package.yml 一处），必须同时改；
       - name: Install protoc (pinned URL + sha256)
         run: node scripts/fetch-protoc.mjs
 

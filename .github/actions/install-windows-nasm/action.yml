@@ -1,0 +1,23 @@
+name: Install pinned Windows NASM
+description: Verify the official NASM archive and add the extracted Windows tool to PATH.
+runs:
+  using: composite
+  steps:
+    - name: Download, verify and unpack NASM
+      shell: bash
+      env:
+        NASM_VERSION: '3.02'
+      run: |
+        set -euo pipefail
+        sha256='161d0bfaff53c2f9e9f3e69fd0672323ebabafd1268976a5cec11be92a19aee7'
+        tmp="$(cygpath -u "$RUNNER_TEMP")"
+        zip="${tmp}/nasm-${NASM_VERSION}-win64.zip"
+        curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 --connect-timeout 20 -o "$zip" \
+          "https://www.nasm.us/pub/nasm/releasebuilds/${NASM_VERSION}/win64/nasm-${NASM_VERSION}-win64.zip"
+        echo "${sha256}  ${zip}" | sha256sum -c -
+        rm -rf "${tmp}/nasm-${NASM_VERSION}"
+        # zip 内已带 nasm-<ver>/。System32 的 bsdtar 不依赖 Git Bash 的 PATH。
+        echo 'extractor: /c/Windows/System32/tar.exe (bsdtar)'
+        /c/Windows/System32/tar.exe -xf "$(cygpath -w "$zip")" -C "$(cygpath -w "$tmp")"
+        cygpath -w "${tmp}/nasm-${NASM_VERSION}" >> "$GITHUB_PATH"
+        echo "NASM_EXPECT=${NASM_VERSION}" >> "$GITHUB_ENV"

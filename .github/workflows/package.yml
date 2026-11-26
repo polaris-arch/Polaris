@@ -630,33 +630,13 @@ jobs:
       #
       # protoc 自 2026-08-18（CI-4）起走 `scripts/fetch-protoc.mjs`：钉扎常量与版本依据的唯一
       # 真值在脚本里（头注），本文件与 ci.yml 不再各持一份 —— 对拍测试的 protoc 部分已退休。
-      # NASM 仍是两处内联：判据与版本依据写在 `ci.yml` 同名步上方，**改 NASM 前先读那段**，
-      # 两个文件的 NASM 常量必须同时改，改一处就漂移（对拍照旧）。
       - name: Install protoc (pinned URL + sha256)
         id: protoc_install
         run: node scripts/fetch-protoc.mjs
 
       - name: Install NASM (Windows — pinned URL + sha256)
         if: runner.os == 'Windows'
-        shell: bash
-        env:
-          NASM_VERSION: '3.02'
-        run: |
-          set -euo pipefail
-          sha256='161d0bfaff53c2f9e9f3e69fd0672323ebabafd1268976a5cec11be92a19aee7'
-          tmp="$(cygpath -u "$RUNNER_TEMP")"
-          zip="${tmp}/nasm-${NASM_VERSION}-win64.zip"
-          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 --connect-timeout 20 -o "$zip" \
-            "https://www.nasm.us/pub/nasm/releasebuilds/${NASM_VERSION}/win64/nasm-${NASM_VERSION}-win64.zip"
-          echo "${sha256}  ${zip}" | sha256sum -c -
-          rm -rf "${tmp}/nasm-${NASM_VERSION}"
-          # 本步 Windows-only，故校验器不写平台分支（写了另一条也是死代码）；解压器用 System32
-          # 的 bsdtar 绝对路径、不用 `7z`——理由（少押一个「7z 在 Git Bash 的 PATH 上」）写在
-          # `ci.yml` 同名步骤上方。落点是 RUNNER_TEMP（runner 保证存在），故无需 `mkdir -p`。
-          echo 'extractor: /c/Windows/System32/tar.exe (bsdtar)'
-          /c/Windows/System32/tar.exe -xf "$(cygpath -w "$zip")" -C "$(cygpath -w "$tmp")"
-          cygpath -w "${tmp}/nasm-${NASM_VERSION}" >> "$GITHUB_PATH"
-          echo "NASM_EXPECT=${NASM_VERSION}" >> "$GITHUB_ENV"
+        uses: $/.github/actions/install-windows-nasm
 
       # 断言的理由与写法同 ci.yml 那步：静默 no-op 的安装步骤比没有更坏，且期望值来自上面两步
       # 写进 $GITHUB_ENV 的变量 —— 哪一步没执行，这里就因 `set -u` 直接红，「没执行」自曝。

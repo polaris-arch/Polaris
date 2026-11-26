@@ -120,6 +120,11 @@ export const PACKAGE_IMPACT_SCOPES = Object.freeze({
     platforms: ['windows'],
     why: 'Windows 打包使用该入口冻结输入、生成安装包并核对载荷。',
   },
+  '.github/actions/install-windows-nasm/action.yml': {
+    kernel: false,
+    platforms: ['windows'],
+    why: 'Windows 打包用该 action 安装 btls-sys 原生构建所需的 NASM。',
+  },
   'vendor/swift-rs/': {
     kernel: false,
     platforms: MACOS,
