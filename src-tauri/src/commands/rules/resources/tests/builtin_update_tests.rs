@@ -785,3 +785,56 @@ async fn timed_out_fixture_clears_only_its_cancel_registration_after_stage_drop(
     );
     assert_eq!(sink.statuses(), ["downloading"]);
 }
+
+#[tokio::test]
+async fn server_edit_reruns_after_geo_metadata_advances_the_revision() {
+    let (plan, dir) = fixture();
+    let live = dir.join(&plan.file_name);
+    let config = Arc::new(ConfigManager::new(dir.join("config")));
+    let mut raw = config.load_full().unwrap();
+    raw["servers"] = json!([{"id": "n-a", "name": "A", "protocol": "trojan",
+        "address": "1.1.1.1", "port": 443, "password": "pw"}]);
+    config.save_full(&raw).unwrap();
+    let proxy = Arc::new(crate::runtime::proxy::ProxyRuntime::new(
+        Arc::clone(&config),
+        Arc::new(crate::runtime::helper::HelperRuntime::never_installed_for_tests(dir.clone())),
+        Arc::new(crate::runtime::mesh::MeshRuntime::new(dir.clone())),
+        Box::new(polaris_system_integration::production_proxy_controller(
+            dir.join(polaris_system_integration::PROXY_MARKER_FILENAME)
+                .to_string_lossy()
+                .into_owned(),
+        )),
+    ));
+    let stage = ResourceStageDir::create(&dir).unwrap();
+    let operation = BuiltinUpdateOperation::begin(&format!("server-edit-{}", new_uuid()));
+    let prepares = std::cell::Cell::new(0);
+    let (_, edit) = crate::commands::server::commit_server_edit(&config, &proxy, || {
+        let prepared = config
+            .prepare_config_edit(|cfg| {
+                let servers = cfg["servers"].as_array_mut().unwrap();
+                let Some(index) = servers.iter().position(|node| node["id"] == "n-a") else {
+                    return Decision::Skip(Err("服务器不存在: n-a".to_owned()));
+                };
+                servers.remove(index);
+                Decision::Write(Ok(()))
+            })
+            .map_err(|error| error.to_string());
+        if prepares.replace(prepares.get() + 1) == 0 {
+            let owner = StagedSaveOwner::capture(&proxy, 0);
+            let paths = (live.as_path(), live.as_path(), &stage);
+            save_resource_change(&config, "geosite-cn", "meta-at", paths, &operation, owner)
+                .unwrap();
+        }
+        prepared
+    })
+    .await
+    .unwrap();
+    assert!(edit.is_some());
+    assert_eq!(prepares.get(), 2);
+    let saved = config.load_full().unwrap();
+    assert_eq!(saved["servers"], json!([]));
+    assert_eq!(
+        saved["builtinGeoMeta"]["geosite-cn"]["updatedAt"],
+        "meta-at"
+    );
+}

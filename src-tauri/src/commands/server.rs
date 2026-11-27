@@ -18,7 +18,6 @@
 //! 节点 CRUD 先经 Core Plan 再按结果原子写（含 WARP 凭据的新增仍先落盘）+ 广播 event:configChanged。
 //! DIRECT_SERVER_ID 哨兵 + 删选中节点的兜底出口逻辑对齐 Polaris（D4/F-1）。
 
-#[cfg(test)]
 use std::sync::Arc;
 
 use serde::Serialize;
@@ -42,7 +41,6 @@ use crate::runtime::config::{
     warp_credentials, ConfigManager, Decision as ConfigDecision, PreparedConfigEdit,
 };
 use crate::runtime::proxy::runtime_config::{HotConfigEditOutcome, StagedSaveOwner};
-#[cfg(test)]
 use crate::runtime::proxy::ProxyRuntime;
 use crate::runtime::proxy::{code, SwitchOutcome};
 #[cfg(test)]
@@ -53,6 +51,11 @@ use crate::runtime::AppRuntime;
 
 /// Polaris 直接选择哨兵（`shared/direct-selection.ts DIRECT_SERVER_ID`）。
 const DIRECT_SERVER_ID: &str = "__direct__";
+
+/// 编辑 revision 由整份配置共用，geo 元数据、订阅与规则集调度、TS 凭据等后台写入都会推进它。冲突时在最新配置上
+/// 重跑一次编辑，与暂存保存的冲突重试（`staged-config-store.ts` 的 `retryOnConflict`）对齐。不复用
+/// `RUNTIME_APPLY_REPLANS`：那是同一份候选对 Core 源刷新的重新 Plan，不重读配置。
+const SERVER_EDIT_CONFLICT_RETRIES: u8 = 1;
 
 /// id 缺失 / 空 → mint uuid（镜像 [`server_add_bulk`] 的 `s["id"]=new_uuid()`）。
 ///
@@ -222,47 +225,18 @@ async fn save_tailscale_login_profile(
     }))
 }
 
-/// 普通节点增删改共用：先由 Core Plan 当前候选，再按结果落盘；拒绝、冲突与待应用阻塞均不写入。
+/// 普通节点增删改共用：先由 Core Plan 当前候选，再按结果落盘；拒绝与待应用阻塞均不写入，冲突在最新配置上重跑 `prepare`。
 async fn apply_prepared_server_edit<R>(
     app: &AppHandle,
     state: &AppRuntime,
-    prepared: Result<(Result<R, String>, Option<PreparedConfigEdit>), String>,
+    prepare: impl Fn() -> Result<(Result<R, String>, Option<PreparedConfigEdit>), String>,
 ) -> Result<R, String> {
-    let (result, edit) = prepared?;
-    let result = result?;
+    let (result, edit) =
+        Box::pin(commit_server_edit(state.config(), &state.proxy, prepare)).await?;
     let Some(edit) = edit else {
         return Ok(result);
     };
     let proxy = state.proxy();
-    let owner = StagedSaveOwner::capture(proxy, edit.revision);
-    let conflict = || "节点配置已变化，请重试".to_owned();
-    let store_error = |error: polaris_store::StoreError| error.to_string();
-    match Box::pin(state.proxy.apply_hot_config_edit(&edit))
-        .await
-        .map_err(&store_error)?
-    {
-        HotConfigEditOutcome::Saved { .. } => {}
-        HotConfigEditOutcome::NeedsManual { .. } => {
-            proxy
-                .commit_manual_resource_edit(&edit, owner)
-                .await
-                .map_err(&store_error)?
-                .ok_or_else(conflict)?;
-        }
-        HotConfigEditOutcome::BlockedByPending if !cfg!(target_os = "ios") => {
-            state
-                .config()
-                .commit_prepared_config_edit(&edit, || true, |_| {})
-                .map_err(&store_error)?
-                .ok_or_else(conflict)?;
-        }
-        HotConfigEditOutcome::BlockedByPending => {
-            return Err("有待应用的配置变更，请先处理后重试".into());
-        }
-        HotConfigEditOutcome::Retryable => return Err("内核暂时无法更新节点，请重试".into()),
-        HotConfigEditOutcome::Rejected => return Err("内核拒绝了节点修改".into()),
-        HotConfigEditOutcome::Conflict => return Err(conflict()),
-    }
     // A7：删当前选中 → selectedServerId 回落 viable/`__direct__` = 出口变 → 作废旧出口解锁探测缓存。
     invalidate_unlock_on_exit_change(
         state.unlock(),
@@ -278,6 +252,56 @@ async fn apply_prepared_server_edit<R>(
     proxy.push_pending_changes();
     emit_config_changed_signal(app);
     Ok(result)
+}
+
+/// [`apply_prepared_server_edit`] 的落盘部分，不依赖 `AppHandle`。重跑仍经 `apply_hot_config_edit` 的
+/// switch_serial 与 idle 前置条件；节点已被并发删改时由 `prepare` 自然报错。
+pub(crate) async fn commit_server_edit<R>(
+    config: &ConfigManager,
+    proxy: &Arc<ProxyRuntime>,
+    prepare: impl Fn() -> Result<(Result<R, String>, Option<PreparedConfigEdit>), String>,
+) -> Result<(R, Option<PreparedConfigEdit>), String> {
+    let conflict = || "节点配置已变化，请重试".to_owned();
+    let store_error = |error: polaris_store::StoreError| error.to_string();
+    let mut retries = 0;
+    loop {
+        let (result, edit) = prepare()?;
+        let result = result?;
+        let Some(edit) = edit else {
+            return Ok((result, None));
+        };
+        let owner = StagedSaveOwner::capture(proxy, edit.revision);
+        match Box::pin(proxy.apply_hot_config_edit(&edit))
+            .await
+            .map_err(&store_error)?
+        {
+            HotConfigEditOutcome::Saved { .. } => {}
+            HotConfigEditOutcome::NeedsManual { .. } => {
+                proxy
+                    .commit_manual_resource_edit(&edit, owner)
+                    .await
+                    .map_err(&store_error)?
+                    .ok_or_else(conflict)?;
+            }
+            HotConfigEditOutcome::BlockedByPending if !cfg!(target_os = "ios") => {
+                config
+                    .commit_prepared_config_edit(&edit, || true, |_| {})
+                    .map_err(&store_error)?
+                    .ok_or_else(conflict)?;
+            }
+            HotConfigEditOutcome::BlockedByPending => {
+                return Err("有待应用的配置变更，请先处理后重试".into());
+            }
+            HotConfigEditOutcome::Retryable => return Err("内核暂时无法更新节点，请重试".into()),
+            HotConfigEditOutcome::Rejected => return Err("内核拒绝了节点修改".into()),
+            HotConfigEditOutcome::Conflict if retries < SERVER_EDIT_CONFLICT_RETRIES => {
+                retries += 1;
+                continue;
+            }
+            HotConfigEditOutcome::Conflict => return Err(conflict()),
+        }
+        return Ok((result, Some(edit)));
+    }
 }
 
 /// 上游 `SERVER_ADD`：新增节点（id 缺失/空则 mint，防 sanitize 丢弃）。
@@ -311,14 +335,16 @@ pub async fn server_add(
     }
     // 远端已注册的 WARP 设备凭据须先本地保管，沿用先落盘路径；其余节点先 Plan 再落盘。
     if warp_credentials(&server).is_none() {
-        let prepared = normalized_add_server(ensure_server_id(server)).and_then(|server| {
-            state
-                .config()
-                .prepare_config_edit(|cfg| append_normalized_server(cfg, &server))
-                .map_err(|e| format!("{e}"))
-        });
+        let prepare = || {
+            normalized_add_server(ensure_server_id(server.clone())).and_then(|server| {
+                state
+                    .config()
+                    .prepare_config_edit(|cfg| append_normalized_server(cfg, &server))
+                    .map_err(|e| format!("{e}"))
+            })
+        };
         return Ok(
-            match Box::pin(apply_prepared_server_edit(&app, &state, prepared)).await {
+            match Box::pin(apply_prepared_server_edit(&app, &state, prepare)).await {
                 Ok(_) => ApiResponse::ok(None),
                 Err(e) => ApiResponse::err(e),
             },
@@ -383,9 +409,9 @@ pub async fn server_add_bulk(
     if servers.is_empty() {
         return Ok(ApiResponse::ok(json!({ "added": 0 })));
     }
-    let prepared = server_add_bulk_core(state.config(), servers);
+    let prepare = || server_add_bulk_core(state.config(), servers.clone());
     Ok(
-        match Box::pin(apply_prepared_server_edit(&app, &state, prepared)).await {
+        match Box::pin(apply_prepared_server_edit(&app, &state, prepare)).await {
             Ok(added) => ApiResponse::ok(json!({ "added": added })),
             Err(e) => ApiResponse::err(e),
         },
@@ -403,9 +429,9 @@ pub async fn server_update(
     state: State<'_, AppRuntime>,
     server: Value,
 ) -> Result<ApiResponse<()>, ()> {
-    let prepared = server_update_core(state.config(), server);
+    let prepare = || server_update_core(state.config(), server.clone());
     Ok(
-        match Box::pin(apply_prepared_server_edit(&app, &state, prepared)).await {
+        match Box::pin(apply_prepared_server_edit(&app, &state, prepare)).await {
             Ok(()) => ok_void(),
             Err(error) => ApiResponse::err(error),
         },
@@ -493,26 +519,31 @@ pub async fn server_delete(
     server_id: String,
     fallback_selected_id: Option<String>,
 ) -> Result<ApiResponse<()>, ()> {
-    let prepared = state.config().prepare_config_edit(|cfg| {
-        let was_selected = cfg.get("selectedServerId").and_then(Value::as_str) == Some(&server_id);
-        let removed = cfg
-            .get_mut("servers")
-            .and_then(Value::as_array_mut)
-            .and_then(|arr| {
-                arr.iter()
-                    .position(|s| s.get("id").and_then(Value::as_str) == Some(&server_id))
-                    .map(|idx| arr.remove(idx))
-            });
-        let Some(_removed) = removed else {
-            return ConfigDecision::Skip(Err(format!("服务器不存在: {server_id}")));
-        };
-        apply_selection_fallback(cfg, was_selected, fallback_selected_id.as_deref());
-        prune_recent_server_ids_to_existing(cfg);
-        ConfigDecision::Write(Ok(()))
-    });
-    let prepared = prepared.map_err(|e| format!("{e}"));
+    let prepare = || {
+        state
+            .config()
+            .prepare_config_edit(|cfg| {
+                let was_selected =
+                    cfg.get("selectedServerId").and_then(Value::as_str) == Some(&server_id);
+                let removed = cfg
+                    .get_mut("servers")
+                    .and_then(Value::as_array_mut)
+                    .and_then(|arr| {
+                        arr.iter()
+                            .position(|s| s.get("id").and_then(Value::as_str) == Some(&server_id))
+                            .map(|idx| arr.remove(idx))
+                    });
+                let Some(_removed) = removed else {
+                    return ConfigDecision::Skip(Err(format!("服务器不存在: {server_id}")));
+                };
+                apply_selection_fallback(cfg, was_selected, fallback_selected_id.as_deref());
+                prune_recent_server_ids_to_existing(cfg);
+                ConfigDecision::Write(Ok(()))
+            })
+            .map_err(|e| format!("{e}"))
+    };
     Ok(
-        match Box::pin(apply_prepared_server_edit(&app, &state, prepared)).await {
+        match Box::pin(apply_prepared_server_edit(&app, &state, prepare)).await {
             Ok(()) => ok_void(),
             Err(error) => ApiResponse::err(error),
         },
@@ -557,24 +588,28 @@ pub async fn server_delete_batch(
     fallback_selected_id: Option<String>,
 ) -> Result<ApiResponse<u32>, ()> {
     let id_set: std::collections::HashSet<&str> = server_ids.iter().map(String::as_str).collect();
-    let prepared = state.config().prepare_config_edit(|cfg| {
-        let removed = remove_batch_manual_nodes(cfg, &id_set);
-        if removed.is_empty() {
-            return ConfigDecision::Skip(Ok(0u32));
-        }
-        let selected = cfg.get("selectedServerId").and_then(Value::as_str);
-        let selected_in_set = selected.is_some_and(|sid| {
-            removed
-                .iter()
-                .any(|server| server["id"].as_str() == Some(sid))
-        });
-        apply_selection_fallback(cfg, selected_in_set, fallback_selected_id.as_deref());
-        prune_recent_server_ids_to_existing(cfg);
-        ConfigDecision::Write(Ok(u32::try_from(removed.len()).unwrap_or(0)))
-    });
-    let prepared = prepared.map_err(|e| format!("{e}"));
+    let prepare = || {
+        state
+            .config()
+            .prepare_config_edit(|cfg| {
+                let removed = remove_batch_manual_nodes(cfg, &id_set);
+                if removed.is_empty() {
+                    return ConfigDecision::Skip(Ok(0u32));
+                }
+                let selected = cfg.get("selectedServerId").and_then(Value::as_str);
+                let selected_in_set = selected.is_some_and(|sid| {
+                    removed
+                        .iter()
+                        .any(|server| server["id"].as_str() == Some(sid))
+                });
+                apply_selection_fallback(cfg, selected_in_set, fallback_selected_id.as_deref());
+                prune_recent_server_ids_to_existing(cfg);
+                ConfigDecision::Write(Ok(u32::try_from(removed.len()).unwrap_or(0)))
+            })
+            .map_err(|e| format!("{e}"))
+    };
     Ok(
-        match Box::pin(apply_prepared_server_edit(&app, &state, prepared)).await {
+        match Box::pin(apply_prepared_server_edit(&app, &state, prepare)).await {
             Ok(removed_count) => ApiResponse::ok(removed_count),
             Err(e) => ApiResponse::err(e),
         },
