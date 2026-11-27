@@ -421,14 +421,10 @@ jobs:
       - name: Cache pnpm store
         if: github.ref_type != 'tag'
         uses: actions/cache@v6
-        with: &pnpm-store
+        with:
           path: ${{ steps.pnpm-store.outputs.store_path }}
           key: ${{ runner.os }}-node26-pnpm12.21.0-${{ hashFiles('ui/pnpm-lock.yaml') }}
           restore-keys: ${{ runner.os }}-node26-pnpm12.21.0-
-      - name: Restore pnpm store for tag
-        if: github.ref_type == 'tag'
-        uses: actions/cache/restore@v6
-        with: *pnpm-store
 
       - name: Install UI dependencies
         run: pnpm --dir ui install --frozen-lockfile

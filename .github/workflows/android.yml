@@ -228,14 +228,10 @@ jobs:
       - name: Cache pnpm store
         if: github.ref_type != 'tag'
         uses: actions/cache@v6
-        with: &pnpm-store
+        with:
           path: ${{ steps.pnpm.outputs.store_path }}
           key: ${{ runner.os }}-node26-pnpm12.21.0-${{ hashFiles('ui/pnpm-lock.yaml') }}
           restore-keys: ${{ runner.os }}-node26-pnpm12.21.0-
-      - name: Restore pnpm store for tag
-        if: github.ref_type == 'tag'
-        uses: actions/cache/restore@v6
-        with: *pnpm-store
 
       # tauri 的 `beforeBuildCommand` 是 `pnpm --dir ../ui build`，依赖必须先就位。
       - name: Install UI dependencies
@@ -601,7 +597,6 @@ jobs:
           node-version: '26'
 
       - name: Setup pnpm (pinned)
-        id: pnpm
         shell: bash
         env:
           PNPM_VERSION: '12.21.0'
@@ -612,11 +607,6 @@ jobs:
           [ "$got" = "$PNPM_VERSION" ] || {
             echo "::error::pnpm is '$got', expected '$PNPM_VERSION'"; exit 1; }
           echo "$RUNNER_TEMP/pnpm/bin" >> "$GITHUB_PATH"
-          echo "store_path=$("$RUNNER_TEMP/pnpm/bin/pnpm" store path --silent)" >> "$GITHUB_OUTPUT"
-
-      - name: Restore pnpm store
-        uses: actions/cache/restore@v6
-        with: *pnpm-store
 
       # tauri 的 `beforeBuildCommand` 是 `pnpm --dir ../ui build`，依赖必须先就位。
       - name: Install UI dependencies

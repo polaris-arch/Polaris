@@ -137,17 +137,12 @@ jobs:
           export PATH="$RUNNER_TEMP/polaris-pnpm/node_modules/.bin:$PATH"
           echo "$RUNNER_TEMP/polaris-pnpm/node_modules/.bin" >> "$GITHUB_PATH"
           echo "PNPM_STORE_PATH=$(pnpm store path --silent)" >> "$GITHUB_ENV"
-      - name: Cache pnpm store
-        if: github.ref_type != 'tag'
+      - if: github.ref_type != 'tag'
         uses: actions/cache@v5
-        with: &pnpm-store
+        with:
           path: ${{ env.PNPM_STORE_PATH }}
           key: ${{ runner.os }}-node26-pnpm12.21.0-${{ hashFiles('ui/pnpm-lock.yaml') }}
           restore-keys: ${{ runner.os }}-node26-pnpm12.21.0-
-      - name: Restore pnpm store for tag
-        if: github.ref_type == 'tag'
-        uses: actions/cache/restore@v5
-        with: *pnpm-store
       - name: Locked frontend dependencies
         run: pnpm --dir ui install --frozen-lockfile
       - name: Frontend resources and admitted two-slice arm64 component
