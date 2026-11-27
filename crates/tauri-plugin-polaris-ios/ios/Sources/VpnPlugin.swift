@@ -153,7 +153,13 @@ final class VpnPlugin: Plugin {
             op.startIntent = intent
         }
         operation = op
-        // Deadline includes load/save/reload preferences, not only NE status changes.
+        armDeadline(op)
+        return op
+    }
+    /// Covers load/reload preferences and NE status changes. A start disarms it
+    /// while save waits on the system permission sheet: that wait is user time,
+    /// and only the save callback can tell a denial from a slow approval.
+    private func armDeadline(_ op: VpnOperation) {
         let deadline = DispatchWorkItem {
             guard self.current(op) else { return }
             if !op.foregroundObservers.isEmpty {
@@ -167,11 +173,10 @@ final class VpnPlugin: Plugin {
             if op.kind == "start", let intent = op.startIntent, op.started {
                 self.stopSubmittedStart(intent, stopRequestID: freshVpnRequestID("timeout"))
             }
-            self.finish(op, error: vpnError("StartupFailed: VPN \(kind) timed out; completion and cleanup are unknown. Check system VPN status before retrying."))
+            self.finish(op, error: vpnError("StartupFailed: VPN \(op.kind) timed out; completion and cleanup are unknown. Check system VPN status before retrying."))
         }
         op.deadline = deadline
-        DispatchQueue.main.asyncAfter(deadline: .now() + (kind == "start" ? 40 : 25), execute: deadline)
-        return op
+        DispatchQueue.main.asyncAfter(deadline: .now() + (op.kind == "start" ? 40 : 25), execute: deadline)
     }
     /// A start refused here never reached startVPNTunnel, so it carries the
     /// no-store proof that lets the host admit the next start.
@@ -256,6 +261,7 @@ final class VpnPlugin: Plugin {
                         // effect can outlive the callback and this host process.
                         try self.writePreferenceIntent(op.requestID, pending: true, unsubmitted: op.identity)
                         guard self.preferenceMutation.begin(op.requestID) else { throw vpnError("Another VPN preference write is pending") }
+                        op.deadline?.cancel()
                         manager.saveToPreferences { error in
                             DispatchQueue.main.async {
                                 if self.preferenceMutation.finish(op.requestID) {
@@ -268,6 +274,7 @@ final class VpnPlugin: Plugin {
                                 }
                                 guard self.current(op) else { return }
                                 if let error { self.finish(op, error: vpnError(vpnStartFailure(error, stage: "save"))); return }
+                                self.armDeadline(op)
                                 manager.loadFromPreferences { error in
                                     DispatchQueue.main.async {
                                         guard self.current(op) else { return }

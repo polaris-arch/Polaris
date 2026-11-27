@@ -1165,7 +1165,10 @@ async fn start_prepared_mode(
             "configContent": custody.0.config, "requestID": custody.request_id(),
             "managedBootstrap": managed, "expectedDirectorySourceIdentity": expected_source,
         }),
-        45,
+        // Far above any reasonable passcode-sheet stay: that save wait is user time,
+        // and Swift bounds every other stage. Only a missing system callback reaches
+        // this cap, which then takes the existing Unknown path.
+        600,
         Some(generation),
         Some(Box::new(move |response| {
             if let NativeStartResponse::NoStore { terminal, .. } = response {
