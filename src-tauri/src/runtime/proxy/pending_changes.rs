@@ -343,6 +343,15 @@ impl ProxyRuntime {
             || recovery_pending
             || baseline_pending
             || native_pending;
+        let restart_deferred = non_node_pending
+            || selected_pending
+            || host_pending
+            || rule_content_pending
+            || baseline_pending
+            || recovery_pending;
+        if restart_deferred {
+            log::debug!("pending restart deferred: non_node={non_node_pending} selected={selected_pending} host={host_pending} rule_content={rule_content_pending} recovery={recovery_pending} baseline={baseline_pending}");
+        }
         let restart_required = !executing_exact_edit
             && applied.as_ref().is_some_and(|runtime| {
                 super::runtime_config::structural_runtime_change(
@@ -364,12 +373,7 @@ impl ProxyRuntime {
                 // observation can preview the disk journal without that fence.
                 .filter(|_| desired.is_none() && publication.is_none() && !executing_exact_edit)
                 .and_then(|running| self.saved_settings_revert_token(current, running)),
-            restart_deferred: non_node_pending
-                || selected_pending
-                || host_pending
-                || rule_content_pending
-                || baseline_pending
-                || recovery_pending,
+            restart_deferred,
         }
     }
 

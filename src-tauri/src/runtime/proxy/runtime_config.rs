@@ -558,6 +558,7 @@ impl RuntimeApplyResult {
     }
 
     fn restart_required(code: &'static str, mut paths: Vec<String>) -> Self {
+        log::info!("runtime restart required: code={code} paths={paths:?}");
         if paths.is_empty() {
             paths.push(String::new());
         }
@@ -3347,9 +3348,14 @@ impl ProxyRuntime {
             }
             Err(_) => return decline(RuntimeApplyResult::status("unconfirmed")),
         };
+        // Plan errors carry fixed codes and schema paths, never configuration values.
         log::debug!(
-            "runtime config plan timing: groups_ms={groups_ms} plan_ms={}",
-            plan_started_at.elapsed().as_millis()
+            "runtime config plan timing: groups_ms={groups_ms} plan_ms={} errors={:?}",
+            plan_started_at.elapsed().as_millis(),
+            plan.errors
+                .iter()
+                .map(|error| (&error.code, &error.effective_path))
+                .collect::<Vec<_>>()
         );
         if plan.contract_version != 1
             || plan.client_impact_policy_version != baseline.pairing.client_impact_policy_version
