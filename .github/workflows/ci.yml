@@ -22,7 +22,7 @@ name: CI
 # 代价（如实记）：
 #   · 每个 job 各付一次环境准备（checkout / Node / rustup / 缓存恢复 / apt / protoc，ubuntu 约 1.5–2 分钟），
 #     总 runner 分钟数上升；公开仓标准 runner 不计额度，换的是墙钟。
-#   · Rust 缓存由一份变三份（键各自独立，见各 job 的 `Setup Rust cache`）。仓库缓存总额度有上限，
+#   · Rust 缓存由一份变两份（lint、test 键各自独立，见各 job 的 `Setup Rust cache`；cross 不缓存）。仓库缓存总额度有上限，
 #     超出后按最久未用淘汰；若观察到缓存频繁 miss，先查这里。
 #   · 全矩阵事件下 windows / macos 各起两个 job（lint、test），两边都要冷编同一批 C 依赖。
 #
@@ -286,8 +286,9 @@ jobs:
       # 逐条复刻被替掉那个 composite action 的**全部**副作用（读它的 action.yml 得到，不是猜）：
       #   · rustup toolchain install <tc> --profile minimal --component … --no-self-update
       #   · rustup default <tc>
-      #   · CARGO_INCREMENTAL=0（仅当未设置）—— 这条是**它**设的，`Swatinem/rust-cache` 并不设；
-      #     漏掉会静默改变增量编译行为与缓存体积，属于「删掉也不报错」的那类回归，故必须带上
+      #   · CARGO_INCREMENTAL=0（仅当未设置）—— `Swatinem/rust-cache` 的恢复步也会导出它（v2 `src/restore.ts`），
+      #     但 cross job 不挂 rust-cache，只靠这一条；漏掉会静默改变增量编译行为与缓存体积，
+      #     属于「删掉也不报错」的那类回归，故必须带上
       #   · CARGO_TERM_COLOR=always（仅当未设置）
       #   · 打印 `rustc -Vv`
       # 确认无消费者、故意不复刻的三项：`cachekey` output（本仓各处 rust-cache 都没引用）、
@@ -309,17 +310,21 @@ jobs:
           cargo fmt --version
           cargo clippy --version
 
-      # 三个 job 的缓存键各自独立（`key` 追加在 rust-cache 的默认键之后），互不恢复、互不覆盖：
-      # 三者的 `target/` 内容不同（clippy metadata / 交叉 target 的 check 单元 / dev 全量 codegen），
-      # 共用一个键时谁最后跑完谁覆盖，另外两个 job 下次恢复到的就是别人的产物 —— 等于次次冷编。
+      # lint 与 test 的缓存键各自独立（`key` 追加在 rust-cache 的默认键之后），互不恢复、互不覆盖：
+      # 两者的 `target/` 内容不同（clippy metadata / dev 全量 codegen），
+      # 共用一个键时谁最后跑完谁覆盖，另一个 job 下次恢复到的就是别人的产物 —— 等于次次冷编。
+      # cross 不挂缓存：冷跑约 14 分钟，短于 CI 最长腿，存了也换不来墙钟。
       # 显式写键而不依赖默认键里的 job id：本 workflow 还会被 package.yml 以 workflow_call 复用，
       # 键里只留本文件自己写下的字面量，才谈得上稳定。
-      # tag 上写的缓存只有同一 tag 能恢复，发布后无用，还会按 LRU 挤掉分支热缓存 ⇒ tag 只恢复不保存。
+      # Rust 缓存只在 main 保存：work 分支、PR 与 tag 先查本 ref 再回落到默认分支，只恢复不写，
+      # 免得各分支各存一份按 LRU 挤掉 main 的热缓存。冻结时在 main 上 dispatch 刷新键。
+      # lint 只存 macOS：Linux/Windows 冷跑约 8 分钟，不在关键路径上；macOS 腿占着 macOS 槽位，
+      # Release Risk 的 Apple component 要等它让出。
       - name: Setup Rust cache
         uses: Swatinem/rust-cache@v2
         with:
           key: lint
-          save-if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+          save-if: ${{ github.ref == 'refs/heads/main' && runner.os == 'macOS' }}
 
       # 原生构建前置：protoc（singbox-grpc build.rs 三平台都要）、Windows NASM（喂 btls-sys
       # 的 BoringSSL 汇编；曾名 boring-sys2，grep "boring" 会扑空——2026-08-18 探针实测移除本步
@@ -461,13 +466,6 @@ jobs:
           [ -n "${CARGO_TERM_COLOR+set}" ] || echo 'CARGO_TERM_COLOR=always' >> "$GITHUB_ENV"
           rustc -Vv
           cargo clippy --version
-
-      # 键独立的理由见 lint job 同名步。
-      - name: Setup Rust cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: cross
-          save-if: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
       # protoc：singbox-grpc 的 build.rs 在每个 target 上都要它。钉扎真值与版本依据见 lint job 同名步。
       - name: Install protoc (pinned URL + sha256)
@@ -692,6 +690,8 @@ jobs:
           pnpm --dir ui install --frozen-lockfile --ignore-scripts
 
       # 判据与逐条理由见 lint job 同名步上方那段。本 job 不装 rustfmt / clippy 组件（不跑那两条门）。
+      # dev/test 构型的 debuginfo 降到 line-tables-only：panic backtrace 仍带 file:line，target/ 与缓存更小、
+      # 链接更快；没有判据读取完整调试信息。须在 rust-cache 之前写入，它的环境哈希含 CARGO*。
       - name: Install Rust toolchain (preinstalled rustup)
         shell: bash
         run: |
@@ -701,14 +701,15 @@ jobs:
           rustup default "$toolchain"
           [ -n "${CARGO_INCREMENTAL+set}" ] || echo 'CARGO_INCREMENTAL=0' >> "$GITHUB_ENV"
           [ -n "${CARGO_TERM_COLOR+set}" ] || echo 'CARGO_TERM_COLOR=always' >> "$GITHUB_ENV"
+          [ -n "${CARGO_PROFILE_DEV_DEBUG+set}" ] || echo 'CARGO_PROFILE_DEV_DEBUG=line-tables-only' >> "$GITHUB_ENV"
           rustc -Vv
 
-      # 键独立的理由见 lint job 同名步。这一份是三者里最大的（dev 构型全量 codegen）。
+      # 键独立的理由见 lint job 同名步，只在 main 保存同理。这一份是两者里大的那份（dev 构型全量 codegen）。
       - name: Setup Rust cache
         uses: Swatinem/rust-cache@v2
         with:
           key: test
-          save-if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install NASM (Windows — pinned URL + sha256)
         if: runner.os == 'Windows'

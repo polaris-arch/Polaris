@@ -176,8 +176,9 @@ before concurrent local heavy validation; this entry cannot account for an
 unregistered external builder.
 
 Android's workflow uses `android-ci.mjs` to prepare pinned tools and source
-before restoring work and cache. Both legs call the shared producer and
-consumer to build or revalidate and materialize the input. The unsigned and signed APK legs verify final
+in empty work and cache slots. Both legs call the shared producer and
+consumer to build and materialize the input; hosted CI keeps no component cache,
+so it never takes the producer's retained-output revalidation path. The unsigned and signed APK legs verify final
 APK ABI/runtime bytes, R8 evidence and the same original AAR/receipt; signed
 publication still goes through existing certificate/tag/draft gates. The formal
 SDK has four ABIs; published App scope remains the existing two ARM ABIs. SDK,

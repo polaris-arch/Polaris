@@ -42,25 +42,16 @@ import {
 /** 夹具默认造缺省 ABI（arm64-v8a）的包；`ABI` 这个名字保留下来只是为了少改一堆现有用例。 */
 const ABI = DEFAULT_ABI;
 
-test('hosted Android cache outputs reject an invalid identity or multiline path before writing', () => {
+test('hosted Android outputs reject a multiline path before writing', () => {
   using fixture = mkdtempDisposableSync(join(tmpdir(), 'polaris-android-hosted-outputs-'));
-  const output = join(fixture.path, 'github-output');
   const environment = join(fixture.path, 'github-env');
-  const env = { GITHUB_OUTPUT: output, GITHUB_ENV: environment };
+  const env = { GITHUB_ENV: environment };
   const paths = Object.fromEntries(['go', 'gomobile', 'gobind', 'ndk', 'jdk', 'sdk', 'source',
     'work', 'cache', 'consume', 'verify', 'carrier'].map(name => [name, join(fixture.path, name)]));
-  for (const file of [output, environment]) writeFileSync(file, 'retained\n');
-  for (const bad of ['', 'A'.repeat(64), 'g'.repeat(64), 'a'.repeat(63), 'a'.repeat(65), 'a'.repeat(64) + '\n']) {
-    assert.throws(() => emitAndroidInputs(env, paths, bad, 'libbox.aar'), /cache fingerprint/);
-  }
-  assert.throws(() => emitAndroidInputs(env, { ...paths, work: '/work\nINJECT=1' }, 'a'.repeat(64),
-    'libbox.aar'), /line controls/);
-  assert.equal(readFileSync(output, 'utf8'), 'retained\n');
+  writeFileSync(environment, 'retained\n');
+  assert.throws(() => emitAndroidInputs(env, { ...paths, work: '/work\nINJECT=1' }, 'libbox.aar'), /line controls/);
   assert.equal(readFileSync(environment, 'utf8'), 'retained\n');
-  const fingerprint = 'a'.repeat(64);
-  emitAndroidInputs(env, paths, fingerprint, 'libbox.aar');
-  assert.equal(readFileSync(output, 'utf8'),
-    `retained\nfingerprint=${fingerprint}\nwork=${paths.work}\ncache=${paths.cache}\n`);
+  emitAndroidInputs(env, paths, 'libbox.aar');
   assert.ok(readFileSync(environment, 'utf8').includes('POLARIS_ANDROID_COMPONENT=' + join(paths.work, 'libbox.aar') + '\n'));
 });
 
@@ -70,24 +61,16 @@ test('hosted Android preparation emits one bound handoff and halts on preparatio
   const source = JSON.parse(readFileSync(new URL('./mobile-core/source-contract.json', import.meta.url)));
   for (const failure of ['capacity', 'NDK', 'source', null]) {
     using fixture = mkdtempDisposableSync(join(tmpdir(), 'polaris-android-hosted-prep-'));
-    const [sdk, ndk, jdk, output, environment] = ['sdk', 'ndk', 'jdk', 'github-output', 'github-env']
-      .map(name => join(fixture.path, name));
-    mkdirSync(join(sdk, 'platforms', source.android.bootclasspath.platform), { recursive: true });
-    mkdirSync(ndk);
-    mkdirSync(join(jdk, 'bin'), { recursive: true });
+    const [sdk, ndk, jdk, environment] = ['sdk', 'ndk', 'jdk', 'github-env'].map(name => join(fixture.path, name));
+    for (const directory of [sdk, ndk, jdk]) mkdirSync(directory);
     const go = join(fixture.path, 'go');
-    for (const file of [go, join(jdk, 'bin/java'), join(jdk, 'bin/javac'),
-      join(ndk, 'source.properties'), join(sdk, 'platforms', source.android.bootclasspath.platform, 'android.jar')]) {
-      writeFileSync(file, 'controlled ' + file);
-    }
-    for (const file of [output, environment]) writeFileSync(file, 'retained\n');
+    writeFileSync(environment, 'retained\n');
     const env = { GITHUB_ACTIONS: 'true', ANDROID_SDK_ROOT: sdk, JAVA_HOME_17_X64: jdk,
-      GITHUB_OUTPUT: output, GITHUB_ENV: environment, ...(failure === 'capacity' ? { GOMAXPROCS: 'auto' } : {}) };
+      GITHUB_ENV: environment, ...(failure === 'capacity' ? { GOMAXPROCS: 'auto' } : {}) };
     const steps = [], observations = [];
     const preparation = prepareAndroid({
       env, home: fixture.path, observeCapacity: () => ({ jobCap: 1 }), report: row => observations.push(row.phase),
       run: async ([program, ...args], options) => {
-        if (program === 'git') return args.includes('status') ? '' : '1'.repeat(40);
         if (program === 'node' && args.includes('--check-license-only')) return '';
         if (program === 'which' && args[0] === 'go') return go;
         if (program === go && args[0] === 'version') return 'go version go' + source.goVersion + ' linux/amd64';
@@ -96,7 +79,6 @@ test('hosted Android preparation emits one bound handoff and halts on preparatio
             'github.com/sagernet/gomobile/cmd/gobind@' + source.gobindVersion]);
           assert.equal(options.env.GOMAXPROCS, '1');
           assert.ok(options.env.GOMODCACHE.startsWith(fixture.path));
-          for (const tool of ['gomobile', 'gobind']) writeFileSync(join(options.env.GOBIN, tool), 'controlled ' + tool);
           steps.push('install');
           return '';
         }
@@ -104,10 +86,6 @@ test('hosted Android preparation emits one bound handoff and halts on preparatio
           steps.push('NDK');
           if (failure === 'NDK') throw new Error('controlled NDK refusal');
           return ndk;
-        }
-        if ([join(jdk, 'bin/java'), join(jdk, 'bin/javac')].includes(program)) {
-          assert.deepEqual(args, ['--version']);
-          return 'controlled JDK 17';
         }
         assert.fail('unexpected hosted operation: ' + program);
       },
@@ -122,14 +100,12 @@ test('hosted Android preparation emits one bound handoff and halts on preparatio
       await preparation;
       assert.deepEqual(observations, ['android-tool-prepare-capacity-sample', 'android-tool-prepare-capacity']);
       assert.deepEqual(steps, ['install', 'NDK', 'source']);
-      assert.match(readFileSync(output, 'utf8'), /\nfingerprint=[0-9a-f]{64}\nwork=.+\ncache=.+\n$/);
       assert.match(readFileSync(environment, 'utf8'), /\nPOLARIS_ANDROID_RECEIPT=.+\/component-receipt\.json\n/);
       continue;
     }
     await assert.rejects(preparation, failure === 'capacity' ? /positive integer/ : new RegExp('controlled ' + failure + ' refusal'));
     assert.equal(observations[0], 'android-tool-prepare-capacity-sample');
     assert.deepEqual(steps, failure === 'capacity' ? [] : failure === 'NDK' ? ['install', 'NDK'] : ['install', 'NDK', 'source']);
-    assert.equal(readFileSync(output, 'utf8'), 'retained\n');
     assert.equal(readFileSync(environment, 'utf8'), 'retained\n');
   }
 });

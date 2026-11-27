@@ -9,8 +9,7 @@ name: Android
 #   `libbox.aar` 117 MiB 且 **gitignored**，须由固定 Go/gomobile/JDK/NDK 与 sing-box 源码现建；
 #   Android 构建由 scripts/build-android-apk.mjs 统一选择 Rust NDK 并调用全局 Tauri CLI。
 # 面 B（GitHub runner 能给什么）：
-#   预装 Android SDK / cmdline-tools / 多版本 JDK / Go；NDK 预装但版本随镜像漂；
-#   `actions/cache` 按「内核版本 × builder/manifest/patch 哈希」缓存 AAR 与构建收据。
+#   预装 Android SDK / cmdline-tools / 多版本 JDK / Go；NDK 预装但版本随镜像漂。
 #
 # 两个面的对差落在**步骤序列**上，不落在 runner 或 tauri_args 上：package.yml 的 `package` job 有 40 个
 # step，全是桌面形态（fetch 桌面内核归档 / cronet / dashboard、编 helper、tauri-action 出 NSIS+dmg+deb、
@@ -106,7 +105,7 @@ permissions:
 
 env:
   # 构建权重的两个开关放在 workflow 级而不是某个 job：两个 job 的前置步骤逐字相同，
-  # 其中 `Select APK build weight` 步与 rust-cache 的键都读它们；放 job 级就得写两份、会漂。
+  # 其中 `Select APK build weight` 步读它们；放 job 级就得写两份、会漂。
   # 轻量构建只认调用方显式传入的 true；手动 dispatch 与 tag 发布调用都没有它 ⇒ '0'。
   # 两者的组合由 `Select APK build weight` 步 fail-closed 校验（轻量 + 发布 ⇒ 当场红）。
   POLARIS_LIGHT_BUILD: ${{ inputs.light_build && '1' || '0' }}
@@ -163,7 +162,7 @@ jobs:
   # 背景（Release Risk 上的实测）：本腿墙钟 18–30 分钟，其中 `Build unsigned release-profile
   # validation APK` 一步约 9–11 分钟。那一步每次都 `cargo clean -p polaris` 后重编应用 crate，而根
   # `Cargo.toml` 的 `lto = "fat"` + `codegen-units = 1` 把全部 crate 的 bitcode 在链接期合成一个
-  # 单线程优化单元 —— 这一段不可缓存，rust-cache 命中也整段重来。
+  # 单线程优化单元 —— 这一段不可缓存。
   # 而本腿要回答的三件事（上面 ①②③：R8 吃进了什么 / mapping 保全 / APK 实际内容）没有一件
   # 取决于 Rust 侧的优化强度。
   #
@@ -262,7 +261,6 @@ jobs:
       # 决策记录、三条 fail-closed、轻量构型下各判据是否仍成立，写在 `release_check` job 的头注；
       # 本步随前置步骤在两个 job 里逐字复制，这里只留指针。
       # 签名发布腿上本步恒走发行分支：零写入，只查「环境里没有任何 cargo profile 覆盖」。
-      # 位置必须在 `Setup Rust cache` 之前：两种构型的缓存键靠下面那步的 `-light` 后缀分开。
       - name: Select APK build weight (release profile vs risk-gate light)
         shell: bash
         run: |
@@ -292,21 +290,6 @@ jobs:
           echo "::notice title=Risk-gate light build::本腿用轻量构型（lto=off, codegen-units=16）编 Rust，只用于验证 release-profile 产物链；APK 不是可分发物，不签名、不上传、不进 release。"
           printf '%s\n' '**Risk-gate light build**: lto=off, codegen-units=16. This APK verifies the release-profile artifact chain only; it is not distributable and is never signed, uploaded or released.' >> "$GITHUB_STEP_SUMMARY"
 
-      # key 用固定串而不是 matrix：本 workflow 每个 job 只有一个 target，
-      # 与 package.yml 那边「两个 mac job 同 job_id 会撞键」的成因不同。
-      #
-      # 轻量构型再加 `-light` 后缀（2026-10-08，与 package.yml 同一写法）：两种构型的依赖产物不通用
-      # （fat LTO 要依赖带 bitcode，轻量不要），同一个 job 上手动 dispatch（发行）与风险门（轻量）
-      # 共用一个键就是互相覆盖。发行构型的键仍是 `android-aarch64`，与改动前逐字相同。
-      # 与桌面不同的一点：rust-cache 的键默认还含 job id（`add-job-id-key` 缺省 true），签名发布腿
-      # 与验证腿本来就各存各的 ⇒ tag 发布构建的缓存冷热不因本改动而变（桌面那边会变，见 package.yml）。
-      - name: Setup Rust cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: '. -> target'
-          key: android-aarch64${{ env.POLARIS_LIGHT_BUILD == '1' && '-light' || '' }}
-          save-if: ${{ !startsWith(github.ref, 'refs/tags/') }}
-
       # `crates/singbox-grpc` 的 build.rs 在**所有** target 上都要 protoc（它是 app crate 的依赖，
       # 不按平台 cfg 掉）。与 package.yml / ci.yml 用同一个钉扎脚本，版本真值只有那一份。
       - name: Install protoc (pinned URL + sha256)
@@ -330,11 +313,10 @@ jobs:
       # ══ 工具链解析：Gradle JDK 从 runner 取；Rust/libbox NDK 从入库版本与 manifest 取 ══
       #
       # 不回落到 runner 默认 NDK：Rust 与 libbox 各自有已验工具链，缺席即失败。
-      # libbox 的缓存键含 JDK 17 的整目录哈希（工具身份的一部分）。取镜像预装的那份时，镜像每换一版
-      # 小版本就变、键就变；新旧镜像并存期间两次 run 各落一版，缓存来回失效，每次多编 13 分钟
-      # （2026-10-07 实证：镜像 20260927 与 20261004 上算出两把不同的键，其余输入逐项相同）。
+      # JDK 17 是 libbox 工具身份的一部分；取镜像预装的那份时，镜像每换一版小版本就变
+      # （2026-10-07 实证：镜像 20260927 与 20261004 的 JDK 不同，其余输入逐项相同）。
       # 所以 JDK 17 与 Go、NDK 一样钉确切版本；本步会把 JAVA_HOME_17_X64 指向它，下一步原样消费。
-      # 升级 = 改这里两处的版本号（Adoptium 的 semver 写法），缓存随之重建一次。
+      # 升级 = 改这里两处的版本号（Adoptium 的 semver 写法）。
       - name: Pin libbox JDK 17
         uses: actions/setup-java@v5
         with:
@@ -383,29 +365,18 @@ jobs:
           [ -f "$rust_ndk/source.properties" ] || { echo "::error::Rust NDK 未安装：$rust_ndk"; exit 1; }
           echo "NDK_RUST=$rust_ndk" >> "$GITHUB_ENV"
 
-          echo "NDK(rust)=$rust_ndk; libbox tools are verified before source cache lookup"
+          echo "NDK(rust)=$rust_ndk"
 
       # ══ libbox.aar：117 MiB、gitignored，CI 上必须现来一份 ══
       #
       # [不选「预置成 release asset / 从别处下载」：那要求有人先手工传一份上去，
       #  「没人传」与「传错了一份」都不会有任何东西说话 —— 正是本仓纪律里那条「自动化必须让没执行自曝」]
-      # [不选「只用 actions/cache，没有就跳过」：`if: cache-hit == 'true'` 这类静默短路等于没有这条腿]
-      # 缓存身份由完整共同 pins、四 ABI policy、实际工具/SDK 与 producer code 形成。
-      # null/partial 配置先拒绝；命中与 fresh 都消费同一个源码/产物谓词。
-      # Pure admission already ran before Go/SDK preparation. Actual tool bytes precede AAR cache lookup.
+      # [不选「缓存组件与 Go 缓存」：组件身份几乎每轮都变，命中率低，且 Android 腿不在 Release Risk 关键路径上]
+      # 每轮在空的 work/cache 槽位里重建，producer 安装前跑同一份 verifyReceipt，再由 consumer 核验。
+      # Pure admission already ran before Go/SDK preparation.
       - name: Prepare formal mobile source and isolated tools
-        id: libbox_input
         shell: bash
         run: node scripts/mobile-core/android-ci.mjs
-
-      - name: Restore formal component and fixed Go cache
-        id: libbox
-        uses: actions/cache/restore@v6
-        with:
-          path: |
-            ${{ steps.libbox_input.outputs.work }}
-            ${{ steps.libbox_input.outputs.cache }}
-          key: libbox-formal-v1-${{ runner.os }}-${{ steps.libbox_input.outputs.fingerprint }}
 
       - name: Build or revalidate formal four-ABI component and App input
         shell: bash
@@ -422,7 +393,6 @@ jobs:
             --go "$POLARIS_ANDROID_GO" --javap "$POLARIS_ANDROID_JDK/bin/javap" --readelf "$POLARIS_ANDROID_READELF"
 
       - name: libbox.aar 必须在位
-        id: libbox_verified
         shell: bash
         run: |
           set -euo pipefail
@@ -431,17 +401,6 @@ jobs:
             --component "$POLARIS_ANDROID_COMPONENT" --receipt "$POLARIS_ANDROID_RECEIPT" \
             --work "$POLARIS_ANDROID_VERIFY" --cache "$POLARIS_ANDROID_CACHE" \
             --go "$POLARIS_ANDROID_GO" --javap "$POLARIS_ANDROID_JDK/bin/javap" --readelf "$POLARIS_ANDROID_READELF"
-
-      # Save only the validated AAR/receipt pair before an unrelated APK failure can discard it.
-      - name: Save verified libbox.aar
-        if: success() && steps.libbox.outputs.cache-hit != 'true' && steps.libbox_verified.outcome == 'success' && !startsWith(github.ref, 'refs/tags/')
-        uses: actions/cache/save@v6
-        with:
-          path: |
-            ${{ steps.libbox_input.outputs.work }}
-            ${{ steps.libbox_input.outputs.cache }}
-          key: ${{ steps.libbox.outputs.cache-primary-key }}
-
 
       # Release profile 构建直接让 Tauri 驱动 Gradle；本腿显式只产出未分发的未签名验证包。
       - name: Build unsigned release-profile validation APK
@@ -686,7 +645,6 @@ jobs:
       # 决策记录、三条 fail-closed、轻量构型下各判据是否仍成立，写在 `release_check` job 的头注；
       # 本步随前置步骤在两个 job 里逐字复制，这里只留指针。
       # 签名发布腿上本步恒走发行分支：零写入，只查「环境里没有任何 cargo profile 覆盖」。
-      # 位置必须在 `Setup Rust cache` 之前：两种构型的缓存键靠下面那步的 `-light` 后缀分开。
       - name: Select APK build weight (release profile vs risk-gate light)
         shell: bash
         run: |
@@ -716,21 +674,6 @@ jobs:
           echo "::notice title=Risk-gate light build::本腿用轻量构型（lto=off, codegen-units=16）编 Rust，只用于验证 release-profile 产物链；APK 不是可分发物，不签名、不上传、不进 release。"
           printf '%s\n' '**Risk-gate light build**: lto=off, codegen-units=16. This APK verifies the release-profile artifact chain only; it is not distributable and is never signed, uploaded or released.' >> "$GITHUB_STEP_SUMMARY"
 
-      # key 用固定串而不是 matrix：本 workflow 每个 job 只有一个 target，
-      # 与 package.yml 那边「两个 mac job 同 job_id 会撞键」的成因不同。
-      #
-      # 轻量构型再加 `-light` 后缀（2026-10-08，与 package.yml 同一写法）：两种构型的依赖产物不通用
-      # （fat LTO 要依赖带 bitcode，轻量不要），同一个 job 上手动 dispatch（发行）与风险门（轻量）
-      # 共用一个键就是互相覆盖。发行构型的键仍是 `android-aarch64`，与改动前逐字相同。
-      # 与桌面不同的一点：rust-cache 的键默认还含 job id（`add-job-id-key` 缺省 true），签名发布腿
-      # 与验证腿本来就各存各的 ⇒ tag 发布构建的缓存冷热不因本改动而变（桌面那边会变，见 package.yml）。
-      - name: Setup Rust cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: '. -> target'
-          key: android-aarch64${{ env.POLARIS_LIGHT_BUILD == '1' && '-light' || '' }}
-          save-if: ${{ !startsWith(github.ref, 'refs/tags/') }}
-
       # `crates/singbox-grpc` 的 build.rs 在**所有** target 上都要 protoc（它是 app crate 的依赖，
       # 不按平台 cfg 掉）。与 package.yml / ci.yml 用同一个钉扎脚本，版本真值只有那一份。
       - name: Install protoc (pinned URL + sha256)
@@ -754,11 +697,10 @@ jobs:
       # ══ 工具链解析：Gradle JDK 从 runner 取；Rust/libbox NDK 从入库版本与 manifest 取 ══
       #
       # 不回落到 runner 默认 NDK：Rust 与 libbox 各自有已验工具链，缺席即失败。
-      # libbox 的缓存键含 JDK 17 的整目录哈希（工具身份的一部分）。取镜像预装的那份时，镜像每换一版
-      # 小版本就变、键就变；新旧镜像并存期间两次 run 各落一版，缓存来回失效，每次多编 13 分钟
-      # （2026-10-07 实证：镜像 20260927 与 20261004 上算出两把不同的键，其余输入逐项相同）。
+      # JDK 17 是 libbox 工具身份的一部分；取镜像预装的那份时，镜像每换一版小版本就变
+      # （2026-10-07 实证：镜像 20260927 与 20261004 的 JDK 不同，其余输入逐项相同）。
       # 所以 JDK 17 与 Go、NDK 一样钉确切版本；本步会把 JAVA_HOME_17_X64 指向它，下一步原样消费。
-      # 升级 = 改这里两处的版本号（Adoptium 的 semver 写法），缓存随之重建一次。
+      # 升级 = 改这里两处的版本号（Adoptium 的 semver 写法）。
       - name: Pin libbox JDK 17
         uses: actions/setup-java@v5
         with:
@@ -807,29 +749,18 @@ jobs:
           [ -f "$rust_ndk/source.properties" ] || { echo "::error::Rust NDK 未安装：$rust_ndk"; exit 1; }
           echo "NDK_RUST=$rust_ndk" >> "$GITHUB_ENV"
 
-          echo "NDK(rust)=$rust_ndk; libbox tools are verified before source cache lookup"
+          echo "NDK(rust)=$rust_ndk"
 
       # ══ libbox.aar：117 MiB、gitignored，CI 上必须现来一份 ══
       #
       # [不选「预置成 release asset / 从别处下载」：那要求有人先手工传一份上去，
       #  「没人传」与「传错了一份」都不会有任何东西说话 —— 正是本仓纪律里那条「自动化必须让没执行自曝」]
-      # [不选「只用 actions/cache，没有就跳过」：`if: cache-hit == 'true'` 这类静默短路等于没有这条腿]
-      # 缓存身份由完整共同 pins、四 ABI policy、实际工具/SDK 与 producer code 形成。
-      # null/partial 配置先拒绝；命中与 fresh 都消费同一个源码/产物谓词。
-      # Pure admission already ran before Go/SDK preparation. Actual tool bytes precede AAR cache lookup.
+      # [不选「缓存组件与 Go 缓存」：组件身份几乎每轮都变，命中率低，且 Android 腿不在 Release Risk 关键路径上]
+      # 每轮在空的 work/cache 槽位里重建，producer 安装前跑同一份 verifyReceipt，再由 consumer 核验。
+      # Pure admission already ran before Go/SDK preparation.
       - name: Prepare formal mobile source and isolated tools
-        id: libbox_input
         shell: bash
         run: node scripts/mobile-core/android-ci.mjs
-
-      - name: Restore formal component and fixed Go cache
-        id: libbox
-        uses: actions/cache/restore@v6
-        with:
-          path: |
-            ${{ steps.libbox_input.outputs.work }}
-            ${{ steps.libbox_input.outputs.cache }}
-          key: libbox-formal-v1-${{ runner.os }}-${{ steps.libbox_input.outputs.fingerprint }}
 
       - name: Build or revalidate formal four-ABI component and App input
         shell: bash
@@ -846,7 +777,6 @@ jobs:
             --go "$POLARIS_ANDROID_GO" --javap "$POLARIS_ANDROID_JDK/bin/javap" --readelf "$POLARIS_ANDROID_READELF"
 
       - name: libbox.aar 必须在位
-        id: libbox_verified
         shell: bash
         run: |
           set -euo pipefail
@@ -855,17 +785,6 @@ jobs:
             --component "$POLARIS_ANDROID_COMPONENT" --receipt "$POLARIS_ANDROID_RECEIPT" \
             --work "$POLARIS_ANDROID_VERIFY" --cache "$POLARIS_ANDROID_CACHE" \
             --go "$POLARIS_ANDROID_GO" --javap "$POLARIS_ANDROID_JDK/bin/javap" --readelf "$POLARIS_ANDROID_READELF"
-
-      # Save only the validated AAR/receipt pair before an unrelated APK failure can discard it.
-      - name: Save verified libbox.aar
-        if: success() && steps.libbox.outputs.cache-hit != 'true' && steps.libbox_verified.outcome == 'success' && !startsWith(github.ref, 'refs/tags/')
-        uses: actions/cache/save@v6
-        with:
-          path: |
-            ${{ steps.libbox_input.outputs.work }}
-            ${{ steps.libbox_input.outputs.cache }}
-          key: ${{ steps.libbox.outputs.cache-primary-key }}
-
       # ── 签名凭据：从 secret 落到 runner 的临时路径，用后即删 ──
       #
       # 🔴 缺任何一件**当场失败**，不许继续：gradle 那侧缺凭据时会走 `signingBlockers` 大声失败，

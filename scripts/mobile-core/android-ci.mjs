@@ -1,16 +1,12 @@
 #!/usr/bin/env node
-// Prepare the hosted Android source/tool slots before any formal component cache lookup.
-import { appendFileSync, readFileSync, realpathSync, statSync, writeSync } from 'node:fs';
+// Prepare the hosted Android source/tool slots for the formal component build.
+import { appendFileSync, realpathSync, statSync, writeSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { ROOT, canonical, load, prepareSource, require, sha } from './fork-input.mjs';
-import { filePin } from './component-admission.mjs';
+import { ROOT, load, prepareSource, require } from './fork-input.mjs';
 import { createNativeRunner, nativeCapacity, nativeEnvironment, privateDir } from './native-runner.mjs';
-import { androidBuildCode, producerCode } from './producer.mjs';
 
-export function emitAndroidInputs(env, paths, fingerprint, artifactName) {
-  require(typeof fingerprint === 'string' && fingerprint.length === 64 && /^[0-9a-f]{64}$/.test(fingerprint),
-    'actual source/tool cache fingerprint required');
+export function emitAndroidInputs(env, paths, artifactName) {
   const settings = {
     POLARIS_ANDROID_GO: paths.go,
     POLARIS_ANDROID_GOMOBILE: paths.gomobile,
@@ -32,11 +28,8 @@ export function emitAndroidInputs(env, paths, fingerprint, artifactName) {
     require(typeof value === 'string' && value.length > 0 && !/[\r\n]/.test(value),
       'output paths contain line controls or are missing');
   }
-  require(env.GITHUB_OUTPUT && env.GITHUB_ENV, 'actual hosted output files required');
-  const outputs = { fingerprint, work: paths.work, cache: paths.cache };
-  const assignments = (map) => Object.entries(map).map(([key, value]) => key + '=' + value + '\n').join('');
-  appendFileSync(env.GITHUB_OUTPUT, assignments(outputs));
-  appendFileSync(env.GITHUB_ENV, assignments(settings));
+  require(env.GITHUB_ENV, 'actual hosted environment file required');
+  appendFileSync(env.GITHUB_ENV, Object.entries(settings).map(([key, value]) => key + '=' + value + '\n').join(''));
 }
 
 export async function prepareAndroid({
@@ -45,7 +38,6 @@ export async function prepareAndroid({
   report = row => writeSync(1, JSON.stringify(row) + '\n'),
 } = {}) {
   const source = load();
-  const producer = await producerCode(run);
   require(env.GITHUB_ACTIONS === 'true', 'hosted Android entry only; local builds use reserved explicit slots');
   const root = privateDir(join(home, 'Code/polaris-mobile-ci'));
   const sdk = realpathSync(env.ANDROID_SDK_ROOT || env.ANDROID_HOME || '');
@@ -76,18 +68,7 @@ export async function prepareAndroid({
     source: join(root, 'fork-source'), consume: privateDir(join(root, 'consume-work')),
     verify: privateDir(join(root, 'verify-work')), carrier: privateDir(join(root, 'final-carrier-work')) };
   await prepare(paths.source, source);
-  require(canonical(await producerCode(run)).equals(canonical(producer)), 'App producer source changed during preparation');
-  const java = realpathSync(join(jdk, 'bin/java'));
-  const javac = realpathSync(join(jdk, 'bin/javac'));
-  const fingerprint = sha(canonical({
-    source, code: androidBuildCode(producer),
-    tools: Object.fromEntries(['go', 'gomobile', 'gobind'].map(name => [name, filePin(paths[name])])),
-    java: { ...filePin(java), version: await run([java, '--version']) },
-    javac: { ...filePin(javac), version: await run([javac, '--version']) },
-    ndkProperties: readFileSync(join(ndk, 'source.properties'), 'utf8').replace(/\r\n?/g, '\n'),
-    bootclasspath: filePin(join(sdk, 'platforms', source.android.bootclasspath.platform, 'android.jar')),
-  }));
-  emitAndroidInputs(env, paths, fingerprint, source.android.outputName);
+  emitAndroidInputs(env, paths, source.android.outputName);
   console.log('Formal Android source/tool slots prepared without binding the component');
 }
 
