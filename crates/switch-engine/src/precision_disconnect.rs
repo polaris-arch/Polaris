@@ -7,10 +7,11 @@
 //! 对本次实际改变了指向的每个 selector 取 `(selector_tag, 旧成员 tag)` 对，只关 chains
 //! 同时含二者的活连接。
 //!
-//! 为何必须应用侧显式关（实测坐实 v1.14.0-alpha.40/41，见上游 SagerNet/sing-box#4281）：
-//! sing-box selector 的 `interrupt_exist_connections` 对 **routed 连接 no-op**——连接经
-//! ConnectionHandler 路径直接 dial，不注册进 selector 的 interrupt group，`SelectOutbound`
-//! 触发的 `Interrupt()` 遍历空集。故存量连接不会被内核断，须 `CloseConnection` 逐条关。
+//! 与内核 selector 中断的分工：Polaris Core 已把经 selector 链的 routed 连接与 TUN 流登记进
+//! interrupt group，`SelectOutbound` 在 RPC 返回前同步关掉它们（v1.14.0-alpha.40/41 的 no-op，
+//! 见上游 SagerNet/sing-box#4281，已不成立）。proxy-selector 只在「无自动成员且开关打开」时生成
+//! `interrupt_exist_connections`（`config-engine/builder/outbounds.rs`），此时快照里通常已无旧连接；
+//! 有自动成员时内核不中断，应用侧 `CloseConnection` 逐条关是唯一断连机制，必须保留。
 //!
 //! # chains 语义（实测坐实）
 //!

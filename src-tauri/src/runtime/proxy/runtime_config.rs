@@ -404,7 +404,7 @@ pub(super) struct RuntimeConfigBaseline {
     physical_route_config: UserConfig,
     protected_physical_root: Option<Arc<ProtectedPhysicalRoot>>,
     deps: GenerateConfigDeps,
-    generated: SingBoxConfig,
+    pub(super) generated: SingBoxConfig,
     android_mesh_id: Option<String>,
     /// 起核前（TUN 建立前）经物理网卡探得 Bootstrap DoH 端点被 RST/拒绝/超时。只报不通，未知按 false。
     pub(super) doh_blocked: bool,

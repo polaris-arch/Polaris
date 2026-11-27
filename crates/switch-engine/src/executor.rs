@@ -22,8 +22,8 @@
 //!
 //! `interrupt_connections_on_switch` 开关关闭 → 热切换成功后**不断**旧成员连接（用户明确接受
 //! 存量连接继续走旧路径直到自然结束）。开关开 → PUT 全成功后调 `precision_disconnect`。
-//! 与 sing-box selector 的 `interrupt_exist_connections`（对 routed 连接 no-op）正交——
-//! 那是内核侧无效，本侧是应用侧显式关。
+//! 与 selector 的 `interrupt_exist_connections` 互补：无自动成员时内核已在 PUT 返回前中断；
+//! 有自动成员时内核不中断，只能由本侧显式关。
 
 #![forbid(unsafe_code)]
 

@@ -2142,8 +2142,23 @@ impl ProxyRuntime {
                         {
                             log::warn!("热切换完成，但精准断连快照失败：{error}");
                         }
+                        // Report the running graph's own proxy-selector flag, generated
+                        // only without auto members; selection PUTs never change it.
                         log::info!(
-                            "switchMode：热切换成功（核未重启），断连请求已确认 {} 条，失败 {} 条",
+                            "switchMode：热切换成功（核未重启），内核 selector 中断={}；应用侧补关 选中 {} / 确认 {} / 失败 {}",
+                            if self.runtime_config_baseline.read().is_ok_and(|baseline| {
+                                baseline.as_ref().is_some_and(|baseline| {
+                                    baseline.generated.outbounds.iter().any(|outbound| {
+                                        outbound.tag == PROXY_SELECTOR_TAG
+                                            && outbound.interrupt_exist_connections == Some(true)
+                                    })
+                                })
+                            }) {
+                                "是"
+                            } else {
+                                "否"
+                            },
+                            disconnect.as_ref().map_or(0, |d| d.selected_ids.len()),
                             disconnect.as_ref().map_or(0, |d| d.closed_ids.len()),
                             disconnect.as_ref().map_or(0, |d| d.failed_ids.len())
                         );
