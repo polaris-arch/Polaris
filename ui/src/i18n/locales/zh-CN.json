@@ -38,7 +38,7 @@
     "installing": "安装中…",
     "installingDesc": "等待一次性管理员授权…",
     "upgradeDescCard": "助手兼容版本需要更新，安装需要管理员授权；缺失的配套内核会一并安装。若助手正被占用，请先在对应应用中正常断开连接。",
-    "coreInstallDesc": "本版本配套内核尚未安装。需要一次管理员授权将其安装到受保护位置，兼容助手会继续复用。",
+    "coreInstallDesc": "本版本配套内核尚未安装。兼容助手会直接安装它；若未成功，需一次管理员授权连同助手一并安装。",
     "upgradeHelperAction": "升级提权助手（需授权）",
     "upgradeToastAction": "去升级",
     "btmTitle": "后台运行被禁用 (BTM)",

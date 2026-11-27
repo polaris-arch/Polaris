@@ -38,7 +38,7 @@
     "installing": "安裝中…",
     "installingDesc": "等待一次性系統管理員授權…",
     "upgradeDescCard": "助手相容版本需要更新，安裝需要管理員授權；缺少的配套核心會一併安裝。若助手正被使用，請先在對應應用程式中正常中斷連線。",
-    "coreInstallDesc": "本版本配套核心尚未安裝。需要一次管理員授權將其安裝到受保護位置，相容助手會繼續沿用。",
+    "coreInstallDesc": "本版本配套核心尚未安裝。相容助手會直接安裝它；若未成功，需一次管理員授權連同助手一併安裝。",
     "upgradeHelperAction": "升級提權助手（需授權）",
     "upgradeToastAction": "去升級",
     "btmTitle": "背景執行被停用 (BTM)",
