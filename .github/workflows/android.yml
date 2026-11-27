@@ -305,6 +305,7 @@ jobs:
         with:
           workspaces: '. -> target'
           key: android-aarch64${{ env.POLARIS_LIGHT_BUILD == '1' && '-light' || '' }}
+          save-if: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
       # `crates/singbox-grpc` 的 build.rs 在**所有** target 上都要 protoc（它是 app crate 的依赖，
       # 不按平台 cfg 掉）。与 package.yml / ci.yml 用同一个钉扎脚本，版本真值只有那一份。
@@ -433,7 +434,7 @@ jobs:
 
       # Save only the validated AAR/receipt pair before an unrelated APK failure can discard it.
       - name: Save verified libbox.aar
-        if: success() && steps.libbox.outputs.cache-hit != 'true' && steps.libbox_verified.outcome == 'success'
+        if: success() && steps.libbox.outputs.cache-hit != 'true' && steps.libbox_verified.outcome == 'success' && !startsWith(github.ref, 'refs/tags/')
         uses: actions/cache/save@v6
         with:
           path: |
@@ -728,6 +729,7 @@ jobs:
         with:
           workspaces: '. -> target'
           key: android-aarch64${{ env.POLARIS_LIGHT_BUILD == '1' && '-light' || '' }}
+          save-if: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
       # `crates/singbox-grpc` 的 build.rs 在**所有** target 上都要 protoc（它是 app crate 的依赖，
       # 不按平台 cfg 掉）。与 package.yml / ci.yml 用同一个钉扎脚本，版本真值只有那一份。
@@ -856,7 +858,7 @@ jobs:
 
       # Save only the validated AAR/receipt pair before an unrelated APK failure can discard it.
       - name: Save verified libbox.aar
-        if: success() && steps.libbox.outputs.cache-hit != 'true' && steps.libbox_verified.outcome == 'success'
+        if: success() && steps.libbox.outputs.cache-hit != 'true' && steps.libbox_verified.outcome == 'success' && !startsWith(github.ref, 'refs/tags/')
         uses: actions/cache/save@v6
         with:
           path: |

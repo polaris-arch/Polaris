@@ -599,11 +599,13 @@ jobs:
       # ⚠️ 随之而来的代价：此前 main 上的风险门打包腿与 tag 发行构建同构型，tag 构建能恢复到
       #    main 留下的缓存；现在 main 上只剩 `-light` 缓存 ⇒ **tag 发行构建基本是冷编**
       #    （发行路径本身一字未改，只是不再有同构型的热缓存可借）。
+      # tag 上写的缓存只有同一 tag 能恢复，发布后无用，还会按 LRU 挤掉分支热缓存 ⇒ tag 只恢复不保存（ci.yml、android.yml 同此）。
       - name: Setup Rust cache
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: '. -> target'
           key: ${{ matrix.label }}${{ env.POLARIS_LIGHT_BUILD == '1' && '-light' || '' }}
+          save-if: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
       # ── Linux 系统依赖（WebKitGTK 4.1 栈）── Tauri 2 打包必需，GitHub ubuntu-22.04 需补装。
       - name: Install Linux system dependencies

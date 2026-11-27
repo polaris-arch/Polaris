@@ -314,10 +314,12 @@ jobs:
       # 共用一个键时谁最后跑完谁覆盖，另外两个 job 下次恢复到的就是别人的产物 —— 等于次次冷编。
       # 显式写键而不依赖默认键里的 job id：本 workflow 还会被 package.yml 以 workflow_call 复用，
       # 键里只留本文件自己写下的字面量，才谈得上稳定。
+      # tag 上写的缓存只有同一 tag 能恢复，发布后无用，还会按 LRU 挤掉分支热缓存 ⇒ tag 只恢复不保存。
       - name: Setup Rust cache
         uses: Swatinem/rust-cache@v2
         with:
           key: lint
+          save-if: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
       # 原生构建前置：protoc（singbox-grpc build.rs 三平台都要）、Windows NASM（喂 btls-sys
       # 的 BoringSSL 汇编；曾名 boring-sys2，grep "boring" 会扑空——2026-08-18 探针实测移除本步
@@ -465,6 +467,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           key: cross
+          save-if: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
       # protoc：singbox-grpc 的 build.rs 在每个 target 上都要它。钉扎真值与版本依据见 lint job 同名步。
       - name: Install protoc (pinned URL + sha256)
@@ -705,6 +708,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           key: test
+          save-if: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
       - name: Install NASM (Windows — pinned URL + sha256)
         if: runner.os == 'Windows'
