@@ -340,6 +340,10 @@ jobs:
       preserve_run: ${{ inputs.preserve_run || github.event.inputs.preserve_run == 'true' }}
       candidate: ${{ needs.classify.outputs.candidate }}
       include_simulator: ${{ github.event_name == 'workflow_dispatch' && inputs.apple_include_simulator }}
+      # 轻量构型，与 package / android 腿同一开关、同一取值。staticlib、`_start_app`/bridge 符号、
+      # wire 检查（只看 PROFILE == release）、Xcode 链接、extension link map 与 TLS 都不取决于 Rust LTO。
+      # 风险门因此**不再验** iOS fat LTO 链接本身，那只在手动 dispatch apple.yml（发行构型）上暴露。
+      light_build: true
 
   gate:
     name: release risk gate

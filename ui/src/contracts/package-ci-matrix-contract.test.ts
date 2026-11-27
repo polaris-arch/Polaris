@@ -950,13 +950,13 @@ describe('风险门轻量构型：只在 release-risk 路径生效，发行构�
       '      light_build:\n        type: boolean\n        required: false\n        default: false\n',
     );
 
-    // 传 true 的调用点全仓恰两处，都在 release-risk：打包腿（与「不上传」成对）与 Android 腿（不传发布）。
+    // 传 true 的调用点全仓恰三处，都在 release-risk：打包腿（与「不上传」成对）、Android 腿（不传发布）与 Apple 腿。
     // 旧判据是「全仓恰一处」；现在按文件、按 job 各自点名，别的 workflow（含 tag 发布所在的 package.yml）为零。
     const names = readdirSync(join(REPO_ROOT, '.github/workflows')).filter((name) => /\.ya?ml$/.test(name));
     expect(names).toContain('release-risk.yml');
     const passes = (text: string) => (executable(text).match(/light_build:\s*true/g) ?? []).length;
     for (const name of names) {
-      expect(passes(workflow(name)), `${name} 里传 light_build: true 的次数`).toBe(name === 'release-risk.yml' ? 2 : 0);
+      expect(passes(workflow(name)), `${name} 里传 light_build: true 的次数`).toBe(name === 'release-risk.yml' ? 3 : 0);
     }
     const risk = workflow('release-risk.yml');
     const riskPackage = executable(jobBlock(risk, 'package'));
@@ -967,6 +967,9 @@ describe('风险门轻量构型：只在 release-risk 路径生效，发行构�
     expect(riskAndroid).toContain('uses: ./.github/workflows/android.yml');
     expect(riskAndroid).toContain('light_build: true');
     expect(riskAndroid).not.toContain('publish_release');
+    const riskApple = executable(jobBlock(risk, 'apple'));
+    expect(riskApple).toContain('uses: ./.github/workflows/apple.yml');
+    expect(riskApple).toContain('light_build: true');
     // tag 发布段调 android.yml 时只传发布，不传轻量。
     const tagAndroid = executable(jobBlock(pkg, 'android_release'));
     expect(tagAndroid).toContain('publish_release: true');

@@ -16,6 +16,12 @@ on:
       preserve_run:
         type: boolean
         default: false
+      # Risk-gate light Rust build (lto=off, codegen-units=16); only release-risk.yml passes it.
+      # Manual dispatch has no such input and keeps the fat-LTO release profile.
+      light_build:
+        type: boolean
+        required: false
+        default: false
   workflow_dispatch:
     inputs:
       include_simulator:
@@ -71,6 +77,37 @@ jobs:
           [ -n "${CARGO_INCREMENTAL+set}" ] || echo 'CARGO_INCREMENTAL=0' >> "$GITHUB_ENV"
           [ -n "${CARGO_TERM_COLOR+set}" ] || echo 'CARGO_TERM_COLOR=always' >> "$GITHUB_ENV"
           rustc -Vv
+      # Same mechanism, values and fail-closed checks as android.yml `Select APK build weight`
+      # (Apple never publishes, so its third check does not apply). It must precede
+      # `apple-cache.mjs prepare`: the dependency cache identity binds CARGO_PROFILE_* overrides.
+      - name: Select Apple Rust build weight (release profile vs risk-gate light)
+        shell: bash
+        env:
+          POLARIS_LIGHT_BUILD: ${{ inputs.light_build && '1' || '0' }}
+        run: |
+          set -euo pipefail
+          leaked="$(env | grep '^CARGO_PROFILE_' || true)"
+          if [ -n "$leaked" ]; then
+            echo "::error::环境里已有 cargo profile 覆盖，拒绝构建（它们会静默改写发行构型）："
+            printf '%s\n' "$leaked"
+            exit 1
+          fi
+          case "$POLARIS_LIGHT_BUILD" in
+            0)
+              echo "构建权重：发行构型（Cargo.toml 的 [profile.release] 原样，无任何环境变量覆盖）"
+              exit 0 ;;
+            1) ;;
+            *) echo "::error::POLARIS_LIGHT_BUILD 取值非法：'$POLARIS_LIGHT_BUILD'"; exit 1 ;;
+          esac
+          case "$GITHUB_REF" in
+            refs/tags/*) echo "::error::轻量构型不得用于 tag（$GITHUB_REF）：tag 上的产物是发布物"; exit 1 ;;
+          esac
+          {
+            echo 'CARGO_PROFILE_RELEASE_LTO=off'
+            echo 'CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16'
+          } >> "$GITHUB_ENV"
+          echo "::notice title=Risk-gate light build::本腿用轻量构型（lto=off, codegen-units=16）编 Rust，只用于验证 release-profile 产物链；iOS fat LTO 链接只在手动 dispatch apple.yml 时验证。"
+          printf '%s\n' '**Risk-gate light build**: lto=off, codegen-units=16. This unsigned App verifies the release-profile artifact chain only; iOS fat-LTO linking is verified only by a manual apple.yml dispatch.' >> "$GITHUB_STEP_SUMMARY"
       - name: Exact tool/source and declared arm64 carrier configuration admission
         run: node scripts/mobile-core/ci-apple.mjs prepare
       - name: Execute pure Swift lifecycle, monitor and G4 receipt seams
