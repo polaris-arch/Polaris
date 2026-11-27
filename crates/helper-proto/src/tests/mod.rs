@@ -249,3 +249,139 @@ fn native_advertisement_matches_target_behavior_generation() {
     assert_eq!(proto_version::for_platform(Platform::Mac), 7);
     assert_eq!(proto_version::for_platform(Platform::Linux), 10);
 }
+
+mod behavior_ledger {
+    //! Each platform's helper-linked crates carry an explicit proto decision: a digest
+    //! change either advances that platform's proto requirement or is re-recorded with
+    //! the reason it is unreachable from the helper. Whole crates are hashed, so
+    //! `super::`, trait impls and `use` aliases cannot hide a change; third-party code
+    //! (Cargo.lock), build configuration and the mandatory-or-not call stay with review.
+    use super::*;
+    use sha2::{Digest, Sha256};
+    use std::path::Path;
+
+    fn uncommented_manifest(dir: &Path) -> String {
+        let manifest = std::fs::read_to_string(dir.join("Cargo.toml")).unwrap();
+        let lines: Vec<_> = manifest
+            .lines()
+            .map(|line| line.split('#').next().unwrap_or_default())
+            .collect();
+        lines.join("\n")
+    }
+
+    /// Non-dev `path =` dependencies that apply to `platform`.
+    fn path_dependencies(manifest: &str, platform: &str) -> Vec<String> {
+        let (mut applies, mut out) = (false, Vec::new());
+        for line in manifest.lines() {
+            if let Some(section) = line.trim().strip_prefix('[') {
+                let section = section.trim_end_matches(']');
+                applies = match section
+                    .strip_prefix("target.'cfg(")
+                    .and_then(|t| t.split_once(")'."))
+                {
+                    Some((_, "dev-dependencies")) => false,
+                    Some(("unix", _)) => platform != "windows",
+                    Some(("windows", _)) => platform == "windows",
+                    Some((cfg, _)) if cfg.starts_with("target_os = ") => {
+                        cfg == format!("target_os = \"{platform}\"")
+                    }
+                    Some((cfg, _)) => panic!("ledger cannot evaluate cfg({cfg}); extend it"),
+                    None => matches!(section, "dependencies" | "build-dependencies"),
+                };
+            } else if let Some((_, rest)) = line.split_once("path = \"../").filter(|_| applies) {
+                out.push(rest.split('"').next().unwrap_or_default().to_owned());
+            }
+        }
+        out
+    }
+
+    /// Comment/whitespace-insensitive sha256 of manifests, build scripts and production
+    /// sources (`src/**/*.rs` without `tests/`); `helper` drops other `platform/<q>/`.
+    fn digest(root: &Path, platform: &str, crates: &[&str]) -> String {
+        let mut hasher = Sha256::new();
+        for name in crates {
+            let dir = root.join("crates").join(name);
+            let mut faces = vec![("Cargo.toml".to_owned(), uncommented_manifest(&dir))];
+            if let Ok(build) = std::fs::read_to_string(dir.join("build.rs")) {
+                faces.push(("build.rs".to_owned(), build));
+            }
+            if dir.join("build").is_dir() {
+                let rel = format!("crates/{name}/build");
+                faces.extend(polaris_source_probe::repo_dir_files_in(root, &rel, "rs"));
+            }
+            let foreign = |rel: &str| {
+                *name == "helper"
+                    && ["linux", "macos", "windows"]
+                        .iter()
+                        .any(|q| *q != platform && rel.starts_with(&format!("platform/{q}/")))
+            };
+            for (rel, text) in polaris_source_probe::module_files_in(&dir, "") {
+                if !foreign(&rel) {
+                    faces.push((format!("src/{rel}"), text));
+                }
+            }
+            for (rel, text) in faces {
+                let text = if rel.ends_with(".rs") {
+                    polaris_source_probe::mask_comments(&text)
+                } else {
+                    text
+                };
+                let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+                hasher.update(format!("{name}/{rel}\0{text}\0"));
+            }
+        }
+        hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    #[test]
+    fn helper_behavior_sources_require_a_recorded_proto_decision() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let root = polaris_source_probe::workspace_root_from(manifest_dir);
+        let ledger =
+            polaris_source_probe::crate_file_in(manifest_dir, "helper-behavior-ledger.json");
+        let ledger: serde_json::Value = serde_json::from_str(&ledger).unwrap();
+        let mut failures = Vec::new();
+        for (name, platform) in [
+            ("linux", Platform::Linux),
+            ("macos", Platform::Mac),
+            ("windows", Platform::Win),
+        ] {
+            let entry = &ledger[name];
+            let mut crates: Vec<&str> = entry["crates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|c| c.as_str())
+                .collect();
+            crates.sort_unstable();
+            for krate in &crates {
+                let manifest = uncommented_manifest(&root.join("crates").join(krate));
+                for dep in path_dependencies(&manifest, name) {
+                    if !crates.contains(&dep.as_str()) {
+                        failures.push(format!(
+                            "{name}: {krate} links {dep}, absent from the ledger"
+                        ));
+                    }
+                }
+            }
+            let generation = proto_version::for_platform(platform);
+            let actual = digest(&root, name, &crates);
+            if entry["generation"] != generation
+                || entry["digest"] != actual.as_str()
+                || entry["reason"].as_str().is_none_or(str::is_empty)
+            {
+                failures.push(format!(
+                    "{name}: helper behavior sources changed (proto {generation}, digest {actual}). \
+                     Either advance the {name} proto requirement for a mandatory fix, or re-record \
+                     generation/digest in crates/helper-proto/helper-behavior-ledger.json with a \
+                     reason showing the change is unreachable from the helper."
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+}

@@ -3461,8 +3461,10 @@ dependencies = [
 name = "polaris-helper-proto"
 version = "1.0.0"
 dependencies = [
+ "polaris-source-probe",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
 ]
 
 [[package]]
