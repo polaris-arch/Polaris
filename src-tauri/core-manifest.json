@@ -2,6 +2,6 @@
   "desktopRelease": {
     "schema": "polaris-app-release-selection-v1",
     "contractPath": "scripts/desktop-core/release-contract.json",
-    "contractSha256": "eda9a4ce13505208d48a95d2154ccfd6233928ce989ca109f6a80a0070df6ab7"
+    "contractSha256": "74c623d4d76b7eac1e90dde4835bab747a3072f7f4fed098dca6dffca27d32e6"
   }
 }
