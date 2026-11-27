@@ -216,14 +216,16 @@ func vpnRetirementEvidence(profileIdentity: [String: Any]?, expectedIdentity: [S
     return result
 }
 
-/// Only explicit system error receipts classify a denial. A generic NE save
-/// failure or any timeout remains StartupFailed/ReadyUnknown.
+/// Only explicit system error receipts classify a denial. On device, rejecting or
+/// cancelling the permission sheet both return only NEVPNErrorDomain 5 to save.
+/// Other NE codes, other stages and any timeout remain StartupFailed/ReadyUnknown.
 func vpnStartFailure(_ error: Error, stage: String) -> String {
     let system = error as NSError
     let underlying = system.userInfo[NSUnderlyingErrorKey] as? NSError
     let errors = [system] + (underlying.map { [$0] } ?? [])
     if stage == "save", errors.contains(where: {
         ($0.domain == NSCocoaErrorDomain && $0.code == NSUserCancelledError)
+            || ($0.domain == "NEVPNErrorDomain" && $0.code == 5)
             || ($0.domain == NSPOSIXErrorDomain && ($0.code == 1 || $0.code == 13))
     }) { return "PermissionDenied: System VPN configuration permission was rejected. " + system.localizedDescription }
     return "StartupFailed: VPN \(stage) failed. " + system.localizedDescription
