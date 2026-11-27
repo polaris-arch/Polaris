@@ -1007,10 +1007,23 @@ jobs:
         id: windows_directory_go_setup
         if: >-
           ${{ runner.os == 'Windows' && steps.windows_directory_go.outcome == 'success' }}
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version: ${{ steps.windows_directory_go.outputs.version }}
+          cache: ${{ github.ref_type != 'tag' }}
           cache-dependency-path: .windows-directory-kernel/go.sum
+      # Match setup-go’s Windows x64 cache key and path order for tag builds.
+      - name: Restore kernel Go cache for tag
+        if: >-
+          ${{ github.ref_type == 'tag' && steps.windows_directory_go_setup.outcome == 'success'
+              && steps.windows_directory_go_setup.outputs.GOMODCACHE != ''
+              && steps.windows_directory_go_setup.outputs.GOCACHE != '' }}
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            ${{ steps.windows_directory_go_setup.outputs.GOMODCACHE }}
+            ${{ steps.windows_directory_go_setup.outputs.GOCACHE }}
+          key: setup-go-Windows-x64-go-${{ steps.windows_directory_go_setup.outputs.go-version }}-${{ hashFiles('.windows-directory-kernel/go.sum') }}
       - name: Build and run native Windows directory producer and consumer acceptance
         id: windows_directory_acceptance
         if: >-

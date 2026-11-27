@@ -137,11 +137,17 @@ jobs:
           export PATH="$RUNNER_TEMP/polaris-pnpm/node_modules/.bin:$PATH"
           echo "$RUNNER_TEMP/polaris-pnpm/node_modules/.bin" >> "$GITHUB_PATH"
           echo "PNPM_STORE_PATH=$(pnpm store path --silent)" >> "$GITHUB_ENV"
-      - uses: actions/cache@v5
-        with:
+      - name: Cache pnpm store
+        if: github.ref_type != 'tag'
+        uses: actions/cache@v5
+        with: &pnpm-store
           path: ${{ env.PNPM_STORE_PATH }}
           key: ${{ runner.os }}-node26-pnpm12.21.0-${{ hashFiles('ui/pnpm-lock.yaml') }}
           restore-keys: ${{ runner.os }}-node26-pnpm12.21.0-
+      - name: Restore pnpm store for tag
+        if: github.ref_type == 'tag'
+        uses: actions/cache/restore@v5
+        with: *pnpm-store
       - name: Locked frontend dependencies
         run: pnpm --dir ui install --frozen-lockfile
       - name: Frontend resources and admitted two-slice arm64 component
@@ -236,7 +242,7 @@ jobs:
           retention-days: 7
       - name: Stage device dependencies without copying accepted App products
         id: rust_device_export
-        if: ${{ !cancelled() && steps.device_arm64.conclusion == 'success' && steps.original_device_arm64.conclusion == 'success' && steps.summary_device_arm64.conclusion == 'success' && steps.rust_device_restore.outputs.cache-hit != 'true' }}
+        if: ${{ github.ref_type != 'tag' && !cancelled() && steps.device_arm64.conclusion == 'success' && steps.original_device_arm64.conclusion == 'success' && steps.summary_device_arm64.conclusion == 'success' && steps.rust_device_restore.outputs.cache-hit != 'true' }}
         run: node scripts/mobile-core/apple-cache.mjs export --slot "device-arm64"
       - name: Save device-arm64 release dependencies before retirement
         id: rust_device_save
@@ -251,7 +257,7 @@ jobs:
         run: node scripts/mobile-core/apple-cache.mjs import --slot "device-arm64" --restored staged
       - name: Check Cargo registry cache archive headroom
         id: rust_registry_ready
-        if: ${{ !cancelled() && steps.device_arm64.conclusion == 'success' && steps.original_device_arm64.conclusion == 'success' && steps.summary_device_arm64.conclusion == 'success' && steps.rust_registry_restore.outputs.cache-hit != 'true' }}
+        if: ${{ github.ref_type != 'tag' && !cancelled() && steps.device_arm64.conclusion == 'success' && steps.original_device_arm64.conclusion == 'success' && steps.summary_device_arm64.conclusion == 'success' && steps.rust_registry_restore.outputs.cache-hit != 'true' }}
         run: node scripts/mobile-core/apple-cache.mjs registry-ready
       - name: Save registry downloads separately from target dependencies
         uses: actions/cache/save@v5
@@ -304,7 +310,7 @@ jobs:
           retention-days: 7
       - name: Stage simulator dependencies without copying accepted App products
         id: rust_sim_export
-        if: ${{ inputs.include_simulator && !cancelled() && steps.sim_arm64.conclusion == 'success' && steps.original_sim_arm64.conclusion == 'success' && steps.summary_sim_arm64.conclusion == 'success' && steps.rust_sim_restore.outputs.cache-hit != 'true' }}
+        if: ${{ inputs.include_simulator && !cancelled() && github.ref_type != 'tag' && steps.sim_arm64.conclusion == 'success' && steps.original_sim_arm64.conclusion == 'success' && steps.summary_sim_arm64.conclusion == 'success' && steps.rust_sim_restore.outputs.cache-hit != 'true' }}
         run: node scripts/mobile-core/apple-cache.mjs export --slot "sim-arm64"
       - name: Save sim-arm64 release dependencies before retirement
         id: rust_sim_save

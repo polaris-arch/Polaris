@@ -84,11 +84,16 @@ jobs:
           echo "store_path=$("$RUNNER_TEMP/pnpm/bin/pnpm" store path --silent)" >> "$GITHUB_OUTPUT"
 
       - name: Cache pnpm store
+        if: github.ref_type != 'tag'
         uses: actions/cache@v6
-        with:
+        with: &pnpm-store
           path: ${{ steps.pnpm.outputs.store_path }}
           key: ${{ runner.os }}-node26-pnpm12.21.0-${{ hashFiles('ui/pnpm-lock.yaml') }}
           restore-keys: ${{ runner.os }}-node26-pnpm12.21.0-
+      - name: Restore pnpm store for tag
+        if: github.ref_type == 'tag'
+        uses: actions/cache/restore@v6
+        with: *pnpm-store
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
