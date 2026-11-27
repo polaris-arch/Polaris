@@ -504,7 +504,7 @@ function submitEdit(
           continue;
         }
         if (outcome.status === 'needsManual') return manualDraft();
-        if (outcome.status === 'blockedByPending') return warn(i18n.t('home.pendingSavedStillNeedsApply'));
+        if (outcome.status === 'blockedByPending') return warn(i18n.t('home.pendingEditBlocked'));
         if (outcome.status !== 'saved') return failed(i18n.t('common.saveFailed'), outcome.status !== 'rejected');
         if (queued) queued.committedVersion = outcome.version;
         completeSave(set, get, disk, merged, entries, observedAtDispatch, outcome, false);

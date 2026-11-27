@@ -533,13 +533,24 @@ describe('edit admission before creating a manual draft', () => {
   });
 
   it('keeps an unclassified edit separate from earlier saved changes awaiting apply', async () => {
+    await i18nReady;
     const store = useStagedConfigStore;
     await hydrateStagedConfig(CONFIG);
     saveMock.mockResolvedValueOnce({ status: 'blockedByPending' });
-    expect(await store.getState().submit(entry('n1', 8443))).toBe('ignored');
-    expect(store.getState()).toMatchObject({ entries: [], saveStatus: 'idle', conflict: null });
-    expect(fake.getItem(STAGED_STORAGE_KEY)).toBeNull();
-    expect(applyMock).not.toHaveBeenCalled();
+    const change = entry('n1', 8443);
+    const warning = vi.fn<typeof import('@/lib/error-handler').toast.warning>();
+    setToastImpl({ warning });
+    try {
+      expect(await store.getState().submit(change)).toBe('ignored');
+      expect(store.getState()).toMatchObject({ entries: [], saveStatus: 'idle', conflict: null });
+      expect(fake.getItem(STAGED_STORAGE_KEY)).toBeNull();
+      expect(applyMock).not.toHaveBeenCalled();
+      expect(warning).toHaveBeenCalledExactlyOnceWith(change.label, {
+        description: i18n.t('home.pendingEditBlocked'),
+      });
+    } finally {
+      setToastImpl({});
+    }
   });
 
   it('warns without staging when another writer changed the same entity', async () => {

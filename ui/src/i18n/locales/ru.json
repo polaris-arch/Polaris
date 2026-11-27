@@ -634,7 +634,8 @@
     },
     "pendingResetShortConfirm": "Отменить черновики?",
     "pendingResetDone": "Несохранённые изменения отменены",
-    "pendingSavedStillNeedsApply": "Сохранённые изменения всё ещё ожидают применения"
+    "pendingSavedStillNeedsApply": "Сохранённые изменения всё ещё ожидают применения",
+    "pendingEditBlocked": "Есть изменения, ожидающие применения. Примените или отмените их, прежде чем вносить правки."
   },
   "settings": {
     "utls": {

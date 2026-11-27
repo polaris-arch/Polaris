@@ -612,7 +612,8 @@
     },
     "pendingResetShortConfirm": "放弃草稿？",
     "pendingResetDone": "已放弃未保存改动",
-    "pendingSavedStillNeedsApply": "已保存的改动仍待应用"
+    "pendingSavedStillNeedsApply": "已保存的改动仍待应用",
+    "pendingEditBlocked": "有改动正在等待应用，请先应用或撤销后再修改"
   },
   "settings": {
     "utls": {

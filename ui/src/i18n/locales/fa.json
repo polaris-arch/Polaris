@@ -634,7 +634,8 @@
     },
     "pendingResetShortConfirm": "پیش‌نویس‌ها لغو شوند؟",
     "pendingResetDone": "تغییرات ذخیره‌نشده لغو شدند",
-    "pendingSavedStillNeedsApply": "تغییرات ذخیره‌شده هنوز باید اعمال شوند"
+    "pendingSavedStillNeedsApply": "تغییرات ذخیره‌شده هنوز باید اعمال شوند",
+    "pendingEditBlocked": "تغییراتی در انتظار اعمال است. ابتدا آن‌ها را اعمال یا بازگردانی کنید، سپس ویرایش کنید."
   },
   "settings": {
     "utls": {

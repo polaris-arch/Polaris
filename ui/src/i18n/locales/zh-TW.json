@@ -612,7 +612,8 @@
     },
     "pendingResetShortConfirm": "放棄草稿？",
     "pendingResetDone": "已放棄未儲存變更",
-    "pendingSavedStillNeedsApply": "已儲存的變更仍待套用"
+    "pendingSavedStillNeedsApply": "已儲存的變更仍待套用",
+    "pendingEditBlocked": "有變更正在等待套用，請先套用或撤銷後再修改"
   },
   "settings": {
     "utls": {

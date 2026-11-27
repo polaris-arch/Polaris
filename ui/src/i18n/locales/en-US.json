@@ -612,7 +612,8 @@
     },
     "pendingResetShortConfirm": "Discard drafts?",
     "pendingResetDone": "Unsaved changes discarded",
-    "pendingSavedStillNeedsApply": "Saved changes still need to be applied"
+    "pendingSavedStillNeedsApply": "Saved changes still need to be applied",
+    "pendingEditBlocked": "Changes are waiting to be applied. Apply or revert them before editing."
   },
   "settings": {
     "utls": {
