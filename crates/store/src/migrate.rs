@@ -569,15 +569,7 @@ pub fn migrate_dns_connection_ownership(value: &mut Value) -> bool {
     }
 
     if let Some(traffic) = canonical_traffic {
-        let ids: std::collections::HashSet<String> = traffic
-            .iter()
-            .filter_map(|rule| rule.get("id").and_then(Value::as_str).map(str::to_owned))
-            .collect();
-        if let Some(order) = root.get_mut("routeRuleOrder").and_then(Value::as_array_mut) {
-            let before = order.len();
-            order.retain(|id| id.as_str().is_some_and(|id| ids.contains(id)));
-            changed |= order.len() != before;
-        }
+        changed |= prune_rule_order(root, "routeRuleOrder", "trafficRules");
         // v4 回滚兼容镜像仍只投影流量规则，但不再携带 DNS 解析字段。
         let mirror = Value::Array(traffic);
         for key in ["policyRules", "customRules"] {
@@ -594,6 +586,27 @@ pub fn migrate_dns_connection_ownership(value: &mut Value) -> bool {
         root.insert("configSchemaVersion".into(), Value::from(4));
     }
     changed
+}
+
+/// 把 `order_key` 剪到 `rules_key` 中现存的规则 id。保存时也剪 routeRuleOrder，否则保存值会在下次加载时被迁移改写。
+pub(crate) fn prune_rule_order(
+    root: &mut Map<String, Value>,
+    order_key: &str,
+    rules_key: &str,
+) -> bool {
+    let Some(rules) = root.get(rules_key).and_then(Value::as_array) else {
+        return false;
+    };
+    let ids: std::collections::HashSet<String> = rules
+        .iter()
+        .filter_map(|rule| rule.get("id").and_then(Value::as_str).map(str::to_owned))
+        .collect();
+    let Some(order) = root.get_mut(order_key).and_then(Value::as_array_mut) else {
+        return false;
+    };
+    let before = order.len();
+    order.retain(|id| id.as_str().is_some_and(|id| ids.contains(id)));
+    order.len() != before
 }
 
 /// 确保三个受保护内置 DNS 服务器始终是显式配置资源；只补缺项，不覆盖用户编辑。

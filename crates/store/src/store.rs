@@ -164,6 +164,10 @@ impl ConfigStore {
         crate::validate::validate_raw_rule_dns_actions(config)?;
         let mut value = config.clone();
         crate::sanitize::sanitize_value_in_place_pub(&mut value);
+        // 暂存删除只移除规则条目；顺序表里残留的 id 若留到下次加载才由迁移剪掉，保存值与加载值会一直不等。
+        if let Some(root) = value.as_object_mut() {
+            crate::migrate::prune_rule_order(root, "routeRuleOrder", "trafficRules");
+        }
         validate_config(&mut value)?;
         crate::validate::validate_raw_rule_ids(&value)?;
         crate::validate::validate_for_save(&value)?;

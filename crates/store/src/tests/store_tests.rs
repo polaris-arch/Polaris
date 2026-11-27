@@ -80,6 +80,8 @@ fn v4_legacy_route_mirrors_need_no_rewrite_when_load_returns_the_saved_document(
     for key in ["trafficRules", "policyRules", "customRules"] {
         config[key] = rules.clone();
     }
+    // A staged deletion removes only the rule; its stale order id must not survive the save.
+    config["routeRuleOrder"] = serde_json::json!(["deleted-rule", "legacy-source"]);
     let fs = MockFs::default();
     ConfigStore::save(&fs, Path::new(CFG), &config, "abcdef012345").unwrap();
     let saved: serde_json::Value =
