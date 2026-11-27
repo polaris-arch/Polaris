@@ -60,6 +60,7 @@ test('mobile native capacity observes cgroup ancestors and Darwin reclaimable pa
     'Pages free: 300000.\nPages inactive: 600000.\nPages speculative: 0.\nPages wired down: 9999.\n';
   const darwin = nativeCapacity({ platform: 'darwin', logicalCPUs: 8, load1: 1, observeVM: () => vm });
   assert.equal(darwin.jobCap, 6);
+  assert.equal(nativeCapacity({ platform: 'darwin', logicalCPUs: 3, load1: 15, observeVM: () => vm }).jobCap, 3);
   assert.equal(darwin.availableMemoryBytes, 900_000 * 16_384);
   assert.equal(darwin.osMemoryObservationKind, 'reclaimable-page-subset-not-complete-available-memory');
   assert.equal(nativeCapacity({ platform: 'darwin', observeVM: () => '' }).jobCap, 1);

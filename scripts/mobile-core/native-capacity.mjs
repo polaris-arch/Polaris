@@ -197,6 +197,9 @@ export function nativeCapacity({
     result.jobCap = 1;
     result.unknown.push('container-memory');
   }
+  // Hosted macOS load1 (14-88 on 3 CPUs) and the vm_stat page subset each pin the cap to 1.
+  // Both stay recorded; an observed darwin host keeps at least min(CPUs, 3) jobs.
+  if (platform === 'darwin' && memory !== undefined) result.jobCap = Math.max(result.jobCap, Math.min(result.effectiveCPUs, 3));
   return result;
 }
 
