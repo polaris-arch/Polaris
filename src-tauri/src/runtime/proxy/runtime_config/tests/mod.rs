@@ -2249,6 +2249,76 @@ async fn background_broadcast_reports_only_the_exhausted_apply_rejection() {
     server.abort();
 }
 
+// Core's source refresh can publish between the capability read and Plan.
+// Prospective prepare replans against the advanced identity without writing D.
+#[tokio::test]
+async fn hot_config_edit_replans_when_core_publishes_before_plan() {
+    let (rt, _dir, _) = crate::runtime::proxy::tests::test_runtime_recording();
+    let mut running = runnable_config_fixture();
+    running["proxyMode"] = json!("global");
+    running["proxyModeType"] = json!("manual");
+    running["clashApiSecret"] = json!("native-retirement-test");
+    rt.config.save_full(&running).unwrap();
+    let running = rt.config.current().unwrap();
+    *rt.current_config.write().unwrap() = Some(running.clone());
+    *rt.startup_snapshot.write().unwrap() = Some(running.clone());
+    *rt.switch_snapshot.write().unwrap() = Some(Default::default());
+    let pending = ts_pending_raw_fixture(&rt, running.clone());
+    let (rpc, server) = native_retirement_rpc_peer(
+        &rt,
+        &pending,
+        daemon::RuntimeConfigOperation {
+            active: pending.plan.expected.clone(),
+            control_revision: pending.plan.expected_control_revision,
+            ..Default::default()
+        },
+    )
+    .await;
+    *rpc.selected_group_member.lock().unwrap() = Some("direct".into());
+    *rpc.rejected_apply_transactions.lock().unwrap() = Some(Vec::new());
+    let edit = prepare_log_edit(&rt);
+
+    use polaris_singbox_grpc::tonic::Code;
+    // A stale identity is replanned only within the bound; one more would succeed.
+    *rpc.failed_plans.lock().unwrap() =
+        vec![Code::FailedPrecondition; usize::from(RUNTIME_APPLY_REPLANS) + 1];
+    assert!(matches!(
+        rt.apply_hot_config_edit(&edit).await.unwrap(),
+        HotConfigEditOutcome::Retryable,
+    ));
+    assert!(rpc.failed_plans.lock().unwrap().is_empty());
+    assert_eq!(rt.config.saved_revision(), edit.revision);
+    assert_eq!(rt.config.current().unwrap(), running);
+    assert!(rpc
+        .rejected_apply_transactions
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .is_empty());
+
+    // An unknown Plan outcome is never replanned: a retry would succeed here.
+    *rpc.failed_plans.lock().unwrap() = vec![Code::DeadlineExceeded];
+    assert!(matches!(
+        rt.apply_hot_config_edit(&edit).await.unwrap(),
+        HotConfigEditOutcome::Retryable,
+    ));
+    assert!(rpc.failed_plans.lock().unwrap().is_empty());
+    assert_eq!(rt.config.current().unwrap(), running);
+
+    *rpc.failed_plans.lock().unwrap() = vec![Code::FailedPrecondition];
+    assert!(matches!(
+        rt.apply_hot_config_edit(&edit).await.unwrap(),
+        HotConfigEditOutcome::Saved {
+            runtime_apply: Some(_),
+            ..
+        },
+    ));
+    assert!(rpc.failed_plans.lock().unwrap().is_empty());
+    assert_eq!(rt.config.current().unwrap(), edit.candidate);
+    server.abort();
+}
+
 // An unconsumed plan is UNKNOWN to Core until it is applied, and Core may still
 // admit it before expiry. Only an expired plan with the unchanged expected
 // identity proves the transaction never published.
@@ -3646,6 +3716,8 @@ struct NativeRetirementRpcFixture {
     apply_response: Arc<std::sync::Mutex<Option<daemon::RuntimeConfigOperation>>>,
     rejected_apply_transactions: Arc<std::sync::Mutex<Option<Vec<String>>>>,
     exhausted_apply_hold: RuntimeRpcReplyHold,
+    // RPC errors answered, in order, before the normal Plan reply.
+    failed_plans: Arc<std::sync::Mutex<Vec<polaris_singbox_grpc::tonic::Code>>>,
 }
 
 #[derive(Clone)]
@@ -3848,6 +3920,16 @@ impl daemon::runtime_config_service_server::RuntimeConfigService for NativeRetir
         polaris_singbox_grpc::tonic::Response<daemon::RuntimeConfigPlan>,
         polaris_singbox_grpc::tonic::Status,
     > {
+        let failure = {
+            let mut failures = self.failed_plans.lock().unwrap();
+            (!failures.is_empty()).then(|| failures.remove(0))
+        };
+        if let Some(code) = failure {
+            return Err(polaris_singbox_grpc::tonic::Status::new(
+                code,
+                "stale or stopped runtime",
+            ));
+        }
         if let Some(transactions) = self.rejected_apply_transactions.lock().unwrap().as_ref() {
             let next = transactions.len() + 1;
             let request = request.into_inner();
@@ -4005,6 +4087,7 @@ async fn native_retirement_rpc_peer(
         apply_response: Arc::default(),
         rejected_apply_transactions: Arc::default(),
         exhausted_apply_hold: Arc::default(),
+        failed_plans: Arc::default(),
     };
     let incoming = futures::stream::unfold(listener, |listener| async move {
         let next = listener.accept().await.map(|(stream, _)| stream);

@@ -2261,33 +2261,47 @@ impl ProxyRuntime {
         if let Some(blocker) = self.hot_config_edit_blocker(&edit.previous, owner) {
             return Ok(not_committed(blocker));
         }
-        let (client, mut pending) = match Box::pin(self.prepare_runtime_candidate(
-            edit.candidate.clone(),
-            Some(&edit.previous),
-            Some(owner),
-            false,
-            true,
-        ))
-        .await
-        {
-            Ok(prepared) => prepared,
-            Err(result) => {
-                log::debug!(
-                    "automatic config prepare: status={} elapsed_ms={}",
-                    result.status,
-                    started_at.elapsed().as_millis()
-                );
-                let outcome = match result.status {
-                    "restartRequired" | "impactConfirmationRequired" => {
-                        HotConfigEditOutcome::NeedsManual {
-                            restart_required: result.restart_required,
-                            reasons: result.reasons,
+        // Core's own source refresh can publish between the capability read and
+        // Plan. Prospective prepare holds no claim and writes no D, so replanning
+        // against the advanced identity leaves Core's CAS contract unchanged.
+        let mut replans = 0;
+        let (client, mut pending) = loop {
+            match Box::pin(self.prepare_runtime_candidate(
+                edit.candidate.clone(),
+                Some(&edit.previous),
+                Some(owner),
+                false,
+                true,
+            ))
+            .await
+            {
+                Ok(prepared) => break prepared,
+                Err(result)
+                    if result.status == "conflict"
+                        && replans < RUNTIME_APPLY_REPLANS
+                        && idle()
+                        && self.saved_revision_matches(Some(edit.revision)) =>
+                {
+                    replans += 1;
+                }
+                Err(result) => {
+                    log::debug!(
+                        "automatic config prepare: status={} replans={replans} elapsed_ms={}",
+                        result.status,
+                        started_at.elapsed().as_millis()
+                    );
+                    let outcome = match result.status {
+                        "restartRequired" | "impactConfirmationRequired" => {
+                            HotConfigEditOutcome::NeedsManual {
+                                restart_required: result.restart_required,
+                                reasons: result.reasons,
+                            }
                         }
-                    }
-                    "rejected" => HotConfigEditOutcome::Rejected,
-                    _ => HotConfigEditOutcome::Retryable,
-                };
-                return Ok(not_committed(outcome));
+                        "rejected" => HotConfigEditOutcome::Rejected,
+                        _ => HotConfigEditOutcome::Retryable,
+                    };
+                    return Ok(not_committed(outcome));
+                }
             }
         };
         let prepared_at = Instant::now();
@@ -2348,7 +2362,7 @@ impl ProxyRuntime {
             }
         };
         log::debug!(
-            "automatic config timing: queue_ms={} prepare_ms={} verify_ms={} store_ms={} apply_ms={} status={}",
+            "automatic config timing: queue_ms={} prepare_ms={} replans={replans} verify_ms={} store_ms={} apply_ms={} status={}",
             (started_at - queued_at).as_millis(),
             (prepared_at - started_at).as_millis(),
             (committing_at - prepared_at).as_millis(),
@@ -3324,6 +3338,13 @@ impl ProxyRuntime {
             .await
         {
             Ok(value) => value,
+            // Core rejects a stale expected identity before planning; that is the
+            // same identity conflict as a mismatched reply. Timeouts stay unknown.
+            Err(RuntimeConfigError::Call(polaris_singbox_grpc::ClientError::Status(status)))
+                if status.code() == polaris_singbox_grpc::tonic::Code::FailedPrecondition =>
+            {
+                return decline(RuntimeApplyResult::status("conflict"))
+            }
             Err(_) => return decline(RuntimeApplyResult::status("unconfirmed")),
         };
         log::debug!(
