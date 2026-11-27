@@ -22,6 +22,10 @@ socket2 = "0.6"
 # Existing locked package; safe kernel peer-euid authentication before Check RPC.
 nix = { version = "0.31.3", features = ["socket", "user"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# Existing locked package; kernel SO_PEERCRED root authentication before any Helper byte.
+nix = { version = "0.31.3", features = ["socket"] }
+
 [target.'cfg(windows)'.dependencies]
 polaris-windows-cleaner = { path = "../windows-cleaner" }
 # Overlapped pipe I/O owns its event and drains cancellation before release.

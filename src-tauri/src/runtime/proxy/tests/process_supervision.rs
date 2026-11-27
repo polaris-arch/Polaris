@@ -271,9 +271,10 @@ async fn confirmed_stop_releases_the_main_claim_before_it_returns_so_logout_is_a
             .register_helper_start_backend_with_main(Some(token))
             .unwrap();
         HelperStartCompletion::for_test(&rt, attempt)
-            .publish(&Ok(HelperStartResult::BirthStarted(exact_helper_target(
-                pid, hex,
-            ))))
+            .publish(&Ok(HelperStartResult::BirthStarted(
+                exact_helper_target(pid, hex),
+                test_core(),
+            )))
             .unwrap();
         reservation.arm_external_start();
     }
@@ -311,7 +312,7 @@ async fn exact_helper_main_mismatch_retains_custody_then_retries_production_birt
         .register_helper_start_backend_with_main(Some(original.clone()))
         .unwrap();
     HelperStartCompletion::for_test(&rt, attempt.clone())
-        .publish(&Ok(HelperStartResult::BirthStarted(target)))
+        .publish(&Ok(HelperStartResult::BirthStarted(target, test_core())))
         .unwrap();
     reservation.arm_external_start();
     drop(reservation);
@@ -1630,6 +1631,10 @@ fn exact_helper_target(pid: u32, birth: &str) -> polaris_helper_proto::HelperBir
     polaris_helper_proto::HelperBirthTarget::parse_wire(&pid.to_string(), birth).unwrap()
 }
 
+fn test_core() -> polaris_helper_proto::core_manifest::CoreId {
+    polaris_helper_proto::core_manifest::CoreId::parse(&"a".repeat(64)).unwrap()
+}
+
 fn known_exact_helper_attempt(
     rt: &Arc<ProxyRuntime>,
     target: polaris_helper_proto::HelperBirthTarget,
@@ -1638,10 +1643,34 @@ fn known_exact_helper_attempt(
     let attempt = rt.register_helper_start_backend().unwrap();
     HelperStartCompletion::for_test(rt, attempt.clone())
         .publish(&Ok(
-            crate::runtime::helper::HelperStartResult::BirthStarted(target),
+            crate::runtime::helper::HelperStartResult::BirthStarted(target, test_core()),
         ))
         .unwrap();
     attempt
+}
+
+#[tokio::test]
+async fn only_a_started_receipt_records_the_core_used_for_birth_attestation() {
+    use super::super::startup::HelperStartCompletion;
+    use crate::runtime::helper::{HelperStartResult, HelperStopTarget};
+    let target = exact_helper_target(4242, "00112233445566778899aabbccddeeff");
+    for (result, recorded) in [
+        (HelperStartResult::BirthRejected(target), None),
+        (
+            HelperStartResult::BirthStarted(target, test_core()),
+            Some(test_core()),
+        ),
+    ] {
+        let (rt, _dir) = test_runtime();
+        let attempt = rt.register_helper_start_backend().unwrap();
+        HelperStartCompletion::for_test(&rt, attempt.clone())
+            .publish(&Ok(result))
+            .unwrap();
+        let (current, known, core) = rt.child.lock().unwrap().helper_started_birth().unwrap();
+        assert!(current.same(&attempt));
+        assert_eq!(known, HelperStopTarget::Birth(target));
+        assert_eq!(core, recorded);
+    }
 }
 
 #[tokio::test]
@@ -1738,7 +1767,7 @@ async fn reaped_exact_start_releases_only_its_reserved_main_claim() {
     reservation.arm_external_start();
     let target = exact_helper_target(4242, "00112233445566778899aabbccddeeff");
     HelperStartCompletion::for_test(&rt, attempt.clone())
-        .publish(&Ok(HelperStartResult::BirthStarted(target)))
+        .publish(&Ok(HelperStartResult::BirthStarted(target, test_core())))
         .unwrap();
     assert!(rt.mesh.main_owns_tailscale("ts-reaped-exact", true));
 
@@ -1781,7 +1810,7 @@ async fn exact_start_cleanup_keeps_reservation_custody_when_registry_compare_rem
         reservation.arm_external_start();
         let target = exact_helper_target(4242, "00112233445566778899aabbccddeeff");
         HelperStartCompletion::for_test(&rt, attempt.clone())
-            .publish(&Ok(HelperStartResult::BirthStarted(target)))
+            .publish(&Ok(HelperStartResult::BirthStarted(target, test_core())))
             .unwrap();
         let successor = rt.mesh.mint_tailscale_main_birth();
         if poison {
@@ -2287,7 +2316,7 @@ async fn cancelled_helper_start_worker_publishes_late_exact_birth() {
         }
         completion
             .publish(&Ok(
-                crate::runtime::helper::HelperStartResult::BirthStarted(target),
+                crate::runtime::helper::HelperStartResult::BirthStarted(target, test_core()),
             ))
             .unwrap();
     });
@@ -2341,7 +2370,7 @@ fn late_old_attempt_ack_cannot_replace_same_pid_new_birth() {
     let mut late = HelperStartCompletion::for_test(&rt, old.clone());
     {
         let mut child = rt.child.lock().unwrap();
-        assert!(child.finish_helper_birth_start(&old, a));
+        assert!(child.finish_helper_birth_start(&old, a, Some(test_core())));
         let (_, target, nonce) = child.begin_helper_stop().unwrap();
         assert!(child.confirm_helper_stop(&old, target, &nonce));
     }
@@ -2349,10 +2378,10 @@ fn late_old_attempt_ack_cannot_replace_same_pid_new_birth() {
     // not be overwritten by the prior attempt's delayed Start completion.
     let new = rt.register_helper_start_backend().unwrap();
     HelperStartCompletion::for_test(&rt, new.clone())
-        .publish(&Ok(HelperStartResult::BirthStarted(b)))
+        .publish(&Ok(HelperStartResult::BirthStarted(b, test_core())))
         .unwrap();
     assert!(late
-        .publish(&Ok(HelperStartResult::BirthStarted(a)))
+        .publish(&Ok(HelperStartResult::BirthStarted(a, test_core())))
         .is_err());
     let (current, target) = rt.child.lock().unwrap().helper_stop_target().unwrap();
     assert!(current.same(&new));

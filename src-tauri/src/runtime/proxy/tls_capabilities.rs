@@ -175,11 +175,11 @@ impl ProxyRuntime {
         let mut stage = "birth";
         let result = async {
             use crate::runtime::helper::HelperStopTarget;
-            let (start_token, target) = self
+            let (start_token, target, started_core) = self
                 .child
                 .lock()
                 .map_err(|_| "Helper child custody unavailable")?
-                .helper_stop_target()
+                .helper_started_birth()
                 .ok_or("Helper birth unavailable")?;
             stage = "core-id";
             let platform = crate::runtime::core_identity::current_platform()?;
@@ -192,7 +192,13 @@ impl ProxyRuntime {
             let before = tokio::task::spawn_blocking(move || helper.protected_native_core_status())
                 .await
                 .map_err(|e| e.to_string())??;
-            if !native_helper_birth_matches(self.helper.platform(), &before, birth, &core) {
+            if !native_helper_birth_matches(
+                self.helper.platform(),
+                &before,
+                birth,
+                &core,
+                started_core.as_ref(),
+            ) {
                 return Err("Helper original birth/selected Core binding unavailable".into());
             }
             stage = "api-channel";
@@ -269,15 +275,27 @@ impl ProxyRuntime {
 
 /// Data predicate only. Production calls it only after the closed OS-root/system
 /// connector has returned the original native-custody status, never generic IPC.
+/// `started` is the CoreId custody kept from this birth's own `BirthStarted` receipt.
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn native_helper_birth_matches(
     platform: polaris_helper_proto::Platform,
     status: &crate::runtime::helper::ManagedCoreStatus,
     expected: polaris_helper_proto::HelperBirthTarget,
     core: &polaris_helper_proto::core_manifest::CoreId,
+    started: Option<&polaris_helper_proto::core_manifest::CoreId>,
 ) -> bool {
     use crate::runtime::helper::ManagedCoreStatus;
     use polaris_helper_proto::Platform;
+    if let ManagedCoreStatus::BirthRunning { target } = status {
+        // Linux status carries no CoreId. The root-authenticated Start receipt bound
+        // it to this random birth, and the root Helper still runs that same birth.
+        return match platform {
+            Platform::Linux => *target == expected && started == Some(core),
+            Platform::Mac | Platform::Win | Platform::Android | Platform::Ios | Platform::Other => {
+                false
+            }
+        };
+    }
     let ManagedCoreStatus::NativeBirthRunning {
         target,
         created,
@@ -298,8 +316,8 @@ fn native_helper_birth_matches(
             created.is_some_and(|value| value > 0)
                 && image.as_ref().is_some_and(|value| !value.is_empty())
         }
-        // Linux uses its separate sealed execution receipt. Mobile runtimes
-        // use loaded native containers, and Other has no desktop Helper issuer.
+        // Linux never reports this native shape. Mobile runtimes use loaded
+        // native containers, and Other has no desktop Helper issuer.
         Platform::Linux | Platform::Android | Platform::Ios | Platform::Other => false,
     }
 }

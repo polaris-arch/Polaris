@@ -112,26 +112,39 @@ impl Connector for UnixConnector {
     }
 }
 
-/// No caller-supplied path, stream, credential, environment override or callback.
-/// Only the closed Mac Check client can manufacture this connector internally.
-#[cfg(target_os = "macos")]
-pub(crate) struct MacRootConnector;
+/// Fixed installed Mac/Linux Helper endpoint whose actual connected peer must be
+/// kernel root before any byte is written. No caller-supplied path, stream,
+/// credential, environment override or callback.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub struct RootConnector;
 
-#[cfg(target_os = "macos")]
-impl Connector for MacRootConnector {
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+impl Connector for RootConnector {
     fn connect(&self) -> Result<Box<dyn ConnectionStream>, ClientError> {
         self.connect_until(Instant::now() + READ_TIMEOUT)
     }
 
     fn connect_until(&self, deadline: Instant) -> Result<Box<dyn ConnectionStream>, ClientError> {
-        let connection = UnixConnector::new(crate::manager::InstallPaths::mac().socket)
-            .connect_stream_until(deadline)?;
+        #[cfg(target_os = "macos")]
+        let paths = crate::manager::InstallPaths::mac();
+        #[cfg(target_os = "linux")]
+        let paths = crate::manager::InstallPaths::linux();
+        let connection = UnixConnector::new(paths.socket).connect_stream_until(deadline)?;
         // The actual connected FD is checked BEFORE any request/token is written.
         // A user-owned proxy at even the fixed pathname cannot issue completion.
-        let (uid, _) = nix::unistd::getpeereid(&connection.stream).map_err(|e| {
+        #[cfg(target_os = "macos")]
+        let uid = nix::unistd::getpeereid(&connection.stream).map(|(uid, _)| uid.as_raw());
+        // SO_PEERCRED reports the credentials the listener held at listen(2).
+        #[cfg(target_os = "linux")]
+        let uid = nix::sys::socket::getsockopt(
+            &connection.stream,
+            nix::sys::socket::sockopt::PeerCredentials,
+        )
+        .map(|credentials| credentials.uid());
+        let uid = uid.map_err(|e| {
             ClientError::Connect(format!("Root Helper peer authentication failed: {e}"))
         })?;
-        if !uid.is_root() {
+        if uid != 0 {
             return Err(ClientError::Connect(
                 "Root Helper peer UID is not root".into(),
             ));

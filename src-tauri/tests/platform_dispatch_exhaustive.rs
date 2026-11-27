@@ -262,7 +262,7 @@ const COMPARISON_REGISTRY: &[Comparison] = &[
         1,
         "The Linux protected-plan extension derives old trusted hosts using fixed Linux binding semantics; changed hosts must earn fresh verified facts. Mac/Win/Android/iOS/Other gain no protected route capability from this constant argument.",
     ),
-    ("crates/helper-client/src/check_config.rs", "client: HelperClient::new( Box::new(crate::connector::MacRootConnector), Platform::Mac, token, ),", 1,
+    ("crates/helper-client/src/check_config.rs", "client: HelperClient::new( Box::new(crate::connector::RootConnector), Platform::Mac, token, ),", 1,
      "SystemMacCheckClient::system constructs only the fixed Mac root connector and is compiled exclusively on macOS. Android/iOS/Linux/Windows/unknown platforms cannot construct this issuer; the Platform::Mac argument does not admit another platform or supply an ordinary execution fallback."),
     (
         "crates/helper-client/src/check_config.rs",

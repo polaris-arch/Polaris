@@ -34,7 +34,7 @@ impl SystemMacCheckClient {
         }
         Ok(Self {
             client: HelperClient::new(
-                Box::new(crate::connector::MacRootConnector),
+                Box::new(crate::connector::RootConnector),
                 Platform::Mac,
                 token,
             ),

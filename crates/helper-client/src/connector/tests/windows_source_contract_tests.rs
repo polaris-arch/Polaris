@@ -86,7 +86,7 @@ fn connectors_keep_one_absolute_deadline(raw: &str) -> bool {
     let code = compact_code(raw);
     let owners = [
         "UnixConnector",
-        "MacRootConnector",
+        "RootConnector",
         "PipeConnector",
         "WindowsSystemConnector",
     ];
@@ -111,7 +111,7 @@ fn connectors_keep_one_absolute_deadline(raw: &str) -> bool {
             return false;
         }
         match owner {
-            "UnixConnector" | "MacRootConnector"
+            "UnixConnector" | "RootConnector"
                 if !body.contains(".connect_stream_until(deadline)?") =>
             {
                 return false
@@ -193,7 +193,13 @@ fn mac_system_route_is_closed(connector: &str, check: &str, app: &str) -> bool {
     else {
         return false;
     };
-    let Some(root) = balanced_block(&c, "implConnectorforMacRootConnector{") else {
+    let Some(linux_status) = a
+        .split("pub(crate)fnprotected_native_core_status(&self)->Result<ManagedCoreStatus,String>{")
+        .nth(2)
+    else {
+        return false;
+    };
+    let Some(root) = balanced_block(&c, "implConnectorforRootConnector{") else {
         return false;
     };
     let Some(windows) = balanced_block(&c, "implConnectorforWindowsSystemConnector{") else {
@@ -202,11 +208,16 @@ fn mac_system_route_is_closed(connector: &str, check: &str, app: &str) -> bool {
     let Some(auth) = root.find("nix::unistd::getpeereid(&connection.stream)") else {
         return false;
     };
+    let Some(linux_auth) = root.find(
+        "nix::sys::socket::getsockopt(&connection.stream,nix::sys::socket::sockopt::PeerCredentials,)",
+    ) else {
+        return false;
+    };
     let Some(ready) = root.find("Ok(Box::new(connection))") else {
         return false;
     };
     for (owner, issuer, platform) in [
-        ("SystemMacCheckClient", "MacRootConnector", "Mac"),
+        ("SystemMacCheckClient", "RootConnector", "Mac"),
         ("SystemWindowsCheckClient", "WindowsSystemConnector", "Win"),
     ] {
         let Some(client) = balanced_block(&h, &format!("impl{owner}{{")) else {
@@ -223,17 +234,22 @@ fn mac_system_route_is_closed(connector: &str, check: &str, app: &str) -> bool {
         { return false; }
     }
     auth < ready
-        && root.contains("UnixConnector::new(crate::manager::InstallPaths::mac().socket)")
-        && root.contains(".connect_stream_until(deadline)?")
-        && root.contains("if!uid.is_root(){returnErr(ClientError::Connect(")
+        && linux_auth < ready
+        && root.contains("letpaths=crate::manager::InstallPaths::mac();")
+        && root.contains("letpaths=crate::manager::InstallPaths::linux();")
+        && root.contains("UnixConnector::new(paths.socket).connect_stream_until(deadline)?")
+        && root.contains("ifuid!=0{returnErr(ClientError::Connect(")
         && !root.contains("write_all")
-        && c.contains("pub(crate)structMacRootConnector;")
+        && c.contains("pubstructRootConnector;")
         && c.contains("pub(crate)structWindowsSystemConnector;")
         && windows.contains("crate::windows_pipe::WinPipeStream::connect_system()")
         && !windows.contains("PipeConnector")
         && app_status.contains("letclient=polaris_helper_client::check_config::SystemMacCheckClient::system(read_token(&self.token_path()),)?;")
         && app_status.contains("letclient=polaris_helper_client::check_config::SystemWindowsCheckClient::system(read_token(&self.token_path()),)?;")
         && app_status.contains("ifself.never_connect||self.test_connector.is_some(){returnErr(")
+        && linux_status.contains("ifself.never_connect||self.test_connector.is_some(){returnErr(")
+        && linux_status.contains("self.managed_core_status()")
+        && a.contains("fnconnector(_socket:&Path)->Result<Box<dynConnector>,String>{Ok(Box::new(polaris_helper_client::connector::RootConnector))}")
 }
 
 #[test]
@@ -251,15 +267,21 @@ fn generic_wire_data_cannot_become_the_production_system_client() {
             "nix::unistd::getpeereid(&connection.stream)",
             "caller_supplied_peer()",
         ),
-        (0, "if !uid.is_root()", "if false"),
+        (0, "nix::sys::socket::getsockopt(", "caller_supplied_peer("),
+        (0, "if uid != 0", "if false"),
         (
             0,
-            "crate::manager::InstallPaths::mac().socket",
+            "crate::manager::InstallPaths::mac()",
+            "caller_supplied_socket()",
+        ),
+        (
+            0,
+            "crate::manager::InstallPaths::linux()",
             "caller_supplied_socket()",
         ),
         (
             1,
-            "Box::new(crate::connector::MacRootConnector)",
+            "Box::new(crate::connector::RootConnector)",
             "caller_supplied_connector",
         ),
         (
@@ -277,6 +299,7 @@ fn generic_wire_data_cannot_become_the_production_system_client() {
         (1, "impl SystemWindowsCheckClient {", "impl SystemWindowsCheckClient {\n    pub fn from_client(client: HelperClient) -> Self { Self { client } }"),
         (1, "Box::new(crate::connector::WindowsSystemConnector)", "caller_supplied_connector"),
         (2, "polaris_helper_client::check_config::SystemWindowsCheckClient::system(", "self.build_client("),
+        (2, "Ok(Box::new(polaris_helper_client::connector::RootConnector))", "Ok(Box::new(UnixConnector::new(_socket)))"),
         (2, "if self.never_connect || self.test_connector.is_some()", "if false"),
     ] {
         let mut faces = [connector.clone(), check.clone(), app.clone()];

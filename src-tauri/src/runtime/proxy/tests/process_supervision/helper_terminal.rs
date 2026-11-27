@@ -20,7 +20,7 @@ async fn confirmed_terminal_replays_stop_without_ipc_or_releasing_a_new_main_cla
         .unwrap();
     let target = exact_helper_target(7123, "00112233445566778899aabbccddeeff");
     HelperStartCompletion::for_test(&rt, attempt.clone())
-        .publish(&Ok(HelperStartResult::BirthStarted(target)))
+        .publish(&Ok(HelperStartResult::BirthStarted(target, test_core())))
         .unwrap();
     reservation.arm_external_start();
     drop(reservation);
@@ -210,7 +210,7 @@ async fn publishing_a_birth_is_not_original_start_worker_completion() {
     let worker = tokio::task::spawn_blocking(move || {
         completion
             .publish(&Ok(
-                crate::runtime::helper::HelperStartResult::BirthStarted(target),
+                crate::runtime::helper::HelperStartResult::BirthStarted(target, test_core()),
             ))
             .unwrap();
         published.send(()).unwrap();
@@ -283,9 +283,10 @@ pub(crate) async fn helper_terminal_exit_fixture(
             .unwrap();
         HelperStartCompletion::for_test(&rt, attempt)
             .publish(&Ok(
-                crate::runtime::helper::HelperStartResult::BirthStarted(exact_helper_target(
-                    pid, hex,
-                )),
+                crate::runtime::helper::HelperStartResult::BirthStarted(
+                    exact_helper_target(pid, hex),
+                    test_core(),
+                ),
             ))
             .unwrap();
         reservation.arm_external_start();

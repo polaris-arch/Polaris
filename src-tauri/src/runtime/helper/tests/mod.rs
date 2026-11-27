@@ -90,29 +90,38 @@ fn pinned_receipt_family_is_explicit_for_every_platform() {
 #[test]
 fn exact_start_accepts_only_birth_receipts_and_never_promotes_already() {
     let target = birth_target(4242, "00112233445566778899aabbccddeeff");
+    let core = polaris_helper_proto::core_manifest::CoreId::parse(&"a".repeat(64)).unwrap();
     assert_eq!(
-        classify_linux_birth_start_response(Response::parse(
-            "OK birth-started 4242 00112233445566778899aabbccddeeff"
-        )),
-        Ok(HelperStartResult::BirthStarted(target))
+        classify_linux_birth_start_response(
+            Response::parse("OK birth-started 4242 00112233445566778899aabbccddeeff"),
+            core.clone()
+        ),
+        Ok(HelperStartResult::BirthStarted(target, core.clone()))
     );
     assert_eq!(
-        classify_linux_birth_start_response(Response::parse(
-            "OK birth-already 4242 00112233445566778899aabbccddeeff"
-        )),
+        classify_linux_birth_start_response(
+            Response::parse("OK birth-already 4242 00112233445566778899aabbccddeeff"),
+            core.clone()
+        ),
         Ok(HelperStartResult::BirthAlready(target))
     );
     assert_eq!(
-        classify_linux_birth_start_response(Response::parse(
-            "OK birth-start-not-admitted pending 4242 00112233445566778899aabbccddeeff"
-        )),
+        classify_linux_birth_start_response(
+            Response::parse(
+                "OK birth-start-not-admitted pending 4242 00112233445566778899aabbccddeeff"
+            ),
+            core.clone()
+        ),
         Ok(HelperStartResult::BirthNotAdmitted {
             target: Some(target),
             pending: true
         })
     );
     assert_eq!(
-        classify_linux_birth_start_response(Response::parse("OK birth-start-not-admitted unknown")),
+        classify_linux_birth_start_response(
+            Response::parse("OK birth-start-not-admitted unknown"),
+            core.clone()
+        ),
         Ok(HelperStartResult::BirthNotAdmitted {
             target: None,
             pending: false
@@ -123,7 +132,7 @@ fn exact_start_accepts_only_birth_receipts_and_never_promotes_already() {
         "OK birth-started 4242 11112222333344445555666677778888 extra=identity",
         "ERR unknown",
     ] {
-        assert!(classify_linux_birth_start_response(Response::parse(wire)).is_err());
+        assert!(classify_linux_birth_start_response(Response::parse(wire), core.clone()).is_err());
     }
 }
 
@@ -1175,7 +1184,7 @@ fn production_start_selects_compiled_id_on_linux_and_native_desktop_birth_wire()
     assert!(!body.contains("Request::LinuxStartBirth("));
     assert!(!body.contains("Request::NativeStartBirth("));
     assert!(body.contains("if self.platform == Platform::Linux"));
-    assert!(body.contains("return classify_linux_birth_start_response(resp)"));
+    assert!(body.contains("return classify_linux_birth_start_response(resp, id)"));
 }
 
 struct RecordingStream {

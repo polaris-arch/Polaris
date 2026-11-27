@@ -136,7 +136,8 @@ impl HelperStartCompletion {
         let known = match result {
             Ok(HelperStartResult::Started(pid)) => Some(*pid),
             Ok(
-                HelperStartResult::BirthStarted(target) | HelperStartResult::BirthRejected(target),
+                HelperStartResult::BirthStarted(target, _)
+                | HelperStartResult::BirthRejected(target),
             ) => Some(target.pid.get()),
             Ok(
                 HelperStartResult::NotAdmitted(_)
@@ -164,9 +165,13 @@ impl HelperStartCompletion {
             Ok(HelperStartResult::BirthAlready(target)) => {
                 child.finish_helper_birth_not_admitted(&self.token, Some(*target))
             }
-            Ok(
-                HelperStartResult::BirthStarted(target) | HelperStartResult::BirthRejected(target),
-            ) => child.finish_helper_birth_start(&self.token, *target),
+            // Only a matching receipt records its CoreId; Rejected keeps Stop custody only.
+            Ok(HelperStartResult::BirthStarted(target, core)) => {
+                child.finish_helper_birth_start(&self.token, *target, Some(core.clone()))
+            }
+            Ok(HelperStartResult::BirthRejected(target)) => {
+                child.finish_helper_birth_start(&self.token, *target, None)
+            }
             Ok(HelperStartResult::Started(_)) => child.finish_helper_start(&self.token, known),
             Err(_) => child.finish_helper_start(&self.token, None),
         };
@@ -3344,7 +3349,7 @@ impl ProxyRuntime {
             .map_err(|e| format!("helper 起核任务 join 失败：{e}"))?;
         let target = match started {
             Ok(HelperStartResult::Started(pid)) => HelperStopTarget::Legacy(pid),
-            Ok(HelperStartResult::BirthStarted(target)) => HelperStopTarget::Birth(target),
+            Ok(HelperStartResult::BirthStarted(target, _)) => HelperStopTarget::Birth(target),
             Ok(HelperStartResult::BirthRejected(target)) => {
                 let (diagnostic, _) = self
                     .reject_helper_start_with_result(

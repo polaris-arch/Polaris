@@ -5,8 +5,8 @@
 //!
 //! 装配（C6-5 收口）：
 //! - [`polaris_helper_client::HelperManager`]：helper 生命周期（install/uninstall + token + 状态探测）。
-//! - [`polaris_helper_client::HelperClient`]：helper 通信（生产 `UnixConnector`（mac/linux）/
-//!   `PipeConnector`（win），经 [`Connector`] trait）。
+//! - [`polaris_helper_client::HelperClient`]：helper 通信（生产 `UnixConnector`（mac）/
+//!   `RootConnector`（linux）/ `PipeConnector`（win），经 [`Connector`] trait）。
 //!
 //! **真机门**：`install`/`uninstall` 触发一次提权（osascript / UAC / pkexec）——本机（Linux 桌面）
 //! 无 bundled helper 二进制 → `resolve_helper_binary` 失败 → 早返「二进制缺失」，**绝不触发提权**（安全）。
@@ -27,7 +27,7 @@ use polaris_helper_client::ConnectionStream;
 use polaris_helper_client::Connector;
 #[cfg(windows)]
 use polaris_helper_client::PipeConnector;
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "linux")))]
 use polaris_helper_client::UnixConnector;
 use polaris_helper_client::{
     read_token, EscalationOutcome, HelperClient, HelperManager, HelperStatus, InstallParams,
@@ -68,11 +68,15 @@ const HELPER_STOP_RETRY_DELAY: Duration = Duration::from_millis(50);
 
 /// A typed helper Start result. `NotAdmitted` is a proven no-spawn outcome
 /// that still carries custody of the earlier Linux helper birth.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum HelperStartResult {
     Started(u32),
     NotAdmitted(StartNotAdmitted),
-    BirthStarted(HelperBirthTarget),
+    /// Carries the CoreId the pinned receipt echoed for this exact birth.
+    BirthStarted(
+        HelperBirthTarget,
+        polaris_helper_proto::core_manifest::CoreId,
+    ),
     BirthAlready(HelperBirthTarget),
     /// Keep exact custody so startup can stop a new birth with the wrong/missing content receipt.
     BirthRejected(HelperBirthTarget),
@@ -1049,9 +1053,16 @@ impl HelperRuntime {
         Ok(HelperClient::new(connector, self.platform, token))
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "linux")))]
     fn connector(socket: &Path) -> Result<Box<dyn Connector>, String> {
         Ok(Box::new(UnixConnector::new(socket)))
+    }
+
+    /// Linux Start receipts are birth evidence: every request first proves the
+    /// fixed endpoint's kernel peer is root, before the token is written.
+    #[cfg(target_os = "linux")]
+    fn connector(_socket: &Path) -> Result<Box<dyn Connector>, String> {
+        Ok(Box::new(polaris_helper_client::connector::RootConnector))
     }
 
     #[cfg(windows)]
@@ -1661,7 +1672,7 @@ impl HelperRuntime {
             _ => return Err("HELPER_CORE_MISMATCH: helper omitted pinned receipt".into()),
         };
         if self.platform == Platform::Linux {
-            return classify_linux_birth_start_response(resp);
+            return classify_linux_birth_start_response(resp, id);
         }
         if matches!(self.platform, Platform::Mac | Platform::Win) {
             return match resp {
@@ -1674,7 +1685,7 @@ impl HelperRuntime {
                         log::info!("helper native core start timing: {timing:?}");
                     }
                     self.remember_start_identity(target.pid.get(), created);
-                    Ok(HelperStartResult::BirthStarted(target))
+                    Ok(HelperStartResult::BirthStarted(target, id))
                 }
                 Response::Ok(ResponseKind::NativeBirthStart(NativeBirthStart::Already {
                     target,
@@ -1822,7 +1833,17 @@ impl HelperRuntime {
             _ => Err("Closed Helper original native birth is not running".into()),
         }
     }
-    #[cfg(not(any(target_os = "macos", windows)))]
+    /// Linux status has no CoreId. Production `build_client` reaches it only via
+    /// the kernel-root `RootConnector`; the caller still requires `BirthRunning`.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn protected_native_core_status(&self) -> Result<ManagedCoreStatus, String> {
+        #[cfg(test)]
+        if self.never_connect || self.test_connector.is_some() {
+            return Err("Fixture transport cannot attest native status".into());
+        }
+        self.managed_core_status()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     pub(crate) fn protected_native_core_status(&self) -> Result<ManagedCoreStatus, String> {
         Err("Protected native status unavailable on this platform".into())
     }
@@ -2138,7 +2159,10 @@ fn flush_dns_request(platform: Platform) -> Request {
     }
 }
 
-fn classify_linux_birth_start_response(response: Response) -> Result<HelperStartResult, String> {
+fn classify_linux_birth_start_response(
+    response: Response,
+    core: polaris_helper_proto::core_manifest::CoreId,
+) -> Result<HelperStartResult, String> {
     match response {
         Response::Ok(ResponseKind::LinuxBirthStart(LinuxBirthStart::Started {
             target,
@@ -2154,7 +2178,7 @@ fn classify_linux_birth_start_response(response: Response) -> Result<HelperStart
                     timing.total_ms
                 );
             }
-            Ok(HelperStartResult::BirthStarted(target))
+            Ok(HelperStartResult::BirthStarted(target, core))
         }
         Response::Ok(ResponseKind::LinuxBirthStart(LinuxBirthStart::Already { target })) => {
             Ok(HelperStartResult::BirthAlready(target))

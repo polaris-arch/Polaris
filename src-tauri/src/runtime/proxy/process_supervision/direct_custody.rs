@@ -111,6 +111,8 @@ struct HelperStartAttempt {
     token: HelperStartToken,
     main_token: Option<crate::runtime::tailscale_login_core::MainBirthToken>,
     phase: HelperStartPhase,
+    /// CoreId echoed by this attempt's `BirthStarted` receipt; never set by `BirthRejected`.
+    started_core: Option<polaris_helper_proto::core_manifest::CoreId>,
     stop_inflight: Option<HelperStopNonce>,
     scope: HelperAttemptScope,
     start_worker: HelperStartWorker,
@@ -302,6 +304,7 @@ impl DirectCoreSlot {
             token: token.clone(),
             main_token,
             phase: HelperStartPhase::Inflight,
+            started_core: None,
             stop_inflight: None,
             scope: HelperAttemptScope {
                 runtime,
@@ -431,6 +434,7 @@ impl DirectCoreSlot {
         &mut self,
         token: &HelperStartToken,
         target: HelperBirthTarget,
+        started_core: Option<polaris_helper_proto::core_manifest::CoreId>,
     ) -> bool {
         let Some(attempt) = &mut self.helper_start else {
             return false;
@@ -439,6 +443,7 @@ impl DirectCoreSlot {
             return false;
         }
         attempt.phase = HelperStartPhase::Known(HelperStopTarget::Birth(target));
+        attempt.started_core = started_core;
         true
     }
 
@@ -489,6 +494,20 @@ impl DirectCoreSlot {
         let attempt = self.helper_start.as_ref()?;
         let target = attempt.phase.exact_stop_target()?;
         Some((attempt.token.clone(), target))
+    }
+
+    /// The exact target plus the CoreId its own `BirthStarted` receipt echoed.
+    /// Set once from Inflight, so it cannot change while the token is unchanged.
+    pub(in crate::runtime::proxy) fn helper_started_birth(
+        &self,
+    ) -> Option<(
+        HelperStartToken,
+        HelperStopTarget,
+        Option<polaris_helper_proto::core_manifest::CoreId>,
+    )> {
+        let attempt = self.helper_start.as_ref()?;
+        let target = attempt.phase.exact_stop_target()?;
+        Some((attempt.token.clone(), target, attempt.started_core.clone()))
     }
 
     /// Reserve the only helper Stop IPC for this attempt before queuing its
