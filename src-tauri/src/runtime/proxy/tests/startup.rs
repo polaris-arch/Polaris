@@ -1959,9 +1959,18 @@ async fn cancelling_start_during_readiness_wait_reaps_the_real_process() {
     let rt2 = Arc::clone(&rt);
     let start = tokio::spawn(async move { rt2.start(cfg).await });
 
-    // 等核 spawn 出来并进入就绪轮询（永不就绪）。
-    tokio::time::sleep(Duration::from_millis(400)).await;
-    let pid = rt.pid.lock().unwrap().expect("此刻应已 spawn 出受管核 pid");
+    // 等待受管的假核登记实际 PID；它不会通过就绪检查。
+    let pid = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let pid = *rt.pid.lock().unwrap();
+            if let Some(pid) = pid {
+                break pid;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("假核应在限时内登记受管 PID");
     assert!(
         ps_alive(pid),
         "前提：假核应在跑（ps 实证），否则本测测不到孤儿面"
