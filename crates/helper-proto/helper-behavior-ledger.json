@@ -22,8 +22,8 @@
       "system-integration",
       "config-engine"
     ],
-    "digest": "0f60a454378bd991feb9eebb88209b144d996bd61e668c9c4e9900465a892e17",
-    "reason": "c5592bb4 基线；9cc49283→c5592bb4 已核实无 helper 行为改动。随后 fix(helper): attest Linux helper births 只改 helper-client 的 App 侧连接器（RootConnector）（Mac root connector 改名、同一 peer 校验），helper 不调用，不可达；helper-proto 仅新增 dev 依赖。"
+    "digest": "2d19680e5ee05dc06b29584e84d2dbe5c19489ec6c3550fc6f0cd9dac4edc95e",
+    "reason": "c5592bb4 基线；9cc49283→c5592bb4 已核实无 helper 行为改动。随后 fix(helper): attest Linux helper births 只改 helper-client 的 App 侧连接器（RootConnector）（Mac root connector 改名、同一 peer 校验），helper 不调用，不可达；helper-proto 仅新增 dev 依赖。随后 fix(config-engine): silence logs from Android mesh shadow projections，helper 不可达：仅 Android 影子投影的日志静默。"
   },
   "windows": {
     "generation": 8,
@@ -37,7 +37,7 @@
       "config-engine",
       "windows-cleaner"
     ],
-    "digest": "073a59790204b102c624aac93a91ad2425eafa3fd6643fe0e0a5ccb1c7ea1830",
-    "reason": "c5592bb4 基线；9cc49283→c5592bb4 已核实无 helper 行为改动。随后 fix(helper): attest Linux helper births 只改 helper-client 的 App 侧连接器（RootConnector）（Windows 不编译该连接器），不可达；helper-proto 仅新增 dev 依赖。"
+    "digest": "3f6a3ebc0c18b2015535729c308ba4a3b1c86443901e82b3c9f5793350597313",
+    "reason": "c5592bb4 基线；9cc49283→c5592bb4 已核实无 helper 行为改动。随后 fix(helper): attest Linux helper births 只改 helper-client 的 App 侧连接器（RootConnector）（Windows 不编译该连接器），不可达；helper-proto 仅新增 dev 依赖。随后 fix(config-engine): silence logs from Android mesh shadow projections，helper 不可达：仅 Android 影子投影的日志静默。"
   }
 }

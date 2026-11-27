@@ -206,6 +206,37 @@ fn android_single_no_exit_ts_precompiles_both_policies_without_web_dashboard() {
 }
 
 #[test]
+fn android_mesh_shadow_projections_do_not_repeat_the_exit_fallback_warn() {
+    thread_local! {
+        static WARNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+    fn count(level: LogLevel, message: &str) {
+        if level == LogLevel::Warn && message.starts_with("选中的组网节点已关闭外网访问")
+        {
+            WARNS.with(|warns| warns.set(warns.get() + 1));
+        }
+    }
+    let mut config = base_config();
+    config.servers.push(ServerConfig {
+        id: "ts".into(),
+        name: "Tailnet".into(),
+        protocol: Protocol::Tailscale,
+        tailscale_settings: Some(Box::default()),
+        ..Default::default()
+    });
+    let mut deps = deps_default();
+    deps.platform = "android".into();
+    deps.has_management_api = true;
+    deps.log = count;
+    for (selected, expected) in [("s1", 0), ("ts", 1)] {
+        config.selected_server_id = Some(selected.into());
+        WARNS.with(|warns| warns.set(0));
+        generate_sing_box_config(&config, &BTreeMap::new(), &deps).unwrap();
+        assert_eq!(WARNS.with(std::cell::Cell::get), expected, "{selected}");
+    }
+}
+
+#[test]
 fn android_warm_block_keeps_the_existing_clash_control_and_uses_block_policy() {
     use crate::builder::mesh_mode::{has_compiled_modes, selected_mode, MESH_DIRECT, NORMAL};
     use crate::user_config::dns_constants::{BLOCK_SERVER_ID, DIRECT_SERVER_ID};

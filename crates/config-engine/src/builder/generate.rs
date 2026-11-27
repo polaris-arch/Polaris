@@ -341,6 +341,11 @@ fn compile_android_mesh_modes(
     mesh.selected_server_id = Some(mesh_id);
     // Both projections use the same builder and runtime facts. The compiler
     // admits only differences it can express through clash_mode and selectors.
+    // The actual selection was already logged; shadow selections must not log.
+    let deps = &GenerateConfigDeps {
+        log: |_, _| {},
+        ..deps.clone()
+    };
     let (Ok(normal), Ok(mesh)) = (
         generate_base_config(&normal, resolved_ips, deps, runtime_bind_interfaces),
         generate_base_config(&mesh, resolved_ips, deps, runtime_bind_interfaces),
