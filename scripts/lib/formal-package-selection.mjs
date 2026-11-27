@@ -281,7 +281,9 @@ async function readZipMember(read, entry, consume, signal) {
 async function scanZip(read, length, suffix, charge, signal) {
   const records = zipRecords(read, length);
   const checked = [];
-  for (const { member, role, target } of selectedMembers(records, suffix)) {
+  // Android reads APK members case-sensitively, like the deb/AppImage consumers; AGP's
+  // shortened resource paths (res/2F.xml beside res/2f.xml) are distinct there. Windows ZIP still folds.
+  for (const { member, role, target } of selectedMembers(records, suffix, suffix === '.apk')) {
     const { entry, bytes } = records.get(target);
     const output = observer(member, bytes, charge);
     await readZipMember(read, entry, output.consume, signal);

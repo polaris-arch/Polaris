@@ -367,6 +367,10 @@ export async function inspectAndroidCarrier({ apk, abi, r8, component, receiptPa
   const payload = JSON.parse(await run([process.execPath, verify, '--sdk-payload', apk, abi, JSON.stringify(pins)], { cwd: ROOT }));
   await run([process.execPath, join(ROOT, 'scripts/assert-r8-evidence.mjs'), r8], { cwd: ROOT });
   for (const target of payload.selectedABIs) await run([process.execPath, verify, apk, '--abi', target], { cwd: ROOT });
+  // The release asset contract's own object check, so unsigned and signed carriers meet it before a tag.
+  // Loaded here so Apple producers, which import this module from a declared file set, do not depend on it.
+  const { inspectFormalArtifact } = await import('../lib/formal-package-selection.mjs');
+  await inspectFormalArtifact(apk);
   demand(equal(await appIdentity({ runner, run }), current) && equal(readReceipt(androidReceipt), material),
     'consumer input changed during final carrier inspection');
   const r8Files = {};
