@@ -1730,11 +1730,14 @@ impl ProxyRuntime {
             ClassifiedSwitch::NotRunning => {
                 if scope == SwitchApplyScope::Full {
                     self.commit_coex_current_config(new_config);
-                    self.process_deferred_config_deletions().await;
+                    if !cfg!(target_os = "android") {
+                        self.process_deferred_config_deletions().await;
+                    }
                     self.selector_reconcile.clear_required();
                 }
                 // 停核时磁盘期望态天然就是下一次运行态；保存/订阅刷新写下的不可逆删除不应悬到
                 // 下次连接才完成。journal 内仍按最新配置复核，重新加入的实体不会被误删。
+                // Android 的独立 VPN 可能仍在用旧源，留给确认的 Stop 或运行中 Apply。
                 log::info!("switchMode：核未运行 → 仅更新配置（下次 start 生效）");
                 return SwitchOutcome::NotRunning;
             }

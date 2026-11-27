@@ -4018,9 +4018,16 @@ const CFG_REGISTRY: &[CfgSite] = &[
     (
         "src-tauri/src/runtime/proxy/runtime_config.rs",
         "target_os = \"android\"",
+        2,
+        IosSide::DiffersUndecided,
+        "A configuration edit saved, or an Apply requested, while the core is stopped consumes deferred deletions immediately, except on Android where a standalone VPN may still use the old source. iOS takes the desktop side; whether PacketTunnel can outlive the stopped state reported to the app needs an iOS device check.",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/hot_switch.rs",
+        "target_os = \"android\"",
         1,
         IosSide::DiffersUndecided,
-        "A configuration edit saved while the core is stopped consumes deferred deletions immediately, except on Android where a standalone VPN may still use the old source. iOS takes the desktop side; whether PacketTunnel can outlive the stopped state reported to the app needs an iOS device check.",
+        "A full config switch while the core is stopped consumes deferred deletions immediately, except on Android where a standalone VPN may still use the old source. iOS takes the desktop side pending the same PacketTunnel device check.",
     ),
     (
         "src-tauri/src/runtime/proxy/startup.rs",
@@ -4787,7 +4794,9 @@ const IOS_SIDE_CENSUS: &[(&str, usize)] = &[
     // Plan-first node edits add two sites whose iOS side needs device evidence:
     // save-only beside pending changes (server.rs) and immediate deferred deletions
     // while stopped, now shared by every offline edit in runtime_config.rs.
-    ("DiffersUndecided", 28),
+    // Stopped-core Apply and full config switches keep the same Android exception
+    // (runtime_config.rs, hot_switch.rs).
+    ("DiffersUndecided", 30),
     // Saved temporary-core concurrency adds three group members; no old debt is repaid.
     // Bounded connection snapshots add 15 stats transport sites to the existing stats
     // debt family: relay.rs (1 + 8 + 2) and source.rs (2 + 2). No old debt is repaid
@@ -4862,6 +4871,11 @@ const IOS_DEBT_SITES: &[(&str, &str, usize)] = &[
         3,
     ),
     (
+        "src-tauri/src/runtime/proxy/hot_switch.rs",
+        "target_os = \"android\"",
+        1,
+    ),
+    (
         "src-tauri/src/runtime/proxy/lifecycle.rs",
         "any(target_os = \"android\", test)",
         3,
@@ -4884,7 +4898,7 @@ const IOS_DEBT_SITES: &[(&str, &str, usize)] = &[
     (
         "src-tauri/src/runtime/proxy/runtime_config.rs",
         "target_os = \"android\"",
-        1,
+        2,
     ),
     (
         "src-tauri/src/runtime/proxy/startup.rs",

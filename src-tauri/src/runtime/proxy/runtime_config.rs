@@ -2731,7 +2731,7 @@ impl ProxyRuntime {
             if saved_owner.is_some() {
                 return decline(RuntimeApplyResult::status("conflict"));
             }
-            if offer_confirmation {
+            if offer_confirmation && !cfg!(target_os = "android") {
                 self.process_deferred_config_deletions().await;
             }
             return decline(RuntimeApplyResult::status("skipped"));
