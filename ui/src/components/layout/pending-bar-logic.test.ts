@@ -9,6 +9,7 @@ import {
   preserveNativeRetirements,
   nativeRetirementsAfterLifecycle,
   dismissApplyState,
+  settleAppliedFailure,
   hostEffectsAccepted,
   hostRetryAvailable,
   type ApplyState,
@@ -222,6 +223,41 @@ describe('hasPendingWork', () => {
     expect(
       hasPendingWork({ ...none, restartDeferred: 'yes' as unknown as boolean })
     ).toBe(false);
+  });
+});
+
+describe('settleAppliedFailure', () => {
+  const failed: ApplyState = { phase: 'failed', reason: 'hot apply failed' };
+
+  it('a publish outside the bar empties pending → failure ends', () => {
+    expect(settleAppliedFailure(failed, false)).toEqual({ phase: 'idle', reason: null });
+  });
+
+  it('persistence debt remains → failure stays', () => {
+    const persistence: ApplyState = { ...failed, persistenceOnly: true };
+    expect(settleAppliedFailure(persistence, false)).toBe(persistence);
+  });
+
+  it('pending work remains → failure stays', () => {
+    expect(settleAppliedFailure(failed, true)).toBe(failed);
+  });
+
+  it('unconfirmed outcome → failure stays', () => {
+    const unconfirmed: ApplyState = { ...failed, transactionId: 'tx-2', reconciling: true };
+    expect(settleAppliedFailure(unconfirmed, false)).toBe(unconfirmed);
+    const unreconciled: ApplyState = { ...failed, transactionId: 'tx-2' };
+    expect(settleAppliedFailure(unreconciled, false)).toBe(unreconciled);
+  });
+
+  it('native cleanup UNKNOWN without a registered debt → failure stays', () => {
+    const unknown = applyReceiptState({ phase: 'applying', reason: null }, { status: 'nativeCleanupUnknown' });
+    expect(unknown).toMatchObject({ phase: 'failed', outcomeUnknown: true });
+    expect(settleAppliedFailure(unknown, false)).toBe(unknown);
+  });
+
+  it('host effects without an owner → failure stays', () => {
+    const ownerless: ApplyState = { ...failed, hostReconciling: false, outcomeUnknown: true };
+    expect(settleAppliedFailure(ownerless, false)).toBe(ownerless);
   });
 });
 

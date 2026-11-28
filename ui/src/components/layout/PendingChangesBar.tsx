@@ -58,6 +58,7 @@ import {
   nativeRetirementsAfterLifecycle,
   preserveNativeRetirements,
   dismissApplyState,
+  settleAppliedFailure,
   runtimePersistenceRetryAvailable,
   runtimePersistenceRecoveryEnded,
   applyStateOnLifecycle,
@@ -235,6 +236,12 @@ export default function PendingChangesBar() {
     }, APPLY_CONFIRM_TIMEOUT_MS);
     return () => clearTimeout(timer);
   }, [apply.phase, apply.applyId]);
+
+  // A Home exit switch publishes without this bar; its success clears only the pending set.
+  const pendingDebt = hasPendingWork(pending) || !!pending.nativeRetirements?.length;
+  useEffect(() => {
+    setApply((state) => settleAppliedFailure(state, pendingDebt));
+  }, [pendingDebt]);
 
   const view = composeBarView({
     stagedPhase: stagedPhaseOf(saveStatus, stagedEntries.length),
@@ -418,7 +425,7 @@ export default function PendingChangesBar() {
       next.hostReconciling = !request.cancelled && reconcileOwnerKnown && next.host?.phase === 'pending';
       if ((result.status === 'hostEffectsPending' || result.status === 'hostEffectsFailed')
           && (!result.hostExecutionId || !reconcileOwnerKnown)) {
-        next = { ...next, phase: 'failed', reason: t('home.pendingHotUnconfirmed'), hostReconciling: false };
+        next = { ...next, phase: 'failed', reason: t('home.pendingHotUnconfirmed'), hostReconciling: false, outcomeUnknown: true };
       }
       if (outcome.phase === 'applying') {
         if (typeof result.applyId !== 'number' || !Number.isSafeInteger(result.applyId) || result.applyId <= 0) {

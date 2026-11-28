@@ -209,6 +209,8 @@ export interface ApplyState {
   hostReconciling?: boolean;
   nativeRetirements?: NativeRetirementDebt[];
   nativeChecking?: boolean;
+  /** The failure cannot prove the apply did not land (UNKNOWN cleanup, ownerless host effects). */
+  outcomeUnknown?: boolean;
   /** Set only after a terminal lifecycle event and its matching live status confirm teardown. */
   nativeEndedBeforeGeneration?: number;
   persistenceRetrying?: boolean;
@@ -261,6 +263,16 @@ export function dismissApplyState(current: ApplyState): ApplyState {
     coreRecovery: undefined, transactionId: undefined, persistenceOnly: false,
     reconciling: false, persistenceRecoveryEnded: false };
   return { ...current, phase: current.coreRecovery ? 'durabilityPending' : 'idle', reason: null };
+}
+
+/** A publish outside this bar can clear every pending item; a known failure that owes nothing then ends. */
+export function settleAppliedFailure(current: ApplyState, pendingDebt: boolean): ApplyState {
+  return current.phase === 'failed' && !pendingDebt
+    && !current.reconciling && !current.transactionId && !current.outcomeUnknown
+    && !current.coreRecovery && !current.persistenceOnly
+    && (!current.host || current.host.phase === 'settled')
+    && !current.nativeRetirements?.length
+    ? dismissApplyState(current) : current;
 }
 
 export function hostEffectsAccepted(effects: PendingApplyResult['hostEffects']): boolean {
@@ -337,7 +349,10 @@ export function applyReceiptState(
       && generation === next.coreRecovery.runtimeGeneration && intent === next.coreRecovery.selectionIntentGeneration) {
     next.coreRecovery = { ...next.coreRecovery, persistenceRetryable: false };
   }
-  if (result.status === 'nativeCleanupUnknown' && !next.nativeRetirements?.length) next.phase = 'failed';
+  if (result.status === 'nativeCleanupUnknown' && !next.nativeRetirements?.length) {
+    next.phase = 'failed';
+    next.outcomeUnknown = true;
+  }
   return next;
 }
 

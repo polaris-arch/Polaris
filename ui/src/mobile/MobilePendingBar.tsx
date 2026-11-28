@@ -63,6 +63,7 @@ import {
   nativeRetirementsAfterLifecycle,
   preserveNativeRetirements,
   dismissApplyState,
+  settleAppliedFailure,
   runtimePersistenceRetryAvailable,
   runtimePersistenceRecoveryEnded,
   applyStateOnLifecycle,
@@ -213,6 +214,12 @@ export function MobilePendingBar(): ReactElement | null {
     }, APPLY_CONFIRM_TIMEOUT_MS);
     return () => clearTimeout(timer);
   }, [apply.phase, apply.applyId]);
+
+  // A Home exit switch publishes without this bar; its success clears only the pending set.
+  const pendingDebt = hasPendingWork(pending) || !!pending.nativeRetirements?.length;
+  useEffect(() => {
+    setApply((state) => settleAppliedFailure(state, pendingDebt));
+  }, [pendingDebt]);
 
   /* ── 冲突档：优先于常规合成（用户点了保存却什么都没发生，先把这件事说清楚）─────────── */
   if (conflict !== null && conflict.length > 0) {
@@ -408,7 +415,7 @@ export function MobilePendingBar(): ReactElement | null {
       next.hostReconciling = !request.cancelled && reconcileOwnerKnown && next.host?.phase === 'pending';
       if ((result.status === 'hostEffectsPending' || result.status === 'hostEffectsFailed')
           && (!result.hostExecutionId || !reconcileOwnerKnown)) {
-        next = { ...next, phase: 'failed', reason: t('home.pendingHotUnconfirmed'), hostReconciling: false };
+        next = { ...next, phase: 'failed', reason: t('home.pendingHotUnconfirmed'), hostReconciling: false, outcomeUnknown: true };
       }
       if (outcome.phase === 'applying') {
         if (typeof result.applyId !== 'number' || !Number.isSafeInteger(result.applyId) || result.applyId <= 0) {
