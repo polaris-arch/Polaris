@@ -12,16 +12,16 @@ next to this file as LICENSE.
    **the Android artifact is distributed as a whole under GPLv3**.
 
 以子进程 / 二进制资源形式集成的第三方组件（非源码链接）：
-  - 桌面 sing-box v1.15.0-polaris-alpha.12.49 (GPLv3) — https://github.com/polaris-arch/sing-box-polaris
+  - 桌面 sing-box v1.15.0-polaris-alpha.12.50 (GPLv3) — https://github.com/polaris-arch/sing-box-polaris
         上游基线源码：https://github.com/SagerNet/sing-box/tree/v1.15.0-alpha.12
-        固定源码：https://github.com/polaris-arch/sing-box-polaris/tree/119d81be7d3010494795399070d0d993752c5943
-        桌面发布：https://github.com/polaris-arch/sing-box-polaris/releases/tag/v1.15.0-polaris-alpha.12.49
-        消费合同 SHA-256：74c623d4d76b7eac1e90dde4835bab747a3072f7f4fed098dca6dffca27d32e6
+        固定源码：https://github.com/polaris-arch/sing-box-polaris/tree/72be53160c89541111b20e27e190daef492bfa08
+        桌面发布：https://github.com/polaris-arch/sing-box-polaris/releases/tag/v1.15.0-polaris-alpha.12.50
+        消费合同 SHA-256：5fd7160cc60e95bb5504381859c76e4a5b93185c04cd5981b9e41bb1c789237b
         Linux SO / Windows DLL 随核同包；macOS 静态链接，无独立 sidecar。
-  - 移动端 libbox v1.15.0-polaris-alpha.12.49 (GPLv3) — https://github.com/polaris-arch/sing-box-polaris
+  - 移动端 libbox v1.15.0-polaris-alpha.12.50 (GPLv3) — https://github.com/polaris-arch/sing-box-polaris
         上游基线源码：https://github.com/SagerNet/sing-box/tree/v1.15.0-alpha.12
-        固定源码：https://github.com/polaris-arch/sing-box-polaris/tree/119d81be7d3010494795399070d0d993752c5943
-        源码标签：https://github.com/polaris-arch/sing-box-polaris/tree/v1.15.0-polaris-alpha.12.49
+        固定源码：https://github.com/polaris-arch/sing-box-polaris/tree/72be53160c89541111b20e27e190daef492bfa08
+        源码标签：https://github.com/polaris-arch/sing-box-polaris/tree/v1.15.0-polaris-alpha.12.50
   - cronet-go               — https://github.com/SagerNet/cronet-go     （NaiveProxy 核心，libcronet 动态库）
   - sing-box-dashboard      — https://github.com/SagerNet/sing-box-dashboard（面板 UI，桌面专属）
   - meta-rules-dat          — https://github.com/MetaCubeX/meta-rules-dat（规则集 / 地理数据 .srs）
@@ -92,15 +92,15 @@ you MIT; taking the Android artifact gives you GPLv3.
 
 ════ 对应源码 / Corresponding Source ════
 
-桌面 sing-box 源码：https://github.com/polaris-arch/sing-box-polaris/tree/v1.15.0-polaris-alpha.12.49（commit 119d81be7d3010494795399070d0d993752c5943）
-桌面 sing-box 源码归档：https://github.com/polaris-arch/sing-box-polaris/archive/119d81be7d3010494795399070d0d993752c5943.tar.gz
-移动端 libbox 源码：https://github.com/polaris-arch/sing-box-polaris/tree/v1.15.0-polaris-alpha.12.49（commit 119d81be7d3010494795399070d0d993752c5943）
+桌面 sing-box 源码：https://github.com/polaris-arch/sing-box-polaris/tree/v1.15.0-polaris-alpha.12.50（commit 72be53160c89541111b20e27e190daef492bfa08）
+桌面 sing-box 源码归档：https://github.com/polaris-arch/sing-box-polaris/archive/72be53160c89541111b20e27e190daef492bfa08.tar.gz
+移动端 libbox 源码：https://github.com/polaris-arch/sing-box-polaris/tree/v1.15.0-polaris-alpha.12.50（commit 72be53160c89541111b20e27e190daef492bfa08）
 对 Android 产物，完整对应源码还包括 Polaris 自身：https://github.com/polaris-arch/Polaris
 安装包不附带内核源码包；以上公开链接即对应源码的获取方式。
 
-Desktop sing-box source: https://github.com/polaris-arch/sing-box-polaris/tree/v1.15.0-polaris-alpha.12.49 (commit 119d81be7d3010494795399070d0d993752c5943)
-Desktop sing-box source archive: https://github.com/polaris-arch/sing-box-polaris/archive/119d81be7d3010494795399070d0d993752c5943.tar.gz
-Mobile libbox source: https://github.com/polaris-arch/sing-box-polaris/tree/v1.15.0-polaris-alpha.12.49 (commit 119d81be7d3010494795399070d0d993752c5943)
+Desktop sing-box source: https://github.com/polaris-arch/sing-box-polaris/tree/v1.15.0-polaris-alpha.12.50 (commit 72be53160c89541111b20e27e190daef492bfa08)
+Desktop sing-box source archive: https://github.com/polaris-arch/sing-box-polaris/archive/72be53160c89541111b20e27e190daef492bfa08.tar.gz
+Mobile libbox source: https://github.com/polaris-arch/sing-box-polaris/tree/v1.15.0-polaris-alpha.12.50 (commit 72be53160c89541111b20e27e190daef492bfa08)
 For Android, Corresponding Source also includes Polaris's own complete source
 at https://github.com/polaris-arch/Polaris. Installers do not bundle the kernel
 source archive; the public links above are how to obtain the Corresponding
