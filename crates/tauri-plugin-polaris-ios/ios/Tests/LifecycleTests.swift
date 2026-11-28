@@ -576,17 +576,40 @@ struct LifecycleTests {
         // While that read is outstanding no successor can mutate preferences.
         let removal = VpnPreferenceMutation()
         let removalID = freshVpnRequestID("remove")
+        let oldUnsubmitted: [String: Any] = ["requestID": profile["requestID"]!, "pending": false, "unsubmittedIdentity": profile]
+        let pendingRemoval: [String: Any] = ["requestID": removalID, "pending": true,
+            "operation": "remove", "previousPreferenceIntent": oldUnsubmitted]
+        let legacyRemoval: [String: Any] = ["requestID": removalID, "pending": true]
+        var pendingSave = oldUnsubmitted
+        pendingSave["pending"] = true
+
+        assert(vpnReconciledRemovalIntent(pendingSave, profileAbsent: true) == nil)
+        assert(vpnReconciledRemovalIntent(pendingRemoval, profileAbsent: false) == nil)
+        assert(vpnReconciledRemovalIntent(pendingRemoval, expectedRequestID: oldHostRequest, profileAbsent: true) == nil)
+        let coldAbsent = vpnReconciledRemovalIntent(pendingRemoval, profileAbsent: true)
+        assert(vpnPreferencePending(coldAbsent) == false && coldAbsent?["unsubmittedIdentity"] == nil)
+        assert(vpnPreferencePending(vpnReconciledRemovalIntent(legacyRemoval, profileAbsent: true)) == false)
+
         assert(removal.begin(removalID))
         assert(!removal.begin(newHostRequest))
-        assert(removal.reconcileRemoval(oldHostRequest, profileExists: .success(false)) {
+        assert(removal.reconcileRemoval(oldHostRequest, profileExists: .success(false)) { _ in
             preconditionFailure("A stale removal must not reconcile the current intent")
         } == nil)
-        let stillExists = removal.reconcileRemoval(removalID, profileExists: .success(true)) {}
-        if case .failure? = stillExists {} else { preconditionFailure("Existing profile accepted as removed") }
+        let failedReadbacks: [Result<Bool, Error>] = [.success(true), .failure(NSError(domain: "Test", code: 1))]
+        for readback in failedReadbacks {
+            var preserved: [String: Any]?
+            let failed = removal.reconcileRemoval(removalID, profileExists: readback) { absent in
+                preserved = vpnReconciledRemovalIntent(pendingRemoval, expectedRequestID: removalID, profileAbsent: absent)
+            }
+            if case .failure? = failed {} else { preconditionFailure("Unverified removal accepted") }
+            assert(vpnProfileWasNeverSubmitted(preference: preserved, identity: profile, report: nil))
+            assert(removal.begin(removalID))
+        }
+        assert(removal.finish(removalID))
         assert(removal.begin(newHostRequest))
         var reconciledIntent = false
-        let absent = removal.reconcileRemoval(newHostRequest, profileExists: .success(false)) {
-            reconciledIntent = true
+        let absent = removal.reconcileRemoval(newHostRequest, profileExists: .success(false)) { profileAbsent in
+            reconciledIntent = profileAbsent
         }
         if case .success? = absent {} else { preconditionFailure("Absent profile was not confirmed") }
         assert(reconciledIntent && !removal.pending)

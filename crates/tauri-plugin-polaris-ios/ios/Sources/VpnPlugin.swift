@@ -317,26 +317,36 @@ final class VpnPlugin: Plugin {
             self.loadManager(create: false) { result in
                 guard self.current(op) else { return }
                 do {
-                    if let failure = self.pendingPreferenceFailure(try self.readPreferenceIntent()) {
-                        throw vpnError(failure)
-                    }
+                    let manager = try result.get().manager
+                    let preference = try self.readPreferenceIntent()
                     try self.requireForeground()
-                    guard let manager = try result.get().manager else {
+                    if let failure = self.pendingPreferenceFailure(preference) {
+                        guard let settled = vpnReconciledRemovalIntent(preference, profileAbsent: manager == nil)
+                        else { throw vpnError(failure) }
+                        try self.writePreferenceIntent(settled)
+                    }
+                    guard let manager else {
                         self.finish(op, snapshot: ["profileExists": false]); return
                     }
                     let status = manager.connection.status
                     guard status == .disconnected || (status == .invalid && !manager.isEnabled) else {
                         throw vpnError("Disconnect Polaris in iOS Settings before removing its VPN profile.")
                     }
-                    try self.writePreferenceIntent(op.requestID, pending: true)
+                    var intent: [String: Any] = ["requestID": op.requestID, "pending": true, "operation": "remove"]
+                    intent["previousPreferenceIntent"] = preference
+                    try self.writePreferenceIntent(intent)
                     guard self.preferenceMutation.begin(op.requestID) else { throw vpnError("Another VPN preference write is pending") }
                     manager.removeFromPreferences { error in
                         DispatchQueue.main.async {
                             // A late terminal can reconcile its own intent, but cannot
                             // publish success or release a newer write.
                             func complete(_ profileExists: Result<Bool, Error>) {
-                                let terminal = self.preferenceMutation.reconcileRemoval(op.requestID, profileExists: profileExists) {
-                                    try self.finishPreferenceIntent(op.requestID, saved: false)
+                                let terminal = self.preferenceMutation.reconcileRemoval(op.requestID, profileExists: profileExists) { absent in
+                                    guard let settled = vpnReconciledRemovalIntent(try self.readPreferenceIntent(),
+                                        expectedRequestID: op.requestID, profileAbsent: absent) else {
+                                        throw vpnError("The VPN removal has no matching preference intent.")
+                                    }
+                                    try self.writePreferenceIntent(settled)
                                 }
                                 switch terminal {
                                 case .success?: self.finish(op, snapshot: ["profileExists": false])
@@ -991,9 +1001,12 @@ final class VpnPlugin: Plugin {
     }
 
     private func writePreferenceIntent(_ requestID: String, pending: Bool, unsubmitted: [String: Any]? = nil) throws {
-        let url = try directory().appendingPathComponent("vpn-preference-intent.json")
         var intent: [String: Any] = ["requestID": requestID, "pending": pending]
         intent["unsubmittedIdentity"] = unsubmitted
+        try writePreferenceIntent(intent)
+    }
+    private func writePreferenceIntent(_ intent: [String: Any]) throws {
+        let url = try directory().appendingPathComponent("vpn-preference-intent.json")
         try JSONSerialization.data(withJSONObject: intent).write(to: url,
             options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
     }

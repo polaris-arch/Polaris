@@ -21,10 +21,10 @@ final class VpnPreferenceMutation {
     }
 
     func reconcileRemoval(_ requestID: String, profileExists: Result<Bool, Error>,
-                          persist: () throws -> Void) -> Result<Void, Error>? {
+                          persist: (Bool) throws -> Void) -> Result<Void, Error>? {
         guard finish(requestID) else { return nil }
         return Result {
-            try persist()
+            try persist((try? profileExists.get()) == false)
             guard try !profileExists.get() else {
                 throw NSError(domain: "PolarisVPN", code: 1, userInfo: [
                     NSLocalizedDescriptionKey: "The Polaris VPN profile still appears in system preferences after removal."
@@ -110,6 +110,26 @@ private func vpnEvidenceGeneration(_ value: Any?) -> UInt64? {
 
 func vpnPreferencePending(_ preference: [String: Any]?) -> Bool? {
     vpnEvidenceBool(preference?["pending"])
+}
+
+/// Without the original terminal callback, only a fresh absence read can settle removal.
+func vpnReconciledRemovalIntent(_ preference: [String: Any]?, expectedRequestID: String? = nil,
+                                profileAbsent: Bool) -> [String: Any]? {
+    guard let preference, vpnPreferencePending(preference) == true,
+          let requestID = preference["requestID"] as? String, requestID.hasPrefix("remove:"),
+          UUID(uuidString: String(requestID.dropFirst("remove:".count))) != nil,
+          expectedRequestID.map({ $0 == requestID }) ?? profileAbsent else { return nil }
+    // The first removal implementation used the nonce prefix alone.
+    if let operation = preference["operation"] {
+        guard operation as? String == "remove" else { return nil }
+    } else if preference.count != 2 {
+        return nil
+    }
+    if let previous = preference["previousPreferenceIntent"] {
+        guard let previous = previous as? [String: Any], vpnPreferencePending(previous) == false else { return nil }
+        if !profileAbsent { return previous }
+    }
+    return ["requestID": requestID, "pending": false]
 }
 
 func vpnProfileWasNeverSubmitted(preference: [String: Any]?, identity: [String: Any], report: [String: Any]?) -> Bool {
