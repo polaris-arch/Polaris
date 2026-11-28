@@ -601,7 +601,7 @@ export function HomeScreenView(props: HomeScreenViewProps): ReactElement {
             className={`h-connect-action ${willDisconnect ? 'is-disconnect' : 'is-connect'}`}
             data-write-control="connect"
             onClick={props.onToggleConnect}
-            disabled={coreBusy || systemVpn === 'unavailable'}
+            disabled={coreBusy || systemVpn === 'unavailable' || props.iosProfileRecovery?.pending}
             aria-busy={coreBusy}
           >
             {coreBusy ? <ActionBusy /> : <ActionGlyph shape="power" />}
@@ -609,6 +609,18 @@ export function HomeScreenView(props: HomeScreenViewProps): ReactElement {
           </button>
         </div>
         <WriteError id="connect" errors={err} />
+        {props.iosProfileRecovery && (
+          <button
+            type="button"
+            className="h-noticeact h-vpn-profile-action"
+            onClick={props.iosProfileRecovery.onRemove}
+            disabled={props.iosProfileRecovery.pending}
+            aria-busy={props.iosProfileRecovery.pending}
+          >
+            {props.iosProfileRecovery.pending && <ActionBusy />}
+            {t('mobileHome.iosVpnProfileRemove')}
+          </button>
+        )}
       </header>
 
       {/* 相关能力共用外框；内部各卡仍持有原来的动作、错误和弹层。 */}

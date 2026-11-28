@@ -1197,6 +1197,7 @@ pub fn run() {
             // ── 代理控制（proxy:start/stop/getStatus + pending + connections）──
             proxy_start,
             proxy_stop,
+            proxy_remove_ios_vpn_profile,
             proxy_get_status,
             proxy_get_pending_changes,
             proxy_revert_saved_settings,

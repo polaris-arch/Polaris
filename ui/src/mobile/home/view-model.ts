@@ -182,6 +182,7 @@ export interface HomeScreenViewProps {
   readonly connState: TakeoverConnState;
   readonly node: NodeIdentity;
   readonly onToggleConnect: () => void;
+  readonly iosProfileRecovery?: { pending: boolean; onRemove: () => void };
   readonly onNetworkCheck: () => void;
   readonly networkCheckBusy: boolean;
   readonly networkCheckTip: string;

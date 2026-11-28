@@ -46,16 +46,17 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, typ
    多一份少一份都红，所以「加一份 CSS」必须是一次显式登记，不能悄悄进链路。 */
 import './home.css';
 import { useTranslation } from 'react-i18next';
-import { api, unlockApi } from '@/ipc';
+import { api, IpcError, unlockApi } from '@/ipc';
 import { manualNetworkContextMatches } from '@/contracts/manual-network-check';
 import { manualSpeedTestCaps } from '@/domain/endpoint-routes';
-import type {
-  ConnectionsDetailUpdate,
-  ProxyMode,
-  ProxyModeType,
-  RuleAction,
-  ServerConfig,
-  TrafficStats,
+import {
+  ProxyErrorCode,
+  type ConnectionsDetailUpdate,
+  type ProxyMode,
+  type ProxyModeType,
+  type RuleAction,
+  type ServerConfig,
+  type TrafficStats,
 } from '@/contracts/types';
 import {
   getEffectiveConfig,
@@ -107,7 +108,7 @@ import {
   totalBytesOf,
   type ActiveTable,
 } from './aggregate';
-import { openMobileForm } from '../forms/form-store';
+import { closeMobileForm, openMobileForm } from '../forms/form-store';
 import { protocolLabel } from '@/components/screens/nodes/nodes-logic';
 import { HomeScreenView, ROUTING_KEY, RULE_ACTION_KEY } from './HomeScreenView';
 import { useHomeSpeedTest } from './use-home-speed-test';
@@ -159,6 +160,8 @@ function checkedLabel(t: (k: string, o?: Record<string, unknown>) => string, at:
 export function MobileHomeScreen(): ReactElement {
   const { t, i18n } = useTranslation();
   const [writeErrors, setWriteErrors] = useState<WriteErrors>({});
+  const [iosPreviousOperationUnconfirmed, setIosPreviousOperationUnconfirmed] = useState(false);
+  const [iosProfileRemovalPending, setIosProfileRemovalPending] = useState(false);
   const mounted = useRef(false);
   const routingIntent = useRef<{ mode: ProxyMode } | null>(null);
   const [manualCheckBusy, setManualCheckBusy] = useState(false);
@@ -510,10 +513,52 @@ export function MobileHomeScreen(): ReactElement {
   const onToggleConnect = useCallback(() => {
     void runWrite(
       'connect',
-      () => proxyRunning ? stopProxy() : withProxyStartClaim(() => startProxy()),
+      async () => {
+        try {
+          await (proxyRunning ? stopProxy() : withProxyStartClaim(() => startProxy()));
+          setIosPreviousOperationUnconfirmed(false);
+        } catch (error) {
+          setIosPreviousOperationUnconfirmed(error instanceof IpcError
+            && error.code === ProxyErrorCode.IOS_PREVIOUS_OPERATION_UNCONFIRMED);
+          throw error;
+        }
+      },
       () => mounted.current,
     );
   }, [runWrite, proxyRunning, startProxy, stopProxy]);
+
+  const offerIosProfileRecovery = typeof document !== 'undefined' && document.documentElement.dataset.mobileOs === 'ios'
+    && (core === 'stopped' || core === 'error')
+    && proxyStatus?.errorCode !== ProxyErrorCode.IOS_SESSION_ACTIVE
+    && (iosPreviousOperationUnconfirmed || (!writeErrors.connect
+      && proxyStatus?.errorCode === ProxyErrorCode.IOS_PREVIOUS_OPERATION_UNCONFIRMED));
+
+  const onRemoveIosVpnProfile = () => {
+    const instanceId = openMobileForm({
+      kind: 'confirm',
+      payload: {
+        title: t('mobileHome.iosVpnProfileRemove'),
+        message: t('mobileHome.iosVpnProfileRemoveConfirm'),
+        confirmLabel: t('common.delete'),
+        danger: true,
+        onConfirm: async () => {
+          closeMobileForm(instanceId);
+          setIosProfileRemovalPending(true);
+          setIosPreviousOperationUnconfirmed(true);
+          try {
+            await runWrite('connect', async () => {
+              await api.proxy.removeIosVpnProfile();
+              setIosPreviousOperationUnconfirmed(false);
+              await useAppStore.getState().refreshProxyStatus();
+              toast.success(t('mobileHome.iosVpnProfileRemoved'));
+            }, () => mounted.current, t('mobileHome.iosVpnProfileRemoveFailed'));
+          } finally {
+            setIosProfileRemovalPending(false);
+          }
+        },
+      },
+    });
+  };
 
   /**
    * 网络检测。**必须消费返回值**：后端有多条早退路径把终态直接塞在返回值里、不经事件，
@@ -816,6 +861,9 @@ export function MobileHomeScreen(): ReactElement {
       connState={connState}
       node={node}
       onToggleConnect={onToggleConnect}
+      iosProfileRecovery={offerIosProfileRecovery || iosProfileRemovalPending
+        ? { pending: iosProfileRemovalPending, onRemove: onRemoveIosVpnProfile }
+        : undefined}
       onNetworkCheck={runNetworkCheck}
       networkCheckBusy={manualCheckBusy || latencyCheck.view.busy === true}
       networkCheckTip={proxyRunning && unlock.running ? t('home.unlockRunningLatencyOnly') : unlockCooldown ? t('home.unlockCooldown') : t('home.networkCheckTip')}

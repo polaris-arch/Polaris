@@ -15,9 +15,19 @@ describe('iOS active system session guidance', () => {
     expect(writeErrorsFromProxyStatus(errors, { running: false, errorCode: ProxyErrorCode.IOS_SESSION_ACTIVE }, t)).toBe(errors);
     expect(writeErrorsFromProxyStatus({}, { running: true, errorCode: ProxyErrorCode.IOS_SESSION_ACTIVE }, t)).toEqual({});
   });
+  it('uses the same recovery warning for startup reconciliation and an awaited connect refusal', () => {
+    const errorCode = ProxyErrorCode.IOS_PREVIOUS_OPERATION_UNCONFIRMED;
+    expect(writeErrorsFromProxyStatus({}, { running: false, errorCode }, t)).toEqual({
+      connect: 'errors.iosPreviousOperationUnconfirmed',
+    });
+    expect(writeFailureText(t, { code: errorCode })).toBe('errors.iosPreviousOperationUnconfirmed');
+  });
   it.each(['en-US', 'zh-CN', 'zh-TW', 'ru', 'fa'])('supplies %s system session, normal first-login and identity-retirement guidance', (locale) => {
     const text = JSON.parse(readFileSync(new URL(`../i18n/locales/${locale}.json`, import.meta.url), 'utf8'));
     expect(text.errors.iosSessionActive).toBeTruthy();
+    for (const key of ['iosVpnProfileRemove', 'iosVpnProfileRemoveConfirm', 'iosVpnProfileRemoved', 'iosVpnProfileRemoveFailed']) {
+      expect(text.mobileHome[key]).toBeTruthy();
+    }
     expect(text.ts.iosAccountActionsUnavailable).toBeUndefined();
     for (const key of ['stoppingConnection', 'retiringIdentity', 'savingCandidate', 'startingConnection',
       'reasonIdentityRetirement', 'reasonSessionChanged', 'reasonConfigurationChanged', 'loginRefreshFailed']) {

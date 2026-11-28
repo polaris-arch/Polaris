@@ -1540,6 +1540,39 @@ impl ProxyRuntime {
         Ok(matches)
     }
 
+    #[cfg(target_os = "ios")]
+    pub(crate) async fn remove_ios_vpn_profile(&self) -> Result<(), String> {
+        let generation = self.gate.generation();
+        let _tailscale_gate = self.mesh.tailscale_state_gate().await;
+        let status = self.status();
+        if status.main_generation != generation
+            || status.running
+            || status.starting
+            || self.core_lifecycle_busy()
+        {
+            return Err("A VPN operation is already in progress".into());
+        }
+        if self
+            .ios_ready_session
+            .read()
+            .map_err(|_| "nativeRetirementUnknown")?
+            .as_ref()
+            .is_some_and(|owner| !owner.allows_successor())
+        {
+            return Err("The previous VPN session still has unresolved cleanup".into());
+        }
+        tauri_plugin_polaris_ios::remove_disconnected_profile().await?;
+        // The profile readback only settles its UI warning. Keep native
+        // lifecycle evidence and original-session custody for their own paths.
+        let _publication = self.gate.lock_generation_publication();
+        if self.gate.generation() == generation
+            && status.error_code.as_deref() == Some(code::IOS_PREVIOUS_OPERATION_UNCONFIRMED)
+        {
+            self.clear_nonfatal_error_if(code::IOS_PREVIOUS_OPERATION_UNCONFIRMED);
+        }
+        Ok(())
+    }
+
     /// A cold host has no running configuration to adopt. Preserve the NE session
     /// and expose its state while keeping the host runtime's configuration unclaimed.
     #[cfg(target_os = "ios")]

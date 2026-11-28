@@ -141,7 +141,7 @@ final class VpnPlugin: Plugin {
 
     private func begin(_ invoke: Invoke, kind: String, requestID: String) -> VpnOperation? {
         guard operation == nil else { rejectUndispatched(invoke, kind: kind, requestID: requestID, "A VPN operation is already in progress"); return nil }
-        guard kind != "start" || !preferenceMutation.pending else {
+        guard kind == "stop" || !preferenceMutation.pending else {
             rejectUndispatched(invoke, kind: kind, requestID: requestID, "A previous VPN preference write has not completed; no new profile mutation can be accepted"); return nil
         }
         generation += 1
@@ -309,6 +309,50 @@ final class VpnPlugin: Plugin {
                 }
             }
         } catch { invoke.reject(error.localizedDescription) }
+    }
+
+    @objc func removeDisconnectedProfile(_ invoke: Invoke) {
+        DispatchQueue.main.async {
+            guard let op = self.begin(invoke, kind: "remove profile", requestID: freshVpnRequestID("remove")) else { return }
+            self.loadManager(create: false) { result in
+                guard self.current(op) else { return }
+                do {
+                    if let failure = self.pendingPreferenceFailure(try self.readPreferenceIntent()) {
+                        throw vpnError(failure)
+                    }
+                    try self.requireForeground()
+                    guard let manager = try result.get().manager else {
+                        self.finish(op, snapshot: ["profileExists": false]); return
+                    }
+                    let status = manager.connection.status
+                    guard status == .disconnected || (status == .invalid && !manager.isEnabled) else {
+                        throw vpnError("Disconnect Polaris in iOS Settings before removing its VPN profile.")
+                    }
+                    try self.writePreferenceIntent(op.requestID, pending: true)
+                    guard self.preferenceMutation.begin(op.requestID) else { throw vpnError("Another VPN preference write is pending") }
+                    manager.removeFromPreferences { error in
+                        DispatchQueue.main.async {
+                            // A late terminal can reconcile its own intent, but cannot
+                            // publish success or release a newer write.
+                            func complete(_ profileExists: Result<Bool, Error>) {
+                                let terminal = self.preferenceMutation.reconcileRemoval(op.requestID, profileExists: profileExists) {
+                                    try self.finishPreferenceIntent(op.requestID, saved: false)
+                                }
+                                switch terminal {
+                                case .success?: self.finish(op, snapshot: ["profileExists": false])
+                                case .failure(let error)?: self.finish(op, error: error)
+                                case nil: break
+                                }
+                            }
+                            if let error { complete(.failure(error)); return }
+                            self.loadManager(create: false) { readback in
+                                complete(readback.map { $0.manager != nil })
+                            }
+                        }
+                    }
+                } catch { self.finish(op, error: error) }
+            }
+        }
     }
 
     @objc func stop(_ invoke: Invoke) {

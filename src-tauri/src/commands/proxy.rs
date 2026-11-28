@@ -265,6 +265,25 @@ fn stop_expectation(
     }))
 }
 
+#[tauri::command]
+pub async fn proxy_remove_ios_vpn_profile(state: State<'_, AppRuntime>) -> ApiResponse<()> {
+    #[cfg(target_os = "ios")]
+    {
+        match state.proxy().remove_ios_vpn_profile().await {
+            Ok(()) => ok_void(),
+            Err(error) => {
+                log::warn!("iOS VPN profile removal did not complete: {error}");
+                ApiResponse::err(error)
+            }
+        }
+    }
+    #[cfg(not(target_os = "ios"))]
+    {
+        let _ = state;
+        ApiResponse::err("VPN profile removal is only available on iOS")
+    }
+}
+
 /// 上游 `PROXY_GET_STATUS`：取代理运行状态。
 #[allow(
     clippy::needless_pass_by_value,

@@ -45,13 +45,14 @@ export function withoutWriteError(prev: WriteErrors, id: WriteControlId): WriteE
   return next;
 }
 
-/** Cold status can carry an active system session without a host-owned running config. */
+/** Cold status can carry an iOS system VPN warning before the user connects. */
 export function writeErrorsFromProxyStatus(
   errors: WriteErrors,
   status: Pick<ProxyStatus, 'running' | 'errorCode'> | null,
   t: TFunction,
 ): WriteErrors {
-  if (errors.connect || status?.running || status?.errorCode !== 'IOS_SESSION_ACTIVE') return errors;
+  if (errors.connect || status?.running
+      || (status?.errorCode !== 'IOS_SESSION_ACTIVE' && status?.errorCode !== 'IOS_PREVIOUS_OPERATION_UNCONFIRMED')) return errors;
   return withWriteError(errors, 'connect', proxyErrorText({ errorCode: status.errorCode }, (key) => t(key)));
 }
 
@@ -79,7 +80,7 @@ export function writeFailureText(t: TFunction, err: unknown): string {
 }
 
 /** 唯一写出口。接线层的**每一处**写调用都必须在它的参数区间内，门逐个对拍。 */
-export type RunWrite = (id: WriteControlId, op: () => Promise<unknown>, isCurrent?: () => boolean) => Promise<void>;
+export type RunWrite = (id: WriteControlId, op: () => Promise<unknown>, isCurrent?: () => boolean, failureMessage?: string) => Promise<void>;
 
 /**
  * 纯工厂。抽出来是为了**可测** —— 本仓 vitest 跑 node、无 jsdom，真 hook 一行都跑不起来，
@@ -89,13 +90,14 @@ export function createRunWrite(
   setErrors: (updater: (prev: WriteErrors) => WriteErrors) => void,
   t: TFunction,
 ): RunWrite {
-  return async (id, op, isCurrent = () => true) => {
+  return async (id, op, isCurrent = () => true, failureMessage) => {
     try {
       await op();
       if (isCurrent()) setErrors((prev) => withoutWriteError(prev, id));
     } catch (err) {
-      if (isCurrent()) setErrors((prev) => withWriteError(prev, id, writeFailureText(t, err)));
-      else toast.error(writeFailureText(t, err));
+      const message = failureMessage ?? writeFailureText(t, err);
+      if (isCurrent()) setErrors((prev) => withWriteError(prev, id, message));
+      else toast.error(message);
     }
   };
 }

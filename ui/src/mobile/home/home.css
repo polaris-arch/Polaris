@@ -626,6 +626,14 @@
   text-decoration: underline;
 }
 
+.h-vpn-profile-action {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin: 0;
+  min-height: var(--tap-min);
+}
+
 /* ═══════════ 底部弹层（节点选择器 / 模式选择）═══════════ */
 
 /* 背幕：吃掉弹层之外的所有点击（见 `Scrim` 的头注：穿透过去正好是连接开关）。 */

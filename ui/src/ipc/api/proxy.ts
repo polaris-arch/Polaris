@@ -26,6 +26,10 @@ export const proxyApi = {
     return invoke(IPC_CHANNELS.PROXY_STOP);
   },
 
+  async removeIosVpnProfile(): Promise<void> {
+    return invoke(IPC_CHANNELS.PROXY_REMOVE_IOS_VPN_PROFILE);
+  },
+
   async stopExpected(expected: ExpectedMainCoreStop): Promise<ExpectedMainCoreStopResult> {
     if (!Number.isSafeInteger(expected.expectedMainGeneration) || expected.expectedMainGeneration <= 0) {
       throw new Error('INVALID_EXPECTED_MAIN_GENERATION');

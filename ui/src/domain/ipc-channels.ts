@@ -16,6 +16,7 @@ export const IPC_CHANNELS = {
   // 代理控制
   PROXY_START: 'proxy_start',
   PROXY_STOP: 'proxy_stop',
+  PROXY_REMOVE_IOS_VPN_PROFILE: 'proxy_remove_ios_vpn_profile',
   PROXY_GET_STATUS: 'proxy_get_status',
   // §2 待应用差集（pull 模型，configChanged/STARTED/STOPPED 后拉）：节点集相对运行核快照的增/改/删差集，供动作条汇总
   // + 待入池/待生效徽标数据源。核未运行（无快照）→ 空差集（动作条隐藏）。

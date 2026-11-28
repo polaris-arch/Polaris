@@ -571,6 +571,26 @@ struct LifecycleTests {
         assert(mutation.begin(newHostRequest))
         assert(!mutation.finish(oldHostRequest))
         assert(mutation.requestID == newHostRequest)
+
+        // A successful NE remove callback still needs a fresh absence readback.
+        // While that read is outstanding no successor can mutate preferences.
+        let removal = VpnPreferenceMutation()
+        let removalID = freshVpnRequestID("remove")
+        assert(removal.begin(removalID))
+        assert(!removal.begin(newHostRequest))
+        assert(removal.reconcileRemoval(oldHostRequest, profileExists: .success(false)) {
+            preconditionFailure("A stale removal must not reconcile the current intent")
+        } == nil)
+        let stillExists = removal.reconcileRemoval(removalID, profileExists: .success(true)) {}
+        if case .failure? = stillExists {} else { preconditionFailure("Existing profile accepted as removed") }
+        assert(removal.begin(newHostRequest))
+        var reconciledIntent = false
+        let absent = removal.reconcileRemoval(newHostRequest, profileExists: .success(false)) {
+            reconciledIntent = true
+        }
+        if case .success? = absent {} else { preconditionFailure("Absent profile was not confirmed") }
+        assert(reconciledIntent && !removal.pending)
+
         var replaced = profile
         replaced["sessionID"] = "session-b"
         let wrongSession = vpnSessionEvidence(profileIdentity: replaced, report: report)

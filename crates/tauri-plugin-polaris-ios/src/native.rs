@@ -959,6 +959,28 @@ pub async fn status() -> Result<TunnelStatus, String> {
     read_status(true).await
 }
 
+pub async fn remove_disconnected_profile() -> Result<(), String> {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct RemovalReadback {
+        profile_exists: bool,
+    }
+
+    let readback: RemovalReadback = call(
+        "removeDisconnectedProfile",
+        serde_json::json!({}),
+        30,
+        None,
+        None,
+    )
+    .await
+    .map_err(NativeCallFailure::message)?;
+    if readback.profile_exists {
+        return Err("The Polaris VPN profile still exists after removal".into());
+    }
+    Ok(())
+}
+
 async fn read_status(check_disconnect: bool) -> Result<TunnelStatus, String> {
     let generation = state()
         .lock()

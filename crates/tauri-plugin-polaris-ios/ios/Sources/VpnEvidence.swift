@@ -19,6 +19,19 @@ final class VpnPreferenceMutation {
         self.requestID = nil
         return true
     }
+
+    func reconcileRemoval(_ requestID: String, profileExists: Result<Bool, Error>,
+                          persist: () throws -> Void) -> Result<Void, Error>? {
+        guard finish(requestID) else { return nil }
+        return Result {
+            try persist()
+            guard try !profileExists.get() else {
+                throw NSError(domain: "PolarisVPN", code: 1, userInfo: [
+                    NSLocalizedDescriptionKey: "The Polaris VPN profile still appears in system preferences after removal."
+                ])
+            }
+        }
+    }
 }
 
 /// Main-queue admission seam used by the real load/save/reload/start callbacks.
