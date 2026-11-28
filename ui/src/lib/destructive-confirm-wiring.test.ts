@@ -339,6 +339,8 @@ describe('T3：确认弹窗的存量清册（新增一处必须显式登记，�
      * `mobile/forms/ConfirmPanel.tsx` 与 `mobile/nodes/node-deletion.ts` 的头注）。
      */
     'mobile/forms/form-store.ts': 1, // union 的类型声明，非调用点（同 dialog-store.ts 那条）
+    // iOS 恢复确认面板说明将移除本应用已断开的系统 VPN 配置，下次连接会重建配置。
+    'mobile/home/MobileHomeScreen.tsx': 1,
     'mobile/forms/NodeFormPanel.tsx': 1, // 脏表单放弃
     // 批 3 的三张组网表：脏表单放弃各一处，TS 设置表另有一处「退出登录」（破坏性 ⇒ 叠一层确认，
     // 触屏没有 hover，桌面那种「按钮翻红再点一次」在这里不成立）。
