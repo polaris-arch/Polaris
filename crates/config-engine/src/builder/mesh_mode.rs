@@ -43,6 +43,8 @@ pub fn dashboard_mode_selector(config: &SingBoxConfig) -> Option<&Outbound> {
 }
 
 /// The retained mode names alone do not prove both routing policies are active.
+/// Block keeps the compiled DNS under a single reject route, so the route must
+/// also carry each mode's catch-all.
 pub fn has_compiled_modes(config: &SingBoxConfig) -> bool {
     config
         .experimental
@@ -59,6 +61,14 @@ pub fn has_compiled_modes(config: &SingBoxConfig) -> bool {
                         .any(|rule| rule.clash_mode.as_deref() == Some(mode))
                 })
             })
+        && config.route.as_ref().is_some_and(|route| {
+            [NORMAL, MESH_DIRECT].into_iter().all(|mode| {
+                route.rules.iter().any(|rule| {
+                    rule.clash_mode.as_deref() == Some(mode)
+                        && rule.action.as_deref() == Some("route")
+                })
+            })
+        })
 }
 
 fn is_no_exit_ts(server: &ServerConfig) -> bool {

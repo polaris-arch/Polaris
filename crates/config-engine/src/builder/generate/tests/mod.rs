@@ -244,6 +244,12 @@ fn android_warm_block_keeps_the_existing_clash_control_and_uses_block_policy() {
     let mut config = base_config();
     config.servers[0].address = "203.0.113.10".into();
     config.servers.push(ServerConfig {
+        id: "s2".into(),
+        name: "JP".into(),
+        address: "203.0.113.20".into(),
+        ..config.servers[0].clone()
+    });
+    config.servers.push(ServerConfig {
         id: "ts".into(),
         name: "Tailnet".into(),
         protocol: Protocol::Tailscale,
@@ -256,7 +262,15 @@ fn android_warm_block_keeps_the_existing_clash_control_and_uses_block_policy() {
     deps.subscription_update_in_port = Some(15491);
     let bindings = BTreeMap::new();
 
-    for starting_exit in ["s1", "ts"] {
+    config.selected_server_id = Some(BLOCK_SERVER_ID.into());
+    let cold = generate_sing_box_config(&config, &BTreeMap::new(), &deps).unwrap();
+    assert!(cold
+        .dns
+        .as_ref()
+        .and_then(|dns| dns.rules.as_ref())
+        .is_some_and(|rules| rules.iter().all(|rule| rule.clash_mode.is_none())));
+
+    for starting_exit in ["s1", "s2", "ts"] {
         config.selected_server_id = Some(starting_exit.into());
         let running = generate_sing_box_config(&config, &BTreeMap::new(), &deps).unwrap();
         assert!(has_compiled_modes(&running));
@@ -278,7 +292,7 @@ fn android_warm_block_keeps_the_existing_clash_control_and_uses_block_policy() {
         }));
         rules.push(reject);
         assert_eq!(blocked.route, block_policy.route);
-        assert_eq!(blocked.dns, block_policy.dns);
+        assert_eq!(blocked.dns, running.dns);
         assert!(!has_compiled_modes(&blocked));
 
         config.selected_server_id = Some(DIRECT_SERVER_ID.into());
@@ -300,7 +314,24 @@ fn android_warm_block_keeps_the_existing_clash_control_and_uses_block_policy() {
             assert_eq!(rule.outbound, route.final_outbound);
         }
 
-        for (previous, next_exit) in [(&blocked, "s1"), (&blocked, "ts"), (&direct, "s1")] {
+        config.selected_server_id = Some(BLOCK_SERVER_ID.into());
+        let reblocked = generate_running_candidate(&config, &deps, &bindings, &direct, Some("ts"))
+            .unwrap()
+            .config;
+        config.selected_server_id = Some(DIRECT_SERVER_ID.into());
+        let redirect =
+            generate_running_candidate(&config, &deps, &bindings, &reblocked, Some("ts"))
+                .unwrap()
+                .config;
+        assert_eq!(reblocked.dns, direct.dns);
+        assert_eq!(redirect.dns, direct.dns);
+
+        for (previous, next_exit) in [
+            (&blocked, "s1"),
+            (&blocked, "s2"),
+            (&blocked, "ts"),
+            (&direct, "s1"),
+        ] {
             config.selected_server_id = Some(next_exit.into());
             let resumed =
                 generate_running_candidate(&config, &deps, &bindings, previous, Some("ts"))
@@ -308,6 +339,7 @@ fn android_warm_block_keeps_the_existing_clash_control_and_uses_block_policy() {
                     .config;
             assert_eq!(resumed.experimental, running.experimental);
             assert!(has_compiled_modes(&resumed));
+            assert_eq!(resumed.dns, running.dns);
             let base = generate_base_config(&config, &BTreeMap::new(), &deps, &bindings)
                 .unwrap()
                 .config;

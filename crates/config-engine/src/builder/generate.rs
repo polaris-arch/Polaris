@@ -312,7 +312,11 @@ pub fn generate_sing_box_config_with_report_and_runtime_bindings(
     runtime_bind_interfaces: &BTreeMap<String, String>,
 ) -> Result<GenerateOutcome, String> {
     let mut outcome = generate_base_config(config, resolved_ips, deps, runtime_bind_interfaces)?;
-    if deps.platform == "android" && deps.has_management_api {
+    // A cold block has no running mode to keep; its DNS stays single-policy.
+    if deps.platform == "android"
+        && deps.has_management_api
+        && !is_block_selection(config.effective_selected_server_id())
+    {
         if let Some((normal_id, mesh_id)) = super::mesh_mode::mode_candidates(config) {
             compile_android_mesh_modes(
                 config,
@@ -352,6 +356,22 @@ fn compile_android_mesh_modes(
     ) else {
         return false;
     };
+    // Block does not restrict DNS: the selector defaults to direct and route
+    // rewrites only proxy-bound rules. Keep the DNS compiled for the public
+    // candidate, so Core retains the DNS graph and every resource keyed on it.
+    if is_block_selection(config.effective_selected_server_id()) {
+        let mut compiled = normal.config.clone();
+        if !super::mesh_mode::try_compile(
+            &mut compiled,
+            &normal.config,
+            &mesh.config,
+            super::mesh_mode::NORMAL,
+        ) {
+            return false;
+        }
+        actual.dns = compiled.dns;
+        return true;
+    }
     super::mesh_mode::try_compile(
         actual,
         &normal.config,
@@ -401,27 +421,35 @@ pub fn generate_running_candidate(
     };
     let selected = config.effective_selected_server_id();
     let blocked = is_block_selection(selected);
-    if blocked
-        || !compile_android_mesh_modes(
+    // Block keeps whichever DNS projection is running: compiled after a mode
+    // exit, single-policy after direct.
+    let compiled = (!blocked
+        || running
+            .dns
+            .as_ref()
+            .and_then(|dns| dns.rules.as_ref())
+            .is_some_and(|rules| rules.iter().any(|rule| rule.clash_mode.is_some())))
+        && compile_android_mesh_modes(
             config,
             &resolved_ips,
             deps,
             runtime_bind_interfaces,
             candidates,
             &mut outcome.config,
-        )
-    {
+        );
+    if blocked || !compiled {
         let single_direct =
             is_direct_selection(selected) && !super::mesh_mode::has_compiled_modes(running);
         if !(blocked || single_direct) {
             return Ok(outcome);
         }
-        if outcome
-            .config
-            .dns
-            .as_ref()
-            .and_then(|dns| dns.rules.as_ref())
-            .is_some_and(|rules| rules.iter().any(|rule| rule.clash_mode.is_some()))
+        if !compiled
+            && outcome
+                .config
+                .dns
+                .as_ref()
+                .and_then(|dns| dns.rules.as_ref())
+                .is_some_and(|rules| rules.iter().any(|rule| rule.clash_mode.is_some()))
         {
             return Ok(outcome);
         }

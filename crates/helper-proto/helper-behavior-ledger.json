@@ -22,8 +22,8 @@
       "system-integration",
       "config-engine"
     ],
-    "digest": "2d19680e5ee05dc06b29584e84d2dbe5c19489ec6c3550fc6f0cd9dac4edc95e",
-    "reason": "c5592bb4 基线；9cc49283→c5592bb4 已核实无 helper 行为改动。随后 fix(helper): attest Linux helper births 只改 helper-client 的 App 侧连接器（RootConnector）（Mac root connector 改名、同一 peer 校验），helper 不调用，不可达；helper-proto 仅新增 dev 依赖。随后 fix(config-engine): silence logs from Android mesh shadow projections，helper 不可达：仅 Android 影子投影的日志静默。"
+    "digest": "b55d11f664ef2bca7245c2c316f6373cfffd67424996f19b043606aa7fa1c7aa",
+    "reason": "c5592bb4 基线；9cc49283→c5592bb4 已核实无 helper 行为改动。随后 fix(helper): attest Linux helper births 只改 helper-client 的 App 侧连接器（RootConnector）（Mac root connector 改名、同一 peer 校验），helper 不调用，不可达；helper-proto 仅新增 dev 依赖。随后 fix(config-engine): silence logs from Android mesh shadow projections，helper 不可达：仅 Android 影子投影的日志静默。随后 fix(config-engine): keep compiled DNS while blocked，helper 不可达：阻断 DNS 投影。"
   },
   "windows": {
     "generation": 8,
@@ -37,7 +37,7 @@
       "config-engine",
       "windows-cleaner"
     ],
-    "digest": "3f6a3ebc0c18b2015535729c308ba4a3b1c86443901e82b3c9f5793350597313",
-    "reason": "c5592bb4 基线；9cc49283→c5592bb4 已核实无 helper 行为改动。随后 fix(helper): attest Linux helper births 只改 helper-client 的 App 侧连接器（RootConnector）（Windows 不编译该连接器），不可达；helper-proto 仅新增 dev 依赖。随后 fix(config-engine): silence logs from Android mesh shadow projections，helper 不可达：仅 Android 影子投影的日志静默。"
+    "digest": "3b6de90b9bd6d807daa4dfaf52094391560981acd403ad6c87414ce0602720e8",
+    "reason": "c5592bb4 基线；9cc49283→c5592bb4 已核实无 helper 行为改动。随后 fix(helper): attest Linux helper births 只改 helper-client 的 App 侧连接器（RootConnector）（Windows 不编译该连接器），不可达；helper-proto 仅新增 dev 依赖。随后 fix(config-engine): silence logs from Android mesh shadow projections，helper 不可达：仅 Android 影子投影的日志静默。随后 fix(config-engine): keep compiled DNS while blocked，helper 不可达：阻断 DNS 投影。"
   }
 }
