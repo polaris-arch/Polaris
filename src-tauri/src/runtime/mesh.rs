@@ -933,10 +933,15 @@ impl MeshRuntime {
         server_id: &str,
         attempt_id: &str,
         form_id: Option<&str>,
+        from_main_window: bool,
     ) -> Result<(), String> {
         self.login_registry
-            .prepare_for_form(server_id, attempt_id, form_id)
+            .prepare_for_form(server_id, attempt_id, form_id, from_main_window)
             .await
+    }
+
+    pub(crate) fn retire_main_window_tailscale_drafts(&self) {
+        self.login_registry.retire_main_window_drafts();
     }
 
     pub(crate) fn provisional_tailscale_draft_attempt(

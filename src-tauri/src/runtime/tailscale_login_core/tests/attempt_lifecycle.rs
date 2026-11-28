@@ -1103,7 +1103,7 @@ async fn cancelled_draft_retry_keeps_closed_evidence_and_running_is_sticky() {
         let sub = fake_subscriber(false);
         let (reg, spawner) = slow_registry(sub.clone());
         let ud = temp_ud();
-        reg.prepare_for_form("ts1", "first", Some("add-form"))
+        reg.prepare_for_form("ts1", "first", Some("add-form"), true)
             .await
             .unwrap();
         let first = reg.provisional_draft_attempt("ts1", "first").unwrap();
@@ -1147,7 +1147,7 @@ async fn cancelled_draft_retry_keeps_closed_evidence_and_running_is_sticky() {
         });
         cancelled.unwrap();
         drop(in_flight_write);
-        reg.prepare_for_form("ts1", "retry", Some("add-form"))
+        reg.prepare_for_form("ts1", "retry", Some("add-form"), true)
             .await
             .unwrap();
         reg.cancel_attempt("ts1", "retry").await.unwrap();
@@ -1175,6 +1175,49 @@ async fn cancelled_draft_retry_keeps_closed_evidence_and_running_is_sticky() {
         assert!(draft.saved_watch("retry").is_none());
         std::fs::remove_dir_all(ud).unwrap();
     }
+}
+
+#[tokio::test]
+async fn destroyed_main_window_retires_only_its_discard_watches() {
+    let (reg, _) = slow_registry(fake_subscriber(false));
+    let owner = [("main", true), ("other-window", false)];
+    let mut attempts = Vec::new();
+    for (id, from_main_window) in owner {
+        reg.prepare_for_form(id, id, Some(id), from_main_window)
+            .await
+            .unwrap();
+        let attempt = reg.provisional_draft_attempt(id, id).unwrap();
+        let watch = Arc::new(AtomicBool::new(true));
+        let published = Arc::downgrade(&watch);
+        attempt
+            .draft
+            .as_ref()
+            .unwrap()
+            .record_saved_watch(id, watch);
+        attempts.push((attempt, published));
+    }
+
+    reg.retire_main_window_drafts();
+    let (main, retired) = &attempts[0];
+    assert!(!main.cancelled());
+    assert!(retired.upgrade().is_none());
+    assert!(attempts[1].1.upgrade().is_some());
+    let late = Arc::new(AtomicBool::new(true));
+    main.draft
+        .as_ref()
+        .unwrap()
+        .record_saved_watch("main", late.clone());
+    assert!(!late.load(Ordering::SeqCst));
+
+    reg.prepare_for_form("replacement", "replacement", Some("fresh-form"), true)
+        .await
+        .unwrap();
+    let replacement = reg
+        .provisional_draft_attempt("replacement", "replacement")
+        .unwrap();
+    let draft = replacement.draft.as_ref().unwrap();
+    draft.record_saved_watch("replacement", Arc::new(AtomicBool::new(true)));
+    assert!(draft.saved_watch("replacement").is_some());
 }
 
 struct SecretChecker(Mutex<Vec<Value>>);

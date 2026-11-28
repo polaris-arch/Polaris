@@ -81,6 +81,7 @@ impl DraftState {
 
 pub(crate) struct LoginDraft {
     form_id: String,
+    pub(super) from_main_window: bool,
     current: Mutex<DraftState>,
     pub(crate) write: tokio::sync::Mutex<()>,
 }
@@ -619,7 +620,7 @@ impl Attempts {
     // Retain cancelled IDs long enough to fence a delayed start IPC, with a hard memory bound.
     #[cfg(test)]
     pub fn prepare(&self, server_id: &str, id: &str) -> Result<Arc<Attempt>, String> {
-        self.prepare_for_form(server_id, id, None)
+        self.prepare_for_form(server_id, id, None, false)
     }
 
     pub fn prepare_for_form(
@@ -627,6 +628,7 @@ impl Attempts {
         server_id: &str,
         id: &str,
         form_id: Option<&str>,
+        from_main_window: bool,
     ) -> Result<Arc<Attempt>, String> {
         if id.is_empty()
             || id.len() > 128
@@ -683,6 +685,7 @@ impl Attempts {
             }
             (None, Some(form_id)) => Some(Arc::new(LoginDraft {
                 form_id: form_id.to_owned(),
+                from_main_window,
                 current: Mutex::new(DraftState {
                     attempt_id: id.to_owned(),
                     observation: DraftObservation::NotDispatched,
@@ -715,11 +718,11 @@ impl Attempts {
         Ok(attempt)
     }
 
-    pub(super) fn block_drafts(&self, uses_node: impl Fn(&str) -> bool) {
+    pub(super) fn block_drafts(&self, matches: impl Fn(&str, &LoginDraft) -> bool) {
         if let Ok(state) = self.0.lock() {
             for attempt in state.entries.values() {
                 if let Some(draft) = &attempt.draft {
-                    if uses_node(&attempt.server_id) {
+                    if matches(&attempt.server_id, draft) {
                         draft.observe(DraftObservation::Blocked);
                     }
                 }

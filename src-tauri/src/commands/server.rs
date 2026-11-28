@@ -1643,6 +1643,7 @@ pub async fn warp_apply_license(
 #[tauri::command]
 pub async fn tailscale_login_prepare(
     state: State<'_, AppRuntime>,
+    window: tauri::Window,
     server_id: String,
     attempt_id: String,
     form_id: Option<String>,
@@ -1658,7 +1659,12 @@ pub async fn tailscale_login_prepare(
     Ok(
         match state
             .mesh()
-            .prepare_tailscale_login(&server_id, &attempt_id, form_id.as_deref())
+            .prepare_tailscale_login(
+                &server_id,
+                &attempt_id,
+                form_id.as_deref(),
+                window.label() == "main",
+            )
             .await
         {
             Ok(()) => ok_void(),

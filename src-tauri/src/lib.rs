@@ -468,6 +468,15 @@ fn create_main_window(
     let event_window = window.clone();
     let app_handle = app.clone();
     window.on_window_event(move |event| match event {
+        tauri::WindowEvent::Destroyed
+            if cfg!(desktop) && !app_handle.state::<QuitState>().0.load(Ordering::SeqCst) =>
+        {
+            // A successful destroy() only queues the event. Wait until the
+            // old renderer can no longer receive Prepare and dispatch Save.
+            if let Some(rt) = app_handle.try_state::<AppRuntime>() {
+                rt.mesh().retire_main_window_tailscale_drafts();
+            }
+        }
         tauri::WindowEvent::Focused(_) => {
             // **不取 focused 的值**：失焦 ≠ 隐藏。窗口失焦但仍在屏上时依然有 UI 消费者，按 focused
             // 降流会让用户看着的首页拓扑/连接明细直接冻住。Tauri 2 的 `WindowEvent` 又没有 show/hide

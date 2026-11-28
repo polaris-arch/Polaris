@@ -2412,7 +2412,8 @@ impl LoginCoreRegistry {
 
     #[cfg(any(target_os = "android", target_os = "ios", test))]
     pub async fn prepare(&self, server_id: &str, attempt_id: &str) -> Result<(), String> {
-        self.prepare_for_form(server_id, attempt_id, None).await
+        self.prepare_for_form(server_id, attempt_id, None, false)
+            .await
     }
 
     pub(crate) async fn prepare_for_form(
@@ -2420,6 +2421,7 @@ impl LoginCoreRegistry {
         server_id: &str,
         attempt_id: &str,
         form_id: Option<&str>,
+        from_main_window: bool,
     ) -> Result<(), String> {
         let _gate = self.state_gate().await;
         if self.closing.load(Ordering::SeqCst) {
@@ -2427,10 +2429,15 @@ impl LoginCoreRegistry {
         }
         polaris_core_supervisor::config_gate::with_check_producer_registration(|| {
             self.attempts
-                .prepare_for_form(server_id, attempt_id, form_id)
+                .prepare_for_form(server_id, attempt_id, form_id, from_main_window)
         })
         .map_err(|error| error.to_string())?
         .map(|_| ())
+    }
+
+    pub(crate) fn retire_main_window_drafts(&self) {
+        self.attempts
+            .block_drafts(|_, draft| draft.from_main_window);
     }
 
     #[cfg(target_os = "ios")]
@@ -3433,7 +3440,7 @@ impl LoginCoreRegistry {
             return Err("Tailscale main reservation changed during transient close".into());
         }
         self.attempts
-            .block_drafts(|id| directories.contains_key(id));
+            .block_drafts(|id, _| directories.contains_key(id));
         *main = Some(MainClaim {
             token: token.clone(),
             directories,
@@ -3475,7 +3482,7 @@ impl LoginCoreRegistry {
         if state != root.join("tailscale").join(id) || self.shared.contains(id) {
             return Err(unknown());
         }
-        self.attempts.block_drafts(|candidate| candidate == id);
+        self.attempts.block_drafts(|candidate, _| candidate == id);
         let directory = canonical_tailscale_claim_directory(state)?;
         let identity = main_endpoint_request_identity(endpoint);
         let mut main = self.shared.main.lock().map_err(|_| unknown())?;
