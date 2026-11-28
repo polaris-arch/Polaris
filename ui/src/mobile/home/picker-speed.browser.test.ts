@@ -126,6 +126,7 @@ import React from 'react';
 import { createRoot } from 'react-dom/client';
 import { MobileHomeScreen } from '/src/mobile/home/MobileHomeScreen';
 import { useAppStore } from '/src/store/app-store';
+import { withConfigWriteLock } from '/src/lib/config-write-lock';
 import { api } from '/src/ipc';
 import { configApi } from '/src/ipc/api/config';
 import { windowApi } from '/src/ipc/api/system';
@@ -140,7 +141,7 @@ import '/src/mobile/redesign.css';
 await i18nReady;
 i18n.addResourceBundle('zh-CN','translation',zhCN,true,true); await i18n.changeLanguage('zh-CN');
 const config={selectedServerId:'node-a',proxyMode:'smart',servers:[{id:'node-a',name:'Fixture node',protocol:'socks',address:'fixture.invalid',port:1}],subscriptions:[]};
-const fixture=window.__sentinelTest={calls:[],messages:[],setRouting(mode){useAppStore.setState(s=>({config:{...s.config,proxyMode:mode}}));}};
+const fixture=window.__sentinelTest={calls:[],messages:[],selected:()=>useAppStore.getState().selectedServerId,setRouting(mode){useAppStore.setState(s=>({config:{...s.config,proxyMode:mode}}));}};
 api.stats.onStatsUpdated=()=>()=>{};
 api.stats.onConnectionsDetail=()=>()=>{};
 api.stats.subscribe=async()=>{};
@@ -149,9 +150,11 @@ configApi.get=async()=>useAppStore.getState().config;
 configApi.onChanged=()=>()=>{};
 windowApi.startupConfigFlags=async()=>({});
 setToastImpl({success:text=>fixture.messages.push(['success',text]),info:text=>fixture.messages.push(['info',text]),warning:text=>fixture.messages.push(['warning',text])});
-useAppStore.setState({config,servers:config.servers,selectedServerId:'node-a',switchServer:async id=>{
- fixture.calls.push(id);useAppStore.setState(s=>({selectedServerId:id,config:{...s.config,selectedServerId:id}}));return {status:'pending'};
-}});
+useAppStore.setState({config,servers:config.servers,selectedServerId:'node-a',switchServer:id=>withConfigWriteLock(async()=>{
+ fixture.calls.push(id);useAppStore.setState(s=>({selectedServerId:id,config:{...s.config,selectedServerId:id}}));
+ if(fixture.hold){fixture.hold=false;await new Promise(resolve=>{fixture.release=resolve;});}
+ return {status:'pending'};
+})});
 createRoot(document.getElementById('root')).render(<MobileHomeScreen/>);
 `;
 const networkEntry = sentinelEntry.replace("import { api } from '/src/ipc';", "import { api, unlockApi } from '/src/ipc';\nimport { HomeScreen } from '/src/components/screens/home/HomeScreen';\nimport { MobileToaster } from '/src/mobile/MobileToaster';\nimport { MeasurementStartNotice } from '/src/mobile/MeasurementStartNotice';").replace(
@@ -416,6 +419,21 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile picker and mea
     await open();expect(await block.isDisabled()).toBe(true);
     expect(await block.innerText()).toContain('当前为直连模式：全部流量都不经过代理出口，阻断不会生效');
     expect(await page.evaluate(()=>(window as any).__sentinelTest.calls)).toHaveLength(2);
+    await page.close();
+  },30_000);
+  it('Home picks made while an earlier switch is held stay queued and the last one wins',async()=>{
+    const page=await browser.newPage({viewport:{width:390,height:844}});await page.goto(origin+'/__sentinel');
+    await page.locator('.h-nodelead').click();await page.locator('.h-picker-sheet').waitFor();
+    await page.evaluate(()=>{(window as any).__sentinelTest.hold=true;});
+    await page.locator('[data-exit-write="home-sentinel-direct"]').click();
+    await page.locator('[data-exit-write="home-sentinel-block"]').click();
+    expect(await page.evaluate(()=>(window as any).__sentinelTest.calls)).toEqual(['__direct__']);
+    await page.evaluate(()=>(window as any).__sentinelTest.release());
+    await page.waitForFunction(()=>(window as any).__sentinelTest.calls.length===2,undefined,{timeout:5_000});
+    await page.locator('.h-picker-sheet').waitFor({state:'detached'});
+    expect(await page.evaluate(()=>(window as any).__sentinelTest.calls)).toEqual(['__direct__','__block__']);
+    await expect.poll(()=>page.evaluate(()=>(window as any).__sentinelTest.messages.at(-1))).toEqual(['info','阻断 · 已保存，正在应用连接更改']);
+    expect(await page.evaluate(()=>(window as any).__sentinelTest.selected())).toBe('__block__');
     await page.close();
   },30_000);
   it('iOS explicit network entry holds one request through preparation, preserves partial success and measures only after ready',async()=>{

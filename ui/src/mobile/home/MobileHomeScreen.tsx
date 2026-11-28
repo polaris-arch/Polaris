@@ -415,7 +415,6 @@ export function MobileHomeScreen(): ReactElement {
   const pickerSession = useRef(0);
   const ruleSession = useRef(0);
   const pendingRuleSession = useRef<number | null>(null);
-  const pendingPickerSession = useRef<number | null>(null);
   useEffect(() => () => { pickerSession.current += 1; ruleSession.current += 1; }, []);
   const [pickerQuery, setPickerQuery] = useState('');
   /* 「给这个主机加一条规则」面板挂着的观测对象；`null` = 面板没开。存对象而不是存 host 字符串 ——
@@ -606,13 +605,11 @@ export function MobileHomeScreen(): ReactElement {
     (server: ServerConfig) => {
       // Only a known manual selection may skip the authoritative switch/readback.
       const session = pickerSession.current;
-      if (pendingPickerSession.current === session) return;
       const config = useAppStore.getState().config;
       if (config && config.selectionIntent === undefined && server.id === config.selectedServerId) {
         setPickerOpen(false);
         return;
       }
-      pendingPickerSession.current = session;
       void runWrite('switch-node', async () => {
         const receipt = await switchServer(server.id);
         if (!receipt || pickerSession.current !== session) return;
@@ -623,7 +620,6 @@ export function MobileHomeScreen(): ReactElement {
       }, () => pickerSession.current === session).then(() => {
         /* 失败也关：选择器是一层覆盖，错误留在它下面等于看不见。关掉之后行内错误就贴在
            动作行的「切换节点」那颗控件下面 —— 那是用户刚刚动过的地方，且是可见的。 */
-        if (pendingPickerSession.current === session) pendingPickerSession.current = null;
         if (pickerSession.current === session) setPickerOpen(false);
       });
     },
@@ -636,13 +632,11 @@ export function MobileHomeScreen(): ReactElement {
       if (kind === 'block' && blockDisabledReason !== null) return;
       const id = kind === 'direct' ? DIRECT_SERVER_ID : BLOCK_SERVER_ID;
       const session = pickerSession.current;
-      if (pendingPickerSession.current === session) return;
       const config = useAppStore.getState().config;
       if (config && config.selectionIntent === undefined && id === config.selectedServerId) {
         setPickerOpen(false);
         return;
       }
-      pendingPickerSession.current = session;
       void runWrite('switch-node', async () => {
         const receipt = await switchServer(id);
         if (!receipt || pickerSession.current !== session) return;
@@ -653,7 +647,6 @@ export function MobileHomeScreen(): ReactElement {
         else if (feedback) toast.info(feedback.text);
       }, () => pickerSession.current === session).then(() => {
         /* 失败也关，理由同 `onUseAsExit`：选择器是一层覆盖，错误留在它下面等于看不见。 */
-        if (pendingPickerSession.current === session) pendingPickerSession.current = null;
         if (pickerSession.current === session) setPickerOpen(false);
       });
     },
