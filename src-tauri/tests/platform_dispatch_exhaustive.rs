@@ -2004,7 +2004,7 @@ const STRING_DISPATCH_REGISTRY: &[StringDispatch] = &[
     // 2026-10-01：对齐出生/退出托管与 Android 调试桥的真实新增点。
     (
         "crates/config-engine/src/builder/generate.rs",
-        "if deps.platform == \"android\" && deps.has_management_api && !is_block_selection(config.effective_selected_server_id())",
+        "if deps.platform == \"android\" && deps.has_management_api && !is_sentinel_selection(config.effective_selected_server_id())",
         1,
         "双模式 Clash 投影仅给已有管理 API 的 Android JNI 宿主；iOS/未知平台不因此取得该投影或管理能力，须先接入自己的管理 API 面。",
     ),

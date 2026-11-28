@@ -3173,7 +3173,14 @@ impl ProxyRuntime {
             "热应用配置生成耗时：候选构建={candidate_ms}ms，运行配置及出站投影={}ms",
             t_previous.elapsed().as_millis()
         );
-        if baseline.dormant_mesh_modes() && has_compiled_modes(&generated) {
+        // Direct and block keep the compiled DNS under one route; it still follows the mode.
+        if (baseline.dormant_mesh_modes() || !has_compiled_modes(&generated))
+            && generated
+                .dns
+                .as_ref()
+                .and_then(|dns| dns.rules.as_ref())
+                .is_some_and(|rules| rules.iter().any(|rule| rule.clash_mode.is_some()))
+        {
             if !identity_equal(
                 capabilities.active.as_ref(),
                 baseline.observed_active.as_ref(),

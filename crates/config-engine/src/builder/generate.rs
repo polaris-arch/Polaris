@@ -312,10 +312,10 @@ pub fn generate_sing_box_config_with_report_and_runtime_bindings(
     runtime_bind_interfaces: &BTreeMap<String, String>,
 ) -> Result<GenerateOutcome, String> {
     let mut outcome = generate_base_config(config, resolved_ips, deps, runtime_bind_interfaces)?;
-    // A cold block has no running mode to keep; its DNS stays single-policy.
+    // A cold block or direct has no running mode to keep; its DNS stays single-policy.
     if deps.platform == "android"
         && deps.has_management_api
-        && !is_block_selection(config.effective_selected_server_id())
+        && !is_sentinel_selection(config.effective_selected_server_id())
     {
         if let Some((normal_id, mesh_id)) = super::mesh_mode::mode_candidates(config) {
             compile_android_mesh_modes(
@@ -356,10 +356,10 @@ fn compile_android_mesh_modes(
     ) else {
         return false;
     };
-    // Block does not restrict DNS: the selector defaults to direct and route
-    // rewrites only proxy-bound rules. Keep the DNS compiled for the public
-    // candidate, so Core retains the DNS graph and every resource keyed on it.
-    if is_block_selection(config.effective_selected_server_id()) {
+    // Block and direct do not restrict DNS: the selector defaults to direct
+    // and only route differs. Keep the DNS compiled for the public candidate,
+    // so Core retains the DNS graph and every resource keyed on it.
+    if is_sentinel_selection(config.effective_selected_server_id()) {
         let mut compiled = normal.config.clone();
         if !super::mesh_mode::try_compile(
             &mut compiled,
@@ -421,9 +421,9 @@ pub fn generate_running_candidate(
     };
     let selected = config.effective_selected_server_id();
     let blocked = is_block_selection(selected);
-    // Block keeps whichever DNS projection is running: compiled after a mode
-    // exit, single-policy after direct.
-    let compiled = (!blocked
+    // Block and direct keep whichever DNS projection is running: compiled
+    // after a mode exit, single-policy otherwise.
+    let compiled = (!is_sentinel_selection(selected)
         || running
             .dns
             .as_ref()
@@ -437,9 +437,9 @@ pub fn generate_running_candidate(
             candidates,
             &mut outcome.config,
         );
-    if blocked || !compiled {
-        let single_direct =
-            is_direct_selection(selected) && !super::mesh_mode::has_compiled_modes(running);
+    if is_sentinel_selection(selected) || !compiled {
+        let single_direct = is_direct_selection(selected)
+            && (compiled || !super::mesh_mode::has_compiled_modes(running));
         if !(blocked || single_direct) {
             return Ok(outcome);
         }

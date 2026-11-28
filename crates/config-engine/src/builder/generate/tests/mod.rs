@@ -262,13 +262,19 @@ fn android_warm_block_keeps_the_existing_clash_control_and_uses_block_policy() {
     deps.subscription_update_in_port = Some(15491);
     let bindings = BTreeMap::new();
 
-    config.selected_server_id = Some(BLOCK_SERVER_ID.into());
-    let cold = generate_sing_box_config(&config, &BTreeMap::new(), &deps).unwrap();
-    assert!(cold
-        .dns
-        .as_ref()
-        .and_then(|dns| dns.rules.as_ref())
-        .is_some_and(|rules| rules.iter().all(|rule| rule.clash_mode.is_none())));
+    for sentinel in [BLOCK_SERVER_ID, DIRECT_SERVER_ID] {
+        config.selected_server_id = Some(sentinel.into());
+        let cold = generate_sing_box_config(&config, &BTreeMap::new(), &deps).unwrap();
+        assert!(cold
+            .dns
+            .as_ref()
+            .and_then(|dns| dns.rules.as_ref())
+            .is_some_and(|rules| rules.iter().all(|rule| rule.clash_mode.is_none())));
+    }
+    let direct_base = generate_base_config(&config, &BTreeMap::new(), &deps, &bindings).unwrap();
+    config.selected_server_id = Some("s1".into());
+    let s1_base = generate_base_config(&config, &BTreeMap::new(), &deps, &bindings).unwrap();
+    assert_eq!(direct_base.config.dns, s1_base.config.dns);
 
     for starting_exit in ["s1", "s2", "ts"] {
         config.selected_server_id = Some(starting_exit.into());
@@ -301,6 +307,13 @@ fn android_warm_block_keeps_the_existing_clash_control_and_uses_block_policy() {
             .config;
         assert_eq!(direct.experimental, running.experimental);
         assert!(!has_compiled_modes(&direct));
+        assert_eq!(direct.dns, running.dns);
+        assert_eq!(selected_mode(&config), NORMAL);
+        let from_exit = generate_running_candidate(&config, &deps, &bindings, &running, Some("ts"))
+            .unwrap()
+            .config;
+        assert_eq!(from_exit.dns, running.dns);
+        assert_eq!(from_exit.route, direct.route);
         let route = direct.route.as_ref().unwrap();
         for (rule, mode) in route
             .rules
@@ -331,6 +344,7 @@ fn android_warm_block_keeps_the_existing_clash_control_and_uses_block_policy() {
             (&blocked, "s2"),
             (&blocked, "ts"),
             (&direct, "s1"),
+            (&from_exit, starting_exit),
         ] {
             config.selected_server_id = Some(next_exit.into());
             let resumed =

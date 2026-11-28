@@ -43,8 +43,8 @@ pub fn dashboard_mode_selector(config: &SingBoxConfig) -> Option<&Outbound> {
 }
 
 /// The retained mode names alone do not prove both routing policies are active.
-/// Block keeps the compiled DNS under a single reject route, so the route must
-/// also carry each mode's catch-all.
+/// Block and direct keep the compiled DNS under a single-policy route, so the
+/// two modes must also route differently.
 pub fn has_compiled_modes(config: &SingBoxConfig) -> bool {
     config
         .experimental
@@ -62,12 +62,18 @@ pub fn has_compiled_modes(config: &SingBoxConfig) -> bool {
                 })
             })
         && config.route.as_ref().is_some_and(|route| {
-            [NORMAL, MESH_DIRECT].into_iter().all(|mode| {
-                route.rules.iter().any(|rule| {
-                    rule.clash_mode.as_deref() == Some(mode)
-                        && rule.action.as_deref() == Some("route")
-                })
-            })
+            let policy = |mode| {
+                route
+                    .rules
+                    .iter()
+                    .filter(|rule| rule.clash_mode.as_deref() == Some(mode))
+                    .map(|rule| RouteRule {
+                        clash_mode: None,
+                        ..rule.clone()
+                    })
+                    .collect::<Vec<_>>()
+            };
+            policy(NORMAL) != policy(MESH_DIRECT)
         })
 }
 
