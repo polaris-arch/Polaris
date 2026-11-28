@@ -219,7 +219,7 @@ export function MobilePendingBar(): ReactElement | null {
   const pendingDebt = hasPendingWork(pending) || !!pending.nativeRetirements?.length;
   useEffect(() => {
     setApply((state) => settleAppliedFailure(state, pendingDebt));
-  }, [pendingDebt]);
+  }, [pendingDebt, apply.phase, apply.reconciling, apply.transactionId]);
 
   /* ── 冲突档：优先于常规合成（用户点了保存却什么都没发生，先把这件事说清楚）─────────── */
   if (conflict !== null && conflict.length > 0) {
