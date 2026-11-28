@@ -231,12 +231,16 @@ pub fn plan_hot_switch(old: &UserConfig, new: &UserConfig, deps: &HotSwitchDeps)
                     && selected_is_mode_candidate(new, &new_mesh)
             },
         );
+        let old_mode = selected_mode(old);
+        let new_mode = selected_mode(new);
+        let mesh_mode_involved = old_mode == MESH_DIRECT || new_mode == MESH_DIRECT;
         let mode_transition_supported = deps.mesh_mode_ready
             && same_mode_candidates
-            && selected_mode(old) != selected_mode(new)
-            && (selected_mode(old) == MESH_DIRECT || selected_mode(new) == MESH_DIRECT)
+            && old_mode != new_mode
+            && mesh_mode_involved
             && !deps.bootstrap_fallback_engaged;
-        if (fallback_changed && !mode_transition_supported)
+        // Equal direct fallbacks can still have different endpoint-bound route/DNS policies.
+        if ((fallback_changed || mesh_mode_involved) && !mode_transition_supported)
             || sel_only_forces_subnets(old_sel)
             || sel_only_forces_subnets(new_sel)
         {
@@ -264,7 +268,7 @@ pub fn plan_hot_switch(old: &UserConfig, new: &UserConfig, deps: &HotSwitchDeps)
             old_member_tag: old_global_tag,
         });
         if fallback_changed && deps.dashboard_mode_selector {
-            let (new_member, old_member) = if selected_mode(new) == MESH_DIRECT {
+            let (new_member, old_member) = if new_mode == MESH_DIRECT {
                 (DIRECT_TAG, PROXY_SELECTOR_TAG)
             } else {
                 (PROXY_SELECTOR_TAG, DIRECT_TAG)

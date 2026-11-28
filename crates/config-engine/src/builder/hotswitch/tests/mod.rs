@@ -375,12 +375,13 @@ fn compiled_ts_mode_requires_same_candidate_set_on_both_sides() {
         tailscale_settings: Some(Box::new(TailscaleSettings::default())),
         ..Default::default()
     });
+    old.servers.push(wg("wg-split", Some(false), Some(true)));
     let mut deps = deps_with_tags();
     deps.mesh_mode_ready = true;
-    deps.current_id_to_tag_map
-        .as_mut()
-        .unwrap()
-        .insert("ts".into(), "Tailnet".into());
+    deps.dashboard_mode_selector = true;
+    let tags = deps.current_id_to_tag_map.as_mut().unwrap();
+    tags.insert("ts".into(), "Tailnet".into());
+    tags.insert("wg-split".into(), "WireGuard".into());
 
     let mut selected_ts = old.clone();
     selected_ts.selected_server_id = Some("ts".into());
@@ -408,12 +409,25 @@ fn compiled_ts_mode_requires_same_candidate_set_on_both_sides() {
         HotSwitchKind::None
     );
 
-    let mut to_direct = old.clone();
-    to_direct.selected_server_id = Some("__direct__".into());
-    assert_eq!(
-        plan_hot_switch(&selected_ts, &to_direct, &deps).kind,
-        HotSwitchKind::None
-    );
+    let mut selected_direct = old.clone();
+    selected_direct.selected_server_id = Some("__direct__".into());
+    let plan = plan_hot_switch(&selected_ts, &selected_direct, &deps);
+    assert_eq!(plan.kind, HotSwitchKind::Global);
+    assert_eq!(plan.puts.len(), 2);
+    assert_eq!(plan.puts[0].selector_tag, PROXY_SELECTOR_TAG);
+    assert_eq!(plan.puts[0].member_tag, DIRECT_TAG);
+    assert_eq!(plan.puts[1].selector_tag, DASHBOARD_SELECTOR);
+    assert_eq!(plan.puts[1].member_tag, PROXY_SELECTOR_TAG);
+
+    // Both selections fall back to direct, but split-only WireGuard is not a
+    // normal-mode candidate and cannot use the compiled Tailscale policy.
+    let mut selected_wg = old;
+    selected_wg.selected_server_id = Some("wg-split".into());
+    for (from, to) in [(&selected_ts, &selected_wg), (&selected_wg, &selected_ts)] {
+        let plan = plan_hot_switch(from, to, &deps);
+        assert_eq!(plan.kind, HotSwitchKind::None);
+        assert!(plan.puts.is_empty());
+    }
 }
 
 #[test]
