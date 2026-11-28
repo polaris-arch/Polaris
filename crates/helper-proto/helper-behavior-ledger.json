@@ -22,8 +22,8 @@
       "system-integration",
       "config-engine"
     ],
-    "digest": "f4e4cfe9690daa92543fd56af346feb8c4523c65af4e15ad61e6b5d9f20c6bff",
-    "reason": "c5592bb4 基线；9cc49283→c5592bb4 已核实无 helper 行为改动。随后 fix(helper): attest Linux helper births 只改 helper-client 的 App 侧连接器（RootConnector）（Mac root connector 改名、同一 peer 校验），helper 不调用，不可达；helper-proto 仅新增 dev 依赖。随后 fix(config-engine): silence logs from Android mesh shadow projections，helper 不可达：仅 Android 影子投影的日志静默。随后 fix(config-engine): keep compiled DNS while blocked，helper 不可达：阻断 DNS 投影。随后 fix(config-engine): keep compiled DNS on the direct exit，helper 不可达：直连 DNS 投影。随后 fix(switch): verify the direct selector before leaving mesh mode，仅 Android 双态路由判定和 App 热切换，helper 不可达。"
+    "digest": "2d3d6b4c480899f0e5f624c3e913682bc46613a7b564ac708ba10b830eb003f8",
+    "reason": "c5592bb4 基线；9cc49283→c5592bb4 已核实无 helper 行为改动。随后 fix(helper): attest Linux helper births 只改 helper-client 的 App 侧连接器（RootConnector）（Mac root connector 改名、同一 peer 校验），helper 不调用，不可达；helper-proto 仅新增 dev 依赖。随后 fix(config-engine): silence logs from Android mesh shadow projections，helper 不可达：仅 Android 影子投影的日志静默。随后 fix(config-engine): keep compiled DNS while blocked，helper 不可达：阻断 DNS 投影。随后 fix(config-engine): keep compiled DNS on the direct exit，helper 不可达：直连 DNS 投影。随后 fix(switch): verify the direct selector before leaving mesh mode，仅 Android 双态路由判定和 App 热切换，helper 不可达。随后 b16158ce 只收紧 App 热切规划的 Tailscale 编译模式候选判定，helper 不调用 plan_hot_switch。"
   },
   "windows": {
     "generation": 8,
@@ -37,7 +37,7 @@
       "config-engine",
       "windows-cleaner"
     ],
-    "digest": "9a925ce81ca4f98e3d43c4b95873ad3abc5261629cb2960d23f402213ea518ae",
-    "reason": "c5592bb4 基线；9cc49283→c5592bb4 已核实无 helper 行为改动。随后 fix(helper): attest Linux helper births 只改 helper-client 的 App 侧连接器（RootConnector）（Windows 不编译该连接器），不可达；helper-proto 仅新增 dev 依赖。随后 fix(config-engine): silence logs from Android mesh shadow projections，helper 不可达：仅 Android 影子投影的日志静默。随后 fix(config-engine): keep compiled DNS while blocked，helper 不可达：阻断 DNS 投影。随后 fix(config-engine): keep compiled DNS on the direct exit，helper 不可达：直连 DNS 投影。随后 fix(switch): verify the direct selector before leaving mesh mode，仅 Android 双态路由判定和 App 热切换，helper 不可达。"
+    "digest": "df5a030a1ccbf175bb40167bfa126490e8f7ea6333dfe031304f1f56273c5d9f",
+    "reason": "c5592bb4 基线；9cc49283→c5592bb4 已核实无 helper 行为改动。随后 fix(helper): attest Linux helper births 只改 helper-client 的 App 侧连接器（RootConnector）（Windows 不编译该连接器），不可达；helper-proto 仅新增 dev 依赖。随后 fix(config-engine): silence logs from Android mesh shadow projections，helper 不可达：仅 Android 影子投影的日志静默。随后 fix(config-engine): keep compiled DNS while blocked，helper 不可达：阻断 DNS 投影。随后 fix(config-engine): keep compiled DNS on the direct exit，helper 不可达：直连 DNS 投影。随后 fix(switch): verify the direct selector before leaving mesh mode，仅 Android 双态路由判定和 App 热切换，helper 不可达。随后 b16158ce 只收紧 App 热切规划的 Tailscale 编译模式候选判定，helper 不调用 plan_hot_switch。"
   }
 }
