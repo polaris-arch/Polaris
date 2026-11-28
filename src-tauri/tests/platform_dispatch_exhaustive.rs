@@ -2875,6 +2875,13 @@ const CFG_REGISTRY: &[CfgSite] = &[
     ),
     (
         "src-tauri/src/lib.rs",
+        "desktop",
+        1,
+        IosSide::WithAndroid,
+        "Only desktop handles main-window destruction without application quit by retiring the old renderer's Tailscale drafts. Android and iOS both exclude this window lifecycle path.",
+    ),
+    (
+        "src-tauri/src/lib.rs",
         "mobile",
         5,
         IosSide::WithAndroid,
@@ -3923,9 +3930,9 @@ const CFG_REGISTRY: &[CfgSite] = &[
     (
         "src-tauri/src/runtime/mesh.rs",
         "target_os = \"android\"",
-        2,
+        1,
         IosSide::DiffersRight,
-        "These bindings reserve or adopt the original Android Main registry and cannot acquire a PacketTunnel writer.",
+        "The Android Main writer binding uses the original registry and cannot acquire a PacketTunnel writer.",
     ),
     (
         "src-tauri/src/runtime/mesh.rs",
@@ -4126,9 +4133,9 @@ const CFG_REGISTRY: &[CfgSite] = &[
     (
         "src-tauri/src/runtime/tailscale_login_core.rs",
         "target_os = \"android\"",
-        2,
+        1,
         IosSide::DiffersRight,
-        "Android execution and login helpers carry the exact Kotlin-origin instance and acknowledge that original attempt.",
+        "Android login execution carries the exact Kotlin-origin instance and acknowledges the original attempt.",
     ),
     (
         "src-tauri/src/runtime/tailscale_login_core.rs",
@@ -4800,7 +4807,10 @@ const IOS_SIDE_CENSUS: &[(&str, usize)] = &[
     // NE liveness and exited-owner bookkeeping add two net iOS-only sites.
     // The unretired-start and unconfirmed-operation refusal codes add two iOS-only
     // constants; no debt is reclassified.
-    ("DiffersRight", 450),
+    // Profile recovery adds both IPC branches and the iOS runtime removal entry.
+    // Tailscale draft cancellation shares two state-gate helpers across platforms,
+    // removing their Android-only dispatch sites.
+    ("DiffersRight", 451),
     // Plan-first node edits add two sites whose iOS side needs device evidence:
     // save-only beside pending changes (server.rs) and immediate deferred deletions
     // while stopped, now shared by every offline edit in runtime_config.rs.
@@ -4830,7 +4840,9 @@ const IOS_SIDE_CENSUS: &[(&str, usize)] = &[
     // The platform split adds two desktop-only branches shared by neither mobile target.
     // The two auto-switch transaction wrappers become test/desktop-acceptance only;
     // production commits call the graph-scoped entry (2 same-side sites). No debt changed.
-    ("WithAndroid", 145),
+    // Both mobile platforms include the no-form logout wrapper and exclude the
+    // desktop main-window destruction path that retires Tailscale drafts.
+    ("WithAndroid", 147),
 ];
 
 /// 「债」的两个格子。同样只写名字，不写 `IosSide::`，理由同 [`IOS_SIDE_CENSUS`]。
