@@ -1097,6 +1097,86 @@ async fn authorization_event_is_emitted_only_after_reap() {
     std::fs::remove_dir_all(ud).unwrap();
 }
 
+#[tokio::test]
+async fn cancelled_draft_retry_keeps_closed_evidence_and_running_is_sticky() {
+    for (phase, expected) in [("NeedsLogin", Some(true)), ("Running", None)] {
+        let sub = fake_subscriber(false);
+        let (reg, spawner) = slow_registry(sub.clone());
+        let ud = temp_ud();
+        reg.prepare_for_form("ts1", "first", Some("add-form"))
+            .await
+            .unwrap();
+        let first = reg.provisional_draft_attempt("ts1", "first").unwrap();
+        let draft = first.draft.as_ref().unwrap();
+        let watch = Arc::new(AtomicBool::new(true));
+        let published = Arc::downgrade(&watch);
+        draft.record_saved_watch("first", watch);
+        let in_flight_write = draft.write.lock().await;
+        let emitter = Arc::new(FakeEmitter::default());
+        let outcome = reg
+            .start_attempt(
+                &ts_server("ts1", "myts"),
+                &ud,
+                request("first"),
+                &offline,
+                emitter.clone(),
+            )
+            .await;
+        assert!(matches!(outcome, StartLoginOutcome::Started));
+        sub.push(
+            0,
+            frame(
+                TAILSCALE_LOGIN_ENDPOINT_TAG,
+                phase,
+                if phase == "NeedsLogin" { URL_1 } else { "" },
+            ),
+        );
+        if phase == "Running" {
+            acquire(&spawner.terminating).await;
+            assert!(published.upgrade().is_none());
+            let late = Arc::new(AtomicBool::new(true));
+            draft.record_saved_watch("first", late.clone());
+            assert!(!late.load(Ordering::SeqCst));
+            assert!(draft.saved_watch("first").is_none());
+        } else {
+            wait_until(|| !captured(&emitter).is_empty()).await;
+        }
+        let (cancelled, ()) = tokio::join!(reg.cancel_attempt("ts1", "first"), async {
+            wait_until(|| first.cancelled()).await;
+            spawner.release.add_permits(1);
+        });
+        cancelled.unwrap();
+        drop(in_flight_write);
+        reg.prepare_for_form("ts1", "retry", Some("add-form"))
+            .await
+            .unwrap();
+        reg.cancel_attempt("ts1", "retry").await.unwrap();
+        let gate = reg.state_gate().await;
+        assert_eq!(
+            reg.provisional_draft_requires_state("ts1", "first", &gate),
+            None
+        );
+        assert_eq!(
+            reg.provisional_draft_requires_state("ts1", "retry", &gate),
+            expected
+        );
+        drop(gate);
+        let _write = draft.write.lock().await;
+        if expected.is_some() {
+            draft.retire_watch("first");
+            assert!(published.upgrade().is_some());
+            assert!(draft.saved_watch("retry").is_some());
+        }
+        draft.retire_watch("retry");
+        assert!(published.upgrade().is_none());
+        let late = Arc::new(AtomicBool::new(true));
+        draft.record_saved_watch("retry", late.clone());
+        assert!(!late.load(Ordering::SeqCst));
+        assert!(draft.saved_watch("retry").is_none());
+        std::fs::remove_dir_all(ud).unwrap();
+    }
+}
+
 struct SecretChecker(Mutex<Vec<Value>>);
 #[async_trait]
 impl ConfigChecker for SecretChecker {

@@ -142,6 +142,7 @@ async fn save_tailscale_login_profile(
     app: &AppHandle,
     state: &AppRuntime,
     server: Value,
+    provisional_attempt_id: Option<&str>,
 ) -> ApiResponse<Option<TailscaleProfileSave>> {
     use TailscaleProfileSave::{RuntimePending, Saved};
 
@@ -149,6 +150,30 @@ async fn save_tailscale_login_profile(
         Ok(server) if server["protocol"] == "tailscale" => server,
         Ok(_) => return ApiResponse::err("Expected a Tailscale profile"),
         Err(error) => return ApiResponse::err(error),
+    };
+    let server_id = server["id"].as_str().expect("validated server ID");
+    let mesh = state.mesh();
+    let attempt = provisional_attempt_id
+        .and_then(|id| mesh.provisional_tailscale_draft_attempt(server_id, id));
+    if provisional_attempt_id.is_some() && attempt.is_none() {
+        return ApiResponse::err("Login request was cancelled or expired");
+    }
+    let draft = attempt.as_ref().and_then(|attempt| attempt.draft.as_ref());
+    let _write = match draft {
+        Some(draft) => Some(draft.write.lock().await),
+        None => None,
+    };
+    if attempt.as_ref().is_some_and(|attempt| attempt.cancelled()) {
+        return ApiResponse::err("Login request was cancelled");
+    }
+    let vacant = if draft.is_some() {
+        let _gate = mesh.tailscale_state_gate().await;
+        mesh.tailscale_state_dir(server_id).is_ok_and(|directory| {
+            std::fs::symlink_metadata(directory)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        })
+    } else {
+        false
     };
     let config = state.config();
     let proxy = &state.proxy;
@@ -161,10 +186,15 @@ async fn save_tailscale_login_profile(
         return ApiResponse::err(error);
     }
     let stopped = || !proxy.tailscale_writer_alive() && !proxy.core_lifecycle_busy();
-    let Some(edit) = edit else {
+    let Some(mut edit) = edit else {
         // The exact profile already exists. An idempotent retry cannot apply an
         // earlier writer's pending graph or infer its terminal from D.
         return ApiResponse::ok(Some(if stopped() { Saved } else { RuntimePending }));
+    };
+    let watch = if vacant {
+        config.bind_provisional_tailscale_edit(&mut edit, server_id, None)
+    } else {
+        None
     };
     let save_only = || {
         // Only this exact append may be written. The native login path
@@ -216,6 +246,9 @@ async fn save_tailscale_login_profile(
         }
         Err(error) => return ApiResponse::err(error.to_string()),
     };
+    if let (Some(draft), Some(attempt_id), Some(watch)) = (draft, provisional_attempt_id, watch) {
+        draft.record_saved_watch(attempt_id, watch);
+    }
     proxy.push_pending_changes();
     emit_config_changed_signal(app);
     ApiResponse::ok(Some(if config.saved_revision() == revision {
@@ -329,9 +362,16 @@ pub async fn server_add(
     state: State<'_, AppRuntime>,
     server: Value,
     for_tailscale_login: Option<bool>,
+    provisional_attempt_id: Option<String>,
 ) -> Result<ApiResponse<Option<TailscaleProfileSave>>, ()> {
     if for_tailscale_login.unwrap_or(false) {
-        return Ok(Box::pin(save_tailscale_login_profile(&app, &state, server)).await);
+        return Ok(Box::pin(save_tailscale_login_profile(
+            &app,
+            &state,
+            server,
+            provisional_attempt_id.as_deref(),
+        ))
+        .await);
     }
     // 远端已注册的 WARP 设备凭据须先本地保管，沿用先落盘路径；其余节点先 Plan 再落盘。
     if warp_credentials(&server).is_none() {
@@ -428,8 +468,39 @@ pub async fn server_update(
     app: AppHandle,
     state: State<'_, AppRuntime>,
     server: Value,
+    provisional_attempt_id: Option<String>,
 ) -> Result<ApiResponse<()>, ()> {
-    let prepare = || server_update_core(state.config(), server.clone());
+    let server_id = server["id"].as_str().unwrap_or_default();
+    let attempt = provisional_attempt_id.as_deref().and_then(|id| {
+        state
+            .mesh()
+            .provisional_tailscale_draft_attempt(server_id, id)
+    });
+    if provisional_attempt_id.is_some() && attempt.is_none() {
+        return Ok(ApiResponse::err("Login request was cancelled or expired"));
+    }
+    let draft = attempt.as_ref().and_then(|attempt| attempt.draft.as_ref());
+    let _write = match draft {
+        Some(draft) => Some(draft.write.lock().await),
+        None => None,
+    };
+    if attempt.as_ref().is_some_and(|attempt| attempt.cancelled()) {
+        return Ok(ApiResponse::err("Login request was cancelled"));
+    }
+    let prepare = || {
+        let (result, mut edit) = server_update_core(state.config(), server.clone())?;
+        let watch = draft
+            .zip(provisional_attempt_id.as_deref())
+            .and_then(|(draft, attempt_id)| draft.saved_watch(attempt_id));
+        if let (Some(edit), Some(watch)) = (edit.as_mut(), watch) {
+            if attempt.as_ref().is_some_and(|attempt| !attempt.cancelled()) {
+                state
+                    .config()
+                    .bind_provisional_tailscale_edit(edit, server_id, Some(&watch));
+            }
+        }
+        Ok((result, edit))
+    };
     Ok(
         match Box::pin(apply_prepared_server_edit(&app, &state, prepare)).await {
             Ok(()) => ok_void(),
@@ -525,14 +596,7 @@ pub async fn server_delete(
             .prepare_config_edit(|cfg| {
                 let was_selected =
                     cfg.get("selectedServerId").and_then(Value::as_str) == Some(&server_id);
-                let removed = cfg
-                    .get_mut("servers")
-                    .and_then(Value::as_array_mut)
-                    .and_then(|arr| {
-                        arr.iter()
-                            .position(|s| s.get("id").and_then(Value::as_str) == Some(&server_id))
-                            .map(|idx| arr.remove(idx))
-                    });
+                let removed = remove_server_row(cfg, &server_id);
                 let Some(_removed) = removed else {
                     return ConfigDecision::Skip(Err(format!("服务器不存在: {server_id}")));
                 };
@@ -548,6 +612,14 @@ pub async fn server_delete(
             Err(error) => ApiResponse::err(error),
         },
     )
+}
+
+fn remove_server_row(cfg: &mut Value, server_id: &str) -> Option<Value> {
+    let servers = cfg.get_mut("servers")?.as_array_mut()?;
+    let index = servers
+        .iter()
+        .position(|server| server["id"].as_str() == Some(server_id))?;
+    Some(servers.remove(index))
 }
 
 /// Individual-node batch actions never remove subscription-managed rows. Source
@@ -1573,6 +1645,7 @@ pub async fn tailscale_login_prepare(
     state: State<'_, AppRuntime>,
     server_id: String,
     attempt_id: String,
+    form_id: Option<String>,
 ) -> Result<ApiResponse<()>, ()> {
     if polaris_mesh::tailscale_state::tailscale_state_dir(std::path::Path::new("."), &server_id)
         .is_err()
@@ -1585,7 +1658,7 @@ pub async fn tailscale_login_prepare(
     Ok(
         match state
             .mesh()
-            .prepare_tailscale_login(&server_id, &attempt_id)
+            .prepare_tailscale_login(&server_id, &attempt_id, form_id.as_deref())
             .await
         {
             Ok(()) => ok_void(),
@@ -1821,6 +1894,71 @@ fn saved_tailscale_identity_epoch(
     crate::runtime::tailscale_login_core::saved_tailscale_identity_epoch(saved, server_id)
 }
 
+async fn discard_provisional_tailscale_profile(
+    app: &AppHandle,
+    state: &AppRuntime,
+    server_id: &str,
+    attempt_id: &str,
+) -> Result<(), String> {
+    let mesh = state.mesh();
+    let proxy = state.proxy();
+    let Some(attempt) = mesh.provisional_tailscale_draft_attempt(server_id, attempt_id) else {
+        return Ok(());
+    };
+    let draft = attempt.draft.as_ref().expect("draft attempt");
+    // Wait for this form's in-flight Add without holding either runtime gate.
+    let _write = draft.write.lock().await;
+    let Some(row) = draft.saved_watch(attempt_id) else {
+        draft.retire_watch(attempt_id);
+        return Ok(());
+    };
+    let (config_patch, gate) = loop {
+        let config_patch = proxy.lock_config_patch().await;
+        if let Some(gate) = mesh.try_tailscale_state_gate() {
+            break (config_patch, gate);
+        }
+        // Let the lifecycle owner settle without holding switch_serial.
+        drop(config_patch);
+        drop(mesh.tailscale_state_gate().await);
+    };
+    let may_remove = mesh
+        .provisional_tailscale_draft_requires_state(server_id, attempt_id, &gate)
+        .is_some_and(|state_required| {
+            proxy.tailscale_candidate_absent_from_runtime(server_id)
+                && mesh.tailscale_state_dir(server_id).is_ok_and(|directory| {
+                    provisional_tailscale_state_allows_discard(&directory, state_required)
+                })
+        });
+    let removed = if may_remove {
+        // R has no candidate. Recheck the row under the saved writer and
+        // keep unrelated edits from the latest D.
+        let (_, saved) = state
+            .config()
+            .update_deferred_cleanup(|cfg| {
+                if !row.load(std::sync::atomic::Ordering::SeqCst)
+                    || cfg["selectedServerId"].as_str() == Some(server_id)
+                    || remove_server_row(cfg, server_id).is_none()
+                {
+                    return ConfigDecision::Skip(());
+                }
+                prune_recent_server_ids_to_existing(cfg);
+                ConfigDecision::Write(())
+            })
+            .map_err(|error| error.to_string())?;
+        saved.is_some()
+    } else {
+        false
+    };
+    draft.retire_watch(attempt_id);
+    drop(gate);
+    drop(config_patch);
+    if removed {
+        proxy.push_pending_changes();
+        emit_config_changed_signal(app);
+    }
+    Ok(())
+}
+
 /// 取消精确登录请求：瞬态核等待收割；正常主核仅撤销本次观察，连接继续由用户控制。
 /// 幂等：取消一个不存在的登录不算错（对齐 Polaris handler 的静默 ok）。
 #[allow(
@@ -1829,20 +1967,32 @@ fn saved_tailscale_identity_epoch(
 )]
 #[tauri::command]
 pub async fn tailscale_login_cancel(
+    app: AppHandle,
     state: State<'_, AppRuntime>,
     server_id: String,
     attempt_id: String,
+    discard_provisional_profile: Option<bool>,
 ) -> Result<ApiResponse<()>, ()> {
-    Ok(
-        match state
-            .mesh()
-            .cancel_tailscale_login_attempt(&server_id, &attempt_id)
+    let result = match state
+        .mesh()
+        .cancel_tailscale_login_attempt(&server_id, &attempt_id)
+        .await
+    {
+        Ok(()) if discard_provisional_profile.unwrap_or(false) => {
+            Box::pin(discard_provisional_tailscale_profile(
+                &app,
+                &state,
+                &server_id,
+                &attempt_id,
+            ))
             .await
-        {
-            Ok(()) => ok_void(),
-            Err(reason) => ApiResponse::err_with_code(reason, "TAILSCALE_LOGIN_CANCEL_FAILED"),
-        },
-    )
+        }
+        result => result,
+    };
+    Ok(match result {
+        Ok(()) => ok_void(),
+        Err(reason) => ApiResponse::err_with_code(reason, "TAILSCALE_LOGIN_CANCEL_FAILED"),
+    })
 }
 
 /// Logout cancels and reaps transient writers before deleting state. A live primary owner is
@@ -2004,6 +2154,28 @@ fn tailscale_state_exists_at(
             Err(error) => Err(error),
         };
     }
+    let Some(bytes) = read_tailscale_state_file(path)? else {
+        return Ok(false);
+    };
+    polaris_mesh::tailscale_state::cached_session_exists_for_presentation(&bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
+fn provisional_tailscale_state_allows_discard(
+    path: &std::path::Path,
+    state_required: bool,
+) -> bool {
+    if !state_required {
+        // A directory that appeared despite no confirmed child dispatch has unknown ownership.
+        return std::fs::symlink_metadata(path)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+    }
+    read_tailscale_state_file(path).is_ok_and(|bytes| {
+        bytes.is_some_and(|bytes| polaris_mesh::tailscale_state::is_prelogin_state(&bytes))
+    })
+}
+
+fn read_tailscale_state_file(path: &std::path::Path) -> std::io::Result<Option<Vec<u8>>> {
     use std::io::Read;
     const MAX_STATE_BYTES: u64 = 4 * 1024 * 1024;
     let unknown = || {
@@ -2014,7 +2186,7 @@ fn tailscale_state_exists_at(
     };
     let directory = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
     if !directory.is_dir() || directory.file_type().is_symlink() {
@@ -2033,7 +2205,7 @@ fn tailscale_state_exists_at(
     let file_path = path.join("tailscaled.state");
     let metadata = match std::fs::symlink_metadata(&file_path) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
     if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > MAX_STATE_BYTES
@@ -2050,8 +2222,7 @@ fn tailscale_state_exists_at(
     if bytes.len() as u64 > MAX_STATE_BYTES {
         return Err(unknown());
     }
-    polaris_mesh::tailscale_state::cached_session_exists_for_presentation(&bytes)
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    Ok(Some(bytes))
 }
 
 /// 上游 `TAILSCALE_GET_STATUS`：拉各 TS 节点状态末帧（sing-box 管理 API STATUS 流缓存）。

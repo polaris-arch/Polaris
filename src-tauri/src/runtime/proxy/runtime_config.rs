@@ -2454,6 +2454,27 @@ impl ProxyRuntime {
         active.then_some(HotConfigEditOutcome::Retryable)
     }
 
+    /// The caller holds switch_serial and the TS state gate through the saved edit.
+    pub(crate) fn tailscale_candidate_absent_from_runtime(&self, id: &str) -> bool {
+        let excludes = |config: &Value| {
+            config["servers"]
+                .as_array()
+                .is_some_and(|servers| servers.iter().all(|row| row["id"].as_str() != Some(id)))
+        };
+        !self.core_lifecycle_busy()
+            && (!self.tailscale_writer_alive()
+                || self
+                    .current_config_snapshot()
+                    .as_ref()
+                    .is_some_and(excludes))
+            && self.runtime_config_apply.lock().is_ok_and(|state| {
+                state
+                    .pending
+                    .as_ref()
+                    .is_none_or(|pending| excludes(&pending.candidate))
+            })
+    }
+
     pub(super) fn config_edit_pending_observation(
         &self,
         published: Option<&(Value, u64)>,

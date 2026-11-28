@@ -19,7 +19,8 @@ pub mod retirement;
 
 mod cached_session;
 pub use cached_session::{
-    cached_session_exists, cached_session_exists_for_presentation, UnknownTailscaleSession,
+    cached_session_exists, cached_session_exists_for_presentation, is_prelogin_state,
+    UnknownTailscaleSession,
 };
 mod auth_projection;
 pub use auth_projection::{

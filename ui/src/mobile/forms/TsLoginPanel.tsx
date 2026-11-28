@@ -10,6 +10,7 @@ import { api } from '@/ipc';
 import {
   TS_LOGIN_TIMEOUT_MS,
   supportsTsAccountActions,
+  cancelTsLoginWithPreparedFallback,
   executeTsLogin,
   nextTsNodeName,
   persistTsLoginServer,
@@ -71,6 +72,7 @@ export function TsLoginPanel({
     .find((group) => group.id === 'mesh')?.servers.map((server) => server.name) ?? [];
 
   const [savedServer, setSavedServer] = useState<ServerConfig>();
+  const [formId] = useState(() => serverId ? undefined : crypto.randomUUID());
   const [name, setName] = useState(() => existingTs?.name ?? nextTsNodeName(meshNames));
   const [nameEdited, setNameEdited] = useState(false);
   const [errName, setErrName] = useState(false);
@@ -94,11 +96,12 @@ export function TsLoginPanel({
   const [progressReadFailedAttempt, setProgressReadFailedAttempt] = useState<string | null>(null);
   type PendingLogin = { serverId: string; attemptId: string; source: 'pending' | 'transient' | 'main'; persisted: boolean };
   const [pending, setPending] = useState<PendingLogin | null>(null);
+  const lastPreparedAdd = useRef<PendingLogin | null>(null);
   const pendingRef = useRef<PendingLogin | null>(null);
+  const closing = useRef(false);
   const submissionRef = useRef(0);
   const editedAfterSaveRef = useRef(false);
   const editRevisionRef = useRef(0);
-  const authorizedRef = useRef(false);
   const progress = useTailscaleLoginProgressStore((s) => progressForLoginRequest(
     pending ? s.attempts[pending.serverId] : undefined,
     pending,
@@ -199,7 +202,6 @@ export function TsLoginPanel({
     if (active?.serverId !== pending.serverId || active.attemptId !== pending.attemptId
       || current?.attemptId !== pending.attemptId || current.phase !== 'authorized') return;
     pendingRef.current = null;
-    authorizedRef.current = true;
     setPending(null);
     setSubmitting(false);
     setTailscaleAuthUrl(pending.serverId, null);
@@ -220,12 +222,12 @@ export function TsLoginPanel({
     setTailscaleLoginInitiated(request.serverId, false);
   };
 
-  const cancelPendingLogin = async (request: PendingLogin, detached = false): Promise<boolean> => {
+  const cancelPendingLogin = async (request: PendingLogin, detached = false, discardProvisionalProfile?: boolean): Promise<boolean> => {
     const current = useTailscaleLoginProgressStore.getState().attempts[request.serverId];
     if (current?.attemptId === request.attemptId && current.phase === 'authorized') return true;
     revokePendingLogin(request);
     try {
-      await api.server.tailscaleLoginCancel(request.serverId, request.attemptId);
+      await api.server.tailscaleLoginCancel(request.serverId, request.attemptId, discardProvisionalProfile);
       return true;
     } catch {
       if (detached) toast.error(t('ts.loginCancelFailed'));
@@ -282,20 +284,17 @@ export function TsLoginPanel({
     }
   };
 
-  // A node saved by this Add panel is removed on close unless it was authorized or handed to the main core.
   const closeAfterCancel = async (): Promise<void> => {
-    const active = pendingRef.current;
-    const addedPhase = savedServer && useTailscaleLoginProgressStore.getState().attempts[savedServer.id]?.phase;
-    if (active && !await cancelPendingLogin(active)) return;
-    pendingRef.current = null;
-    setPending(null);
-    closeInstance(instanceId);
-    if (!serverId && savedServer && !authorizedRef.current && addedPhase !== 'authorized' && addedPhase !== 'mainCore') {
-      try {
-        await api.server.delete(savedServer.id);
-      } catch {
-        toast.error(t('nodes.deleteFail'));
-      }
+    if (closing.current) return;
+    closing.current = true;
+    try {
+      if (!await cancelTsLoginWithPreparedFallback(pendingRef.current, lastPreparedAdd.current,
+        request => cancelPendingLogin(request, false, formId ? true : undefined))) return;
+      pendingRef.current = null;
+      setPending(null);
+      closeInstance(instanceId);
+    } finally {
+      closing.current = false;
     }
   };
 
@@ -320,7 +319,7 @@ export function TsLoginPanel({
   };
 
   const submit = async (stopNoticed = false): Promise<void> => {
-    if (submitting) return;
+    if (submitting || closing.current) return;
     const submissionBase = savedServer ?? existingTs;
     const submittedName = !nameEdited && !submissionBase ? nextTsNodeName(meshNames) : name.trim();
     if (!submittedName) {
@@ -386,7 +385,7 @@ export function TsLoginPanel({
     setNotice(undefined);
     let persisted = false;
     try {
-      if (!await discardPendingLogin()) return;
+      if (!await discardPendingLogin() || closing.current || !hasInstance(instanceId)) return;
       const { server, persist } = planTsLoginSubmit({
         // Presence is presentation metadata. Only an explicit switch selects replacement;
         // the backend owns the writer/identity gates in both platform flows.
@@ -402,7 +401,7 @@ export function TsLoginPanel({
       setTailscaleLoginInitiated(server.id, true);
       const stillActive = () => {
         const phase = useTailscaleLoginProgressStore.getState().attempts[server.id];
-        return pendingRef.current?.attemptId === request.attemptId && hasInstance(instanceId)
+        return !closing.current && pendingRef.current?.attemptId === request.attemptId && hasInstance(instanceId)
           && phase?.attemptId === request.attemptId
           && phase.phase !== 'timedOut' && phase.phase !== 'failed' && phase.phase !== 'cancelled';
       };
@@ -421,7 +420,8 @@ export function TsLoginPanel({
         backendReplacement,
         backendCredentials,
         isActive: stillActive,
-        prepare: () => api.server.tailscaleLoginPrepare(server.id, request.attemptId),
+        prepare: () => api.server.tailscaleLoginPrepare(server.id, request.attemptId, formId),
+        onPrepared: () => { if (formId) lastPreparedAdd.current = request; },
         verifyState: !isIOS && (mode === 'authkey' || replaceIdentity) ? async () => {
           const states = await api.server.tailscaleStateExists([server.id], true);
           if (typeof states[server.id] !== 'boolean') throw new Error('STATE_QUERY_UNAVAILABLE');
@@ -429,7 +429,7 @@ export function TsLoginPanel({
           return states[server.id];
         } : undefined,
         logout: () => api.server.tailscaleLogout(server.id, request.attemptId),
-        save: () => persistTsLoginServer(server, persist),
+        save: () => persistTsLoginServer(server, persist, formId && mode === 'browser' ? request.attemptId : undefined),
         onSaved: () => recordSaved(server),
         refresh: async () => {
           if (!backendOwned && persist === 'none') return;

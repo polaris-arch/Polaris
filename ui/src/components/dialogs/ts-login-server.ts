@@ -224,6 +224,7 @@ export interface TsLoginExecution {
   backendCredentials?: boolean;
   isActive: () => boolean;
   prepare: () => Promise<void>;
+  onPrepared?: () => void;
   verifyState?: () => Promise<boolean>;
   logout: () => Promise<unknown>;
   save: () => Promise<'saved' | 'runtimePending' | void>;
@@ -253,9 +254,19 @@ export function tsLoginErrorReason(error: unknown): string | undefined {
   return undefined;
 }
 
-export async function persistTsLoginServer(server: ServerConfig, persist: 'add' | 'update' | 'none') {
-  if (persist === 'add') return api.server.addTailscaleLoginProfile(server);
-  if (persist === 'update') await api.server.update(server);
+export async function persistTsLoginServer(server: ServerConfig, persist: 'add' | 'update' | 'none', provisionalAttemptId?: string) {
+  if (persist === 'add') return api.server.addTailscaleLoginProfile(server, provisionalAttemptId);
+  if (persist === 'update') await api.server.update(server, provisionalAttemptId);
+}
+
+/** Fence an in-flight Prepare before asking the last acknowledged Add to discard. */
+export async function cancelTsLoginWithPreparedFallback<Request extends { attemptId: string }>(
+  active: Request | null,
+  prepared: Request | null,
+  cancel: (request: Request) => Promise<boolean>,
+): Promise<boolean> {
+  if (active && !await cancel(active)) return false;
+  return !prepared || active?.attemptId === prepared.attemptId || cancel(prepared);
 }
 
 /** Empty-credential login saves first; backend-owned actions refresh once after their request settles. */
@@ -269,6 +280,7 @@ export async function executeTsLogin(input: TsLoginExecution): Promise<{ phase: 
     try {
       await input.prepare();
       if (!input.isActive()) return { phase: 'cancelled' };
+      input.onPrepared?.();
       if (!backendOwned && input.verifyState) {
         stage = 'stateQueryFailed';
         const exists = await input.verifyState();

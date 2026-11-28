@@ -76,6 +76,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 mod attempts;
 mod stale;
 pub(crate) use attempts::Attempt;
+use attempts::DraftObservation;
 use attempts::{AttemptGuard, Attempts};
 pub use attempts::{LoginMode, LoginProgressReceipt, LoginRequest};
 pub use stale::{ProcessStaleLoginSweeper, StaleLoginCoreSweeper};
@@ -2409,13 +2410,24 @@ impl LoginCoreRegistry {
         self.cancel_login(server_id).await.map(|_| ())
     }
 
+    #[cfg(any(target_os = "android", target_os = "ios", test))]
     pub async fn prepare(&self, server_id: &str, attempt_id: &str) -> Result<(), String> {
+        self.prepare_for_form(server_id, attempt_id, None).await
+    }
+
+    pub(crate) async fn prepare_for_form(
+        &self,
+        server_id: &str,
+        attempt_id: &str,
+        form_id: Option<&str>,
+    ) -> Result<(), String> {
         let _gate = self.state_gate().await;
         if self.closing.load(Ordering::SeqCst) {
             return Err("Polaris is shutting down".into());
         }
         polaris_core_supervisor::config_gate::with_check_producer_registration(|| {
-            self.attempts.prepare(server_id, attempt_id)
+            self.attempts
+                .prepare_for_form(server_id, attempt_id, form_id)
         })
         .map_err(|error| error.to_string())?
         .map(|_| ())
@@ -2508,6 +2520,33 @@ impl LoginCoreRegistry {
         attempt.finish();
         guard.1 = true;
         Ok(())
+    }
+
+    pub(crate) fn provisional_draft_attempt(
+        &self,
+        server_id: &str,
+        id: &str,
+    ) -> Option<Arc<Attempt>> {
+        self.attempts.draft_attempt(server_id, id)
+    }
+
+    pub(crate) fn provisional_draft_requires_state(
+        &self,
+        server_id: &str,
+        id: &str,
+        gate: &tokio::sync::MutexGuard<'_, ()>,
+    ) -> Option<bool> {
+        self.assert_auth_state_available(server_id, gate, None)
+            .ok()?;
+        let attempt = self.provisional_draft_attempt(server_id, id)?;
+        if !attempt.is_finished() || !attempt.cancelled() {
+            return None;
+        }
+        match attempt.draft.as_ref()?.proof(id)? {
+            DraftObservation::NotDispatched => Some(false),
+            DraftObservation::Closed => Some(true),
+            DraftObservation::Dispatched | DraftObservation::Blocked => None,
+        }
     }
 
     /// Read-only, attempt-scoped recovery of a missed renderer event. Native running status and
@@ -3231,7 +3270,6 @@ impl LoginCoreRegistry {
         }
     }
 
-    #[cfg(target_os = "android")]
     pub(crate) fn try_state_gate(&self) -> Option<tokio::sync::MutexGuard<'_, ()>> {
         self.start_gate.try_lock().ok()
     }
@@ -3394,6 +3432,8 @@ impl LoginCoreRegistry {
         if main.is_some() {
             return Err("Tailscale main reservation changed during transient close".into());
         }
+        self.attempts
+            .block_drafts(|id| directories.contains_key(id));
         *main = Some(MainClaim {
             token: token.clone(),
             directories,
@@ -3435,6 +3475,7 @@ impl LoginCoreRegistry {
         if state != root.join("tailscale").join(id) || self.shared.contains(id) {
             return Err(unknown());
         }
+        self.attempts.block_drafts(|candidate| candidate == id);
         let directory = canonical_tailscale_claim_directory(state)?;
         let identity = main_endpoint_request_identity(endpoint);
         let mut main = self.shared.main.lock().map_err(|_| unknown())?;
@@ -5056,6 +5097,9 @@ impl LoginCoreRegistry {
                     return false;
                 }
             }
+            if let Some(draft) = &attempt.draft {
+                draft.observe(DraftObservation::Dispatched);
+            }
             if let Some(entry) = pending_entry.take() {
                 self.shared.insert(server.id.clone(), entry);
                 config_guard.disarm();
@@ -5375,12 +5419,15 @@ async fn finish_login_tail(
         native.validate_exit(&ctx.shared.identity, ctx.epoch, fact.clone())?;
         drain.ok_or("登录核 stdio custody 缺失")?.finished().await?;
         ctx.shared
-            .retire_login_tail(&ctx.server_id, ctx.epoch, &native, fact)
+            .retire_login_tail(&ctx.server_id, ctx.epoch, &native, fact)?;
     } else {
         remove_login_config_confirmed(&ctx.config_path)?;
         ctx.shared.remove_if_epoch(&ctx.server_id, ctx.epoch);
-        Ok(())
     }
+    if let Some(draft) = &ctx.attempt.draft {
+        draft.observe(DraftObservation::Closed);
+    }
+    Ok(())
 }
 
 #[cfg(any(target_os = "android", test))]
@@ -5732,6 +5779,16 @@ fn apply_status_frame(
     current: &LoginState,
     update: &daemon::TailscaleStatusUpdate,
 ) -> Result<LoginState, ()> {
+    if let Some(draft) = &ctx.attempt.draft {
+        if update
+            .endpoints
+            .iter()
+            .any(|ep| ctx.tag_to_id.contains_key(&ep.endpoint_tag) && ep.backend_state == "Running")
+        {
+            // The exact native observation survives Cancel and asynchronous reap.
+            draft.observe(DraftObservation::Blocked);
+        }
+    }
     if update.endpoints.iter().any(|ep| {
         ctx.tag_to_id.contains_key(&ep.endpoint_tag)
             && !ep.auth_url.is_empty()

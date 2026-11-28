@@ -12,10 +12,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-#[cfg(test)]
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use polaris_store::fs::{durable_atomic_write, durable_remove, random_tmp_suffix, ConfigFs, StdFs};
 use polaris_store::mesh_guard::{self, REQUIRED_MARKER_FILE};
@@ -515,11 +513,21 @@ pub(crate) struct PreparedConfigEdit {
     pub(crate) previous: Value,
     pub(crate) candidate: Value,
     pub(crate) revision: u64,
+    provisional_tailscale: Option<(String, Arc<AtomicBool>)>,
 }
 
 struct PublishedConfig {
     value: Arc<Value>,
     revision: u64,
+    // Volatile row watches exist only for Add dialogs with an unfinished login.
+    provisional_tailscale_rows: BTreeMap<String, (Value, Weak<AtomicBool>)>,
+}
+
+fn server_row<'a>(config: &'a Value, id: &str) -> Option<&'a Value> {
+    config["servers"]
+        .as_array()?
+        .iter()
+        .find(|row| row["id"].as_str() == Some(id))
 }
 
 /// 配置运行时（`State`-managed，单实例）。
@@ -890,11 +898,65 @@ impl ConfigManager {
 
     fn publish_config_cache(&self, value: Value) {
         if let Ok(mut guard) = self.cache.write() {
+            let provisional_tailscale_rows =
+                guard.as_mut().map_or_else(BTreeMap::new, |previous| {
+                    let mut drafts = std::mem::take(&mut previous.provisional_tailscale_rows);
+                    drafts.retain(|id, (expected, watch)| {
+                        let Some(watch) = watch.upgrade() else {
+                            return false;
+                        };
+                        if !watch.load(Ordering::SeqCst) {
+                            return false;
+                        }
+                        let matches = server_row(&value, id) == Some(expected);
+                        if !matches {
+                            watch.store(false, Ordering::SeqCst);
+                        }
+                        matches
+                    });
+                    drafts
+                });
             *guard = Some(PublishedConfig {
                 value: Arc::new(value),
                 revision: self.saved_revision(),
+                provisional_tailscale_rows,
             });
         }
+    }
+
+    /// Bind an actual Add or a same-form correction to the normal prepared CAS.
+    pub(crate) fn bind_provisional_tailscale_edit(
+        &self,
+        edit: &mut PreparedConfigEdit,
+        id: &str,
+        previous_watch: Option<&Arc<AtomicBool>>,
+    ) -> Option<Arc<AtomicBool>> {
+        let next = server_row(&edit.candidate, id)?;
+        if next["protocol"] != "tailscale" || !next["tailscaleSettings"]["authKey"].is_null() {
+            return None;
+        }
+        let previous = server_row(&edit.previous, id);
+        let watch = match (previous_watch, previous) {
+            (None, None) => Arc::new(AtomicBool::new(true)),
+            (Some(watch), Some(previous)) if watch.load(Ordering::SeqCst) => {
+                // Only fields this form edits on the ordinary browser retry may advance the watch.
+                let mut corrected = previous.clone();
+                corrected["name"] = next["name"].clone();
+                let settings = corrected["tailscaleSettings"].as_object_mut()?;
+                if let Some(url) = next["tailscaleSettings"].get("controlUrl") {
+                    settings.insert("controlUrl".into(), url.clone());
+                } else {
+                    settings.remove("controlUrl");
+                }
+                if corrected != *next {
+                    return None;
+                }
+                watch.clone()
+            }
+            _ => return None,
+        };
+        edit.provisional_tailscale = Some((id.to_owned(), watch.clone()));
+        Some(watch)
     }
 
     /// Observe one published D revision without I/O or acquiring the writer.
@@ -1933,6 +1995,7 @@ impl ConfigManager {
                     previous,
                     candidate: self.canonicalize_untrusted_under_write_lock(&candidate)?,
                     revision: self.saved_revision(),
+                    provisional_tailscale: None,
                 }),
             )),
         }
@@ -1968,7 +2031,24 @@ impl ConfigManager {
             &edit.previous,
             edit.candidate.clone(),
             &[],
-            before_cache_publication,
+            |revision| {
+                if let Some((id, watch)) = edit
+                    .provisional_tailscale
+                    .as_ref()
+                    .filter(|(_, watch)| watch.load(Ordering::SeqCst))
+                {
+                    if let Ok(mut cache) = self.cache.write() {
+                        if let (Some(saved), Some(row)) =
+                            (cache.as_mut(), server_row(&edit.candidate, id))
+                        {
+                            saved
+                                .provisional_tailscale_rows
+                                .insert(id.clone(), (row.clone(), Arc::downgrade(watch)));
+                        }
+                    }
+                }
+                before_cache_publication(revision);
+            },
         )?;
         Ok(Some(self.saved_revision()))
     }

@@ -563,13 +563,7 @@ const SITES: readonly Site[] = [
     file: 'components/dialogs/TsLoginDialog.tsx',
     callee: 'api.server.tailscaleLoginCancel(',
     route: 'direct',
-    why: 'W-3：撤销已发起的远端登录会话，副作用已经在远端发生',
-  },
-  {
-    file: 'components/dialogs/TsLoginDialog.tsx',
-    callee: 'api.server.delete(',
-    route: 'direct',
-    why: 'W-3：撤回本弹窗「添加」时经 addTailscaleLoginProfile 直写落盘、关闭时仍未授权的新节点；与那条直写对称，进暂存会留下一条待 Apply 的残留',
+    why: 'W-3：取消精确登录尝试，放弃新建时由原生核验该尝试与保存 revision 后撤回候选行',
   },
   {
     file: 'App.tsx',
@@ -726,13 +720,7 @@ const SITES: readonly Site[] = [
     file: 'mobile/forms/TsLoginPanel.tsx',
     callee: 'api.server.tailscaleLoginCancel(',
     route: 'direct',
-    why: 'W-3：撤销已发起的远端登录会话，副作用已经在远端发生',
-  },
-  {
-    file: 'mobile/forms/TsLoginPanel.tsx',
-    callee: 'api.server.delete(',
-    route: 'direct',
-    why: 'W-3：撤回本面板「添加」时经 addTailscaleLoginProfile 直写落盘、关闭时仍未授权的新节点（同 TsLoginDialog）',
+    why: 'W-3：取消精确登录尝试，放弃新建时由原生核验该尝试与保存 revision 后撤回候选行',
   },
   {
     file: 'mobile/forms/TsLoginPanel.tsx',

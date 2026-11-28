@@ -20,10 +20,9 @@ fn empty_store_machine_key_and_taildrop_metadata_are_not_cached_accounts() {
         json!({"_machinekey":"bWFjaGluZS1maXh0dXJl"}),
         json!({"_machinekey":"bWFjaGluZS1maXh0dXJl", "_taildrop-received":"MQ==", "_profiles":"e30="}),
     ] {
-        assert_eq!(
-            cached_session_exists(&serde_json::to_vec(&document).unwrap()),
-            Ok(false)
-        );
+        let bytes = serde_json::to_vec(&document).unwrap();
+        assert_eq!(cached_session_exists(&bytes), Ok(false));
+        assert!(is_prelogin_state(&bytes));
     }
 }
 
@@ -38,7 +37,12 @@ fn only_the_current_saved_profile_is_a_cached_session_even_when_runtime_is_stopp
         .as_object_mut()
         .unwrap()
         .remove("_current-profile");
+    assert!(!is_prelogin_state(
+        &serde_json::to_vec(&unselected).unwrap()
+    ));
     assert_eq!(parse(unselected), Ok(false));
+    assert!(!is_prelogin_state(br#"{"_profiles":"invalid"}"#));
+    assert!(!is_prelogin_state(br#"{"_unknown":"MQ=="}"#));
 }
 
 #[test]

@@ -6,7 +6,11 @@ fn cached_presentation_is_separate_from_physical_directory_cleanup() {
     let state = root.join("node");
     assert!(!tailscale_state_exists_at(&state, false).unwrap());
     assert!(!tailscale_state_exists_at(&state, true).unwrap());
+    assert!(provisional_tailscale_state_allows_discard(&state, false));
+    assert!(!provisional_tailscale_state_allows_discard(&state, true));
     std::fs::create_dir(&state).unwrap();
+    assert!(!provisional_tailscale_state_allows_discard(&state, false));
+    assert!(!provisional_tailscale_state_allows_discard(&state, true));
     assert!(tailscale_state_exists_at(&state, false).unwrap());
     assert!(!tailscale_state_exists_at(&state, true).unwrap());
     std::fs::create_dir(state.join("taildrop")).unwrap();
@@ -18,6 +22,8 @@ fn cached_presentation_is_separate_from_physical_directory_cleanup() {
         br#"{"_machinekey":"bWFjaGluZS1maXh0dXJl"}"#,
     ] {
         std::fs::write(state.join("tailscaled.state"), bytes).unwrap();
+        assert!(!provisional_tailscale_state_allows_discard(&state, false));
+        assert!(provisional_tailscale_state_allows_discard(&state, true));
         assert!(!tailscale_state_exists_at(&state, true).unwrap());
         assert_eq!(
             std::fs::read(state.join("tailscaled.state")).unwrap(),

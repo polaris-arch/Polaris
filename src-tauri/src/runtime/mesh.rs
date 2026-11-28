@@ -932,8 +932,30 @@ impl MeshRuntime {
         &self,
         server_id: &str,
         attempt_id: &str,
+        form_id: Option<&str>,
     ) -> Result<(), String> {
-        self.login_registry.prepare(server_id, attempt_id).await
+        self.login_registry
+            .prepare_for_form(server_id, attempt_id, form_id)
+            .await
+    }
+
+    pub(crate) fn provisional_tailscale_draft_attempt(
+        &self,
+        server_id: &str,
+        attempt_id: &str,
+    ) -> Option<Arc<crate::runtime::tailscale_login_core::Attempt>> {
+        self.login_registry
+            .provisional_draft_attempt(server_id, attempt_id)
+    }
+
+    pub(crate) fn provisional_tailscale_draft_requires_state(
+        &self,
+        server_id: &str,
+        id: &str,
+        gate: &tokio::sync::MutexGuard<'_, ()>,
+    ) -> Option<bool> {
+        self.login_registry
+            .provisional_draft_requires_state(server_id, id, gate)
     }
 
     pub fn tailscale_login_progress(
@@ -1016,7 +1038,6 @@ impl MeshRuntime {
         self.login_registry.state_gate().await
     }
 
-    #[cfg(target_os = "android")]
     pub(crate) fn try_tailscale_state_gate(&self) -> Option<tokio::sync::MutexGuard<'_, ()>> {
         self.login_registry.try_state_gate()
     }

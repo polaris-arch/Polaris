@@ -49,8 +49,8 @@ export const serverApi = {
     return invoke(IPC_CHANNELS.SERVER_ADD, { server });
   },
 
-  async addTailscaleLoginProfile(server: ServerConfig): Promise<'saved' | 'runtimePending'> {
-    return invoke(IPC_CHANNELS.SERVER_ADD, { server, forTailscaleLogin: true });
+  async addTailscaleLoginProfile(server: ServerConfig, provisionalAttemptId?: string): Promise<'saved' | 'runtimePending'> {
+    return invoke(IPC_CHANNELS.SERVER_ADD, { server, forTailscaleLogin: true, ...(provisionalAttemptId ? { provisionalAttemptId } : {}) });
   },
 
   /** 批量添加自建节点（本地导入，一次写盘） */
@@ -58,9 +58,9 @@ export const serverApi = {
     return invoke(IPC_CHANNELS.SERVER_ADD_BULK, { servers });
   },
 
-  async update(server: ServerConfig): Promise<void> {
+  async update(server: ServerConfig, provisionalAttemptId?: string): Promise<void> {
     // Rust server_update(server: Value) —— 参数袋 key = `server`。
-    return invoke(IPC_CHANNELS.SERVER_UPDATE, { server });
+    return invoke(IPC_CHANNELS.SERVER_UPDATE, { server, ...(provisionalAttemptId ? { provisionalAttemptId } : {}) });
   },
 
   /**
@@ -85,8 +85,8 @@ export const serverApi = {
   },
 
   /** Reserve an exact login attempt before saving or preparing the normal main connection. */
-  async tailscaleLoginPrepare(serverId: string, attemptId: string): Promise<void> {
-    return invoke(IPC_CHANNELS.TAILSCALE_LOGIN_PREPARE, { serverId, attemptId });
+  async tailscaleLoginPrepare(serverId: string, attemptId: string, formId?: string): Promise<void> {
+    return invoke(IPC_CHANNELS.TAILSCALE_LOGIN_PREPARE, { serverId, attemptId, formId });
   },
 
   /** Read the last native result for this request after a browser foreground transition. */
@@ -105,8 +105,8 @@ export const serverApi = {
   },
 
   /** Cancels this exact login request; it does not certify retirement of the main proxy. */
-  async tailscaleLoginCancel(serverId: string, attemptId: string): Promise<void> {
-    return invoke(IPC_CHANNELS.TAILSCALE_LOGIN_CANCEL, { serverId, attemptId });
+  async tailscaleLoginCancel(serverId: string, attemptId: string, discardProvisionalProfile?: boolean): Promise<void> {
+    return invoke(IPC_CHANNELS.TAILSCALE_LOGIN_CANCEL, { serverId, attemptId, discardProvisionalProfile });
   },
 
   /** 退出登录：只清目标认证记录，保留 Taildrop；iOS 的正常连接/停止由后端负责。 */

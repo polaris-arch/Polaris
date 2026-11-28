@@ -100,19 +100,40 @@ api.server.tailscaleGetStatus = async () => {
     : { connected: false, statuses: [] };
 };
 api.system.openExternal = async url => { test.opens.push(url); };
-api.server.tailscaleLoginPrepare = async () => {
+test.preparedForms = [];
+api.server.tailscaleLoginPrepare = async (serverId, attemptId, formId) => {
+  const prepared = { serverId, attemptId, formId };
+  const hold = test.holdPrepare;
   test.prepares++;
-  if (mode === 'prepare' || mode?.includes('retained-prepare')) await new Promise(resolve => { test.releasePrepare = resolve; });
+  if (hold === 'registered') test.preparedForms.push(prepared);
+  if (mode === 'prepare' || mode?.includes('retained-prepare') || hold) {
+    await new Promise(resolve => { test.releasePrepare = resolve; });
+  }
+  // An attempt cancelled before native Prepare reached the registry cannot register later.
+  if (hold === 'registered' || (hold && test.cancels.some(([, id]) => id === attemptId))) return;
+  test.preparedForms.push(prepared);
 };
 api.server.tailscaleLogout = async () => {
   if (heldDesktop && test.mainStops === 0) throw { code: 'TAILSCALE_LOGOUT_MAIN_CORE' };
   test.logouts++;
 };
-api.server.tailscaleLoginCancel = async (serverId, attemptId) => { test.cancels.push([serverId,attemptId]); };
+test.discards = [];
+api.server.tailscaleLoginCancel = async (serverId, attemptId, discardProvisionalProfile) => {
+  test.cancels.push([serverId,attemptId]);
+  if (!discardProvisionalProfile) return;
+  test.discards.push([serverId, attemptId]);
+  if (mode === 'add-racing') await new Promise(resolve => { test.releaseCancel = resolve; });
+  const prepared = test.preparedForms.at(-1);
+  if (test.provisionalForm?.serverId !== serverId || prepared?.attemptId !== attemptId
+    || prepared.formId !== test.provisionalForm.formId || test.authorizedNatively) return;
+  useAppStore.setState({ servers: [server], config: { servers: [server], subscriptions: [], selectedServerId: null } });
+};
 test.deletes = [];
 api.server.delete = async id => { test.deletes.push(id); };
-api.server.addTailscaleLoginProfile = async next => {
+api.server.addTailscaleLoginProfile = async (next, attemptId) => {
   test.saves++;
+  test.provisionalForm = test.preparedForms.at(-1);
+  if (test.provisionalForm.attemptId !== attemptId) throw Error('Add must carry its exact Prepare');
   useAppStore.setState({ servers: [server, next], config: { servers: [server, next], subscriptions: [], selectedServerId: null } });
   return 'saved';
 };
@@ -159,8 +180,12 @@ useAppStore.setState({ servers: [server], selectedServerId: null, config: { serv
   } });
 // The real config synchronizer also needs the same explicit selection context.
 api.config.get = async () => useAppStore.getState().config;
-api.server.update = async next => {
+api.server.update = async (next, attemptId) => {
   test.saves++;
+  if (mode === 'add-corrected') {
+    if (test.preparedForms.at(-1).attemptId !== attemptId) throw Error('Correction must carry its exact Prepare');
+    test.correctedAttemptId = attemptId;
+  }
   if (next.tailscaleCredentialIntent) {
     next = { ...next, tailscaleSettings: { ...next.tailscaleSettings } };
     delete next.tailscaleCredentialIntent; delete next.tailscaleSettings.authKey;
@@ -206,7 +231,8 @@ test.setRevision = revision => {
 };
 const off = startMobileAppWiring(key => key);
 test.emit = (name, payload) => { for (const fn of listeners.get(name) || []) fn(payload); };
-test.attempt = () => useTailscaleLoginProgressStore.getState().attempts['ts-1'];
+test.attempt = (id = 'ts-1') => useTailscaleLoginProgressStore.getState().attempts[id];
+test.candidatePresent = () => useAppStore.getState().servers.some(server => server.id === test.candidate.id);
 test.begin = id => useTailscaleLoginProgressStore.getState().begin('ts-1', id);
 test.authUrl = () => useAppStore.getState().tailscaleAuthUrls['ts-1'];
 test.initiated = () => useAppStore.getState().tailscaleLoginInitiated['ts-1'];
@@ -823,28 +849,103 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile TS attempt lif
     } finally { await page.close(); }
   }, 30_000);
 
-  it.each([['__ts-login', '.m-form-head .m-form-x'], ['__ts-desktop', '.entry-form-dlg .btn.ghost']])('%s close removes an unauthorized node saved by Add, never an existing one', async (endpoint, close) => {
+  it.each([
+    ['__ts-login', '.m-form-head .m-form-x'],
+    ['__ts-desktop', '.entry-form-dlg .dlg-foot .btn.ghost'],
+  ].flatMap(([endpoint, close]) => ['add', 'existing', 'add-authorized', 'add-racing', 'add-retry', 'add-corrected',
+    'add-retry-prepare', 'add-retry-prepare-registered', 'add-retry-prepare-authorized']
+    .map(mode => ({ endpoint, close, mode }))))
+  ('$endpoint $mode gives native Cancel exact Add ownership', async ({ endpoint, close, mode }) => {
     const page = await browser.newPage({ viewport: { width: 1100, height: 850 }, locale: 'zh-CN' });
+    page.setDefaultTimeout(7_000);
     try {
-      for (const mode of ['add', 'existing', 'add-authorized']) {
-        await page.goto(`${origin}/${endpoint}?mode=${mode}`);
-        await page.locator('.m-form-foot .primary, .entry-form-dlg .btn.flow').click();
-        await page.waitForFunction(() => (window as any).__tsTest.starts === 1);
-        if (mode === 'add-authorized') {
-          // Authorized after an edit keeps it open; a later attempt resets the phase to starting.
-          await page.locator('#mts-name, #ts-login-name').fill('Edited');
-          await page.evaluate(() => { const t = (window as any).__tsTest; t.emit('onTailscaleLoginProgress', { ...t.startRequest, phase: 'authorized', url: null }); });
-          await page.locator('.m-form-foot .primary, .entry-form-dlg .btn.flow').click();
-          await page.waitForFunction(() => (window as any).__tsTest.starts === 2);
-        }
-        await page.locator(close).click();
-        await page.evaluate(() => (window as any).__tsTest.topConfirm()?.onConfirm());
-        await page.waitForFunction(() => (window as any).__tsTest.cancels.length > 0);
-        await page.waitForTimeout(100);
-        const { deletes, id } = await page.evaluate(() => ({ deletes: (window as any).__tsTest.deletes, id: (window as any).__tsTest.candidate.id }));
-        expect(deletes).toEqual(mode === 'add' ? [id] : []);
-        expect(id === 'ts-1').toBe(mode === 'existing');
+      await page.goto(`${origin}/${endpoint}?mode=${mode}`);
+      await page.locator('.m-form-foot .primary, .entry-form-dlg .btn.flow').click();
+      await page.waitForFunction(() => (window as any).__tsTest.starts === 1);
+      if (mode === 'add' || mode === 'add-racing') {
+        await page.evaluate(() => {
+          const t = (window as any).__tsTest;
+          t.emit('onTailscaleLoginProgress', { ...t.startRequest, phase: 'awaitingAuth', url: 'https://login.example/auth' });
+        });
+        await page.waitForFunction(() => {
+          const t = (window as any).__tsTest;
+          return t.attempt(t.startRequest.serverId)?.phase === 'awaitingAuth';
+        });
       }
+      if (mode === 'add-authorized') {
+        // Authorized after an edit keeps it open; a later attempt resets the phase to starting.
+        await page.locator('#mts-name, #ts-login-name').fill('Edited');
+        await page.evaluate(() => { const t = (window as any).__tsTest; t.authorizedNatively = true; t.emit('onTailscaleLoginProgress', { ...t.startRequest, phase: 'authorized', url: null }); });
+        await page.locator('.m-form-foot .primary, .entry-form-dlg .btn.flow').click();
+        await page.waitForFunction(() => (window as any).__tsTest.starts === 2);
+      }
+      const retryPrepareHeld = mode.startsWith('add-retry-prepare');
+      if (mode === 'add-retry' || mode === 'add-corrected' || retryPrepareHeld) {
+        await page.evaluate(mode => {
+          const t = (window as any).__tsTest;
+          t.emit('onTailscaleLoginProgress', { ...t.startRequest, phase: 'failed', reason: 'processExited', url: null });
+          if (mode.startsWith('add-retry-prepare')) {
+            t.holdPrepare = mode.endsWith('-registered') ? 'registered' : 'beforeDispatch';
+            t.authorizedNatively = mode.endsWith('-authorized');
+          }
+        }, mode);
+        if (mode === 'add-corrected') {
+          await page.locator('#mts-name, #ts-login-name').fill('Corrected');
+          await page.locator('#mts-control-url, #ts-login-control-url').fill('https://headscale.example');
+        }
+        await page.locator('.m-form-foot .primary, .entry-form-dlg .btn.flow').click({ timeout: 6_000 });
+        await page.waitForFunction(count => {
+          const t = (window as any).__tsTest;
+          return count === 1 ? t.prepares === 2 && typeof t.releasePrepare === 'function' : t.starts === count;
+        }, retryPrepareHeld ? 1 : 2, { timeout: 6_000 });
+      }
+      await page.locator(close).click();
+      await page.evaluate(() => (window as any).__tsTest.topConfirm()?.onConfirm());
+      await page.waitForFunction(() => (window as any).__tsTest.cancels.length > 0);
+      if (retryPrepareHeld) {
+        await page.waitForFunction(() => (window as any).__tsTest.discards.length === 2);
+        await page.evaluate(() => (window as any).__tsTest.releasePrepare());
+        await page.waitForFunction(() => {
+          const t = (window as any).__tsTest;
+          const retryId = t.discards[0][1];
+          return t.cancels.filter(([, id]: [string, string]) => id === retryId).length === 2;
+        });
+      }
+      if (mode === 'add-racing') {
+        await page.waitForFunction(() => typeof (window as any).__tsTest.releaseCancel === 'function');
+        await page.evaluate(() => {
+          const t = (window as any).__tsTest;
+          t.authorizedNatively = true;
+          t.emit('onTailscaleLoginProgress', { ...t.startRequest, phase: 'authorized', url: null });
+          t.releaseCancel();
+        });
+      }
+      const result = await page.evaluate(() => {
+        const t = (window as any).__tsTest;
+        const progress = t.attempt(t.startRequest.serverId);
+        return { deletes: t.deletes, discards: t.discards, request: t.startRequest, form: t.provisionalForm,
+          prepared: t.preparedForms.at(-1), correctedAttemptId: t.correctedAttemptId, present: t.candidatePresent(),
+          phase: progress?.phase, latestAttemptId: progress?.attemptId, starts: t.starts, saves: t.saves };
+      });
+      expect(result.deletes).toEqual([]);
+      const started = [result.request.serverId, result.request.attemptId];
+      if (retryPrepareHeld) {
+        expect(result.latestAttemptId).not.toBe(result.request.attemptId);
+        expect(result.discards).toEqual([[result.request.serverId, result.latestAttemptId], started]);
+        expect([result.starts, result.saves]).toEqual([1, 1]);
+        expect(result.present).toBe(mode.endsWith('-authorized'));
+      } else {
+        expect(result.discards).toEqual(mode === 'existing' ? [] : [started]);
+        expect(result.present).toBe(!['add', 'add-retry', 'add-corrected'].includes(mode));
+      }
+      if (mode !== 'existing') {
+        expect(result.form.formId).toBeTruthy();
+        expect(result.form.formId).toBe(result.prepared.formId);
+        expect(result.form.serverId).toBe(result.request.serverId);
+      }
+      if (mode === 'add-retry') expect(result.form.attemptId).not.toBe(result.prepared.attemptId);
+      if (mode === 'add-corrected') expect(result.correctedAttemptId).toBe(result.prepared.attemptId);
+      if (mode === 'add-racing') expect(result.phase).toBe('cancelled');
     } finally { await page.close(); }
   }, 30_000);
 

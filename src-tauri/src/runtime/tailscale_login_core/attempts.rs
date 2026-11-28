@@ -52,8 +52,92 @@ pub struct LoginProgressReceipt {
     pub identity_epoch: Option<String>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum DraftObservation {
+    NotDispatched,
+    Dispatched,
+    Closed,
+    Blocked,
+}
+
+struct DraftState {
+    attempt_id: String,
+    observation: DraftObservation,
+    saved_watch: Option<Arc<AtomicBool>>,
+}
+
+impl DraftState {
+    fn block(&mut self) {
+        self.observation = DraftObservation::Blocked;
+        if let Some(watch) = self.saved_watch.take() {
+            watch.store(false, Ordering::SeqCst);
+        }
+    }
+
+    fn may_keep_watch(&self, attempt_id: &str) -> bool {
+        self.attempt_id == attempt_id && self.observation != DraftObservation::Blocked
+    }
+}
+
+pub(crate) struct LoginDraft {
+    form_id: String,
+    current: Mutex<DraftState>,
+    pub(crate) write: tokio::sync::Mutex<()>,
+}
+
+impl LoginDraft {
+    pub(super) fn observe(&self, observation: DraftObservation) {
+        if let Ok(mut current) = self.current.lock() {
+            if current.observation == DraftObservation::Blocked {
+                return;
+            }
+            if observation == DraftObservation::Blocked
+                || (current.observation == DraftObservation::Dispatched
+                    && observation == DraftObservation::Dispatched)
+            {
+                current.block();
+            } else {
+                current.observation = observation;
+            }
+        }
+    }
+
+    pub(super) fn proof(&self, attempt_id: &str) -> Option<DraftObservation> {
+        let state = self.current.lock().ok()?;
+        (state.attempt_id == attempt_id).then_some(state.observation)
+    }
+
+    pub(crate) fn saved_watch(&self, attempt_id: &str) -> Option<Arc<AtomicBool>> {
+        let state = self.current.lock().ok()?;
+        if !state.may_keep_watch(attempt_id) {
+            return None;
+        }
+        state.saved_watch.clone()
+    }
+
+    pub(crate) fn record_saved_watch(&self, attempt_id: &str, watch: Arc<AtomicBool>) {
+        if let Ok(mut state) = self.current.lock() {
+            if state.may_keep_watch(attempt_id) {
+                state.saved_watch = Some(watch);
+                return;
+            }
+        }
+        // A pending save may commit after the form or its authorization has finished.
+        watch.store(false, Ordering::SeqCst);
+    }
+
+    pub(crate) fn retire_watch(&self, attempt_id: &str) {
+        if let Ok(mut state) = self.current.lock() {
+            if state.attempt_id == attempt_id {
+                state.block();
+            }
+        }
+    }
+}
+
 pub(crate) struct Attempt {
     pub server_id: String,
+    pub(crate) draft: Option<Arc<LoginDraft>>,
     pub claimed: AtomicBool,
     pub process_owned: AtomicBool,
     #[cfg(any(target_os = "android", test))]
@@ -270,6 +354,9 @@ impl Attempt {
     }
 
     pub fn bind_main(&self, generation: u64, identity_epoch: Option<String>) {
+        if let Some(draft) = &self.draft {
+            draft.observe(DraftObservation::Blocked);
+        }
         *self
             .main_context
             .lock()
@@ -473,6 +560,9 @@ impl Attempts {
         state.retired_ids.extend(ids);
         drop(state);
         for attempt in &attempts {
+            if let Some(draft) = &attempt.draft {
+                draft.observe(DraftObservation::Blocked);
+            }
             attempt.cancel();
             if !attempt.claimed.load(Ordering::SeqCst) {
                 attempt.finish();
@@ -527,8 +617,21 @@ impl Attempts {
             .ok_or_else(|| "Login request expired or was not prepared".into())
     }
     // Retain cancelled IDs long enough to fence a delayed start IPC, with a hard memory bound.
+    #[cfg(test)]
     pub fn prepare(&self, server_id: &str, id: &str) -> Result<Arc<Attempt>, String> {
-        if id.is_empty() || id.len() > 128 {
+        self.prepare_for_form(server_id, id, None)
+    }
+
+    pub fn prepare_for_form(
+        &self,
+        server_id: &str,
+        id: &str,
+        form_id: Option<&str>,
+    ) -> Result<Arc<Attempt>, String> {
+        if id.is_empty()
+            || id.len() > 128
+            || form_id.is_some_and(|form| form.is_empty() || form.len() > 128)
+        {
             return Err("Invalid login request identity".into());
         }
         let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
@@ -542,6 +645,7 @@ impl Attempts {
             return if attempt.server_id == server_id
                 && !attempt.cancelled()
                 && !attempt.is_finished()
+                && attempt.draft.as_ref().map(|draft| draft.form_id.as_str()) == form_id
             {
                 Ok(attempt.clone())
             } else {
@@ -556,10 +660,43 @@ impl Attempts {
         if state.entries.len() >= 512 {
             return Err("Too many pending login requests".into());
         }
+        let mut draft = None;
+        for attempt in state
+            .entries
+            .values()
+            .filter(|attempt| attempt.server_id == server_id)
+        {
+            if let Some(prior) = &attempt.draft {
+                if Some(prior.form_id.as_str()) == form_id {
+                    draft = Some(prior.clone());
+                } else {
+                    prior.observe(DraftObservation::Blocked);
+                }
+            }
+        }
+        let draft = match (draft, form_id) {
+            (Some(draft), _) => {
+                if let Ok(mut current) = draft.current.lock() {
+                    id.clone_into(&mut current.attempt_id);
+                }
+                Some(draft)
+            }
+            (None, Some(form_id)) => Some(Arc::new(LoginDraft {
+                form_id: form_id.to_owned(),
+                current: Mutex::new(DraftState {
+                    attempt_id: id.to_owned(),
+                    observation: DraftObservation::NotDispatched,
+                    saved_watch: None,
+                }),
+                write: tokio::sync::Mutex::new(()),
+            })),
+            (None, None) => None,
+        };
         let (cancel, _) = watch::channel(false);
         let (done, _) = watch::channel(false);
         let attempt = Arc::new(Attempt {
             server_id: server_id.into(),
+            draft,
             claimed: AtomicBool::new(false),
             process_owned: AtomicBool::new(false),
             #[cfg(any(target_os = "android", test))]
@@ -576,6 +713,28 @@ impl Attempts {
         });
         state.entries.insert(id.into(), attempt.clone());
         Ok(attempt)
+    }
+
+    pub(super) fn block_drafts(&self, uses_node: impl Fn(&str) -> bool) {
+        if let Ok(state) = self.0.lock() {
+            for attempt in state.entries.values() {
+                if let Some(draft) = &attempt.draft {
+                    if uses_node(&attempt.server_id) {
+                        draft.observe(DraftObservation::Blocked);
+                    }
+                }
+            }
+        }
+    }
+
+    pub(super) fn draft_attempt(&self, server_id: &str, id: &str) -> Option<Arc<Attempt>> {
+        let state = self.0.lock().ok()?;
+        let attempt = state.entries.get(id)?;
+        if attempt.server_id != server_id || state.retired_ids.contains(id) {
+            return None;
+        }
+        attempt.draft.as_ref()?.proof(id)?;
+        Some(attempt.clone())
     }
 
     pub fn cancel(&self, server_id: &str, id: &str) -> Result<Option<Arc<Attempt>>, String> {
@@ -607,6 +766,7 @@ impl Attempts {
             let (done, _) = watch::channel(false);
             let attempt = Arc::new(Attempt {
                 server_id: server_id.into(),
+                draft: None,
                 claimed: AtomicBool::new(false),
                 process_owned: AtomicBool::new(false),
                 #[cfg(any(target_os = "android", test))]

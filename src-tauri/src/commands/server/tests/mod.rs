@@ -259,13 +259,45 @@ fn prepared_tailscale_add_keeps_stable_id_and_exact_saved_revision() {
             .unwrap(),
         None
     );
-    let current = prepare().unwrap();
+    let mut current = prepare().unwrap();
+    let draft = config
+        .bind_provisional_tailscale_edit(&mut current, "ts-fresh", None)
+        .unwrap();
     assert!(config
         .commit_prepared_config_edit(&current, || true, |_| {})
         .unwrap()
         .is_some());
     assert_eq!(config.load_full().unwrap()["servers"][1]["id"], "ts-fresh");
     assert!(prepare().is_none());
+    let mut corrected = node.clone();
+    corrected["name"] = json!("Corrected");
+    corrected["tailscaleSettings"]["controlUrl"] = json!("https://headscale.example");
+    let (_, edit) = server_update_core(&config, corrected.clone()).unwrap();
+    let mut edit = edit.unwrap();
+    assert!(config
+        .bind_provisional_tailscale_edit(&mut edit, "ts-fresh", Some(&draft))
+        .is_some());
+    assert!(config
+        .commit_prepared_config_edit(&edit, || true, |_| {})
+        .unwrap()
+        .is_some());
+    assert!(draft.load(std::sync::atomic::Ordering::SeqCst));
+    config
+        .update_deferred_cleanup(|cfg| {
+            cfg["mixedPort"] = json!(23456);
+            ConfigDecision::Write(())
+        })
+        .unwrap();
+    assert_eq!(config.current().unwrap()["mixedPort"], json!(23456));
+    assert!(draft.load(std::sync::atomic::Ordering::SeqCst));
+    config
+        .update_deferred_cleanup(|cfg| {
+            assert!(remove_server_row(cfg, "ts-fresh").is_some());
+            ConfigDecision::Write(())
+        })
+        .unwrap();
+    server_add_core(&config, corrected).unwrap();
+    assert!(!draft.load(std::sync::atomic::Ordering::SeqCst));
 }
 
 #[test]

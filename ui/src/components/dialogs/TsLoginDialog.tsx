@@ -11,7 +11,7 @@ import { api } from '@/ipc';
 import { toast } from '@/lib/error-handler';
 import { Modal } from './Modal';
 import { useDialogStore } from './dialog-store';
-import { executeTsLogin, nextTsNodeName, persistTsLoginServer, planTsLoginSubmit, tsAccountActionsUseNormalMain, tsLoginUsesBackendCredentials, tsLoginUsesBackendReplacement } from './ts-login-server';
+import { cancelTsLoginWithPreparedFallback, executeTsLogin, nextTsNodeName, persistTsLoginServer, planTsLoginSubmit, tsAccountActionsUseNormalMain, tsLoginUsesBackendCredentials, tsLoginUsesBackendReplacement } from './ts-login-server';
 import { captureMainCoreOwner, stopOwnedCore } from './ts-logout-flow';
 import { groupServersBySubscription } from '@/domain/server-grouping';
 import { TsLoginModeSwitch } from './TsLoginModeSwitch';
@@ -49,12 +49,14 @@ export function TsLoginDialog({ instanceId, serverId, replaceIdentity = false }:
   // 否则多节点时会把登录写进任意一个既有节点，重犯 node-edit-routing 那条缺陷）。
   const savedServer = useRef<ServerConfig | undefined>(undefined);
   const activeRequest = useRef<{ serverId: string; attemptId: string; revision: number } | null>(null);
+  const lastPreparedAdd = useRef<typeof activeRequest.current>(null);
   const editRevision = useRef(0);
-  const authorized = useRef(false);
+  const discardOnClose = useRef(false);
   const [saved, setSaved] = useState(Boolean(serverId));
   const existingTs = servers.find((s) => s.id === (serverId ?? savedServer.current?.id)) ?? savedServer.current;
   const meshNames = groupServersBySubscription(visibleServers, subscriptions)
     .find((group) => group.id === 'mesh')?.servers.map((server) => server.name) ?? [];
+  const [formId] = useState(() => serverId ? undefined : crypto.randomUUID());
   const [name, setName] = useState(() => existingTs?.name ?? nextTsNodeName(meshNames));
   const [nameEdited, setNameEdited] = useState(false);
   const [errName, setErrName] = useState(false);
@@ -161,7 +163,6 @@ export function TsLoginDialog({ instanceId, serverId, replaceIdentity = false }:
     // Detach before closing: unmount must not send cancel for a completed login,
     // and a late start receipt cannot complete a successor dialog or attempt.
     activeRequest.current = null;
-    authorized.current = true;
     setPendingRequest(null);
     setSubmitting(false);
     setTailscaleAuthUrl(request.serverId, null);
@@ -186,29 +187,39 @@ export function TsLoginDialog({ instanceId, serverId, replaceIdentity = false }:
     setPendingRequest(null);
   };
 
-  // A node saved by this Add dialog is removed on close unless it was authorized or handed to the main core.
   useEffect(() => () => {
-    const request = activeRequest.current;
+    const activeRequestAtClose = activeRequest.current;
+    const prepared = lastPreparedAdd.current;
+    const request = activeRequestAtClose ?? (discardOnClose.current ? prepared : null);
     activeRequest.current = null;
-    const s = useAppStore.getState();
-    const added = serverId ? undefined : savedServer.current;
-    const addedPhase = added && useTailscaleLoginProgressStore.getState().attempts[added.id]?.phase;
-    let cancelled: Promise<unknown> = Promise.resolve();
-    const current = request && useTailscaleLoginProgressStore.getState().attempts[request.serverId];
-    if (request && current?.attemptId === request.attemptId && loginAttemptActive(current.phase)) {
+    if (!request) return;
+    const current = useTailscaleLoginProgressStore.getState().attempts[request.serverId];
+    const active = current?.attemptId === request.attemptId && loginAttemptActive(current.phase);
+    const discard = discardOnClose.current && !!formId && current?.phase !== 'authorized';
+    if (active) {
       useTailscaleLoginProgressStore.getState().apply({ ...current, phase: 'cancelled', url: null });
+      const s = useAppStore.getState();
       s.setTailscaleLoginInitiated(request.serverId, false);
       s.setTailscaleAuthUrl(request.serverId, null);
-      cancelled = api.server.tailscaleLoginCancel(request.serverId, request.attemptId).catch(() => {});
     }
-    if (added && !authorized.current && addedPhase !== 'authorized' && addedPhase !== 'mainCore') {
-      void cancelled.then(() => api.server.delete(added.id)).catch(() => toast.error(t('nodes.deleteFail')));
+    if (active || discard) {
+      const cancel = async (target: typeof request): Promise<boolean> => {
+        await api.server.tailscaleLoginCancel(target.serverId, target.attemptId, discard || undefined);
+        return true;
+      };
+      const cancelled = discard ? cancelTsLoginWithPreparedFallback(activeRequestAtClose, prepared, cancel) : cancel(request);
+      void cancelled.catch(() => { if (discard) toast.error(t('ts.loginCancelFailed')); });
     }
   }, []);
 
+  const discardAndClose = () => {
+    discardOnClose.current = true;
+    close();
+  };
+
   const requestClose = () => {
     if (!dirty) {
-      close();
+      discardAndClose();
       return;
     }
     const confirmId = open({
@@ -220,7 +231,7 @@ export function TsLoginDialog({ instanceId, serverId, replaceIdentity = false }:
         danger: true,
         onConfirm: () => {
           closeInstance(confirmId);
-          close();
+          discardAndClose();
         },
       },
     });
@@ -316,14 +327,15 @@ export function TsLoginDialog({ instanceId, serverId, replaceIdentity = false }:
       backendReplacement,
       backendCredentials,
       isActive: stillActive,
-      prepare: () => api.server.tailscaleLoginPrepare(server.id, request.attemptId),
+      prepare: () => api.server.tailscaleLoginPrepare(server.id, request.attemptId, formId),
+      onPrepared: () => { if (formId) lastPreparedAdd.current = request; },
       verifyState: !isIOS && (mode === 'authkey' || replaceIdentity) ? async () => {
         const states = await api.server.tailscaleStateExists([server.id], true);
         if (typeof states[server.id] !== 'boolean') throw new Error('STATE_QUERY_UNAVAILABLE');
         return states[server.id];
       } : undefined,
       logout: () => api.server.tailscaleLogout(server.id, request.attemptId),
-      save: () => persistTsLoginServer(server, persist),
+      save: () => persistTsLoginServer(server, persist, formId && mode === 'browser' ? request.attemptId : undefined),
       onSaved: () => {
         savedServer.current = server;
         if (stillActive()) { setSaved(true); if (editRevision.current === submissionRevision) setDirty(false); }

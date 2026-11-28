@@ -68,6 +68,21 @@ pub fn cached_session_exists(bytes: &[u8]) -> Result<bool, UnknownTailscaleSessi
     Ok(false)
 }
 
+/// Recognize a newly created FileStore that contains only pre-login metadata.
+pub fn is_prelogin_state(bytes: &[u8]) -> bool {
+    parse_value(bytes).ok().and_then(|value| {
+        Some(value.as_object()?.iter().all(|(key, value)| {
+            decode_value(value).is_ok_and(|decoded| match key.as_str() {
+                "_machinekey" | "_taildrop-received" => true,
+                "_profiles" => parse_value(&decoded).ok().is_some_and(|profiles| {
+                    profiles.as_object().is_some_and(serde_json::Map::is_empty)
+                }),
+                _ => false,
+            })
+        }))
+    }) == Some(true)
+}
+
 /// Read-only account presence after auth retirement. Absence grants no writer or cleanup authority.
 /// Only a complete modern retired reference pair adds an absent result to the strict getter.
 pub fn cached_session_exists_for_presentation(
