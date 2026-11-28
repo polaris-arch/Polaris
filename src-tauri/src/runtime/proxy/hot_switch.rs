@@ -929,11 +929,25 @@ impl ProxyRuntime {
         generation: u64,
     ) {
         if old_mode == MESH_DIRECT {
-            let _ = self.set_clash_mode_strict(generation, None, old_mode).await;
-            self.rollback_selector_puts(plan, generation).await;
+            if self.set_clash_mode_strict(generation, None, old_mode).await {
+                self.rollback_selector_puts(plan, generation).await;
+            }
         } else {
             self.rollback_selector_puts(plan, generation).await;
-            let _ = self.set_clash_mode_strict(generation, None, old_mode).await;
+            if let Some(old_proxy) = plan
+                .puts
+                .iter()
+                .find(|put| put.selector_tag == PROXY_SELECTOR_TAG)
+                .and_then(|put| put.old_member_tag.as_deref())
+            {
+                if self.read_selector_groups().await.is_some_and(|groups| {
+                    groups
+                        .iter()
+                        .any(|group| group.tag == PROXY_SELECTOR_TAG && group.selected == old_proxy)
+                }) {
+                    let _ = self.set_clash_mode_strict(generation, None, old_mode).await;
+                }
+            }
         }
     }
 
@@ -1926,13 +1940,13 @@ impl ProxyRuntime {
                             )
                             .await
                     {
+                        if self.gate.generation() == switch_generation {
+                            let _ = self
+                                .set_clash_mode_strict(switch_generation, None, old_mode)
+                                .await;
+                        }
                         if !self.selector_operation_is_current(switch_generation, intent_generation)
                         {
-                            if self.gate.generation() == switch_generation {
-                                let _ = self
-                                    .set_clash_mode_strict(switch_generation, None, old_mode)
-                                    .await;
-                            }
                             self.selector_reconcile.mark_required();
                             self.push_pending_changes();
                             return SwitchOutcome::Pending;
@@ -1977,13 +1991,16 @@ impl ProxyRuntime {
                         // normal route/DNS rules live. Strict mode readback is the commit gate.
                         if mode_change.is_some()
                             && new_mode == NORMAL
-                            && !self
+                            && (!selectors_match_puts(
+                                &plan.puts,
+                                self.read_selector_groups().await.as_deref(),
+                            ) || !self
                                 .set_clash_mode_strict(
                                     switch_generation,
                                     Some(intent_generation),
                                     NORMAL,
                                 )
-                                .await
+                                .await)
                         {
                             if !self
                                 .selector_operation_is_current(switch_generation, intent_generation)
@@ -2005,7 +2022,10 @@ impl ProxyRuntime {
                             if self.gate.generation() != switch_generation {
                                 return SwitchOutcome::Pending;
                             }
-                            self.rollback_selector_puts(&plan, switch_generation).await;
+                            if let Some(old_mode) = mode_change {
+                                self.rollback_mode_transition(&plan, old_mode, switch_generation)
+                                    .await;
+                            }
                             log::warn!(
                                 "TS mode 切回普通出口失败或读回不符 → 保持待应用，不隐式重启"
                             );
@@ -2101,6 +2121,14 @@ impl ProxyRuntime {
                                 return SwitchOutcome::Pending;
                             }
                             if !selectors_match_puts(&plan.puts, groups.as_deref()) {
+                                if let Some(old_mode) = mode_change {
+                                    self.rollback_mode_transition(
+                                        &plan,
+                                        old_mode,
+                                        switch_generation,
+                                    )
+                                    .await;
+                                }
                                 log::warn!(
                                     "显式节点热切：PUT 未获严格运行态读回 → 保持选择投影待应用，不隐式重启"
                                 );

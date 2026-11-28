@@ -21,7 +21,9 @@ use polaris_config_engine::builder::mesh_mode::{
 };
 use polaris_config_engine::builder::GenerateConfigDeps;
 use polaris_config_engine::singbox::SingBoxConfig;
-use polaris_config_engine::user_config::dns_constants::is_sentinel_selection;
+use polaris_config_engine::user_config::dns_constants::{
+    is_direct_selection, is_sentinel_selection,
+};
 use polaris_config_engine::user_config::UserConfig;
 use polaris_helper_proto::Platform;
 use polaris_singbox_grpc::{
@@ -3173,8 +3175,11 @@ impl ProxyRuntime {
             "热应用配置生成耗时：候选构建={candidate_ms}ms，运行配置及出站投影={}ms",
             t_previous.elapsed().as_millis()
         );
-        // Direct and block keep the compiled DNS under one route; it still follows the mode.
-        if (baseline.dormant_mesh_modes() || !has_compiled_modes(&generated))
+        // A dormant route is independent of Clash mode. An active split-only
+        // route can only switch to direct through the selector-first control path.
+        let dormant_mesh_modes = baseline.dormant_mesh_modes();
+        let direct = is_direct_selection(typed.effective_selected_server_id());
+        if (direct || dormant_mesh_modes && has_compiled_modes(&generated))
             && generated
                 .dns
                 .as_ref()
@@ -3199,6 +3204,15 @@ impl ProxyRuntime {
                 return decline(RuntimeApplyResult::status("unconfirmed"));
             }
             if before.current_mode != mode {
+                if !dormant_mesh_modes {
+                    return decline(restart_choice(
+                        &candidate,
+                        "structuralChange",
+                        vec!["runtime.clash_mode".into()],
+                        generation,
+                        intent,
+                    ));
+                }
                 if prospective || !offer_confirmation {
                     let mut result = RuntimeApplyResult::status("impactConfirmationRequired");
                     result.reasons.push(RuntimeApplyReason {

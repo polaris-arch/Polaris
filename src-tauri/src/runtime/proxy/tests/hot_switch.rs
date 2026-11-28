@@ -635,6 +635,22 @@ async fn android_dual_mode_ts_switches_both_directions_without_core_generation_c
             "normal",
         ),
         (
+            "ts-mesh",
+            DIRECT_SERVER_ID,
+            "TS Mesh",
+            "direct",
+            "mesh-direct",
+            "normal",
+        ),
+        (
+            DIRECT_SERVER_ID,
+            "ts-mesh",
+            "direct",
+            "TS Mesh",
+            "normal",
+            "mesh-direct",
+        ),
+        (
             "warp-test",
             "ts-mesh",
             "WARP Test",
@@ -1168,11 +1184,32 @@ async fn replacement_during_mode_rollback_cannot_receive_selector_rollback() {
 }
 
 #[tokio::test]
-async fn silent_clash_mode_noop_rolls_back_or_restarts_without_false_hot_switch_receipt() {
+async fn failed_mode_or_selector_readback_rolls_back_without_false_hot_switch_receipt() {
     let ts = mesh_only_ts_node("ts-mesh", "TS Mesh");
-    for (old, new, old_tag, old_mode) in [
-        ("node-a", "ts-mesh", "Node A", "normal"),
-        ("ts-mesh", "node-a", "TS Mesh", "mesh-direct"),
+    for (old, new, old_tag, old_mode, failure) in [
+        ("node-a", "ts-mesh", "Node A", "normal", "mode"),
+        ("ts-mesh", "node-a", "TS Mesh", "mesh-direct", "mode"),
+        (
+            "ts-mesh",
+            DIRECT_SERVER_ID,
+            "TS Mesh",
+            "mesh-direct",
+            "mode",
+        ),
+        (
+            "ts-mesh",
+            DIRECT_SERVER_ID,
+            "TS Mesh",
+            "mesh-direct",
+            "selector",
+        ),
+        (
+            "ts-mesh",
+            DIRECT_SERVER_ID,
+            "TS Mesh",
+            "mesh-direct",
+            "readback",
+        ),
     ] {
         let (rt, _dir) = test_runtime();
         let mut running = config_with_nodes(old, std::slice::from_ref(&ts));
@@ -1188,8 +1225,9 @@ async fn silent_clash_mode_noop_rolls_back_or_restarts_without_false_hot_switch_
         *rt.startup_snapshot.write().unwrap() = Some(running.clone());
         let sink = Arc::new(TestPutSink::default());
         *sink.mode.lock().unwrap() = Some(old_mode.into());
-        sink.mode_noop.store(true, Ordering::SeqCst);
-        sink.follow_puts.store(true, Ordering::SeqCst);
+        sink.mode_noop.store(failure == "mode", Ordering::SeqCst);
+        sink.follow_puts
+            .store(failure != "selector", Ordering::SeqCst);
         *sink.groups.lock().unwrap() = Some(vec![
             group(PROXY_SELECTOR_TAG, old_tag),
             group(
@@ -1201,6 +1239,15 @@ async fn silent_clash_mode_noop_rolls_back_or_restarts_without_false_hot_switch_
                 },
             ),
         ]);
+        if failure == "readback" {
+            let after_mode = Arc::clone(&sink);
+            *sink.on_mode.lock().unwrap() = Some(Box::new(move || {
+                let stale = Arc::clone(&after_mode);
+                *after_mode.on_groups.lock().unwrap() = Some(Box::new(move || {
+                    stale.groups.lock().unwrap().as_mut().unwrap()[1].selected = "stale".into();
+                }));
+            }));
+        }
         *rt.management_api_stub.lock().unwrap() = Some(Arc::clone(&sink));
         let generation = rt.gate.generation();
         let mut disk = running;
@@ -1221,6 +1268,21 @@ async fn silent_clash_mode_noop_rolls_back_or_restarts_without_false_hot_switch_
         );
         assert!(rt.pending_force_restart.read().unwrap().is_none());
         assert_eq!(sink.mode.lock().unwrap().as_deref(), Some(old_mode));
+        if failure == "selector" {
+            assert!(!sink
+                .operations
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|op| op == "mode:normal"));
+        }
+        if failure == "readback" {
+            assert!(sink.operations.lock().unwrap().ends_with(&[
+                "mode:mesh-direct".into(),
+                format!("selector:{DASHBOARD_SELECTOR}:direct"),
+                format!("selector:{PROXY_SELECTOR_TAG}:{old_tag}"),
+            ]));
+        }
         let groups = sink.groups.lock().unwrap();
         assert!(
             groups

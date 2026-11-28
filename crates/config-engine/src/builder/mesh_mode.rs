@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::builder::endpoint_routes::mesh_node_carries_full_tunnel;
 use crate::singbox::{ClashApi, DnsRule, DnsServer, Outbound, RouteRule, SingBoxConfig};
 use crate::user_config::app_config::UserConfig;
-use crate::user_config::dns_constants::{DIRECT_TAG, PROXY_SELECTOR_TAG};
+use crate::user_config::dns_constants::{is_direct_selection, DIRECT_TAG, PROXY_SELECTOR_TAG};
 use crate::user_config::server_config::{Protocol, ServerConfig};
 
 pub const NORMAL: &str = "normal";
@@ -66,14 +66,19 @@ pub fn has_compiled_modes(config: &SingBoxConfig) -> bool {
                 route
                     .rules
                     .iter()
-                    .filter(|rule| rule.clash_mode.as_deref() == Some(mode))
-                    .map(|rule| RouteRule {
-                        clash_mode: None,
-                        ..rule.clone()
-                    })
-                    .collect::<Vec<_>>()
+                    .rev()
+                    .filter(move |rule| rule.clash_mode.as_deref() == Some(mode))
             };
-            policy(NORMAL) != policy(MESH_DIRECT)
+            let mut normal = policy(NORMAL);
+            let mut mesh = policy(MESH_DIRECT);
+            let (Some(normal_fallback), Some(mesh_fallback)) = (normal.next(), mesh.next()) else {
+                return false;
+            };
+            normal_fallback.action.as_deref() == Some("route")
+                && mesh_fallback.action.as_deref() == Some("route")
+                && (normal_fallback.outbound != mesh_fallback.outbound
+                    || normal.next().is_some()
+                    || mesh.next().is_some())
         })
 }
 
@@ -139,13 +144,14 @@ pub fn selected_mode(config: &UserConfig) -> &'static str {
     }
 }
 
-/// A mode transition may only select one of the public exits represented by the compiled
-/// normal policy, or the unique split-only Tailscale endpoint represented by mesh-direct.
+/// The normal policy can use the direct member of proxy-selector, or a public exit.
+/// Mesh-direct represents the unique split-only Tailscale endpoint.
 pub fn selected_is_mode_candidate(config: &UserConfig, mesh_id: &str) -> bool {
     let Some(selected) = config.effective_selected_server_id() else {
         return false;
     };
-    selected == mesh_id
+    is_direct_selection(Some(selected))
+        || selected == mesh_id
         || config.servers.iter().any(|server| {
             server.id == selected
                 && server.protocol != Protocol::Tailscale

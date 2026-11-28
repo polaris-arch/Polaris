@@ -22,8 +22,8 @@
       "system-integration",
       "config-engine"
     ],
-    "digest": "91de6ec2e9cbc2d089863cc07a6ade924020ad7aad5272a48aa2f17fed1ccf9e",
-    "reason": "c5592bb4 基线；9cc49283→c5592bb4 已核实无 helper 行为改动。随后 fix(helper): attest Linux helper births 只改 helper-client 的 App 侧连接器（RootConnector）（Mac root connector 改名、同一 peer 校验），helper 不调用，不可达；helper-proto 仅新增 dev 依赖。随后 fix(config-engine): silence logs from Android mesh shadow projections，helper 不可达：仅 Android 影子投影的日志静默。随后 fix(config-engine): keep compiled DNS while blocked，helper 不可达：阻断 DNS 投影。随后 fix(config-engine): keep compiled DNS on the direct exit，helper 不可达：直连 DNS 投影。"
+    "digest": "f4e4cfe9690daa92543fd56af346feb8c4523c65af4e15ad61e6b5d9f20c6bff",
+    "reason": "c5592bb4 基线；9cc49283→c5592bb4 已核实无 helper 行为改动。随后 fix(helper): attest Linux helper births 只改 helper-client 的 App 侧连接器（RootConnector）（Mac root connector 改名、同一 peer 校验），helper 不调用，不可达；helper-proto 仅新增 dev 依赖。随后 fix(config-engine): silence logs from Android mesh shadow projections，helper 不可达：仅 Android 影子投影的日志静默。随后 fix(config-engine): keep compiled DNS while blocked，helper 不可达：阻断 DNS 投影。随后 fix(config-engine): keep compiled DNS on the direct exit，helper 不可达：直连 DNS 投影。随后 fix(switch): verify the direct selector before leaving mesh mode，仅 Android 双态路由判定和 App 热切换，helper 不可达。"
   },
   "windows": {
     "generation": 8,
@@ -37,7 +37,7 @@
       "config-engine",
       "windows-cleaner"
     ],
-    "digest": "ea41b2b4579686ff7acc0ebd915dd15b50d92a0b60608ea0accde05157dbd8a6",
-    "reason": "c5592bb4 基线；9cc49283→c5592bb4 已核实无 helper 行为改动。随后 fix(helper): attest Linux helper births 只改 helper-client 的 App 侧连接器（RootConnector）（Windows 不编译该连接器），不可达；helper-proto 仅新增 dev 依赖。随后 fix(config-engine): silence logs from Android mesh shadow projections，helper 不可达：仅 Android 影子投影的日志静默。随后 fix(config-engine): keep compiled DNS while blocked，helper 不可达：阻断 DNS 投影。随后 fix(config-engine): keep compiled DNS on the direct exit，helper 不可达：直连 DNS 投影。"
+    "digest": "9a925ce81ca4f98e3d43c4b95873ad3abc5261629cb2960d23f402213ea518ae",
+    "reason": "c5592bb4 基线；9cc49283→c5592bb4 已核实无 helper 行为改动。随后 fix(helper): attest Linux helper births 只改 helper-client 的 App 侧连接器（RootConnector）（Windows 不编译该连接器），不可达；helper-proto 仅新增 dev 依赖。随后 fix(config-engine): silence logs from Android mesh shadow projections，helper 不可达：仅 Android 影子投影的日志静默。随后 fix(config-engine): keep compiled DNS while blocked，helper 不可达：阻断 DNS 投影。随后 fix(config-engine): keep compiled DNS on the direct exit，helper 不可达：直连 DNS 投影。随后 fix(switch): verify the direct selector before leaving mesh mode，仅 Android 双态路由判定和 App 热切换，helper 不可达。"
   }
 }
