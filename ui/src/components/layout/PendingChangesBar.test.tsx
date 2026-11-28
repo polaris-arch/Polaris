@@ -922,7 +922,7 @@ describe('desktop native listener cleanup stays independent', () => {
   });
 });
 
-describe('a reconciled Apply failure settles once the pending set is published elsewhere', () => {
+describe('a known Apply failure settles once the pending set is published elsewhere', () => {
   const owner = { transactionId: 'tx-u', runtimeGeneration: 7, selectionIntentGeneration: 9 };
   const empty = (): PendingNodeChanges => ({ added: [], modified: [], removed: [], restartDeferred: false });
   async function unconfirmed(): Promise<void> {
@@ -932,6 +932,16 @@ describe('a reconciled Apply failure settles once the pending set is published e
     vi.useFakeTimers();
     renderBar();
   }
+
+  it('clears a rejected Apply reply even when it has a transaction ID', async () => {
+    h.applyNow.mockResolvedValueOnce({ ...owner, ok: false, status: 'rejected', saved: true });
+    click('home.pendingApplyBtn');
+    await vi.waitFor(() => expect((h.states[0] as ApplyState).phase).toBe('failed'));
+    expect(renderBar()).not.toBeNull();
+    h.app.pendingChanges = empty();
+    renderBar();
+    expect(renderBar()).toBeNull();
+  });
 
   it.each([['after', 'rejected', false], ['before', 'rejected', false], ['before', 'unconfirmed', true]] as const)(
     'pending clears %s the poll answers %s', async (order, status, kept) => {

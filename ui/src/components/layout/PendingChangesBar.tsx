@@ -241,7 +241,7 @@ export default function PendingChangesBar() {
   const pendingDebt = hasPendingWork(pending) || !!pending.nativeRetirements?.length;
   useEffect(() => {
     setApply((state) => settleAppliedFailure(state, pendingDebt));
-  }, [pendingDebt, apply.phase, apply.reconciling, apply.transactionId]);
+  }, [pendingDebt, apply]);
 
   const view = composeBarView({
     stagedPhase: stagedPhaseOf(saveStatus, stagedEntries.length),

@@ -195,8 +195,8 @@ export function useRuntimeApplyReconciliation(
     }
     setApply((state) => {
       if (!sameCore(state, owner)) return state;
-      if (disposition === 'failure') return { ...mergeNativeRetirements(state, result.nativeRetirements), phase: 'failed', reconciling: false,
-        ...(result.status === 'rejected' && !state.persistenceOnly && !state.coreRecovery ? { transactionId: undefined } : {}),
+      if (disposition === 'failure') return { ...applyReceiptState(state, { status: result.status, nativeRetirements: result.nativeRetirements }),
+        phase: 'failed', reconciling: false,
         persistenceRecoveryEnded: state.persistenceOnly === true && runtimePersistenceRecoveryEnded(result.status, result.reasons),
         reason: t.current(result.status === 'conflict' ? runtimeApplyConflictKey(result.reasons)
           : result.status === 'rejected' ? runtimeApplyRejectedKey(result.reasons) : 'home.pendingHotUnconfirmed') };

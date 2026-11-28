@@ -294,6 +294,9 @@ export function applyReceiptState(
   allowNewHost = false,
 ): ApplyState {
   const next = { ...mergeNativeRetirements(current, result.nativeRetirements) };
+  if (result.status === 'rejected' && !current.persistenceOnly && !current.coreRecovery) {
+    next.transactionId = undefined;
+  }
   const generation = result.runtimeGeneration;
   const intent = result.selectionIntentGeneration;
   const ownerKnown = Number.isSafeInteger(generation) && (generation ?? 0) > 0
